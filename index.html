@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hack the Badge Emulator</title>
+    <link rel="stylesheet" href="/src/ui/shell.css" />
+  </head>
+  <body>
+    <div id="app">
+      <h1>Hack the North 2026 &mdash; Badge Emulator</h1>
+      <div id="badge-frame">
+        <canvas id="badge-screen" width="320" height="240"></canvas>
+        <div id="led-row"></div>
+      </div>
+      <div id="button-pad"></div>
+      <div id="log-panel">
+        <div id="log-header">console.log</div>
+        <pre id="log-output"></pre>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
