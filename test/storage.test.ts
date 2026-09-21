@@ -66,6 +66,28 @@ describe("badge.store", () => {
     ).not.toThrow();
   });
 
+  // Regression test for a code-review finding: get_int()'s fallback branch
+  // used to run Number() on the whole tagged string (e.g. "s:42") instead of
+  // stripping the tag prefix first, so a string-tagged numeric value always
+  // read back as 0 (NaN) via get_int() instead of the string's numeric
+  // value.
+  test("get_int() on a set_str()-tagged numeric string strips the tag before parsing", () => {
+    const env = storeEnv("app_get_int_on_str");
+    expect(() =>
+      runMainScript(
+        env,
+        `
+          store_a.set_str("k1", "42")
+          assert(store_a.get_int("k1") == 42)
+
+          -- Non-numeric string content still falls back to 0, not a crash.
+          store_a.set_str("k2", "not a number")
+          assert(store_a.get_int("k2") == 0)
+        `,
+      ),
+    ).not.toThrow();
+  });
+
   test("key pattern is enforced: [A-Za-z0-9_] only, and rejects (throws) on violation", () => {
     const env = storeEnv("app_key");
     expect(() => runMainScript(env, `store_a.set_int("bad-key!", 1)`)).toThrow(/invalid key/);

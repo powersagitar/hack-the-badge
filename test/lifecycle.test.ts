@@ -186,6 +186,57 @@ describe("runtime/lifecycle end-to-end (fake in-memory fileLoader)", () => {
     }
   });
 
+  // Regression test for a code-review finding: stop() used to leave
+  // `entered`/tick-and-button-suspension state untouched, so restarting the
+  // same AppRuntime after a stop() silently skipped on_enter (since
+  // `entered` was still true) and could inherit a stale tick suspension from
+  // before the stop. stop() now resets this state so start() after stop()
+  // behaves like a fresh run.
+  test("stop() then start() again re-fires on_enter and clears a prior tick suspension", async () => {
+    const runtime = createAppRuntime(
+      BASE_MANIFEST,
+      "/app",
+      makeLoader({
+        "main.lua": `
+          enter_count = 0
+          fail_tick = true
+          tick_calls = 0
+          function on_enter(root)
+            enter_count = enter_count + 1
+          end
+          function on_tick()
+            tick_calls = tick_calls + 1
+            if fail_tick then error("on_tick fails until told otherwise") end
+          end
+        `,
+      }),
+    );
+    const originalConsoleError = console.error;
+    console.error = () => {};
+    try {
+      runtime.start(5);
+      expect(getLuaGlobal(runtime, "enter_count")).toBe(1);
+      await sleep(60); // long enough to exhaust the 3-failure suspension
+      expect(getLuaGlobal(runtime, "tick_calls")).toBe(3);
+      runtime.stop();
+
+      // Flip the Lua-side flag so ticks would succeed if actually dispatched,
+      // then restart: on_enter must re-fire, and ticking must resume (not
+      // stay suspended from before the stop()).
+      runtime.start(5);
+      expect(getLuaGlobal(runtime, "enter_count")).toBe(2);
+      const L = runtime.env.L;
+      lua.lua_pushboolean(L, false);
+      lua.lua_setglobal(L, to_luastring("fail_tick"));
+      await sleep(60);
+      const callsAfterRestart = getLuaGlobal(runtime, "tick_calls") as number;
+      expect(callsAfterRestart).toBeGreaterThan(3);
+    } finally {
+      console.error = originalConsoleError;
+      runtime.stop();
+    }
+  });
+
   test("parseManifest + createAppRuntime together via loadApp with a synthetic app", () => {
     const files = {
       "manifest.cfg": "slug=synthetic\nname=Synthetic App",

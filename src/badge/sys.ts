@@ -11,10 +11,13 @@ const FIXED_FREE_HEAP_BYTES = 196608; // 192 KiB, plausible ESP32-C3 free heap
 
 export interface SysModuleOptions {
   getWidgetCount?: () => number;
+  /** Overrides `stats().lua_limit`; defaults to `FIXED_LUA_LIMIT_BYTES`. */
+  luaLimitBytes?: number;
 }
 
 export function createSysModule(opts: SysModuleOptions = {}) {
   const startTime = now();
+  const luaLimitBytes = opts.luaLimitBytes ?? FIXED_LUA_LIMIT_BYTES;
 
   function elapsedMs(): number {
     return Math.max(0, Math.floor(now() - startTime));
@@ -51,7 +54,7 @@ export function createSysModule(opts: SysModuleOptions = {}) {
       return {
         lua_used: 32768,
         lua_peak: 40960,
-        lua_limit: FIXED_LUA_LIMIT_BYTES,
+        lua_limit: luaLimitBytes,
         widgets: opts.getWidgetCount ? opts.getWidgetCount() : 0,
         uptime_ms: elapsedMs(),
         free_heap: FIXED_FREE_HEAP_BYTES,

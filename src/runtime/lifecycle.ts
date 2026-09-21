@@ -154,7 +154,10 @@ export function createAppRuntime(manifest: AppManifest, appDir: string, fileLoad
     exitRequested = true;
     console.log(`[badge.app.exit] '${manifest.slug}' requested exit (no launcher in this milestone)`);
   });
-  const sys = createSysModule({ getWidgetCount: () => countWidgets(ui.root) });
+  const sys = createSysModule({
+    getWidgetCount: () => countWidgets(ui.root),
+    luaLimitBytes: manifest.heap_kb !== undefined ? manifest.heap_kb * 1024 : undefined,
+  });
 
   setGlobalRaw(env, "badge", (L: LuaState) => {
     lua.lua_newtable(L);
@@ -248,6 +251,13 @@ export function createAppRuntime(manifest: AppManifest, appDir: string, fileLoad
     }
     const res = callGlobalIfDefined(env, "on_exit");
     if (res.error) console.error(`[${manifest.slug}] on_exit error:`, res.error);
+    // Reset lifecycle state so a later start() on this same AppRuntime
+    // behaves like a fresh run (re-fires on_enter, doesn't inherit a stale
+    // tick/button suspension from before this stop()).
+    entered = false;
+    tickFailureStreak = 0;
+    tickSuspended = false;
+    buttonSuspended = false;
   }
 
   return {

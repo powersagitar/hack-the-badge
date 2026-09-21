@@ -208,6 +208,30 @@ describe("common widget methods", () => {
     expect(ui.root.children.length).toBe(0);
   });
 
+  // Regression test for a code-review finding: delete() used to remove only
+  // the widget itself from the registry, leaking a registry entry per
+  // descendant and leaving orphaned children still resolvable from Lua even
+  // though they were detached from the render tree. Widget *methods* are
+  // closures over the JS object directly (registry-independent by design --
+  // see the module doc comment), so the observable effect of the leak is
+  // specifically that a deleted child could still be passed as a `parent`
+  // argument (which does go through the registry via resolveWidgetArg) to
+  // create new widgets under it. That must now fail instead of succeeding.
+  test("delete() recursively removes descendants, so a deleted child can no longer be used as a parent", () => {
+    const { env } = makeUiEnv();
+    expect(() =>
+      runMainScript(
+        env,
+        `
+          local a = badge.ui.box(root, 10, 10)
+          child_ref = badge.ui.box(a, 1, 1)
+          a:delete()
+          badge.ui.box(child_ref, 1, 1)
+        `,
+      ),
+    ).toThrow(/stale or invalid widget reference/);
+  });
+
   test("style({...}) merges into the widget's base style", () => {
     const { env, ui } = makeUiEnv();
     runMainScript(

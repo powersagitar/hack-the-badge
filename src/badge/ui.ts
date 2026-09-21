@@ -179,6 +179,12 @@ export function createUiModule(): UiModule {
   const registry = new Map<number, Widget>();
   registry.set(root.id, root);
 
+  /** Recursively removes a widget and all its descendants from `registry`. */
+  function removeSubtreeFromRegistry(w: Widget): void {
+    registry.delete(w.id);
+    for (const child of w.children) removeSubtreeFromRegistry(child);
+  }
+
   function resolveWidgetArg(L: LuaState, idx: number): Widget {
     if (lua.lua_type(L, idx) !== lua.LUA_TTABLE) {
       luaErrorStr(L, "expected a widget (table with __wid) argument");
@@ -263,7 +269,7 @@ export function createUiModule(): UiModule {
         const i = w.parent.children.indexOf(w);
         if (i >= 0) w.parent.children.splice(i, 1);
       }
-      registry.delete(w.id);
+      removeSubtreeFromRegistry(w);
       return 0;
     });
     method("set_text", (L, w) => {
@@ -310,6 +316,10 @@ export function createUiModule(): UiModule {
       const c = argInt(L, 2);
       if (w.type === "line") w.style.line_color = c;
       else if (w.type === "arc") w.style.arc_color = c;
+      // bar/slider render their value indicator from `style.color` (see
+      // canvas.ts's `paintValueFill`), not `style.bg_color` (which is the
+      // track background painted underneath it via `paintBox`).
+      else if (w.type === "bar" || w.type === "slider") w.style.color = c;
       else w.style.bg_color = c;
       return 0;
     });
@@ -322,7 +332,13 @@ export function createUiModule(): UiModule {
     });
     method("set_font_size", (L, w) => {
       const s = argStr(L, 2);
-      if (s) w.fontSize = s;
+      if (s) {
+        w.fontSize = s;
+        // `fontPx()` in canvas.ts reads `style.text_font`, not the
+        // standalone `fontSize` field -- keep both in sync so this
+        // actually changes the rendered text size.
+        w.style.text_font = s;
+      }
       return 0;
     });
     method("style", (L, w) => {

@@ -76,7 +76,9 @@ export function createStoreModule(appSlug: string) {
     get_int(key: string) {
       const raw = readTagged(key);
       if (raw === null) return null;
-      const n = raw.startsWith("n:") ? Number(raw.slice(2)) : Number(raw);
+      const stripped =
+        raw.startsWith("n:") || raw.startsWith("s:") ? raw.slice(2) : raw;
+      const n = Number(stripped);
       return Number.isFinite(n) ? Math.trunc(n) : 0;
     },
     set_str(key: string, value: string) {
