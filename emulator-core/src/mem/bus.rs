@@ -20,7 +20,11 @@
 //!    answer a read, which is exactly the cross-peripheral access the
 //!    ruling anticipated: [`FirmwareBus::read_byte`] reads both concrete
 //!    fields directly, no trait object involved.
-//! 5. **Catch-all**: any address covered by none of the above (every
+//! 5. **GPIO** ([`crate::mem::soc::GPIO_RANGE`]): routed to
+//!    [`FirmwareBus::gpio`], same ruling — see `crate::peripherals::gpio`
+//!    for the register model and the emulated 74HC165 button shift
+//!    register.
+//! 6. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -35,11 +39,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::systimer::SysTimer;
 
 use super::image::SegmentDescriptor;
-use super::soc::{is_xip_addr, INTERRUPT_CORE0_RANGE, SYSTIMER_RANGE};
+use super::soc::{is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SYSTIMER_RANGE};
 use super::Bus;
 
 /// Max number of catch-all accesses [`FirmwareBus`] remembers (oldest
@@ -100,6 +105,9 @@ pub struct FirmwareBus {
     /// The `INTERRUPT_CORE0` interrupt matrix (`crate::peripherals::intc`),
     /// same ruling.
     pub intc: InterruptController,
+    /// The GPIO peripheral (`crate::peripherals::gpio`), same ruling —
+    /// includes the emulated 74HC165 button shift register.
+    pub gpio: Gpio,
     /// Ring buffer of the most recent catch-all accesses, capped at
     /// [`UNMAPPED_LOG_CAPACITY`].
     unmapped_log: VecDeque<UnmappedAccess>,
@@ -137,6 +145,7 @@ impl FirmwareBus {
             ram_regions,
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
+            gpio: Gpio::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
     }
@@ -204,6 +213,9 @@ impl FirmwareBus {
             }
             return self.intc.read_byte(offset);
         }
+        if GPIO_RANGE.contains(&addr) {
+            return self.gpio.read_byte(addr - GPIO_RANGE.start);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -229,6 +241,10 @@ impl FirmwareBus {
                 // matching real hardware.
                 self.intc.write_byte(offset, val);
             }
+            return;
+        }
+        if GPIO_RANGE.contains(&addr) {
+            self.gpio.write_byte(addr - GPIO_RANGE.start, val);
             return;
         }
         self.record_unmapped(addr, true);

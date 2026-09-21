@@ -12,13 +12,17 @@
 //! - [`intc`]: [`intc::InterruptController`], the ESP32-C3's non-PLIC
 //!   interrupt matrix (`INTERRUPT_CORE0`) — per-source MAP registers routing
 //!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG`.
+//! - [`gpio`]: [`gpio::Gpio`], the GPIO peripheral plus an emulated 74HC165
+//!   shift register (`gpio::Hc165`) the real badge uses to read 7 of its 8
+//!   buttons.
 //!
-//! Per this plan's pre-flight design ruling, neither peripheral is behind a
-//! trait object: `FirmwareBus` holds concrete, named fields for both, and
+//! Per this plan's pre-flight design ruling, no peripheral is behind a
+//! trait object: `FirmwareBus` holds concrete, named fields for each, and
 //! does its own address-range dispatch (see `mem::bus`'s module doc) —
 //! mirroring how `FirmwareBus` already distinguishes XIP vs. RAM-copied
 //! regions by a manual range check, not a generic abstraction.
 
+pub mod gpio;
 pub mod intc;
 pub mod systimer;
 

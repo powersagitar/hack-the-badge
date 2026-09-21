@@ -63,6 +63,13 @@ pub const SYSTIMER_RANGE: Range<u32> = 0x6002_3000..0x6002_4000;
 /// modeled within it.
 pub const INTERRUPT_CORE0_RANGE: Range<u32> = 0x600c_2000..0x600c_3000;
 
+/// GPIO peripheral registers (`DR_REG_GPIO_BASE`, confirmed via ESP-IDF
+/// v5.5.3's `soc/reg_base.h`). Same one-4KiB-page rationale as
+/// [`SYSTIMER_RANGE`] (the header's highest-cited `GPIO_*_REG` offset is
+/// `0x6FC`, comfortably inside one page). See `crate::peripherals::gpio` for
+/// what's actually modeled within it.
+pub const GPIO_RANGE: Range<u32> = 0x6000_4000..0x6000_5000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +97,16 @@ mod tests {
         assert!(!INTERRUPT_CORE0_RANGE.contains(&SYSTIMER_RANGE.start));
         assert!(!is_xip_addr(SYSTIMER_RANGE.start));
         assert!(!is_xip_addr(INTERRUPT_CORE0_RANGE.start));
+    }
+
+    #[test]
+    fn gpio_range_is_disjoint_from_the_other_peripheral_ranges_and_xip_iram() {
+        assert!(GPIO_RANGE.contains(&0x6000_4000));
+        assert!(!GPIO_RANGE.contains(&0x6000_5000)); // exclusive end
+        assert!(!SYSTIMER_RANGE.contains(&GPIO_RANGE.start));
+        assert!(!INTERRUPT_CORE0_RANGE.contains(&GPIO_RANGE.start));
+        assert!(!GPIO_RANGE.contains(&SYSTIMER_RANGE.start));
+        assert!(!GPIO_RANGE.contains(&INTERRUPT_CORE0_RANGE.start));
+        assert!(!is_xip_addr(GPIO_RANGE.start));
     }
 }
