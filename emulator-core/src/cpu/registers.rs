@@ -64,6 +64,7 @@ pub mod mstatus_bits {
 /// to `Cpu::raise_interrupt`, since a later ESP32-C3-specific interrupt
 /// controller owns the mapping of its own peripherals to cause numbers.
 pub mod exception_code {
+    pub const INSTRUCTION_ACCESS_FAULT: u32 = 1;
     pub const ILLEGAL_INSTRUCTION: u32 = 2;
     pub const BREAKPOINT: u32 = 3;
     pub const ENVIRONMENT_CALL_FROM_M_MODE: u32 = 11;

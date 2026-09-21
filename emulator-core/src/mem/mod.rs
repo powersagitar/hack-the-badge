@@ -32,4 +32,20 @@ pub trait Bus {
     fn write8(&mut self, addr: u32, val: u8);
     fn write16(&mut self, addr: u32, val: u16);
     fn write32(&mut self, addr: u32, val: u32);
+
+    /// Fetches 16 bits at `addr` for **instruction fetch**, distinct from
+    /// [`Bus::read16`]. Returns `Some(value)` if `addr` is genuinely
+    /// executable/mapped; `None` if it would otherwise fall through to a
+    /// never-panic catch-all (unmapped space, or not-yet-modeled peripheral
+    /// MMIO that a real CPU cannot execute out of).
+    ///
+    /// This is intentionally a separate method from `read16`, not a
+    /// replacement: ordinary *data* loads through `read16`/`read8`/`read32`
+    /// must keep returning `0` for unmapped addresses (never trap) since
+    /// that's correct behavior for MMIO probes firmware makes before later
+    /// tasks implement the relevant peripheral. Only the CPU core's
+    /// instruction-fetch path should call `fetch16`, and it should treat
+    /// `None` as an instruction-access-fault condition rather than decoding
+    /// a fabricated value.
+    fn fetch16(&mut self, addr: u32) -> Option<u16>;
 }

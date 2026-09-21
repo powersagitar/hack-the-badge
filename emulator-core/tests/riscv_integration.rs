@@ -84,6 +84,14 @@ impl Bus for FlatBus {
             }
         }
     }
+    fn fetch16(&mut self, addr: u32) -> Option<u16> {
+        let a = addr as usize;
+        if a + 1 < self.mem.len() {
+            Some(u16::from_le_bytes([self.mem[a], self.mem[a + 1]]))
+        } else {
+            None
+        }
+    }
 }
 
 /// Finds `rust-objcopy` (preferred) or `llvm-objcopy` alongside the active

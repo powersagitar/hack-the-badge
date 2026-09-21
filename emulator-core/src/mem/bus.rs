@@ -168,6 +168,15 @@ impl FirmwareBus {
         }
         self.record_unmapped(addr, true);
     }
+
+    /// `true` if `addr` falls inside an XIP or RAM-copied region — i.e. is
+    /// "genuinely executable" per [`Bus::fetch16`]'s contract. Reuses the
+    /// same region-membership checks [`FirmwareBus::read_byte`]/
+    /// [`FirmwareBus::write_byte`] use, rather than duplicating them.
+    fn is_mapped(&self, addr: u32) -> bool {
+        self.xip_regions.iter().any(|r| r.contains(addr))
+            || self.ram_regions.iter().any(|r| r.contains(addr))
+    }
 }
 
 impl Bus for FirmwareBus {
@@ -202,6 +211,15 @@ impl Bus for FirmwareBus {
     fn write32(&mut self, addr: u32, val: u32) {
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             self.write_byte(addr.wrapping_add(i as u32), *b);
+        }
+    }
+
+    fn fetch16(&mut self, addr: u32) -> Option<u16> {
+        let hi_addr = addr.wrapping_add(1);
+        if self.is_mapped(addr) && self.is_mapped(hi_addr) {
+            Some(self.read16(addr))
+        } else {
+            None
         }
     }
 }

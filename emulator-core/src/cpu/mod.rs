@@ -103,7 +103,20 @@ impl Cpu {
         }
 
         let pc = self.regs.pc;
-        let (instr, len) = fetch_and_decode(bus, pc);
+        let (instr, len) = match fetch_and_decode(bus, pc) {
+            Ok(fetched) => fetched,
+            Err(fault_addr) => {
+                // `self.regs.pc` is still `pc` here (untouched), so
+                // `enter_trap` saves the faulting instruction's address as
+                // `mepc`, matching how the `Exception` path below behaves.
+                self.enter_trap(exception_code::INSTRUCTION_ACCESS_FAULT, false, fault_addr);
+                return StepInfo {
+                    trap_taken: true,
+                    instr_len: 0,
+                    pc_before,
+                };
+            }
+        };
 
         match execute::execute(self, bus, instr, pc, len) {
             execute::ExecResult::Normal => StepInfo {
@@ -166,14 +179,24 @@ impl Cpu {
 /// remaining 16 bits (forming a 32-bit word) if `bits[1:0] != 0b11` doesn't
 /// hold, i.e. if it's *not* a compressed opcode. Returns the decoded
 /// instruction and its length in bytes (2 or 4).
-fn fetch_and_decode<B: Bus>(bus: &mut B, pc: u32) -> (Instruction, u8) {
-    let lo = bus.read16(pc);
+///
+/// Uses [`Bus::fetch16`] (not `read16`) for both halfwords, since fetching
+/// an instruction is architecturally distinct from a data load: an address
+/// that isn't genuinely executable must fault rather than silently decode
+/// whatever the never-panic data catch-all would have returned. On such a
+/// fault, returns `Err(addr)` with the specific halfword address that
+/// wasn't mapped (either `pc` itself, or `pc + 2` if the first halfword
+/// fetched fine but indicated a full-width instruction whose second half
+/// wasn't mapped).
+fn fetch_and_decode<B: Bus>(bus: &mut B, pc: u32) -> Result<(Instruction, u8), u32> {
+    let lo = bus.fetch16(pc).ok_or(pc)?;
     if lo & 0b11 != 0b11 {
-        (decode::decode_16(lo), 2)
+        Ok((decode::decode_16(lo), 2))
     } else {
-        let hi = bus.read16(pc.wrapping_add(2));
+        let hi_addr = pc.wrapping_add(2);
+        let hi = bus.fetch16(hi_addr).ok_or(hi_addr)?;
         let word = (lo as u32) | ((hi as u32) << 16);
-        (decode::decode_32(word), 4)
+        Ok((decode::decode_32(word), 4))
     }
 }
 
@@ -242,6 +265,14 @@ mod tests {
                 if let Some(slot) = self.mem.get_mut(a + i) {
                     *slot = *b;
                 }
+            }
+        }
+        fn fetch16(&mut self, addr: u32) -> Option<u16> {
+            let a = addr as usize;
+            if a + 1 < self.mem.len() {
+                Some(u16::from_le_bytes([self.mem[a], self.mem[a + 1]]))
+            } else {
+                None
             }
         }
     }
@@ -650,6 +681,109 @@ mod tests {
         assert!(info.trap_taken);
         assert_eq!(cpu.csr.mcause, exception_code::ILLEGAL_INSTRUCTION);
         assert_eq!(cpu.regs.pc, 0x1000);
+    }
+
+    // ---------------- Instruction-access-fault (unmapped fetch) ----------------
+
+    /// A `Bus` double where data accesses (`read8`/`read16`/`read32`) behave
+    /// like [`TestBus`] (never trap, read 0 out of bounds), but
+    /// [`Bus::fetch16`] treats only addresses below `exec_limit` as
+    /// executable — modeling a real bus where some address range is mapped
+    /// and some isn't.
+    struct PartiallyExecutableBus {
+        mem: Vec<u8>,
+        exec_limit: u32,
+    }
+
+    impl Bus for PartiallyExecutableBus {
+        fn read8(&mut self, addr: u32) -> u8 {
+            self.mem.get(addr as usize).copied().unwrap_or(0)
+        }
+        fn read16(&mut self, addr: u32) -> u16 {
+            let a = addr as usize;
+            u16::from_le_bytes([
+                self.mem.get(a).copied().unwrap_or(0),
+                self.mem.get(a + 1).copied().unwrap_or(0),
+            ])
+        }
+        fn read32(&mut self, addr: u32) -> u32 {
+            let a = addr as usize;
+            let mut buf = [0u8; 4];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = self.mem.get(a + i).copied().unwrap_or(0);
+            }
+            u32::from_le_bytes(buf)
+        }
+        fn write8(&mut self, _: u32, _: u8) {}
+        fn write16(&mut self, _: u32, _: u16) {}
+        fn write32(&mut self, _: u32, _: u32) {}
+        fn fetch16(&mut self, addr: u32) -> Option<u16> {
+            if addr < self.exec_limit && addr.wrapping_add(1) < self.exec_limit {
+                Some(self.read16(addr))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn unmapped_fetch_raises_instruction_access_fault_not_a_silent_noop() {
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x2000;
+        let mut bus = PartiallyExecutableBus {
+            mem: vec![0u8; 16],
+            exec_limit: 8, // only [0, 8) is "executable"
+        };
+        cpu.regs.pc = 0x100; // well past exec_limit -> unmapped fetch
+
+        let info = cpu.step(&mut bus);
+
+        assert!(info.trap_taken);
+        assert_eq!(
+            cpu.csr.mcause,
+            exception_code::INSTRUCTION_ACCESS_FAULT,
+            "mcause must be the exception code"
+        );
+        assert_eq!(
+            cpu.csr.mcause & 0x8000_0000,
+            0,
+            "the interrupt bit must NOT be set -- this is a synchronous exception"
+        );
+        assert_eq!(
+            cpu.csr.mtval, 0x100,
+            "mtval must be the faulting fetch address"
+        );
+        assert_eq!(
+            cpu.regs.pc, 0x2000,
+            "pc must redirect to mtvec, not advance past the faulting address"
+        );
+        assert_eq!(info.instr_len, 0, "no instruction was executed");
+    }
+
+    #[test]
+    fn unmapped_second_halfword_of_full_width_instruction_faults_at_its_own_address() {
+        // The first halfword (0xffff) has bits[1:0] == 0b11, so
+        // fetch_and_decode must fetch a second halfword at pc+2 to form a
+        // full 32-bit instruction. exec_limit only covers the first
+        // halfword, so the SECOND fetch is what must fault, with mtval
+        // reporting pc+2 (not pc).
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x3000;
+        let mut bus = PartiallyExecutableBus {
+            mem: vec![0xff, 0xff, 0, 0, 0, 0, 0, 0],
+            exec_limit: 2, // only [0, 2) executable; pc+2 is unmapped
+        };
+        cpu.regs.pc = 0;
+
+        let info = cpu.step(&mut bus);
+
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(
+            cpu.csr.mtval, 2,
+            "mtval must be the second halfword's address, not pc"
+        );
+        assert_eq!(cpu.regs.pc, 0x3000);
     }
 
     // ---------------- RV32C coverage across all three quadrants ----------------

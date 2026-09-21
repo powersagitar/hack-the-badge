@@ -40,6 +40,7 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
     const STEP_BUDGET: usize = 5_000;
     let mut trap_count = 0usize;
     let mut last_traps: Vec<(usize, u32, u32)> = Vec::new(); // (step, pc_before, mcause)
+    let mut first_instruction_access_fault: Option<(usize, u32, u32)> = None; // (step, pc_before, mtval)
 
     for i in 0..STEP_BUDGET {
         let info = cpu.step(&mut bus);
@@ -48,17 +49,23 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
             if last_traps.len() < 20 {
                 last_traps.push((i, info.pc_before, cpu.csr.mcause));
             }
+            if first_instruction_access_fault.is_none()
+                && cpu.csr.mcause == exception_code::INSTRUCTION_ACCESS_FAULT
+            {
+                first_instruction_access_fault = Some((i, info.pc_before, cpu.csr.mtval));
+            }
         }
     }
 
     eprintln!(
         "boot_integration: ran {STEP_BUDGET} steps; pc ended at 0x{:08x}; \
          sp (x2) = 0x{:08x}; traps taken = {trap_count}; first traps (step, pc_before, mcause) = {:?}; \
-         unmapped accesses recorded = {}",
+         unmapped accesses recorded = {}; first instruction-access-fault (step, pc_before, mtval) = {:?}",
         cpu.regs.pc,
         cpu.regs.read(2),
         last_traps,
         bus.unmapped_log().len(),
+        first_instruction_access_fault,
     );
 
     // The CPU must have made observable forward progress: pc should not be
@@ -69,12 +76,30 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
         "pc collapsed to 0 -- likely an unhandled jump-to-null, treat as stuck"
     );
 
-    // This is an observation harness, not a strict pass/fail gate: real
-    // FreeRTOS boot needs interrupt/timer/peripheral support this task
-    // doesn't build. We only assert the loop *completed* the step budget
-    // (no panic/hang triggered a test framework timeout) -- reaching here at
-    // all is the actual assertion; the eprintln! above is what a human
-    // reads to judge "stuck vs progressing".
+    // Task 2.1's core fix: before it, the CPU's fetch path used the same
+    // never-panic `read16` as data loads, so running the PC into genuinely
+    // unmapped space (the on-chip mask-ROM call this firmware makes ~20
+    // instructions into boot -- see this crate's fetch16/INSTRUCTION_ACCESS_
+    // FAULT plumbing) silently decoded as a no-op HINT and ran away instead
+    // of failing loudly. Assert that boot now genuinely traps there instead.
+    let (fault_step, fault_pc, fault_mtval) = first_instruction_access_fault.expect(
+        "expected the real firmware's boot run to hit at least one \
+         instruction-access-fault (unmapped instruction fetch, e.g. the \
+         on-chip mask-ROM call) within the step budget -- if this no longer \
+         happens, either the fix regressed or the firmware/memory map changed",
+    );
+    eprintln!(
+        "boot_integration: first instruction-access-fault at step {fault_step}, \
+         pc_before=0x{fault_pc:08x}, mtval=0x{fault_mtval:08x}"
+    );
+
+    // This is otherwise an observation harness, not a strict pass/fail gate:
+    // real FreeRTOS boot needs interrupt/timer/peripheral support this task
+    // doesn't build. Beyond the instruction-access-fault assertion above, we
+    // only assert the loop *completed* the step budget (no panic/hang
+    // triggered a test framework timeout) -- reaching here at all is the
+    // rest of the assertion; the eprintln! above is what a human reads to
+    // judge "stuck vs progressing".
 }
 
 #[test]
@@ -99,6 +124,9 @@ fn illegal_instruction_traps_are_recoverable_not_fatal() {
         fn write8(&mut self, _: u32, _: u8) {}
         fn write16(&mut self, _: u32, _: u16) {}
         fn write32(&mut self, _: u32, _: u32) {}
+        fn fetch16(&mut self, _: u32) -> Option<u16> {
+            Some(0xffff)
+        }
     }
 
     let mut cpu = Cpu::new();
