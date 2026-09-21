@@ -779,6 +779,58 @@ mod tests {
     }
 
     #[test]
+    fn decodes_csrrwi_csrrsi_csrrci() {
+        // csrrwi x1, mscratch(0x340), uimm=5 -> funct3=101, rs1 field holds
+        // the 5-bit immediate directly (no register read).
+        let word = (0x340u32 << 20) | (5 << 15) | (0b101 << 12) | (1 << 7) | 0b1110011;
+        match decode_32(word) {
+            Instruction::Csr {
+                rd,
+                csr,
+                src: CsrSrc::Imm(uimm),
+                kind: CsrOp::Rw,
+            } => {
+                assert_eq!(rd, 1);
+                assert_eq!(csr, 0x340);
+                assert_eq!(uimm, 5);
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
+
+        // csrrsi x2, mscratch(0x340), uimm=0x1f -> funct3=110
+        let word = (0x340u32 << 20) | (0x1f << 15) | (0b110 << 12) | (2 << 7) | 0b1110011;
+        match decode_32(word) {
+            Instruction::Csr {
+                rd,
+                csr,
+                src: CsrSrc::Imm(uimm),
+                kind: CsrOp::Rs,
+            } => {
+                assert_eq!(rd, 2);
+                assert_eq!(csr, 0x340);
+                assert_eq!(uimm, 0x1f);
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
+
+        // csrrci x3, mscratch(0x340), uimm=0x0a -> funct3=111
+        let word = (0x340u32 << 20) | (0x0a << 15) | (0b111 << 12) | (3 << 7) | 0b1110011;
+        match decode_32(word) {
+            Instruction::Csr {
+                rd,
+                csr,
+                src: CsrSrc::Imm(uimm),
+                kind: CsrOp::Rc,
+            } => {
+                assert_eq!(rd, 3);
+                assert_eq!(csr, 0x340);
+                assert_eq!(uimm, 0x0a);
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
+    }
+
+    #[test]
     fn decodes_ecall_ebreak_mret() {
         assert_eq!(
             decode_32(0b0000000_00000_00000_000_00000_1110011),

@@ -323,6 +323,30 @@ mod tests {
         ((csr as u32) << 20) | ((rs1 as u32) << 15) | (0b011 << 12) | ((rd as u32) << 7) | 0b1110011
     }
 
+    fn csrrwi(rd: u8, csr: u16, uimm: u8) -> u32 {
+        ((csr as u32) << 20)
+            | ((uimm as u32) << 15)
+            | (0b101 << 12)
+            | ((rd as u32) << 7)
+            | 0b1110011
+    }
+
+    fn csrrsi(rd: u8, csr: u16, uimm: u8) -> u32 {
+        ((csr as u32) << 20)
+            | ((uimm as u32) << 15)
+            | (0b110 << 12)
+            | ((rd as u32) << 7)
+            | 0b1110011
+    }
+
+    fn csrrci(rd: u8, csr: u16, uimm: u8) -> u32 {
+        ((csr as u32) << 20)
+            | ((uimm as u32) << 15)
+            | (0b111 << 12)
+            | ((rd as u32) << 7)
+            | 0b1110011
+    }
+
     // ---------------- RV32I: LUI/AUIPC/JAL/JALR ----------------
 
     #[test]
@@ -556,6 +580,57 @@ mod tests {
         cpu.csr.mscratch = 0xff;
         cpu.regs.write(1, 0x0f);
         let word = csrrc(5, csr_addr::MSCRATCH, 1);
+        let mut bus = TestBus::with_program(&[word]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(5), 0xff);
+        assert_eq!(cpu.csr.mscratch, 0xf0);
+    }
+
+    #[test]
+    fn csrrwi_writes_immediate_and_reads_back_old_value() {
+        let mut cpu = Cpu::new();
+        cpu.csr.mscratch = 0xff;
+        // CSRRWI x5, mscratch, 5 -> rd gets old value (0xff), CSR becomes 5.
+        let word = csrrwi(5, csr_addr::MSCRATCH, 5);
+        let mut bus = TestBus::with_program(&[word]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(5), 0xff, "rd must observe the OLD csr value");
+        assert_eq!(
+            cpu.csr.mscratch, 5,
+            "csr must be unconditionally overwritten with uimm"
+        );
+    }
+
+    #[test]
+    fn csrrsi_sets_bits_via_immediate() {
+        let mut cpu = Cpu::new();
+        cpu.csr.mscratch = 0xf0;
+        // CSRRSI x5, mscratch, 0x0f -> sets the low nibble, rd gets old value.
+        let word = csrrsi(5, csr_addr::MSCRATCH, 0x0f);
+        let mut bus = TestBus::with_program(&[word]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(5), 0xf0);
+        assert_eq!(cpu.csr.mscratch, 0xff);
+    }
+
+    #[test]
+    fn csrrsi_skips_write_when_uimm_is_zero() {
+        let mut cpu = Cpu::new();
+        cpu.csr.mscratch = 0xff;
+        // CSRRSI x5, mscratch, 0 -> per spec, uimm==0 must not write.
+        let word = csrrsi(5, csr_addr::MSCRATCH, 0);
+        let mut bus = TestBus::with_program(&[word]);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(5), 0xff);
+        assert_eq!(cpu.csr.mscratch, 0xff, "must not have been modified");
+    }
+
+    #[test]
+    fn csrrci_clears_bits_via_immediate() {
+        let mut cpu = Cpu::new();
+        cpu.csr.mscratch = 0xff;
+        // CSRRCI x5, mscratch, 0x0f -> clears the low nibble, rd gets old value.
+        let word = csrrci(5, csr_addr::MSCRATCH, 0x0f);
         let mut bus = TestBus::with_program(&[word]);
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.read(5), 0xff);
