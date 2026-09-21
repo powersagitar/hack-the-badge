@@ -70,6 +70,14 @@ pub const INTERRUPT_CORE0_RANGE: Range<u32> = 0x600c_2000..0x600c_3000;
 /// what's actually modeled within it.
 pub const GPIO_RANGE: Range<u32> = 0x6000_4000..0x6000_5000;
 
+/// SPI2 (GPSPI2) peripheral registers (`DR_REG_SPI2_BASE`, confirmed via
+/// ESP-IDF v5.5.3's `soc/reg_base.h`). This is the SPI instance the badge's
+/// ST7789 display uses (SPI2_HOST). Same one-4KiB-page rationale as
+/// [`SYSTIMER_RANGE`] (the header's highest-cited register this module
+/// models, `SPI_W15_REG` at `0xD4`, is comfortably inside one page). See
+/// `crate::peripherals::spi` for what's actually modeled within it.
+pub const SPI2_RANGE: Range<u32> = 0x6002_4000..0x6002_5000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +116,18 @@ mod tests {
         assert!(!GPIO_RANGE.contains(&SYSTIMER_RANGE.start));
         assert!(!GPIO_RANGE.contains(&INTERRUPT_CORE0_RANGE.start));
         assert!(!is_xip_addr(GPIO_RANGE.start));
+    }
+
+    #[test]
+    fn spi2_range_is_disjoint_from_the_other_peripheral_ranges_and_xip_iram() {
+        assert!(SPI2_RANGE.contains(&0x6002_4000));
+        assert!(!SPI2_RANGE.contains(&0x6002_5000)); // exclusive end
+        assert!(!SYSTIMER_RANGE.contains(&SPI2_RANGE.start));
+        assert!(!INTERRUPT_CORE0_RANGE.contains(&SPI2_RANGE.start));
+        assert!(!GPIO_RANGE.contains(&SPI2_RANGE.start));
+        assert!(!SPI2_RANGE.contains(&SYSTIMER_RANGE.start));
+        assert!(!SPI2_RANGE.contains(&INTERRUPT_CORE0_RANGE.start));
+        assert!(!SPI2_RANGE.contains(&GPIO_RANGE.start));
+        assert!(!is_xip_addr(SPI2_RANGE.start));
     }
 }

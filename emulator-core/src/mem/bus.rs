@@ -24,7 +24,17 @@
 //!    [`FirmwareBus::gpio`], same ruling — see `crate::peripherals::gpio`
 //!    for the register model and the emulated 74HC165 button shift
 //!    register.
-//! 6. **Catch-all**: any address covered by none of the above (every
+//! 6. **SPI2/GPSPI2** ([`crate::mem::soc::SPI2_RANGE`]): routed to
+//!    [`FirmwareBus::spi`], same ruling — see `crate::peripherals::spi` for
+//!    the register model and the ST7789 command/pixel-stream interpreter.
+//!    A triggering write (one that sets `SPI_CMD_REG`'s `SPI_USR` bit)
+//!    needs `gpio`'s live GPIO0 level (the D/C line) to know whether the
+//!    transaction is a command or data — another cross-peripheral read
+//!    the "no trait-object dispatch" ruling anticipated:
+//!    [`FirmwareBus::write_byte`] reads `self.gpio.pin_level(0)` directly
+//!    and hands it to [`crate::peripherals::spi::Spi::process_transaction`],
+//!    no trait object involved.
+//! 7. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -41,10 +51,11 @@ use std::sync::Arc;
 
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
+use crate::peripherals::spi::Spi;
 use crate::peripherals::systimer::SysTimer;
 
 use super::image::SegmentDescriptor;
-use super::soc::{is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SYSTIMER_RANGE};
+use super::soc::{is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE};
 use super::Bus;
 
 /// Max number of catch-all accesses [`FirmwareBus`] remembers (oldest
@@ -108,6 +119,10 @@ pub struct FirmwareBus {
     /// The GPIO peripheral (`crate::peripherals::gpio`), same ruling —
     /// includes the emulated 74HC165 button shift register.
     pub gpio: Gpio,
+    /// The SPI2/GPSPI2 peripheral (`crate::peripherals::spi`), same ruling —
+    /// includes the ST7789 command/pixel-stream interpreter and
+    /// reconstructed framebuffer.
+    pub spi: Spi,
     /// Ring buffer of the most recent catch-all accesses, capped at
     /// [`UNMAPPED_LOG_CAPACITY`].
     unmapped_log: VecDeque<UnmappedAccess>,
@@ -146,6 +161,7 @@ impl FirmwareBus {
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             gpio: Gpio::new(),
+            spi: Spi::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
     }
@@ -216,6 +232,9 @@ impl FirmwareBus {
         if GPIO_RANGE.contains(&addr) {
             return self.gpio.read_byte(addr - GPIO_RANGE.start);
         }
+        if SPI2_RANGE.contains(&addr) {
+            return self.spi.read_byte(addr - SPI2_RANGE.start);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -245,6 +264,20 @@ impl FirmwareBus {
         }
         if GPIO_RANGE.contains(&addr) {
             self.gpio.write_byte(addr - GPIO_RANGE.start, val);
+            return;
+        }
+        if SPI2_RANGE.contains(&addr) {
+            let triggered = self.spi.write_byte(addr - SPI2_RANGE.start, val);
+            if triggered {
+                // Cross-peripheral read: needs gpio's live GPIO0 level (the
+                // D/C line) at exactly this moment, not a stale snapshot.
+                // Both fields are concrete on `self`, so this is just
+                // direct field access — the same pattern the
+                // INTERRUPT_CORE0 tier above already uses for its own
+                // cross-peripheral read.
+                let dc_low = !self.gpio.pin_level(0);
+                self.spi.process_transaction(dc_low);
+            }
             return;
         }
         self.record_unmapped(addr, true);

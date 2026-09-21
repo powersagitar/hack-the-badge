@@ -299,6 +299,18 @@ impl Gpio {
         }
     }
 
+    /// The live `GPIO_IN_REG`-equivalent level for a single `pin` (`0..26`)
+    /// — same semantics as one bit of [`Gpio::in_word`], but as a targeted
+    /// single-pin read that doesn't require reconstructing the whole 26-bit
+    /// word. Added for Task 5's SPI/ST7789 peripheral, which needs to read
+    /// GPIO0's live driven level (the D/C line) at the exact moment a SPI
+    /// transaction is triggered — a direct, synchronous field read on the
+    /// concrete `Gpio` field `FirmwareBus` already holds, per this plan's
+    /// "no trait-object peripheral dispatch" ruling.
+    pub fn pin_level(&self, pin: u32) -> bool {
+        self.pin_in_level(pin)
+    }
+
     fn in_word(&self) -> u32 {
         let mut word = 0u32;
         for pin in 0..26 {

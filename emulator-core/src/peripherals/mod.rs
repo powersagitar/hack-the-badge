@@ -15,6 +15,11 @@
 //! - [`gpio`]: [`gpio::Gpio`], the GPIO peripheral plus an emulated 74HC165
 //!   shift register (`gpio::Hc165`) the real badge uses to read 7 of its 8
 //!   buttons.
+//! - [`spi`]: [`spi::Spi`], the SPI2 (GPSPI2) peripheral plus an ST7789
+//!   command/pixel-stream interpreter (`spi::St7789`) that reconstructs a
+//!   framebuffer from what real firmware writes to drive the badge's LCD.
+//!   Needs a live cross-peripheral read of `gpio`'s GPIO0 level (the D/C
+//!   line) at transaction-trigger time — see `spi`'s module doc.
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -24,6 +29,7 @@
 
 pub mod gpio;
 pub mod intc;
+pub mod spi;
 pub mod systimer;
 
 /// Replaces byte `idx` (`0..=3`, little-endian, i.e. `idx == 0` is the
