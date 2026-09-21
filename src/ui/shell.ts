@@ -1,6 +1,8 @@
 /**
  * Page chrome: mounts the on-screen button pad (mouse) and keyboard
- * bindings that both inject `badge.input` events, plus a tiny LED HUD.
+ * bindings that both inject `badge.input` events, a tiny LED HUD, and the
+ * Lua-sandbox-vs-real-firmware mode toggle (`CLAUDE.md`'s architecture
+ * section names this file as where that toggle lives).
  *
  * Keyboard mapping (documented per spec):
  *   ArrowUp/Down/Left/Right -> UP/DOWN/LEFT/RIGHT
@@ -9,11 +11,25 @@
  *   Escape                  -> HOME
  *   Space                   -> AUX1
  * (unmapped: none needed for the smoke-test app; extend KEY_TO_BUTTON as needed.)
+ *
+ * The button pad, keyboard bindings and canvas are shared between modes —
+ * `shell.ts` itself has no notion of "which runtime"; `src/main.ts` owns
+ * both runtimes and passes this module a single `ButtonInjector` that it
+ * internally routes to whichever one is currently active. This module only
+ * reports *which* mode was picked, via `mountModeToggle`'s callback.
  */
 import { BUTTON_NAMES, type ButtonName } from "../badge/input";
 import type { Rgb } from "../badge/led";
 
 export type ButtonInjector = (button: ButtonName, kind: "pressed" | "released") => void;
+
+/** The two emulator modes `CLAUDE.md`'s architecture section describes. */
+export type EmulatorMode = "lua" | "firmware";
+
+const MODE_OPTIONS: Array<{ value: EmulatorMode; label: string }> = [
+  { value: "lua", label: "Lua Sandbox" },
+  { value: "firmware", label: "Real Firmware" },
+];
 
 const KEY_TO_BUTTON: Record<string, ButtonName> = {
   ArrowUp: "UP",
@@ -33,6 +49,18 @@ export interface ShellHandles {
   mountButtons(inject: ButtonInjector): void;
   mountKeyboard(inject: ButtonInjector): void;
   renderLeds(colors: Rgb[]): void;
+  /**
+   * Mounts (or re-renders) the mode-select control into `#mode-toggle`
+   * (a no-op, not an error, if that element isn't present in the page —
+   * same defensive style `mountButtons`/`renderLeds` already use for
+   * `#button-pad`/`#led-row`). `current` controls which option starts
+   * highlighted; `onSelect` fires once per user click on a *different*
+   * option than the one currently highlighted (clicking the already-active
+   * option is a no-op, not a redundant callback). The caller (`main.ts`)
+   * owns actually switching runtimes; this function only reports the choice
+   * and updates which button looks active.
+   */
+  mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void;
 }
 
 export function mountShell(): ShellHandles {
@@ -100,5 +128,22 @@ export function mountShell(): ShellHandles {
     });
   }
 
-  return { canvas, ctx, mountButtons, mountKeyboard, renderLeds };
+  function mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void {
+    const container = document.getElementById("mode-toggle");
+    if (!container) return;
+    container.innerHTML = "";
+    for (const { value, label } of MODE_OPTIONS) {
+      const btn = document.createElement("button");
+      btn.textContent = label;
+      btn.type = "button";
+      btn.className = "mode-btn" + (value === current ? " active" : "");
+      btn.addEventListener("click", () => {
+        if (value === current) return; // already active, nothing to do
+        onSelect(value);
+      });
+      container.appendChild(btn);
+    }
+  }
+
+  return { canvas, ctx, mountButtons, mountKeyboard, renderLeds, mountModeToggle };
 }

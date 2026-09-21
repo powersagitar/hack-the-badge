@@ -38,6 +38,28 @@ h1 {
   margin: 0;
 }
 
+#mode-toggle {
+  display: flex;
+  gap: 8px;
+}
+
+.mode-btn {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid #333a44;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.mode-btn.active {
+  background: var(--accent);
+  color: #061018;
+  border-color: var(--accent);
+}
+
 #badge-frame {
   background: #05070a;
   border: 3px solid #2a2e36;
