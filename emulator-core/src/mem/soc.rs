@@ -47,6 +47,22 @@ pub fn is_xip_addr(addr: u32) -> bool {
     DROM_RANGE.contains(&addr) || IROM_RANGE.contains(&addr)
 }
 
+/// SYSTIMER peripheral registers (`DR_REG_SYSTIMER_BASE`, confirmed via
+/// ESP-IDF v5.5.3's `soc/reg_base.h`). One full 4 KiB register page, the
+/// standard ESP32 peripheral spacing — generous on purpose (same rationale
+/// as [`DROM_RANGE`]/[`IROM_RANGE`]: a later task adding more systimer
+/// register support shouldn't need to touch this range), and tight enough
+/// not to swallow the next peripheral's base address. See
+/// `crate::peripherals::systimer` for what's actually modeled within it.
+pub const SYSTIMER_RANGE: Range<u32> = 0x6002_3000..0x6002_4000;
+
+/// `INTERRUPT_CORE0` (the ESP32-C3's non-PLIC interrupt matrix) registers
+/// (`DR_REG_INTERRUPT_CORE0_BASE == DR_REG_INTERRUPT_BASE`, confirmed via
+/// ESP-IDF v5.5.3's `soc/reg_base.h`). Same one-4KiB-page rationale as
+/// [`SYSTIMER_RANGE`]. See `crate::peripherals::intc` for what's actually
+/// modeled within it.
+pub const INTERRUPT_CORE0_RANGE: Range<u32> = 0x600c_2000..0x600c_3000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +78,17 @@ mod tests {
         assert!(!is_xip_addr(0x3fc99c00)); // DRAM
         assert!(!is_xip_addr(0x40380000)); // IRAM
         assert!(!is_xip_addr(0x50000000)); // RTC
+    }
+
+    #[test]
+    fn systimer_and_interrupt_core0_ranges_are_disjoint_from_each_other_and_xip_iram() {
+        assert!(SYSTIMER_RANGE.contains(&0x6002_3000));
+        assert!(!SYSTIMER_RANGE.contains(&0x6002_4000)); // exclusive end
+        assert!(INTERRUPT_CORE0_RANGE.contains(&0x600c_2000));
+        assert!(!INTERRUPT_CORE0_RANGE.contains(&0x600c_3000)); // exclusive end
+        assert!(!SYSTIMER_RANGE.contains(&INTERRUPT_CORE0_RANGE.start));
+        assert!(!INTERRUPT_CORE0_RANGE.contains(&SYSTIMER_RANGE.start));
+        assert!(!is_xip_addr(SYSTIMER_RANGE.start));
+        assert!(!is_xip_addr(INTERRUPT_CORE0_RANGE.start));
     }
 }

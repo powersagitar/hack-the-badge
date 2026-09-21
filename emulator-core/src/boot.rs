@@ -98,6 +98,40 @@ pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), Image
     Ok((cpu, bus))
 }
 
+/// Steps `cpu` once, then advances [`FirmwareBus`]'s peripherals
+/// ([`FirmwareBus::tick_peripherals`]: the SYSTIMER's counter plus the
+/// interrupt matrix's poll) exactly once, delivering any newly-pending,
+/// enabled interrupt line into the CPU core via [`Cpu::raise_interrupt`].
+///
+/// This is Task 3's interrupt-delivery driving loop (interrupt matrix +
+/// SYSTIMER, see `crate::peripherals`). Callers that want peripherals (and
+/// therefore interrupts) to actually work should call this instead of
+/// `cpu.step(&mut bus)` directly.
+///
+/// ## Why exactly one poll per step, and why *after* stepping
+///
+/// `Cpu::raise_interrupt` (Task 1) marks a single pending-trap slot that's
+/// consumed at the very start of the *next* `step()` call, not the one
+/// during which it was raised — see that method's own doc comment. So the
+/// natural, correctly-synchronized loop is: execute (or take an
+/// already-pending trap for) one instruction, *then* advance peripheral
+/// time by the same one step's worth and check whether that produced a new
+/// interrupt for the CPU to take on its next call. Polling more than once
+/// per `step()` (e.g. in an unsynchronized background loop) would risk
+/// silently dropping an interrupt if two polls both returned `Some` before
+/// the CPU consumed the first one, since `raise_interrupt` only remembers
+/// the most recent call (a known Task 1 limitation) — calling it at most
+/// once per `step()` is the correct granularity to avoid that, not a
+/// shortcut, since real hardware only ever has the CPU take one interrupt
+/// at a time anyway (it re-polls after `mret` returns from the ISR).
+pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu::StepInfo {
+    let info = cpu.step(bus);
+    if let Some(line) = bus.tick_peripherals() {
+        cpu.raise_interrupt(line);
+    }
+    info
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

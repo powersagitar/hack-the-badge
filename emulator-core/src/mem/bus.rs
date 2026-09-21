@@ -1,7 +1,7 @@
 //! [`FirmwareBus`]: the real ESP32-C3 memory map, backing Task 1's [`Bus`]
 //! trait with an app image's parsed segments (see `crate::mem::image`).
 //!
-//! Three kinds of address ranges, checked in this order on every access:
+//! Five kinds of address ranges, checked in this order on every access:
 //! 1. **XIP** (flash-mapped, [`crate::mem::soc::is_xip_addr`]): read directly
 //!    out of the original flash image bytes at `file_offset + (addr -
 //!    load_addr)`. Writes are silently dropped (real hardware: read-only
@@ -9,20 +9,37 @@
 //! 2. **RAM-copied**: a real, mutable, per-segment `Vec<u8>` that the
 //!    segment's bytes were copied into at boot. Reads/writes go straight to
 //!    it.
-//! 3. **Catch-all**: any address covered by neither of the above (this is
-//!    every not-yet-modeled ESP32-C3 peripheral MMIO register, plus truly
-//!    unmapped space). Reads return `0`, writes are dropped — this must
-//!    never panic, for any address, since real firmware immediately starts
-//!    probing peripheral registers that later tasks haven't built yet. Every
-//!    such access is recorded into a small capped ring buffer
+//! 3. **SYSTIMER** ([`crate::mem::soc::SYSTIMER_RANGE`]): routed to
+//!    [`FirmwareBus::systimer`], a concrete named field per this plan's
+//!    pre-flight "no trait-object peripheral dispatch" ruling — see
+//!    `crate::peripherals` and `crate::peripherals::systimer`.
+//! 4. **INTERRUPT_CORE0** ([`crate::mem::soc::INTERRUPT_CORE0_RANGE`]):
+//!    routed to [`FirmwareBus::intc`], same ruling — see
+//!    `crate::peripherals::intc`. One register
+//!    (`CPU_INT_EIP_STATUS_REG`) needs `systimer`'s live pending state to
+//!    answer a read, which is exactly the cross-peripheral access the
+//!    ruling anticipated: [`FirmwareBus::read_byte`] reads both concrete
+//!    fields directly, no trait object involved.
+//! 5. **Catch-all**: any address covered by none of the above (every
+//!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
+//!    truly unmapped space). Reads return `0`, writes are dropped — this
+//!    must never panic, for any address, since real firmware immediately
+//!    starts probing peripheral registers that later tasks haven't built
+//!    yet. Every such access is recorded into a small capped ring buffer
 //!    ([`FirmwareBus::unmapped_log`]) as a debugging aid for later
-//!    "why is boot stuck" investigation.
+//!    "why is boot stuck" investigation. (Addresses inside the SYSTIMER/
+//!    INTERRUPT_CORE0 ranges but not backed by a named register within
+//!    those peripherals are *not* logged here — they're handled, and
+//!    silently no-op'd, one tier up; see each peripheral module's doc.)
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::peripherals::intc::{self, InterruptController};
+use crate::peripherals::systimer::SysTimer;
+
 use super::image::SegmentDescriptor;
-use super::soc::is_xip_addr;
+use super::soc::{is_xip_addr, INTERRUPT_CORE0_RANGE, SYSTIMER_RANGE};
 use super::Bus;
 
 /// Max number of catch-all accesses [`FirmwareBus`] remembers (oldest
@@ -76,6 +93,13 @@ pub struct FirmwareBus {
     flash: Arc<[u8]>,
     xip_regions: Vec<XipRegion>,
     ram_regions: Vec<RamRegion>,
+    /// The SYSTIMER peripheral (`crate::peripherals::systimer`), a concrete
+    /// named field per this plan's pre-flight design ruling — see the
+    /// module doc.
+    pub systimer: SysTimer,
+    /// The `INTERRUPT_CORE0` interrupt matrix (`crate::peripherals::intc`),
+    /// same ruling.
+    pub intc: InterruptController,
     /// Ring buffer of the most recent catch-all accesses, capped at
     /// [`UNMAPPED_LOG_CAPACITY`].
     unmapped_log: VecDeque<UnmappedAccess>,
@@ -111,8 +135,21 @@ impl FirmwareBus {
             flash,
             xip_regions,
             ram_regions,
+            systimer: SysTimer::new(),
+            intc: InterruptController::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
+    }
+
+    /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
+    /// ticks and polls [`FirmwareBus::intc`] for a newly-pending, enabled
+    /// interrupt line. Call exactly once per `Cpu::step()` — see
+    /// `crate::boot::step_with_interrupts`, the driving loop that does so
+    /// and feeds the result into `Cpu::raise_interrupt`.
+    pub fn tick_peripherals(&mut self) -> Option<u32> {
+        self.systimer.advance();
+        let pending = self.systimer.target0_pending();
+        self.intc.poll(pending)
     }
 
     /// Adds a fresh, zero-initialized, real read/write RAM region
@@ -152,6 +189,21 @@ impl FirmwareBus {
             let offset = (addr - region.load_addr) as usize;
             return region.data[offset];
         }
+        if SYSTIMER_RANGE.contains(&addr) {
+            return self.systimer.read_byte(addr - SYSTIMER_RANGE.start);
+        }
+        if INTERRUPT_CORE0_RANGE.contains(&addr) {
+            let offset = addr - INTERRUPT_CORE0_RANGE.start;
+            if offset & !0b11 == intc::CPU_INT_EIP_STATUS_REG {
+                // Cross-peripheral read: needs systimer's live pending
+                // state. Both fields are concrete on `self`, so this is
+                // just direct field access — exactly what the pre-flight
+                // "no trait-object peripheral dispatch" ruling anticipated.
+                let word = self.intc.eip_status(self.systimer.target0_pending());
+                return word.to_le_bytes()[(offset & 0b11) as usize];
+            }
+            return self.intc.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -164,6 +216,19 @@ impl FirmwareBus {
         if let Some(region) = self.ram_regions.iter_mut().find(|r| r.contains(addr)) {
             let offset = (addr - region.load_addr) as usize;
             region.data[offset] = val;
+            return;
+        }
+        if SYSTIMER_RANGE.contains(&addr) {
+            self.systimer.write_byte(addr - SYSTIMER_RANGE.start, val);
+            return;
+        }
+        if INTERRUPT_CORE0_RANGE.contains(&addr) {
+            let offset = addr - INTERRUPT_CORE0_RANGE.start;
+            if offset & !0b11 != intc::CPU_INT_EIP_STATUS_REG {
+                // CPU_INT_EIP_STATUS_REG is read-only; writes to it drop,
+                // matching real hardware.
+                self.intc.write_byte(offset, val);
+            }
             return;
         }
         self.record_unmapped(addr, true);
