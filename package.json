@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "bun test"
+    "test": "bun test",
+    "build:wasm": "wasm-pack build emulator-wasm --target web --out-dir ../src/cpu/wasm-pkg"
   },
   "dependencies": {
     "fengari": "^0.1.5",

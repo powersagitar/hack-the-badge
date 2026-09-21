@@ -1,0 +1,8 @@
+[package]
+name = "emulator-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "emulator_core"
+path = "src/lib.rs"
