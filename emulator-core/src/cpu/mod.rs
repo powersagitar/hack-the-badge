@@ -10,9 +10,11 @@
 mod decode;
 mod execute;
 mod registers;
+pub mod rom_stubs;
 
 pub use decode::{AluOp, BranchKind, CsrOp, CsrSrc, Instruction, LoadKind, MulDivOp, StoreKind};
 pub use registers::{csr_addr, exception_code, mstatus_bits, Csrs, Registers};
+pub use rom_stubs::{RomStub, RomStubTable};
 
 use crate::mem::Bus;
 
@@ -34,11 +36,18 @@ pub struct StepInfo {
     /// instead of completing an instruction normally.
     pub trap_taken: bool,
     /// Length in bytes of the instruction that was fetched (2 or 4), or 0
-    /// if a trap was taken before/instead of executing an instruction.
+    /// if a trap was taken before/instead of executing an instruction, or if
+    /// this step was a ROM-stub interception (see
+    /// [`StepInfo::rom_stub`] — no real instruction is fetched in that case).
     pub instr_len: u8,
     /// The value of `pc` at the start of this `step()` call, before any
     /// trap-entry or normal advance.
     pub pc_before: u32,
+    /// `Some(addr)` if this step intercepted a high-level-emulated ROM call
+    /// at `addr` instead of fetching/executing an instruction there — see
+    /// [`rom_stubs`] for the mechanism. `None` for every ordinary step, and
+    /// therefore always `None` for a `Cpu` that never installed a stub table.
+    pub rom_stub: Option<u32>,
 }
 
 /// The RV32IMC CPU core.
@@ -46,6 +55,12 @@ pub struct Cpu {
     pub regs: Registers,
     pub csr: Csrs,
     pending_trap: Option<PendingTrap>,
+    /// High-level-emulated ROM-call stubs, checked just before each
+    /// instruction fetch. **Empty by default** — an empty table makes the
+    /// check a single branch and leaves behavior byte-for-byte identical to
+    /// a core without this mechanism. See [`rom_stubs`] and
+    /// [`Cpu::set_rom_stubs`].
+    rom_stubs: RomStubTable,
 }
 
 impl Default for Cpu {
@@ -54,6 +69,7 @@ impl Default for Cpu {
             regs: Registers::new(),
             csr: Csrs::new(),
             pending_trap: None,
+            rom_stubs: RomStubTable::new(),
         }
     }
 }
@@ -61,6 +77,22 @@ impl Default for Cpu {
 impl Cpu {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs (replacing any previous) the high-level-emulation ROM-stub
+    /// table this core consults before each instruction fetch. Opt-in: a
+    /// `Cpu` that never calls this keeps an empty table and behaves exactly
+    /// as it did before the mechanism existed. See [`rom_stubs`] for the full
+    /// semantics, and `crate::rom::esp32c3_rom_stubs` for the ESP32-C3 table
+    /// real-firmware boot installs.
+    pub fn set_rom_stubs(&mut self, table: RomStubTable) {
+        self.rom_stubs = table;
+    }
+
+    /// The currently-installed ROM-stub table (empty unless
+    /// [`Cpu::set_rom_stubs`] was called).
+    pub fn rom_stubs(&self) -> &RomStubTable {
+        &self.rom_stubs
     }
 
     /// Requests that an interrupt be delivered. This does *not* take the
@@ -99,10 +131,25 @@ impl Cpu {
                 trap_taken: true,
                 instr_len: 0,
                 pc_before,
+                rom_stub: None,
             };
         }
 
         let pc = self.regs.pc;
+
+        // High-level-emulated ROM call? Checked *before* the fetch, since the
+        // whole point is that there are no instruction bytes at these
+        // addresses to fetch (see `rom_stubs`). Consumes this entire step.
+        if let Some(stub) = self.rom_stubs.lookup(pc) {
+            self.apply_rom_stub(stub, bus);
+            return StepInfo {
+                trap_taken: false,
+                instr_len: 0,
+                pc_before,
+                rom_stub: Some(pc),
+            };
+        }
+
         let (instr, len) = match fetch_and_decode(bus, pc) {
             Ok(fetched) => fetched,
             Err(fault_addr) => {
@@ -114,6 +161,7 @@ impl Cpu {
                     trap_taken: true,
                     instr_len: 0,
                     pc_before,
+                    rom_stub: None,
                 };
             }
         };
@@ -123,6 +171,7 @@ impl Cpu {
                 trap_taken: false,
                 instr_len: len,
                 pc_before,
+                rom_stub: None,
             },
             execute::ExecResult::Exception { cause, tval } => {
                 self.enter_trap(cause, false, tval);
@@ -130,9 +179,46 @@ impl Cpu {
                     trap_taken: true,
                     instr_len: len,
                     pc_before,
+                    rom_stub: None,
                 }
             }
         }
+    }
+
+    /// Runs one high-level-emulated ROM stub's [`rom_stubs::RomStubEffect`],
+    /// then redirects `pc` to the return address the caller left in `ra`. See
+    /// [`rom_stubs`]'s module doc for the reasoning and the known
+    /// `ra`-validity limitation.
+    fn apply_rom_stub<B: Bus>(&mut self, stub: RomStub, bus: &mut B) {
+        use rom_stubs::RomStubEffect;
+        match stub.effect {
+            RomStubEffect::Return(value) => self.regs.write(rom_stubs::REG_A0, value),
+            RomStubEffect::Void => {}
+            RomStubEffect::Memset => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let byte = self.regs.read(rom_stubs::REG_A1) as u8;
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                for i in 0..len {
+                    bus.write8(dst.wrapping_add(i), byte);
+                }
+                // `memset` returns `dst`, which is already in `a0`.
+            }
+            RomStubEffect::Int64(op) => {
+                // RV32 ABI: 64-bit values live in aligned register pairs, low
+                // word first -- see `Int64Op`'s doc.
+                let lhs = u64::from(self.regs.read(rom_stubs::REG_A0))
+                    | (u64::from(self.regs.read(rom_stubs::REG_A1)) << 32);
+                let rhs = u64::from(self.regs.read(rom_stubs::REG_A2))
+                    | (u64::from(self.regs.read(rom_stubs::REG_A3)) << 32);
+                let result = op.apply(lhs, rhs);
+                self.regs.write(rom_stubs::REG_A0, result as u32);
+                self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
+            }
+        }
+        self.regs.pc = self.regs.read(rom_stubs::REG_RA);
     }
 
     /// Common trap-entry sequence (RV32 privileged spec, M-mode only):
@@ -934,6 +1020,234 @@ mod tests {
         assert!(!info.trap_taken);
         assert_eq!(cpu.regs.pc, 0x100);
         assert_ne!(cpu.csr.mstatus & mstatus_bits::MIE, 0);
+    }
+
+    // ---------------- Mask-ROM HLE stubs ----------------
+
+    /// Builds the shared program both ROM-stub tests below run: a normal ABI
+    /// call (`jalr ra, 0(x5)`) to `STUB_ADDR`, a distinctive instruction at
+    /// the return site, and a *real, executable* instruction sitting at
+    /// `STUB_ADDR` itself so "was the stub intercepted, or did we fall
+    /// through and execute the bytes there?" is directly observable.
+    fn rom_stub_test_bus() -> TestBus {
+        const STUB_ADDR: usize = 0x100;
+        let mut bus = TestBus::with_program(&[
+            addi(5, 0, STUB_ADDR as i32),      // x5 = STUB_ADDR
+            i_type(0b1100111, 0b000, 1, 5, 0), // jalr x1, 0(x5): ra = 8, pc = STUB_ADDR
+            addi(6, 0, 99),                    // the return site -- only runs if pc == ra
+        ]);
+        // The "ROM body": if the stub mechanism ever lets a fetch happen at
+        // STUB_ADDR, this writes 7 into x7 and the test can tell.
+        bus.mem[STUB_ADDR..STUB_ADDR + 4].copy_from_slice(&addi(7, 0, 7).to_le_bytes());
+        bus
+    }
+
+    const ROM_STUB_ADDR: u32 = 0x100;
+
+    #[test]
+    fn rom_stub_sets_a0_redirects_pc_to_ra_and_skips_the_real_instruction() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::returning("fake_rom_fn", 42));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+
+        cpu.step(&mut bus); // addi x5, x0, 0x100
+        let call = cpu.step(&mut bus); // jalr x1, 0(x5)
+        assert!(!call.trap_taken);
+        assert_eq!(cpu.regs.read(1), 8, "ra must hold the return address");
+        assert_eq!(cpu.regs.pc, ROM_STUB_ADDR);
+
+        let stubbed = cpu.step(&mut bus);
+        assert!(!stubbed.trap_taken, "a stub is not a trap");
+        assert_eq!(stubbed.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(
+            stubbed.instr_len, 0,
+            "no real instruction is fetched on a stub step"
+        );
+        assert_eq!(cpu.regs.read(10), 42, "a0/x10 must hold the return value");
+        assert_eq!(cpu.regs.pc, 8, "pc must be redirected to ra");
+        assert_eq!(
+            cpu.regs.read(7),
+            0,
+            "the real instruction at the stub address must NOT have executed"
+        );
+
+        // And the caller genuinely resumes at the return site.
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(6), 99);
+        assert_eq!(cpu.regs.pc, 12);
+    }
+
+    #[test]
+    fn without_a_stub_table_the_same_call_executes_the_real_instruction() {
+        // The control for the test above, and the guarantee the whole
+        // mechanism rests on: a `Cpu` that never opts in behaves exactly as
+        // it did before ROM stubs existed.
+        let mut cpu = Cpu::new();
+        assert!(cpu.rom_stubs().is_empty());
+
+        let mut bus = rom_stub_test_bus();
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, None);
+        assert_eq!(info.instr_len, 4, "a real 4-byte instruction was fetched");
+        assert_eq!(cpu.regs.read(7), 7, "the bytes at 0x100 executed normally");
+        assert_eq!(cpu.regs.pc, ROM_STUB_ADDR + 4);
+        assert_eq!(cpu.regs.read(10), 0, "nothing wrote a0");
+    }
+
+    #[test]
+    fn void_rom_stub_leaves_a0_untouched_but_still_returns() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::void("fake_void_rom_fn"));
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 0xdead_beef); // a value the caller is keeping across the call
+
+        let mut bus = rom_stub_test_bus();
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        let stubbed = cpu.step(&mut bus);
+
+        assert_eq!(stubbed.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(
+            cpu.regs.read(10),
+            0xdead_beef,
+            "a void stub must not clobber a0"
+        );
+        assert_eq!(cpu.regs.pc, 8);
+    }
+
+    #[test]
+    fn memset_rom_stub_really_writes_the_bytes_through_the_bus() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memset("memset"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        // memset(dst = 0x200, c = 0xab, n = 5)
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0xab);
+        cpu.regs.write(12, 5);
+        cpu.regs.write(1, 0x40); // ra
+        cpu.regs.pc = ROM_STUB_ADDR;
+        bus.mem[0x205] = 0x11; // sentinel just past the end
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[0x200..0x205], &[0xab; 5]);
+        assert_eq!(bus.mem[0x205], 0x11, "must not write past n bytes");
+        assert_eq!(cpu.regs.read(10), 0x200, "memset returns dst");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn int64_rom_stub_reads_and_writes_the_rv32_register_pairs() {
+        use rom_stubs::Int64Op;
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::int64("__udivdi3", Int64Op::UDiv));
+        cpu.set_rom_stubs(table);
+
+        // __udivdi3(0x0000_0002_0000_0000, 0x0000_0000_0000_0003)
+        cpu.regs.write(10, 0x0000_0000); // a0 = lhs low
+        cpu.regs.write(11, 0x0000_0002); // a1 = lhs high
+        cpu.regs.write(12, 3); // a2 = rhs low
+        cpu.regs.write(13, 0); // a3 = rhs high
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let mut bus = rom_stub_test_bus();
+        let info = cpu.step(&mut bus);
+
+        let expected = 0x0000_0002_0000_0000u64 / 3;
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.read(10), expected as u32, "result low word in a0");
+        assert_eq!(
+            cpu.regs.read(11),
+            (expected >> 32) as u32,
+            "result high word in a1"
+        );
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn memset_rom_stub_length_is_capped_so_a_garbage_argument_cannot_hang() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memset("memset"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0xff);
+        cpu.regs.write(12, u32::MAX); // nonsense length
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        // Completes rather than looping ~4 billion times. (TestBus drops
+        // out-of-range writes, so the only thing being asserted here is that
+        // the call terminates at all, and does so at the documented cap.)
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn pending_interrupt_is_taken_before_a_stub_at_the_same_pc() {
+        // Documented ordering (see `rom_stubs`' module doc): the instruction
+        // boundary in front of a stubbed call is a valid one to deliver an
+        // interrupt at, so the trap wins and `mepc` points back at the stub
+        // address -- the stub runs when the handler returns.
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x2000;
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::returning("fake_rom_fn", 42));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        cpu.step(&mut bus);
+        cpu.step(&mut bus); // pc is now ROM_STUB_ADDR
+        cpu.raise_interrupt(7);
+
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(info.rom_stub, None, "the trap ran, not the stub");
+        assert_eq!(cpu.csr.mepc, ROM_STUB_ADDR);
+        assert_eq!(cpu.regs.pc, 0x2000);
+        assert_eq!(cpu.regs.read(10), 0, "the stub has not run yet");
+    }
+
+    #[test]
+    fn rom_stub_with_a_bogus_ra_faults_loudly_rather_than_silently() {
+        // The mechanism's documented limitation: `pc = ra` is only meaningful
+        // if control arrived via a real ABI call. A zeroed `ra` sends pc to 0,
+        // which this bus happens to consider executable -- so use an address
+        // that isn't, and confirm the failure surfaces as a normal
+        // instruction-access fault on the following step rather than
+        // wandering off quietly.
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x3000;
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::returning("fake_rom_fn", 1));
+        cpu.set_rom_stubs(table);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.regs.write(1, 0xffff_0000); // nonsense "return address", far past the bus
+
+        let mut bus = rom_stub_test_bus();
+        let stubbed = cpu.step(&mut bus);
+        assert_eq!(stubbed.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.pc, 0xffff_0000);
+
+        let faulted = cpu.step(&mut bus);
+        assert!(faulted.trap_taken);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(cpu.csr.mtval, 0xffff_0000);
     }
 
     #[test]

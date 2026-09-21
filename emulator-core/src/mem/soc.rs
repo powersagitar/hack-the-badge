@@ -32,12 +32,44 @@ pub const IROM_RANGE: Range<u32> = 0x4200_0000..0x4400_0000;
 /// heap, and the stack actually live at runtime. The app image only carries
 /// initialized bytes for the segments that need them (`.data`/`.rodata`);
 /// `.bss`/heap/stack occupy the rest of this same aperture without any
-/// bytes present in the flash image (they don't need init data). Used by
-/// `crate::boot` to place a scratch stack region right after the
-/// highest-address DRAM segment the image actually carries — see
-/// `boot::boot_from_factory_image`'s doc comment for the SP investigation
-/// this backs.
+/// bytes present in the flash image (they don't need init data), so
+/// `crate::boot` backs the whole aperture with zeroed RAM — see
+/// `boot::boot_from_factory_image`'s doc comment.
+///
+/// Matches `SOC_DRAM_LOW`/`SOC_DRAM_HIGH` in ESP-IDF v5.5.3's
+/// `components/soc/esp32c3/include/soc/soc.h` exactly.
 pub const DRAM_RANGE: Range<u32> = 0x3FC8_0000..0x3FCE_0000;
+
+/// Internal SRAM mapped as instructions (IRAM): where `.iram*` code and any
+/// IRAM-resident data/bss live. `SOC_IRAM_LOW`/`SOC_IRAM_HIGH` from the same
+/// `soc.h`.
+///
+/// **Known fidelity gap**: on real silicon DRAM and IRAM are two apertures
+/// onto *the same* 400 KiB SRAM (IRAM `0x4038_0000` is the same physical word
+/// as DRAM `0x3FC8_0000`), and the app image's own segment layout shows it —
+/// its IRAM segment ends at SRAM offset `0x1db6c` and its first DRAM segment
+/// starts at `0x1dc00`, packed contiguously by the linker. This emulator
+/// models the two apertures as *separate* buffers, so firmware that writes
+/// through one aperture and reads through the other would not see its own
+/// write. Nothing observed so far depends on that; it's recorded here rather
+/// than silently assumed away.
+pub const IRAM_RANGE: Range<u32> = 0x4037_C000..0x403E_0000;
+
+/// RTC slow memory (`SOC_RTC_IRAM_LOW`..`SOC_RTC_IRAM_HIGH`, which on the
+/// ESP32-C3 is the same window as `SOC_RTC_DRAM_*`/`SOC_RTC_DATA_*` — the chip
+/// has only one RTC memory). Survives deep sleep on real hardware; here it's
+/// just ordinary zeroed RAM.
+pub const RTC_RANGE: Range<u32> = 0x5000_0000..0x5000_2000;
+
+/// Base of the region at the top of DRAM that the *mask ROM* uses for its own
+/// stack (`SOC_ROM_STACK_START`/`SOC_ROM_STACK_SIZE` in ESP-IDF v5.5.3's
+/// `soc.h`: `0x3fcd_e710`, `0x2000` — a downward-growing stack, so the
+/// reserved window is `[START - SIZE, START)`). `crate::boot` seeds the app's
+/// initial `sp` just below it, which is where a real 2nd-stage bootloader's
+/// own stack sits when it hands control to the app.
+pub const ROM_STACK_START: u32 = 0x3FCD_E710;
+/// Size of the mask ROM's reserved stack window — see [`ROM_STACK_START`].
+pub const ROM_STACK_SIZE: u32 = 0x2000;
 
 /// `true` if `addr` falls inside one of the flash-mapped XIP apertures
 /// ([`DROM_RANGE`] or [`IROM_RANGE`]). Everything else in the app image

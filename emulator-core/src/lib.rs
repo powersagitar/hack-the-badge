@@ -2,6 +2,8 @@ pub mod boot;
 pub mod cpu;
 pub mod mem;
 pub mod peripherals;
+pub mod rom;
+pub mod runtime;
 
 pub fn add(a: u32, b: u32) -> u32 {
     a + b

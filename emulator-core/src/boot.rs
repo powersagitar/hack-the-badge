@@ -18,16 +18,7 @@ use std::sync::Arc;
 use crate::cpu::Cpu;
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::{parse_image, ImageParseError};
-use crate::mem::soc::DRAM_RANGE;
-
-/// Size of the scratch stack/bss region reserved in DRAM for the CPU's
-/// initial stack pointer (see [`boot_from_factory_image`]'s doc comment for
-/// why this exists at all). 64 KiB is an arbitrary but generous choice for
-/// early startup code; it is *not* derived from the real firmware's actual
-/// `.bss`/stack size (we don't have that — no ELF/map file is committed,
-/// only the flattened flash image), so it is exactly the kind of assumption
-/// the task brief asked to flag rather than bury.
-const SCRATCH_STACK_LEN: u32 = 64 * 1024;
+use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, RTC_RANGE};
 
 /// Parses `image` (expected to be the raw bytes of an ESP-IDF app image,
 /// e.g. `public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
@@ -35,66 +26,106 @@ const SCRATCH_STACK_LEN: u32 = 64 * 1024;
 /// image's `entry_addr` — ready for the caller to start calling
 /// `cpu.step(&mut bus)`.
 ///
+/// ## Uninitialized RAM (`.bss`, heap, stack)
+///
+/// An app image only carries bytes for the segments that need init data
+/// (`.data`/`.rodata`/code). `.bss`, the heap and the stack occupy the *rest*
+/// of the same on-chip SRAM apertures with nothing stored in flash for them,
+/// so nothing in the segment table describes them. This function therefore
+/// backs the **whole** of each RAM aperture — [`DRAM_RANGE`], [`IRAM_RANGE`]
+/// and [`RTC_RANGE`] — with zeroed RAM, appended *after* the image's own
+/// segments so that wherever the two overlap the image's real bytes win (see
+/// [`FirmwareBus::add_scratch_ram`] and `FirmwareBus`'s first-match region
+/// lookup).
+///
+/// This replaced an earlier, narrower placeholder (a single 64 KiB scratch
+/// window starting just past the highest DRAM segment) that turned out to be
+/// the direct cause of a boot failure worth recording, since it's exactly the
+/// class of bug this layer can hide: the real firmware's `.bss` runs from
+/// `0x3fca_87f0` to `0x3fcb_d180` (observed from its own
+/// `memset(0x3fca87f0, 0, 0x14990)` during startup), which overran that
+/// 64 KiB window by ~19 KiB. Writes to the overrun tail were silently dropped
+/// by the never-panic MMIO catch-all and reads came back as `0`, so a FreeRTOS
+/// critical-section counter never incremented and `vPortExitCritical`'s
+/// `configASSERT(port_uxCriticalNesting[0] > 0)` fired ~250 instructions into
+/// boot. Backing whole apertures removes that entire failure mode rather than
+/// re-tuning a window size.
+///
 /// ## Stack pointer (x2)
 ///
 /// Investigated empirically (see this crate's `tests/boot_integration.rs`
 /// and the task report) rather than assumed: stepping the real firmware
 /// from `entry_addr` shows its very first instruction is `c.addi sp, sp,
 /// -32` — it decrements whatever `sp` already holds, never first loading an
-/// absolute address into it. So (unlike the brief's anticipated "sets its
-/// own SP from a linker symbol" case) this firmware's entry code *assumes*
-/// `sp` was already set up by its caller — on real hardware, the 2nd-stage
-/// bootloader, which this emulator doesn't model at all.
+/// absolute address into it. So this firmware's entry code *assumes* `sp` was
+/// already set up by its caller — on real hardware, the 2nd-stage bootloader,
+/// which this emulator doesn't model at all.
 ///
-/// Per the brief's guidance for that case, we pick a placeholder: a fresh
-/// [`SCRATCH_STACK_LEN`]-byte scratch RAM region is reserved immediately
-/// after the highest-address DRAM segment the image actually carries bytes
-/// for (mirroring where a real ESP-IDF linker script places `.bss`/heap/
-/// stack — right after `.data`/`.rodata` in the same DRAM aperture, per
-/// [`DRAM_RANGE`]), and `sp` is set to point at the top of it (stack grows
-/// down). **This is a placeholder, not a derived-from-truth value**: we
-/// don't have the real firmware's linker map, so we don't actually know its
-/// true `.bss` size or where its intended stack/heap boundary falls within
-/// DRAM — a later task that gets far enough to observe stack-relative
-/// memory corruption should revisit this.
+/// So `sp` is seeded here, to the highest DRAM address not inside the mask
+/// ROM's own reserved stack window ([`ROM_STACK_START`]/[`ROM_STACK_SIZE`],
+/// read from ESP-IDF's `soc.h`) — which is where a real bootloader's stack
+/// sits when it hands over, and comfortably above where any plausible `.bss`
+/// ends. The previous scheme put `sp` *inside* `.bss` (it derived the stack
+/// from the last DRAM segment's end, which is precisely where `.bss` starts),
+/// so early startup was overwriting its own static variables from below while
+/// using them.
 ///
-/// In the current shortcut-boot run, this placeholder has no observable
-/// effect either way: execution reaches an unresolved call into on-chip
-/// mask ROM (not part of this image, not modeled at all — see the report)
-/// only ~20 instructions after entry, before any `sp`-relative load/store
-/// occurs. It's set up now anyway so the CPU's register state isn't left in
-/// an obviously-nonsensical state (`sp = 0xffff_ffe0`, from decrementing
-/// `Cpu::new()`'s zeroed default) for whichever later task picks this back
-/// up once ROM-call stubs exist.
+/// **Still an approximation, not ground truth**: we have no linker map for
+/// this firmware (only the flattened flash image), so its intended
+/// stack/heap boundary is unknown. What's asserted here is narrower and
+/// checkable: this `sp` is inside real backed RAM, above `.bss`, and outside
+/// the ROM's reserved window.
 pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), ImageParseError> {
     let parsed = parse_image(image)?;
 
     let flash: Arc<[u8]> = Arc::from(image.to_vec().into_boxed_slice());
     let mut bus = FirmwareBus::from_segments(flash, &parsed.segments);
 
-    let mut cpu = Cpu::new();
-    cpu.regs.pc = parsed.header.entry_addr;
-
-    let dram_end = parsed
-        .segments
-        .iter()
-        .filter(|s| DRAM_RANGE.contains(&s.load_addr))
-        .map(|s| s.load_addr as u64 + s.len as u64)
-        .max();
-    if let Some(dram_end) = dram_end {
-        // dram_end is always < DRAM_RANGE.end (segments were parsed from a
-        // real image whose DRAM segments fit inside the SoC's DRAM
-        // aperture), so this cast and the following subtraction can't
-        // underflow/overflow in practice; still clamp defensively so a
-        // pathological image can't push scratch_base past the aperture.
-        let scratch_base = (dram_end as u32).min(DRAM_RANGE.end);
-        let scratch_len = SCRATCH_STACK_LEN.min(DRAM_RANGE.end - scratch_base);
-        if scratch_len > 0 {
-            bus.add_scratch_ram(scratch_base, scratch_len as usize);
-            cpu.regs.write(2, scratch_base + scratch_len);
-        }
+    for aperture in [&DRAM_RANGE, &IRAM_RANGE, &RTC_RANGE] {
+        bus.add_scratch_ram(aperture.start, (aperture.end - aperture.start) as usize);
     }
 
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = parsed.header.entry_addr;
+    cpu.regs.write(2, initial_stack_pointer());
+
+    Ok((cpu, bus))
+}
+
+/// The seeded initial `sp` — see [`boot_from_factory_image`]'s doc. Kept as a
+/// named function so tests can assert the value without restating the
+/// arithmetic.
+pub fn initial_stack_pointer() -> u32 {
+    // The ROM stack grows down from ROM_STACK_START, so its reserved window is
+    // [START - SIZE, START); the first address below that window is the app's.
+    // Masked to a 16-byte boundary, the RISC-V ABI's stack alignment.
+    (ROM_STACK_START - ROM_STACK_SIZE) & !0xf
+}
+
+/// Same as [`boot_from_factory_image`], plus the ESP32-C3 mask-ROM
+/// high-level-emulation stub table ([`crate::rom::esp32c3_rom_stubs`])
+/// installed on the returned [`Cpu`].
+///
+/// ## Why this is a separate entry point rather than the default
+///
+/// Real ESP-IDF firmware calls fixed-address on-chip mask-ROM functions
+/// within its first ~20 instructions (see [`crate::rom`] and
+/// [`crate::cpu::rom_stubs`] for the whole story), so *any* attempt to
+/// actually run `factory.bin` needs these stubs. But installing them changes
+/// observable behavior — most obviously, boot no longer stops at the
+/// `INSTRUCTION_ACCESS_FAULT` that Task 2.1's plain-boot integration test
+/// exists specifically to pin down. Keeping [`boot_from_factory_image`]
+/// stub-free preserves that test (and every other pre-existing one) exactly
+/// as written, and makes "are ROM stubs in play?" an explicit property of the
+/// call site rather than a hidden global.
+///
+/// This is the entry point `crate::runtime::FirmwareRuntime` (and therefore
+/// the browser's real-firmware mode) uses.
+pub fn boot_from_factory_image_with_rom_stubs(
+    image: &[u8],
+) -> Result<(Cpu, FirmwareBus), ImageParseError> {
+    let (mut cpu, bus) = boot_from_factory_image(image)?;
+    cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs());
     Ok((cpu, bus))
 }
 
@@ -179,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn boot_seeds_sp_above_highest_dram_segment_when_one_is_present() {
+    fn boot_seeds_sp_just_below_the_roms_reserved_stack_window() {
         let code = [0x13, 0x00, 0x00, 0x00]; // addi x0, x0, 0
         let dram_data = [0u8; 16];
         let image = build_synthetic_image(
@@ -187,25 +218,72 @@ mod tests {
             &[(0x4200_0000, &code), (0x3fc99c00, &dram_data)],
         );
 
-        let (cpu, _bus) = boot_from_factory_image(&image).expect("should boot");
+        let (cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
 
-        let expected_scratch_base = 0x3fc99c00 + 16;
-        assert_eq!(
-            cpu.regs.read(2),
-            expected_scratch_base + SCRATCH_STACK_LEN,
-            "sp should point at the top of a scratch region placed right \
-             after the highest DRAM segment"
+        let sp = cpu.regs.read(2);
+        assert_eq!(sp, initial_stack_pointer());
+        assert_eq!(sp, ROM_STACK_START - ROM_STACK_SIZE);
+        assert_eq!(sp % 16, 0, "RISC-V ABI requires 16-byte stack alignment");
+        assert!(
+            DRAM_RANGE.contains(&sp),
+            "sp must land inside the DRAM aperture"
         );
+        assert!(
+            sp > 0x3fc99c00 + 16,
+            "sp must be above the image's own DRAM data, not inside it"
+        );
+
+        // And it points at *real* RAM: a push/pop round-trips rather than
+        // being swallowed by the never-panic MMIO catch-all.
+        bus.write32(sp - 4, 0xc0ffee00);
+        assert_eq!(bus.read32(sp - 4), 0xc0ffee00);
     }
 
     #[test]
-    fn boot_leaves_sp_at_default_when_no_dram_segment_present() {
-        // No DRAM-range segment at all -> nowhere principled to place a
-        // scratch stack, so sp stays at Cpu::new()'s default.
+    fn boot_backs_every_ram_aperture_even_where_the_image_carries_no_bytes() {
+        // The regression this guards: `.bss`/heap/stack have no segment in the
+        // image, so an address just past the last DRAM segment used to be
+        // unbacked -- writes dropped, reads 0. See this module's doc.
+        let code = [0x13, 0x00, 0x00, 0x00];
+        let dram_data = [0u8; 16];
+        let image = build_synthetic_image(
+            0x4200_0000,
+            &[(0x4200_0000, &code), (0x3fc99c00, &dram_data)],
+        );
+        let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
+
+        for addr in [
+            DRAM_RANGE.start,
+            0x3fc99c00 + 16, // immediately past the image's DRAM segment
+            DRAM_RANGE.end - 4,
+            IRAM_RANGE.start,
+            IRAM_RANGE.end - 4,
+            RTC_RANGE.start,
+            RTC_RANGE.end - 4,
+        ] {
+            bus.write32(addr, 0xa5a5_5a5a);
+            assert_eq!(
+                bus.read32(addr),
+                0xa5a5_5a5a,
+                "0x{addr:08x} should be real read/write RAM"
+            );
+        }
+
+        // ...and the image's own bytes still win where the two overlap.
+        assert_eq!(bus.read8(0x3fc99c00 + 15), 0);
+        bus.write8(0x3fc99c00 + 15, 0x77);
+        assert_eq!(bus.read8(0x3fc99c00 + 15), 0x77);
+    }
+
+    #[test]
+    fn boot_seeds_sp_even_when_the_image_has_no_dram_segment() {
+        // The seeded sp comes from the SoC's documented memory map, not from
+        // the image's segment table, so an image with no DRAM segment at all
+        // still gets a usable stack.
         let code = [0x13, 0x00, 0x00, 0x00];
         let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
         let (cpu, _bus) = boot_from_factory_image(&image).expect("should boot");
-        assert_eq!(cpu.regs.read(2), 0);
+        assert_eq!(cpu.regs.read(2), initial_stack_pointer());
     }
 
     #[test]
