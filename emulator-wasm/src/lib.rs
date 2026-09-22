@@ -119,7 +119,7 @@ impl FirmwareEmulator {
     }
 
     /// Presses/releases a raw button slot — slot 0 is `PIN_START` (GPIO9),
-    /// slots 1..=7 are the 74HC165's button bits. The human-name→slot mapping
+    /// slots 1..=8 are the 74HC165's button bits. The human-name→slot mapping
     /// lives in `src/runtime/firmware-runtime.ts`; see
     /// `emulator_core::runtime`'s module doc for why it isn't in Rust.
     #[wasm_bindgen(js_name = setButton)]

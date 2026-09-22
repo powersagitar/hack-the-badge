@@ -1,7 +1,8 @@
 //! [`FirmwareBus`]: the real ESP32-C3 memory map, backing Task 1's [`Bus`]
 //! trait with an app image's parsed segments (see `crate::mem::image`).
 //!
-//! Five kinds of address ranges, checked in this order on every access:
+//! An ordered sequence of named address ranges, checked in this order on
+//! every access:
 //! 1. **XIP** (flash-mapped, [`crate::mem::soc::is_xip_addr`]): read directly
 //!    out of the original flash image bytes at `file_offset + (addr -
 //!    load_addr)`. Writes are silently dropped (real hardware: read-only
@@ -102,7 +103,9 @@ impl RamRegion {
 }
 
 /// The concrete [`Bus`] implementation used to boot a real ESP-IDF app
-/// image. See the module-level docs for the three-tier read/write behavior.
+/// image. See the module-level docs for the ordered-sequence-of-named-
+/// regions read/write dispatch (XIP, RAM, SYSTIMER, INTERRUPT_CORE0, GPIO,
+/// SPI2/GPSPI2, then a never-panic catch-all).
 pub struct FirmwareBus {
     /// The original flash image bytes, kept once and shared (never copied)
     /// — XIP regions index directly into this.
@@ -146,11 +149,30 @@ impl FirmwareBus {
                     file_offset: seg.file_offset,
                 });
             } else {
-                let data = flash[seg.file_offset..seg.file_offset + seg.len].to_vec();
-                ram_regions.push(RamRegion {
-                    load_addr: seg.load_addr,
-                    data,
-                });
+                // `seg.file_offset + seg.len` used to be unchecked here. It
+                // was safe when this function's only caller was
+                // `boot::boot_from_factory_image`'s pre-validated internal
+                // path (`parse_image` already rejects a segment whose data
+                // runs past the image), but `FirmwareEmulator::new`
+                // (emulator-wasm) now reaches this constructor directly with
+                // a browser-supplied image, so a malformed/adversarial
+                // `SegmentDescriptor` must not be able to overflow this
+                // addition (wraps on wasm32, where `usize` is 32 bits) and
+                // panic on the resulting bad slice bound. Same contract this
+                // bus already holds every *data* access to (see the module
+                // doc's catch-all tier): malformed input degrades gracefully
+                // rather than panicking. Skip the segment rather than
+                // constructing a broken RAM region for it.
+                match seg.file_offset.checked_add(seg.len) {
+                    Some(end) if end <= flash.len() => {
+                        let data = flash[seg.file_offset..end].to_vec();
+                        ram_regions.push(RamRegion {
+                            load_addr: seg.load_addr,
+                            data,
+                        });
+                    }
+                    _ => continue,
+                }
             }
         }
 
@@ -414,6 +436,70 @@ mod tests {
         assert_eq!(bus.read8(0), 0);
         assert_eq!(bus.read32(u32::MAX - 3), 0);
         bus.write32(u32::MAX - 3, 0x1); // must not panic (near-top-of-address-space)
+    }
+
+    #[test]
+    fn from_segments_does_not_panic_on_an_offset_plus_len_overflow() {
+        // Regression test for Fix 3: a malformed/adversarial segment
+        // descriptor whose file_offset + len overflows must not panic --
+        // from_segments must skip it (or otherwise handle it gracefully)
+        // instead of computing a bad slice bound.
+        let flash: Arc<[u8]> = Arc::from(vec![0xAAu8; 16].into_boxed_slice());
+        let segments = [SegmentDescriptor {
+            load_addr: 0x3fc80000, // a RAM-copied (non-XIP) address
+            file_offset: usize::MAX - 3,
+            len: 100, // file_offset + len overflows usize
+        }];
+
+        // Must not panic.
+        let bus = FirmwareBus::from_segments(flash, &segments);
+
+        // And the malformed segment must not have been silently accepted as
+        // a real, readable RAM region either.
+        assert!(!bus.is_mapped(0x3fc80000));
+    }
+
+    #[test]
+    fn from_segments_does_not_panic_when_offset_plus_len_exceeds_the_image_without_overflowing() {
+        // A non-overflowing but still out-of-range segment (offset+len is a
+        // valid usize, but exceeds the actual flash buffer) must likewise be
+        // skipped rather than panicking on an out-of-bounds slice.
+        let flash: Arc<[u8]> = Arc::from(vec![0xAAu8; 16].into_boxed_slice());
+        let segments = [SegmentDescriptor {
+            load_addr: 0x3fc80000,
+            file_offset: 10,
+            len: 1000, // 10 + 1000 = 1010, way past flash.len() == 16
+        }];
+
+        let bus = FirmwareBus::from_segments(flash, &segments);
+        assert!(!bus.is_mapped(0x3fc80000));
+    }
+
+    #[test]
+    fn fetching_zeroed_but_mapped_memory_traps_instead_of_running_forever() {
+        // Regression test for Fix 2: a stray jump into a mapped-but-zeroed
+        // region (e.g. uninitialized .bss/scratch RAM, which this bus backs
+        // with real read/write storage per `boot::add_scratch_ram`) used to
+        // decode `0x0000` as a valid C.ADDI4SPN no-op and just keep
+        // executing/advancing pc forever. It must now trap as an illegal
+        // instruction on the very first fetch.
+        let mut bus = bus_with(vec![(0x3fc80000, vec![0u8; 64])]);
+        let mut cpu = crate::cpu::Cpu::new();
+        cpu.csr.mtvec = 0x9000;
+        cpu.regs.pc = 0x3fc80000;
+
+        let info = cpu.step(&mut bus);
+
+        assert!(
+            info.trap_taken,
+            "fetching zeroed mapped memory must trap, not silently execute"
+        );
+        assert_eq!(
+            cpu.csr.mcause,
+            crate::cpu::exception_code::ILLEGAL_INSTRUCTION,
+            "0x0000 is a reserved RVC encoding, not a valid instruction"
+        );
+        assert_eq!(cpu.regs.pc, 0x9000, "pc must redirect to mtvec");
     }
 
     #[test]

@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_button_slot_0_drives_pin_start_and_slots_1_to_7_drive_the_shift_register() {
+    fn raw_button_slot_0_drives_pin_start_and_slots_1_to_8_drive_the_shift_register() {
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
         use crate::peripherals::gpio::PIN_START;
 

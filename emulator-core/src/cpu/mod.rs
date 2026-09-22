@@ -18,16 +18,6 @@ pub use rom_stubs::{RomStub, RomStubTable};
 
 use crate::mem::Bus;
 
-/// A trap that [`Cpu::raise_interrupt`] has requested but that hasn't been
-/// taken yet. Applied at the very start of the next [`Cpu::step`] call,
-/// before fetching the next instruction.
-#[derive(Debug, Clone, Copy)]
-struct PendingTrap {
-    cause: u32,
-    is_interrupt: bool,
-    tval: u32,
-}
-
 /// Outcome of a single [`Cpu::step`] call, for tests/callers to observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepInfo {
@@ -54,7 +44,33 @@ pub struct StepInfo {
 pub struct Cpu {
     pub regs: Registers,
     pub csr: Csrs,
-    pending_trap: Option<PendingTrap>,
+    /// Bitset of pending interrupt lines (bit `n` set means line `n`, as
+    /// passed to [`Cpu::raise_interrupt`], is pending and not yet taken).
+    ///
+    /// This used to be a single `Option<PendingTrap>` slot that a second
+    /// `raise_interrupt` call would silently overwrite (and therefore drop)
+    /// if the first hadn't been consumed by `step()` yet. That was judged
+    /// harmless when the only driver polled at most one line per `step()`
+    /// call and `MIE`-gating didn't exist yet (a pending interrupt was
+    /// always taken on the very next step, leaving essentially no window for
+    /// a second call to land). Once `step()` started gating interrupt-taking
+    /// on `mstatus.MIE` (see below), a pending interrupt can now sit
+    /// unconsumed across many steps while `MIE` is clear, making that
+    /// overwrite-and-drop window real. A bitset fixes this precisely: each
+    /// line has its own bit, so `raise_interrupt` on one line can never
+    /// clobber another line's pending state, and calling it again for a
+    /// line that's already pending is simply idempotent (matches real
+    /// level-triggered hardware, which doesn't "double-pend"). Cleared one
+    /// bit at a time by `step()` as each line is taken.
+    ///
+    /// Chosen priority when multiple lines are pending simultaneously:
+    /// lowest line number wins (`trailing_zeros()`). This core doesn't yet
+    /// model the ESP32-C3 interrupt matrix's per-line `CPU_INT_PRI_n`
+    /// priority registers (see `peripherals::intc`'s module doc — v1 only
+    /// ever has one real source wired up, so this is moot in practice); this
+    /// is a documented placeholder ordering, not a claim of spec-accurate
+    /// priority arbitration.
+    pending_interrupts: u32,
     /// High-level-emulated ROM-call stubs, checked just before each
     /// instruction fetch. **Empty by default** — an empty table makes the
     /// check a single branch and leaves behavior byte-for-byte identical to
@@ -68,7 +84,7 @@ impl Default for Cpu {
         Self {
             regs: Registers::new(),
             csr: Csrs::new(),
-            pending_trap: None,
+            pending_interrupts: 0,
             rom_stubs: RomStubTable::new(),
         }
     }
@@ -96,37 +112,51 @@ impl Cpu {
     }
 
     /// Requests that an interrupt be delivered. This does *not* take the
-    /// trap immediately — it marks it pending, and it is taken at the start
-    /// of the next [`Cpu::step`] call, before that step fetches/executes an
-    /// instruction. This is the mechanism an external interrupt
-    /// controller/timer (built in a later task) calls to deliver an
-    /// interrupt into the core.
+    /// trap immediately — it marks `cause`'s line pending in
+    /// [`Cpu::pending_interrupts`], and it is taken (subject to the
+    /// `mstatus.MIE` gate — see [`Cpu::step`]) at the start of a future
+    /// [`Cpu::step`] call, before that step fetches/executes an instruction.
+    /// This is the mechanism an external interrupt controller/timer calls to
+    /// deliver an interrupt into the core.
     ///
-    /// `cause` is the raw RISC-V exception code (e.g. 7 for
-    /// machine-timer-interrupt, 11 for machine-external-interrupt per the
-    /// standard cause numbering) — the interrupt bit is set automatically.
+    /// `cause` is the raw RISC-V exception code / CPU interrupt line number
+    /// (e.g. 7 for machine-timer-interrupt, 11 for machine-external-interrupt
+    /// per the standard cause numbering; the ESP32-C3 interrupt matrix uses
+    /// this as its 0..=31 CPU line number — see `peripherals::intc`) — the
+    /// interrupt bit is set automatically on trap entry. Only the low 5 bits
+    /// are meaningful (32 lines); calling this twice for the same line before
+    /// it's taken is idempotent, and calling it for a different line never
+    /// drops the first one (see the [`Cpu::pending_interrupts`] doc).
     /// Synchronous exceptions (`ECALL`/`EBREAK`/illegal instruction) are
     /// distinct from this mechanism: they're taken immediately, as part of
     /// the same `step()` that decoded the faulting instruction, since they
     /// are architecturally synchronous to it.
     pub fn raise_interrupt(&mut self, cause: u32) {
-        self.pending_trap = Some(PendingTrap {
-            cause,
-            is_interrupt: true,
-            tval: 0,
-        });
+        self.pending_interrupts |= 1u32 << (cause & 0x1f);
     }
 
     /// Executes exactly one instruction: fetch, decode, execute, and advance
     /// `pc` — or, if an interrupt is pending (via [`Cpu::raise_interrupt`])
-    /// or the instruction just decoded raises a synchronous exception,
-    /// takes that trap instead (saving `mepc`/`mcause`, updating `mstatus`,
-    /// and jumping to `mtvec`).
+    /// *and* `mstatus.MIE` is set, or the instruction just decoded raises a
+    /// synchronous exception, takes that trap instead (saving
+    /// `mepc`/`mcause`, updating `mstatus`, and jumping to `mtvec`).
+    ///
+    /// Per the RISC-V privileged spec, a pending interrupt is only actually
+    /// taken while the global `mstatus.MIE` bit is set. If `MIE` is clear,
+    /// the interrupt is left pending (not cleared) rather than taken — a
+    /// level-triggered source stays asserted and will simply be taken on a
+    /// later step once `MIE` is set again (typically by the firmware's own
+    /// `mret`). Without this gate, a level-triggered interrupt source would
+    /// livelock the core: the trap fires on cycle N, `mepc` is set, but
+    /// before the ISR's first instruction can execute the same source
+    /// re-asserts and the trap fires again, so the ISR body never runs.
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepInfo {
         let pc_before = self.regs.pc;
 
-        if let Some(pending) = self.pending_trap.take() {
-            self.enter_trap(pending.cause, pending.is_interrupt, pending.tval);
+        if self.pending_interrupts != 0 && self.csr.mstatus & mstatus_bits::MIE != 0 {
+            let line = self.pending_interrupts.trailing_zeros();
+            self.pending_interrupts &= !(1u32 << line);
+            self.enter_trap(line, true, 0);
             return StepInfo {
                 trap_taken: true,
                 instr_len: 0,
@@ -1022,6 +1052,141 @@ mod tests {
         assert_ne!(cpu.csr.mstatus & mstatus_bits::MIE, 0);
     }
 
+    // ---------------- Fix 1: mstatus.MIE gates interrupt-taking ----------------
+
+    #[test]
+    fn pending_interrupt_is_held_while_mie_clear_then_taken_once_mie_set_and_isr_returns_cleanly() {
+        // Layout:
+        //   0x00, 0x04, 0x08: three ordinary ADDIs -- normal code that must
+        //     keep running undisturbed while the interrupt is pending but
+        //     MIE is clear.
+        //   0x0C: a NOP -- "normal execution resumes here" after `mret`
+        //     (this is where the trap-taking step's `mepc` will point).
+        //   0x40 (mtvec): the simulated ISR body -- one ADDI, then `mret`.
+        const MTVEC: u32 = 0x40;
+        let mret_word: u32 = 0b0011000_00010_00000_000_00000_1110011;
+        let mut bus = TestBus::new(128);
+        let prog = [
+            (0x00u32, addi(5, 0, 1)),
+            (0x04, addi(5, 0, 2)),
+            (0x08, addi(5, 0, 3)),
+            (0x0C, addi(0, 0, 0)), // NOP: where execution resumes post-mret
+            (MTVEC, addi(6, 0, 99)),
+            (MTVEC + 4, mret_word),
+        ];
+        for (addr, word) in prog {
+            bus.mem[addr as usize..addr as usize + 4].copy_from_slice(&word.to_le_bytes());
+        }
+
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = MTVEC;
+        // MIE starts clear (Csrs::default()). Arm a pending interrupt now.
+        cpu.raise_interrupt(7);
+
+        // Three steps with MIE clear: the interrupt must NOT be taken -- the
+        // CPU just keeps executing normal code, and mcause is left alone.
+        for expected_x5 in [1u32, 2, 3] {
+            let info = cpu.step(&mut bus);
+            assert!(
+                !info.trap_taken,
+                "interrupt must not be taken while MIE is clear"
+            );
+            assert_eq!(cpu.regs.read(5), expected_x5);
+        }
+        assert_eq!(cpu.regs.pc, 0x0C);
+        assert_eq!(cpu.csr.mcause, 0, "mcause must be untouched so far");
+
+        // Now enable MIE. The very next step must take the still-pending
+        // interrupt instead of fetching the NOP at 0x0C.
+        cpu.csr.mstatus |= mstatus_bits::MIE;
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken, "interrupt must be taken once MIE is set");
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 7);
+        assert_eq!(cpu.csr.mepc, 0x0C, "mepc must be the NOP that didn't run");
+        assert_eq!(cpu.regs.pc, MTVEC);
+        assert_eq!(
+            cpu.csr.mstatus & mstatus_bits::MIE,
+            0,
+            "MIE must clear on trap entry"
+        );
+
+        // Inside the simulated ISR: the level-triggered source re-asserting
+        // while MIE is clear must NOT cause another trap on the next step --
+        // this is the actual livelock this fix prevents.
+        cpu.raise_interrupt(7);
+        let info = cpu.step(&mut bus); // executes ADDI x6, x0, 99 at MTVEC
+        assert!(
+            !info.trap_taken,
+            "re-asserting the source must not re-trap while MIE is clear (would be the livelock)"
+        );
+        assert_eq!(cpu.regs.read(6), 99, "the ISR body must actually run");
+
+        // The ISR now clears the interrupt source (modeled here as the
+        // source simply no longer being asserted) before returning.
+        cpu.pending_interrupts = 0;
+
+        // `mret`: MIE is restored from MPIE (which captured the old MIE=1),
+        // pc returns to mepc.
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(cpu.regs.pc, 0x0C);
+        assert_ne!(cpu.csr.mstatus & mstatus_bits::MIE, 0);
+
+        // And normal execution resumes without immediately re-trapping --
+        // proving this isn't still spinning on the level-triggered re-raise.
+        let info = cpu.step(&mut bus);
+        assert!(
+            !info.trap_taken,
+            "must not re-trap immediately after mret once the source is cleared"
+        );
+        assert_eq!(cpu.regs.pc, 0x10);
+    }
+
+    #[test]
+    fn raise_interrupt_on_a_different_line_does_not_drop_an_already_pending_one() {
+        // The "bundled fix": a second `raise_interrupt` call for a different
+        // line, made while an earlier line is still pending and unconsumed
+        // (MIE clear), must not silently clobber the first one. Both must
+        // remain observable as pending, and the CPU takes them one at a time
+        // rather than losing either.
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x1000;
+        let mut bus = TestBus::with_program(&[
+            addi(0, 0, 0), // NOP x3, padding so there's always something to fetch
+            addi(0, 0, 0),
+            addi(0, 0, 0),
+        ]);
+
+        cpu.raise_interrupt(3); // line 3 pending first
+        cpu.raise_interrupt(9); // line 9 pending second -- must not drop line 3
+
+        assert_eq!(
+            cpu.pending_interrupts,
+            (1 << 3) | (1 << 9),
+            "both lines must be recorded as pending, not just the most recent call"
+        );
+
+        cpu.csr.mstatus |= mstatus_bits::MIE;
+
+        // Lowest line number is taken first (this core's documented, v1
+        // placeholder priority ordering -- see `Cpu::pending_interrupts`).
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 3, "line 3 taken first");
+        assert_eq!(
+            cpu.pending_interrupts,
+            1 << 9,
+            "line 9 must still be pending after line 3 is taken"
+        );
+
+        // `mret` back out, then the still-pending line 9 must be taken next.
+        cpu.exec_mret();
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 9, "line 9 taken second");
+        assert_eq!(cpu.pending_interrupts, 0, "nothing left pending");
+    }
+
     // ---------------- Mask-ROM HLE stubs ----------------
 
     /// Builds the shared program both ROM-stub tests below run: a normal ABI
@@ -1206,6 +1371,7 @@ mod tests {
         // address -- the stub runs when the handler returns.
         let mut cpu = Cpu::new();
         cpu.csr.mtvec = 0x2000;
+        cpu.csr.mstatus |= mstatus_bits::MIE;
         let mut table = RomStubTable::new();
         table.insert(ROM_STUB_ADDR, RomStub::returning("fake_rom_fn", 42));
         cpu.set_rom_stubs(table);

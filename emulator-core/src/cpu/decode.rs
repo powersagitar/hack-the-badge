@@ -394,12 +394,23 @@ pub fn decode_16(half: u16) -> Instruction {
     match (op, funct3) {
         // ---------------- Quadrant 0 ----------------
         (0b00, 0b000) => {
-            // C.ADDI4SPN: rd' = x2 + nzuimm (nzuimm != 0, else HINT/no-op)
-            let rd = creg(cbits(half, 4, 2));
+            // C.ADDI4SPN: rd' = x2 + nzuimm. Per the RVC spec, `nzuimm == 0`
+            // (all-zero immediate fields -- which includes the all-zero
+            // halfword `0x0000`) is a *reserved* encoding, not a valid
+            // no-op/HINT: it must decode as illegal. This matters beyond
+            // spec fidelity for its own sake -- `0x0000` is exactly what a
+            // stray fetch from unmapped/zeroed memory reads, and Illegal is
+            // what makes that fault loudly (see `execute::execute`'s
+            // `Instruction::Illegal` arm) instead of silently running an
+            // ADDI-shaped no-op forever.
             let nzuimm = (cbits(half, 10, 7) << 6)
                 | (cbits(half, 12, 11) << 4)
                 | (cbits(half, 5, 5) << 3)
                 | (cbits(half, 6, 6) << 2);
+            if nzuimm == 0 {
+                return Instruction::Illegal(half as u32);
+            }
+            let rd = creg(cbits(half, 4, 2));
             Instruction::OpImm {
                 rd,
                 rs1: 2,
@@ -868,6 +879,33 @@ mod tests {
                 rd: 8,
                 rs1: 8,
                 imm: 1,
+                kind: AluOp::Add
+            }
+        );
+    }
+
+    #[test]
+    fn all_zero_halfword_decodes_as_illegal_not_c_addi4spn_noop() {
+        // 0x0000 matches C.ADDI4SPN's encoding (op=00, funct3=000) with
+        // nzuimm=0, which the RVC spec reserves -- it must NOT decode as a
+        // valid `addi rd', x2, 0`. This is exactly what a stray fetch from
+        // unmapped/zeroed memory reads, so this also doubles as the decode-
+        // level regression test for that failure mode.
+        assert_eq!(decode_16(0x0000), Instruction::Illegal(0));
+    }
+
+    #[test]
+    fn nonzero_c_addi4spn_still_decodes_normally() {
+        // Sanity check alongside the reserved-encoding test above: a genuine
+        // nonzero nzuimm must still decode as C.ADDI4SPN, not regress to
+        // Illegal too. op=00 funct3=000, rd'=0(x8), nzuimm=4 -> bit[6]=1.
+        let half: u16 = (0b000 << 13) | (1 << 6) | (0b000 << 2) | 0b00;
+        assert_eq!(
+            decode_16(half),
+            Instruction::OpImm {
+                rd: 8,
+                rs1: 2,
+                imm: 4,
                 kind: AluOp::Add
             }
         );

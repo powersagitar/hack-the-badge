@@ -15,11 +15,10 @@
 //! standard RISC-V 32-bit-constant idiom, so nothing here needs a `-0x800`
 //! sign-extension carve-out):
 //! 1. Sets `mtvec = 0x8000_0000 | 1` (vectored mode).
-//! 2. Sets `mstatus.MIE` (realistic firmware behavior; Task 1's `enter_trap`
-//!    doesn't currently gate interrupt delivery on it, so this isn't load-
-//!    bearing for the test passing, but it's what real firmware would do,
-//!    and this test should keep working if a future Task 1 fix adds that
-//!    gating with `MIE` already set).
+//! 2. Sets `mstatus.MIE` (realistic firmware behavior; `Cpu::step` gates
+//!    interrupt-taking on this bit, so it *is* load-bearing -- without it,
+//!    the interrupt would stay pending forever and this test would time out
+//!    against its step budget).
 //! 3. Routes `SYSTIMER_TARGET0` to CPU interrupt line 5 via
 //!    `SYSTIMER_TARGET0_INT_MAP_REG`.
 //! 4. Enables that line in `CPU_INT_ENABLE_REG`.

@@ -20,9 +20,9 @@ ESP32-C3 device), in two complementary modes:
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
 
-Both modes are designed to share the same on-screen button pad/keyboard
-input and the same `<canvas>` element, toggled via a mode switch in
-`src/ui/shell.ts` — that wiring lands in the final phase of Milestone 2.
+Both modes share the same on-screen button pad/keyboard input and the same
+`<canvas>` element, toggled via a mode switch in `src/ui/shell.ts` — that
+wiring has landed (see `src/main.ts`).
 
 ## Commands
 
@@ -73,35 +73,38 @@ src/render/canvas.ts  Pure function: walks a Widget tree, paints it to a
 src/ui/shell.ts       Page chrome: on-screen button pad + keyboard bindings
                       that call runtime.injectButton(); LED HUD.
 src/main.ts           Wires it all together; loads public/apps/smoke-test.
-                      Will grow to own both the Lua AppRuntime and the CPU
-                      FirmwareRuntime once real-firmware mode lands (see
-                      emulator-core/ below) — currently Lua-only.
+                      Owns both the Lua AppRuntime and the CPU
+                      FirmwareRuntime (see emulator-core/ below), with a
+                      mode toggle (src/ui/shell.ts) that switches which one
+                      drives the shared canvas/button pad. The `./cpu/bridge`
+                      import is dynamic, loaded lazily on first switch to
+                      firmware mode, so Lua-only usage has no static
+                      dependency on the Rust/WASM toolchain output.
 public/apps/<slug>/   Static app bundles (main.lua + manifest.cfg), served
                       by Vite's public/ dir and fetched via a *synchronous*
                       XHR-based fileLoader (required because Lua require()
                       must return synchronously).
 
 emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
-                      natively. Will hold the RV32IMC RISC-V decode/execute
+                      natively. Holds the full RV32IMC RISC-V decode/execute
                       core (src/cpu/), the memory map + flash-image boot
-                      loader (src/mem/, boot.rs), and a minimal ESP32-C3
-                      peripheral set (src/peripherals/: timer, interrupt
-                      controller, GPIO, SPI->ST7789 framebuffer
-                      reconstruction) as later phases land; currently just
-                      scaffolding + a round-trip smoke test (`add()`).
+                      loader (src/mem/, boot.rs), and the ESP32-C3
+                      peripheral set implemented so far (src/peripherals/:
+                      SYSTIMER + interrupt matrix, GPIO, SPI2/GPSPI2 ->
+                      ST7789 framebuffer reconstruction), plus mask-ROM
+                      high-level-emulation stubs (src/rom.rs) that get the
+                      real firmware image past its early boot wall.
 emulator-wasm/        Thin wasm-bindgen shim over emulator-core, built via
                       `bun run build:wasm` into src/cpu/wasm-pkg/ (gitignored).
                       TS-side consumers (src/cpu/bridge.ts,
                       src/runtime/firmware-runtime.ts, src/render/framebuffer.ts
                       — the CPU-emulator analogs of the Lua-mode files above)
-                      land alongside the peripheral phases that need them.
-public/firmware/      The dumped real badge firmware: factory.bin (the
-                      app partition the CPU emulator boots) and
-                      full_flash_dump.bin (the complete 4MB flash, kept for
-                      future bootloader/OTA work). Captured read-only via
-                      esptool from a physical badge; publication approved
-                      by Hack the North organizers ahead of their own
-                      open-sourcing of this firmware.
+                      exist now, wired up by src/main.ts's mode toggle.
+public/firmware/      The dumped real badge firmware: factory.bin, the app
+                      partition the CPU emulator boots. Captured read-only
+                      via esptool from a physical badge; publication
+                      approved by Hack the North organizers ahead of their
+                      own open-sourcing of this firmware.
 ```
 
 Module boundaries are intentionally pure where feasible (manifest parsing,

@@ -19,8 +19,18 @@
  * wired once, below, to a single `inject` function that routes to whichever
  * runtime is currently active) — per the plan's "toggled via a mode switch
  * in `src/ui/shell.ts`" note.
+ *
+ * **What mode-switching actually gates:** only *painting*. `setMode` stops/
+ * starts the Lua rAF paint loop (`startLuaPaintLoop`/`stopLuaPaintLoop`) and
+ * the firmware runtime's own step+paint loop (`FirmwareRuntime.start`/
+ * `.stop`) depending on which mode is now selected — but `luaRuntime`'s
+ * `on_tick` timer (`lifecycle.ts`'s `setInterval`) is started once, here,
+ * and never stopped except on page unload. So the Lua app keeps running and
+ * mutating its own state in the background even while real-firmware mode is
+ * the one being displayed; only its canvas output is suspended. This is
+ * intentional (switching back to Lua mode resumes it mid-state instead of
+ * restarting `main.lua` from `on_enter`), not a bug.
  */
-import { createFirmwareEmulator, initCpuWasm } from "./cpu/bridge";
 import { renderFrame } from "./render/canvas";
 import { createFirmwareRuntime, type FirmwareRuntime } from "./runtime/firmware-runtime";
 import { createHttpFileLoader, loadApp } from "./runtime/lifecycle";
@@ -84,12 +94,22 @@ function main(): void {
   // pays the cost of fetching/booting factory.bin through WASM. Once built,
   // it's kept alive (not disposed) across later mode switches so switching
   // back doesn't re-boot from scratch.
+  //
+  // The `./cpu/bridge` import itself is dynamic (below), not static at the
+  // top of this file: `bridge.ts` imports the gitignored, Rust-toolchain-
+  // generated `src/cpu/wasm-pkg/`, so a static import here would make
+  // Lua-sandbox mode -- which has no need for any of that -- fail to even
+  // load (`vite dev`/`vite build`/`bunx tsc --noEmit` all error) on a clean
+  // checkout that hasn't run `bun run build:wasm`. Keeping the import inside
+  // this lazy-boot function means the Lua-only path never touches `src/cpu/`
+  // at all.
   let firmwareRuntime: FirmwareRuntime | null = null;
   let firmwareRuntimePromise: Promise<FirmwareRuntime> | null = null;
 
   async function ensureFirmwareRuntime(): Promise<FirmwareRuntime> {
     if (firmwareRuntime) return firmwareRuntime;
     firmwareRuntimePromise ??= (async () => {
+      const { createFirmwareEmulator, initCpuWasm } = await import("./cpu/bridge");
       await initCpuWasm();
       const res = await fetch(FIRMWARE_IMAGE_URL);
       if (!res.ok) {
@@ -100,7 +120,13 @@ function main(): void {
       const rt = createFirmwareRuntime(handle, shell.ctx);
       firmwareRuntime = rt;
       return rt;
-    })();
+    })().catch((e: unknown) => {
+      // Don't let a rejected boot attempt (e.g. a transient fetch failure)
+      // stay cached forever -- reset the slot so the next toggle attempt
+      // retries the fetch/boot instead of replaying this same rejection.
+      firmwareRuntimePromise = null;
+      throw e;
+    });
     return firmwareRuntimePromise;
   }
 

@@ -27,13 +27,28 @@
 //!
 //! ## How this list was arrived at
 //!
-//! Empirically, not speculatively: boot the real image, see which address the
-//! PC faults on, look that address up in the linker scripts, add the smallest
-//! stub that lets boot proceed, repeat. `tests/rom_stub_boot.rs` records the
-//! resulting call sequence. Nothing is stubbed "just in case" — an unstubbed
-//! ROM address faults loudly with the address in `mtval`, which is a far better
-//! failure than a stub quietly returning a wrong answer, so the table stays as
-//! small as the firmware allows.
+//! The *driving loop* was empirical, not speculative: boot the real image,
+//! see which address the PC faults on, look that address up in the linker
+//! scripts, add the smallest stub that lets boot proceed, repeat.
+//! `tests/rom_stub_boot.rs` records the resulting call sequence, and each of
+//! the 6 `NAMED_STUBS` entries (`rtc_get_reset_reason`, `ets_delay_us`,
+//! `memset`, `ets_get_cpu_frequency` + its setter, `ets_printf`) was chosen
+//! because the real boot run was observed calling that exact address and the
+//! generic zero-return default either stalled it or would have silently
+//! corrupted a caller. The bulk of the table's ~69 entries, though — the
+//! whole `Cache_*` family, the `rom_i2c_*` family, and (to a lesser degree,
+//! since each does get real arithmetic semantics rather than a generic
+//! zero) the libgcc 64-bit integer family — were added preemptively in one
+//! shot once their linker-script *range* was known, on the documented
+//! reasoning that this emulator models no cache and no analog register bus
+//! at all (see "Which functions are stubbed, and why these semantics"
+//! below), not because each individual address in those families was
+//! independently observed being called during that boot run; most never
+//! were. What *is* true of the whole table, addresses-observed or not: an
+//! unstubbed ROM address faults loudly with the address in `mtval` rather
+//! than a stub quietly returning a wrong answer, so adding a family in one
+//! shot is a defensible way to stay ahead of the boot run's next fault
+//! without individually re-deriving each member's justification.
 //!
 //! ## Which functions are stubbed, and why these semantics
 //!
