@@ -199,6 +199,13 @@ impl FirmwareRuntime {
     pub fn bus(&self) -> &FirmwareBus {
         &self.bus
     }
+
+    /// Everything the firmware has printed to its console (USB-Serial-JTAG
+    /// TX), lossily decoded as UTF-8 — see
+    /// `crate::peripherals::console::Console::text`.
+    pub fn console_output(&self) -> String {
+        self.bus.console.text()
+    }
 }
 
 #[cfg(test)]
@@ -221,6 +228,16 @@ mod tests {
         buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
         buf.extend_from_slice(&code);
         buf
+    }
+
+    #[test]
+    fn console_output_reflects_usb_serial_jtag_tx_writes() {
+        use crate::mem::soc::USB_SERIAL_JTAG_RANGE;
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
+        assert_eq!(rt.console_output(), "");
+        rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, b'Q' as u32);
+        assert_eq!(rt.console_output(), "Q");
     }
 
     #[test]

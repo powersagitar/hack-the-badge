@@ -20,6 +20,12 @@
 //!   framebuffer from what real firmware writes to drive the badge's LCD.
 //!   Needs a live cross-peripheral read of `gpio`'s GPIO0 level (the D/C
 //!   line) at transaction-trigger time — see `spi`'s module doc.
+//! - [`console`]: [`console::Console`], a capped byte sink every "firmware
+//!   printed something" path (USB-Serial-JTAG TX, UART0 TX, ROM putc stubs)
+//!   feeds into — diagnostic output, not emulated device state.
+//! - [`usb_serial_jtag`]: [`usb_serial_jtag::UsbSerialJtag`], the
+//!   USB-Serial-JTAG peripheral (the badge's actual console transport) that
+//!   feeds [`console::Console`] from firmware TX writes.
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -27,10 +33,12 @@
 //! mirroring how `FirmwareBus` already distinguishes XIP vs. RAM-copied
 //! regions by a manual range check, not a generic abstraction.
 
+pub mod console;
 pub mod gpio;
 pub mod intc;
 pub mod spi;
 pub mod systimer;
+pub mod usb_serial_jtag;
 
 /// Replaces byte `idx` (`0..=3`, little-endian, i.e. `idx == 0` is the
 /// least-significant byte) of `word` with `val`, leaving the other three

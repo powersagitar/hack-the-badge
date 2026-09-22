@@ -158,4 +158,12 @@ impl FirmwareEmulator {
     pub fn total_steps(&self) -> f64 {
         self.inner.total_steps() as f64
     }
+
+    /// Everything the firmware has printed to its console so far. A method
+    /// (not a getter) since it does real work (lossy UTF-8 decode of the
+    /// capped console ring) on every call rather than exposing cheap state.
+    #[wasm_bindgen(js_name = consoleOutput)]
+    pub fn console_output(&self) -> String {
+        self.inner.console_output()
+    }
 }

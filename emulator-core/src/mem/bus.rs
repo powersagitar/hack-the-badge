@@ -35,7 +35,14 @@
 //!    [`FirmwareBus::write_byte`] reads `self.gpio.pin_level(0)` directly
 //!    and hands it to [`crate::peripherals::spi::Spi::process_transaction`],
 //!    no trait object involved.
-//! 7. **Catch-all**: any address covered by none of the above (every
+//! 7. **USB-Serial-JTAG** ([`crate::mem::soc::USB_SERIAL_JTAG_RANGE`]):
+//!    routed to [`FirmwareBus::usb_serial_jtag`], same ruling — see
+//!    `crate::peripherals::usb_serial_jtag`. TX-byte writes also need a
+//!    live mutable reference to [`FirmwareBus::console`] (the capped sink
+//!    that firmware console output accumulates into); `FirmwareBus::write_byte`
+//!    passes `&mut self.console` straight through, another instance of the
+//!    "no trait object" ruling's direct concrete-field access.
+//! 8. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -50,13 +57,18 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::peripherals::console::Console;
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::spi::Spi;
 use crate::peripherals::systimer::SysTimer;
+use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
-use super::soc::{is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE};
+use super::soc::{
+    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE,
+    USB_SERIAL_JTAG_RANGE,
+};
 use super::Bus;
 
 /// Max number of catch-all accesses [`FirmwareBus`] remembers (oldest
@@ -126,6 +138,13 @@ pub struct FirmwareBus {
     /// includes the ST7789 command/pixel-stream interpreter and
     /// reconstructed framebuffer.
     pub spi: Spi,
+    /// The USB-Serial-JTAG peripheral (`crate::peripherals::usb_serial_jtag`),
+    /// same ruling — the badge's actual console transport.
+    pub usb_serial_jtag: UsbSerialJtag,
+    /// Capped sink for everything the firmware prints
+    /// (`crate::peripherals::console`), fed by
+    /// [`FirmwareBus::usb_serial_jtag`]'s TX-byte writes.
+    pub console: Console,
     /// Ring buffer of the most recent catch-all accesses, capped at
     /// [`UNMAPPED_LOG_CAPACITY`].
     unmapped_log: VecDeque<UnmappedAccess>,
@@ -184,6 +203,8 @@ impl FirmwareBus {
             intc: InterruptController::new(),
             gpio: Gpio::new(),
             spi: Spi::new(),
+            usb_serial_jtag: UsbSerialJtag::new(),
+            console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
     }
@@ -257,6 +278,11 @@ impl FirmwareBus {
         if SPI2_RANGE.contains(&addr) {
             return self.spi.read_byte(addr - SPI2_RANGE.start);
         }
+        if USB_SERIAL_JTAG_RANGE.contains(&addr) {
+            return self
+                .usb_serial_jtag
+                .read_byte(addr - USB_SERIAL_JTAG_RANGE.start);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -300,6 +326,14 @@ impl FirmwareBus {
                 let dc_low = !self.gpio.pin_level(0);
                 self.spi.process_transaction(dc_low);
             }
+            return;
+        }
+        if USB_SERIAL_JTAG_RANGE.contains(&addr) {
+            self.usb_serial_jtag.write_byte(
+                addr - USB_SERIAL_JTAG_RANGE.start,
+                val,
+                &mut self.console,
+            );
             return;
         }
         self.record_unmapped(addr, true);
@@ -500,6 +534,13 @@ mod tests {
             "0x0000 is a reserved RVC encoding, not a valid instruction"
         );
         assert_eq!(cpu.regs.pc, 0x9000, "pc must redirect to mtvec");
+    }
+
+    #[test]
+    fn usb_serial_jtag_tx_writes_reach_the_console() {
+        let mut bus = bus_with(vec![]);
+        bus.write32(0x6004_3000, b'Z' as u32);
+        assert_eq!(bus.console.bytes(), b"Z");
     }
 
     #[test]
