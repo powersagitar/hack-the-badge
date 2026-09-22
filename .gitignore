@@ -6,3 +6,7 @@ dist/
 .claude/worktrees/
 target/
 frontend/src/cpu/wasm-pkg/
+
+# Local-only artifacts (full flash dumps contain personal data — never commit)
+/local/
+*flash*dump*.bin
