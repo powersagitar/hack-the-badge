@@ -183,12 +183,15 @@ impl SysTimer {
 
     /// `true` iff `offset`'s word-aligned offset is one of the registers
     /// named above -- i.e. exactly the set [`SysTimer::read_byte`]/
-    /// [`SysTimer::write_byte`] give real behavior to, as opposed to falling
-    /// through to their `_ => 0`/`_ => {}` catch-all. Pure function of the
-    /// word offset (any low 2 bits in `offset` are masked off before
-    /// comparing), used by `crate::mem::bus::FirmwareBus` to additionally
-    /// log an access to a not-yet-modeled systimer register as "unmapped" --
-    /// see its module doc.
+    /// [`SysTimer::write_byte`] give a *named* arm to (even where that arm's
+    /// behavior is a constant `0`, as for the write-only `COMP0_LOAD_REG`/
+    /// `INT_CLR_REG` on the read side -- see `read_byte`'s comment on that
+    /// arm), as opposed to falling through to their unnamed `_ => 0`/
+    /// `_ => {}` catch-all. Pure function of the word offset (any low 2 bits
+    /// in `offset` are masked off before comparing), used by
+    /// `crate::mem::bus::FirmwareBus` to additionally log an access to a
+    /// not-yet-modeled systimer register as "unmapped" -- see its module
+    /// doc.
     pub fn handles(offset: u32) -> bool {
         matches!(
             offset & !0b11,
@@ -295,9 +298,18 @@ impl SysTimer {
             INT_RAW_REG => self.int_raw,
             // TARGET0_INT_BIT is bit 0, so this is just the bool as a u32.
             INT_ST_REG => u32::from(self.target0_pending()),
-            // COMP0_LOAD_REG and everything else this module doesn't name
-            // (unit1/target1/target2/DATE/etc.): no real storage in v1,
-            // reads as 0 -- see the module doc.
+            // COMP0_LOAD_REG (TIMER_COMP0_LOAD, WT) and INT_CLR_REG
+            // (TARGET0_INT_CLR, WTC) are write-only trigger/clear registers
+            // per systimer_reg.h -- real hardware has no readable storage
+            // behind either bit, so both read back as 0. Named explicitly
+            // (rather than falling into the catch-all below) so
+            // `SysTimer::handles` -- which counts both as modeled -- stays
+            // accurate: this module does give them real behavior on the
+            // write side (see `write_byte`), just not on the read side.
+            COMP0_LOAD_REG | INT_CLR_REG => 0,
+            // Everything else this module doesn't name (unit1/target1/
+            // target2/DATE/etc.): no real storage in v1, reads as 0 -- see
+            // the module doc.
             _ => 0,
         };
         word.to_le_bytes()[idx]

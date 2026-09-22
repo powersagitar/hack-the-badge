@@ -587,6 +587,19 @@ mod tests {
     }
 
     #[test]
+    fn write_only_systimer_registers_read_as_zero_and_are_not_logged() {
+        // COMP0_LOAD_REG (0x50) and INT_CLR_REG (0x6c) are write-only
+        // trigger/clear registers -- `SysTimer::handles` counts both as
+        // modeled (see its doc), so a *read* of either must both read back
+        // 0 (no readable storage behind a WT/WTC bit) and not show up in
+        // the unmapped-access log.
+        let mut bus = bus_with(vec![]);
+        assert_eq!(bus.read32(0x6002_3000 + 0x50), 0);
+        assert_eq!(bus.read32(0x6002_3000 + 0x6c), 0);
+        assert!(bus.unmapped_log().is_empty());
+    }
+
+    #[test]
     fn unmapped_log_records_accesses_and_caps_at_capacity() {
         let mut bus = bus_with(vec![]);
         for addr in 0..(UNMAPPED_LOG_CAPACITY as u32 + 10) {

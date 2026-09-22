@@ -63,7 +63,16 @@ struct Args {
     dump_frame: Option<String>,
 }
 
-fn parse_args() -> Args {
+/// Parses `--steps N`/`--window W` values strictly: a missing value or one
+/// that doesn't parse as a `u32` is an error, not a silent fall-back to the
+/// default -- a typo'd flag value should be loud, not quietly ignored.
+fn parse_u32_flag(flag: &str, raw: Option<String>) -> Result<u32, String> {
+    let raw = raw.ok_or_else(|| format!("{flag} requires a value"))?;
+    raw.parse::<u32>()
+        .map_err(|_| format!("{flag} value {raw:?} is not a valid non-negative integer"))
+}
+
+fn parse_args() -> Result<Args, String> {
     let mut steps = DEFAULT_STEPS;
     let mut window = DEFAULT_WINDOW;
     let mut dump_frame = None;
@@ -72,16 +81,10 @@ fn parse_args() -> Args {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--steps" => {
-                steps = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(DEFAULT_STEPS);
+                steps = parse_u32_flag("--steps", args.next())?;
             }
             "--window" => {
-                window = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(DEFAULT_WINDOW);
+                window = parse_u32_flag("--window", args.next())?;
             }
             "--dump-frame" => {
                 dump_frame = args.next();
@@ -92,11 +95,11 @@ fn parse_args() -> Args {
         }
     }
 
-    Args {
+    Ok(Args {
         steps,
         window,
         dump_frame,
-    }
+    })
 }
 
 /// Lexically normalizes a path (resolves `.`/`..` components without
@@ -243,7 +246,10 @@ fn print_full_dump_partition_table() {
 }
 
 fn main() {
-    let args = parse_args();
+    let args = parse_args().unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
 
     let image_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/factory.bin");
