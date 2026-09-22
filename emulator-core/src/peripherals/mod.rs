@@ -26,6 +26,10 @@
 //! - [`usb_serial_jtag`]: [`usb_serial_jtag::UsbSerialJtag`], the
 //!   USB-Serial-JTAG peripheral (the badge's actual console transport) that
 //!   feeds [`console::Console`] from firmware TX writes.
+//! - [`timg`]: [`timg::Timg`], the TIMG0/TIMG1 timer-group peripherals —
+//!   RTC slow-clock calibration (`RTCCALICFG*_REG`, what `rtc_clk_cal()`
+//!   polls at boot) plus inert MWDT watchdog storage. `FirmwareBus` holds
+//!   one `Timg` instance per timer group (`timg0`, `timg1`).
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -38,6 +42,7 @@ pub mod gpio;
 pub mod intc;
 pub mod spi;
 pub mod systimer;
+pub mod timg;
 pub mod usb_serial_jtag;
 
 /// Replaces byte `idx` (`0..=3`, little-endian, i.e. `idx == 0` is the

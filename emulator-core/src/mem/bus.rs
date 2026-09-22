@@ -42,7 +42,14 @@
 //!    that firmware console output accumulates into); `FirmwareBus::write_byte`
 //!    passes `&mut self.console` straight through, another instance of the
 //!    "no trait object" ruling's direct concrete-field access.
-//! 8. **Catch-all**: any address covered by none of the above (every
+//! 8. **TIMG0** ([`crate::mem::soc::TIMG0_RANGE`]): routed to
+//!    [`FirmwareBus::timg0`], same ruling — see `crate::peripherals::timg`
+//!    for the RTC slow-clock calibration model `rtc_clk_cal_internal()`
+//!    polls at boot, plus inert MWDT watchdog storage.
+//! 9. **TIMG1** ([`crate::mem::soc::TIMG1_RANGE`]): routed to
+//!    [`FirmwareBus::timg1`], same peripheral model as TIMG0 (a second,
+//!    independent instance) — same ruling.
+//! 10. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -70,12 +77,13 @@ use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::spi::Spi;
 use crate::peripherals::systimer::SysTimer;
+use crate::peripherals::timg::Timg;
 use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE,
-    USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE, TIMG0_RANGE,
+    TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -149,6 +157,12 @@ pub struct FirmwareBus {
     /// The USB-Serial-JTAG peripheral (`crate::peripherals::usb_serial_jtag`),
     /// same ruling — the badge's actual console transport.
     pub usb_serial_jtag: UsbSerialJtag,
+    /// TIMG0 (`crate::peripherals::timg`), same ruling — RTC slow-clock
+    /// calibration plus inert MWDT watchdog storage.
+    pub timg0: Timg,
+    /// TIMG1 (`crate::peripherals::timg`), a second independent instance of
+    /// the same peripheral model, same ruling.
+    pub timg1: Timg,
     /// Capped sink for everything the firmware prints
     /// (`crate::peripherals::console`), fed by
     /// [`FirmwareBus::usb_serial_jtag`]'s TX-byte writes.
@@ -212,6 +226,8 @@ impl FirmwareBus {
             gpio: Gpio::new(),
             spi: Spi::new(),
             usb_serial_jtag: UsbSerialJtag::new(),
+            timg0: Timg::new(),
+            timg1: Timg::new(),
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
@@ -298,6 +314,12 @@ impl FirmwareBus {
                 .usb_serial_jtag
                 .read_byte(addr - USB_SERIAL_JTAG_RANGE.start);
         }
+        if TIMG0_RANGE.contains(&addr) {
+            return self.timg0.read_byte(addr - TIMG0_RANGE.start);
+        }
+        if TIMG1_RANGE.contains(&addr) {
+            return self.timg1.read_byte(addr - TIMG1_RANGE.start);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -356,6 +378,14 @@ impl FirmwareBus {
                 val,
                 &mut self.console,
             );
+            return;
+        }
+        if TIMG0_RANGE.contains(&addr) {
+            self.timg0.write_byte(addr - TIMG0_RANGE.start, val);
+            return;
+        }
+        if TIMG1_RANGE.contains(&addr) {
+            self.timg1.write_byte(addr - TIMG1_RANGE.start, val);
             return;
         }
         self.record_unmapped(addr, true);
@@ -563,6 +593,16 @@ mod tests {
         let mut bus = bus_with(vec![]);
         bus.write32(0x6004_3000, b'Z' as u32);
         assert_eq!(bus.console.bytes(), b"Z");
+    }
+
+    #[test]
+    fn timg0_and_timg1_are_independent_and_reachable_through_the_bus() {
+        let mut bus = bus_with(vec![]);
+        // RTCCALICFG_REG (+0x68) on TIMG0: arm CLK_SEL=0, MAX=10, START.
+        bus.write32(0x6001_F000 + 0x68, (10u32 << 16) | (1 << 31));
+        assert_ne!(bus.read32(0x6001_F000 + 0x68) & (1 << 15), 0);
+        // TIMG1 must be a completely separate, still-unstarted instance.
+        assert_eq!(bus.read32(0x6002_0000 + 0x68) & (1 << 15), 0);
     }
 
     #[test]

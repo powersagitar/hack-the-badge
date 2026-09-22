@@ -160,13 +160,23 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// Where boot currently *stops*: a tight polling loop inside SoC clock
-/// initialization, waiting on a TIMERGROUP0 register this emulator doesn't
-/// model. Pinned down as a test so the next task on this code has an exact,
-/// checkable starting point rather than a prose description — and so that
-/// modelling that peripheral produces a visible, deliberate failure here
-/// instead of quietly changing behavior.
+/// initialization, now waiting on RTCCNTL's RTC-timer latch registers this
+/// emulator doesn't model. Pinned down as a test so the next task on this
+/// code has an exact, checkable starting point rather than a prose
+/// description — and so that modelling that peripheral produces a visible,
+/// deliberate failure here instead of quietly changing behavior.
+///
+/// **History**: until Milestone 3 Task 3
+/// (`emulator-core/src/peripherals/timg.rs`), this test pinned an *earlier*
+/// stall one peripheral back — an unmodelled TIMERGROUP0
+/// (`TIMG_RTCCALICFG_REG`/`TIMG_RTCCALICFG2_REG`) that `rtc_clk_cal()`
+/// polled forever. That peripheral is now modeled (see
+/// `emulator-core/tests/boot_progress.rs` and
+/// `docs/firmware-emulator-notes.md`'s "Known limitations" item 1), so this
+/// test's expected stall point moved forward to RTCCNTL, the next
+/// not-yet-modelled peripheral boot reaches.
 #[test]
-fn boot_currently_stalls_polling_an_unmodelled_timergroup0_register() {
+fn boot_currently_stalls_polling_unmodelled_rtccntl_time_registers() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
@@ -176,13 +186,16 @@ fn boot_currently_stalls_polling_an_unmodelled_timergroup0_register() {
     assert_eq!(summary.traps, 0);
 
     // Every catch-all (not-yet-modelled MMIO) access still in the bus's capped
-    // log is a read of one of two registers in the TIMERGROUP0 page
-    // (`DR_REG_TIMERGROUP0_BASE = 0x6001_f000`): `TIMG_RTCCALICFG_REG`
-    // (`+0x68`), whose `RTC_CALI_RDY` bit the firmware is spinning on, and
-    // `TIMG_RTCCALICFG2_REG` (`+0x80`). That's ESP-IDF's `rtc_clk_cal()`
-    // measuring the RTC slow clock against the crystal: it kicks off a
-    // calibration and polls until ready. With no TIMERGROUP0 model the ready
-    // bit reads 0 forever, so the loop never exits.
+    // log is a read or write of one of three registers in the RTCCNTL page
+    // (`DR_REG_RTCCNTL_BASE = 0x6000_8000`, per
+    // `components/soc/esp32c3/register/soc/reg_base.h`):
+    // `RTC_CNTL_TIME_UPDATE_REG` (`+0x0c`, both read and written -- the
+    // trigger-a-snapshot/poll-for-done register) and
+    // `RTC_CNTL_TIME_LOW0_REG`/`RTC_CNTL_TIME_HIGH0_REG` (`+0x10`/`+0x14`,
+    // read-only -- the latched RTC-timer snapshot), per
+    // `components/soc/esp32c3/register/soc/rtc_cntl_reg.h`. With no RTCCNTL
+    // model, the snapshot never appears "done", so whatever's waiting on it
+    // spins forever.
     let polled: std::collections::BTreeSet<(u32, bool)> = rt
         .bus()
         .unmapped_log()
@@ -191,11 +204,16 @@ fn boot_currently_stalls_polling_an_unmodelled_timergroup0_register() {
         .collect();
     assert_eq!(
         polled,
-        [(0x6001_f068, false), (0x6001_f080, false)]
-            .into_iter()
-            .collect(),
-        "expected the stall to be reads of TIMG_RTCCALICFG_REG / \
-         TIMG_RTCCALICFG2_REG and nothing else"
+        [
+            (0x6000_800c, false),
+            (0x6000_800c, true),
+            (0x6000_8010, false),
+            (0x6000_8014, false),
+        ]
+        .into_iter()
+        .collect(),
+        "expected the stall to be reads/writes of RTC_CNTL_TIME_UPDATE_REG / \
+         RTC_CNTL_TIME_LOW0_REG / RTC_CNTL_TIME_HIGH0_REG and nothing else"
     );
 
     // And nothing has been drawn, because the display driver is never reached.

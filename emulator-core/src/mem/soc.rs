@@ -121,6 +121,21 @@ pub const SPI2_RANGE: Range<u32> = 0x6002_4000..0x6002_5000;
 /// within it.
 pub const USB_SERIAL_JTAG_RANGE: Range<u32> = 0x6004_3000..0x6004_4000;
 
+/// TIMG0 (timer group 0) peripheral registers
+/// (`DR_REG_TIMERGROUP0_BASE`, confirmed via ESP-IDF v5.5.3's
+/// `components/soc/esp32c3/include/soc/reg_base.h`). One full 4 KiB page,
+/// same rationale as [`SYSTIMER_RANGE`]. This is the timer group
+/// `rtc_clk_cal_internal()` uses for RTC slow-clock calibration at boot
+/// (`TIMG_RTCCALICFG*_REG`) — see `crate::peripherals::timg` for what's
+/// actually modeled within it.
+pub const TIMG0_RANGE: Range<u32> = 0x6001_F000..0x6002_0000;
+
+/// TIMG1 (timer group 1) peripheral registers. Immediately follows
+/// [`TIMG0_RANGE`] (`DR_REG_TIMERGROUP1_BASE == DR_REG_TIMERGROUP0_BASE +
+/// 0x1000`, same header). Same one-4KiB-page rationale; see
+/// `crate::peripherals::timg`.
+pub const TIMG1_RANGE: Range<u32> = 0x6002_0000..0x6002_1000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +202,32 @@ mod tests {
         assert!(!USB_SERIAL_JTAG_RANGE.contains(&GPIO_RANGE.start));
         assert!(!USB_SERIAL_JTAG_RANGE.contains(&SPI2_RANGE.start));
         assert!(!is_xip_addr(USB_SERIAL_JTAG_RANGE.start));
+    }
+
+    #[test]
+    fn timg0_and_timg1_ranges_are_disjoint_from_each_other_and_the_other_peripheral_ranges_and_xip_iram(
+    ) {
+        assert!(TIMG0_RANGE.contains(&0x6001_F000));
+        assert!(!TIMG0_RANGE.contains(&0x6002_0000)); // exclusive end
+        assert!(TIMG1_RANGE.contains(&0x6002_0000));
+        assert!(!TIMG1_RANGE.contains(&0x6002_1000)); // exclusive end
+        assert!(!TIMG0_RANGE.contains(&TIMG1_RANGE.start));
+        assert!(!TIMG1_RANGE.contains(&TIMG0_RANGE.start));
+
+        for other in [
+            SYSTIMER_RANGE.start,
+            INTERRUPT_CORE0_RANGE.start,
+            GPIO_RANGE.start,
+            SPI2_RANGE.start,
+            USB_SERIAL_JTAG_RANGE.start,
+        ] {
+            assert!(!TIMG0_RANGE.contains(&other));
+            assert!(!TIMG1_RANGE.contains(&other));
+        }
+        assert!(!SYSTIMER_RANGE.contains(&TIMG0_RANGE.start));
+        assert!(!SYSTIMER_RANGE.contains(&TIMG1_RANGE.start));
+
+        assert!(!is_xip_addr(TIMG0_RANGE.start));
+        assert!(!is_xip_addr(TIMG1_RANGE.start));
     }
 }

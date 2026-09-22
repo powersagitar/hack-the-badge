@@ -198,10 +198,45 @@ physical-hardware visual cross-check) was always out of scope for Milestone
 **Milestone 3 candidate work**, in the order a whole-branch code review
 predicted these blockers would surface once TIMG unblocks further boot:
 
-1. **Model `TIMG_RTCCALICFG_REG`** — set `RTC_CALI_RDY` + a plausible cycle
-   count on a `RTC_CALI_START` write. The lead candidate to unblock further
-   progress; everything below is currently unreachable/dormant because boot
-   never gets past this point.
+1. ~~**Model `TIMG_RTCCALICFG_REG`**~~ — **Resolved in Milestone 3, Task 3**
+   (`emulator-core/src/peripherals/timg.rs`). `RTCCALICFG_REG`/
+   `RTCCALICFG1_REG`/`RTCCALICFG2_REG` on both TIMG0 and TIMG1 are now
+   modeled per `components/soc/esp32c3/register/soc/timer_group_reg.h` and
+   `components/esp_hw_support/port/esp32c3/rtc_time.c`'s
+   `rtc_clk_cal_internal()`: a write setting `RTC_CALI_START` completes the
+   calibration instantly (`RDY := 1`, `VALUE := MAX * 40_000_000 /
+   slow_hz(CLK_SEL)`); the six `WDTCONFIG*`/`WDTFEED`/`WDTWPROTECT`
+   watchdog registers are plain inert storage (the watchdog never fires).
+   This unblocked the exact pre-Task-3 stall: hot PCs are no longer
+   confined to `0x4038c80c`-`0x4038c822` (confirmed by
+   `emulator-core/tests/boot_progress.rs`'s
+   `timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop`, which
+   asserts no single PC in that range is hit 1,000+ times in a
+   3,000,000-step trace — pre-fix it was ~22,222 per address; post-fix each
+   address in that range is hit exactly once, i.e. the same poll loop still
+   legitimately executes once per boot, it just no longer spins).
+   **Where boot now stalls** (measured via `cargo run -p emulator-core
+   --release --example boot-probe -- --steps 20000000`): still **zero**
+   console output after 20,000,000 steps (`rom_stub_calls: 181005`, `traps:
+   0` — still executing real, non-faulting code, not stuck on a fault).
+   Hot PCs (last 200,000-step window) are now a *different*, wider pair of
+   loops at `0x4038bbbe`-`0x4038bbe4` and `0x4038f8f6`-`0x4038f8fe`
+   (~1,810/~3,620 hits respectively — smaller counts than the old
+   fully-blocking spin, consistent with *some* forward progress happening
+   between visits, not a hard stall — but still not advancing past this
+   pair over the full 20M-step run). The dominant unmapped accesses are now
+   `0x6000_800c`/`0x6000_8010`/`0x6000_8014` (16 reads/writes each in the
+   trailing-window tail) — all three fall inside `RTCCNTL`
+   (`DR_REG_RTCCNTL_BASE == 0x6000_8000`, confirmed via
+   `components/soc/esp32c3/register/soc/reg_base.h`) at offsets `0x0c`
+   (`RTC_CNTL_TIME_UPDATE_REG`, W — triggers an RTC-timer snapshot),
+   `0x10`/`0x14` (`RTC_CNTL_TIME_LOW0_REG`/`RTC_CNTL_TIME_HIGH0_REG`, R —
+   the latched snapshot), per
+   `components/soc/esp32c3/register/soc/rtc_cntl_reg.h` — a trigger/poll/
+   read-latch pattern structurally identical to SYSTIMER's `OP_REG`/
+   `UNIT0_VALUE_HI/LO_REG` this codebase already knows how to model. This is
+   the natural next Milestone 3 candidate (RTCCNTL isn't modeled at all
+   yet), likely used by ESP-IDF's `esp_log`/timestamp path or `rtc_time_get()`.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
