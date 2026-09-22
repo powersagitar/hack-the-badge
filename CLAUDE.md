@@ -12,13 +12,17 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestone 2, in progress): the badge's *built-in*
-   apps (Snake, Dice, etc.) are native RISC-V machine code baked into one
-   monolithic ESP-IDF app image — not extractable as Lua files (confirmed
-   by flash-dump forensics; see `emulator-core/`'s doc comments). This mode
+2. **Real-firmware mode** (Milestone 2): the badge's *built-in* apps (Snake,
+   Dice, etc.) are native RISC-V machine code baked into one monolithic
+   ESP-IDF app image — not extractable as Lua files (confirmed by
+   flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
    runs the actual dumped firmware (`public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
+   Real-firmware boot currently runs 2,000,000+ instructions cleanly but
+   stalls before reaching any built-in app (a known, documented gap — see
+   `docs/firmware-emulator-notes.md`'s "Known limitations" section before
+   assuming a built-in app is reachable in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `src/ui/shell.ts` — that
@@ -86,26 +90,78 @@ public/apps/<slug>/   Static app bundles (main.lua + manifest.cfg), served
                       must return synchronously).
 
 emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
-                      natively. Holds the full RV32IMC RISC-V decode/execute
-                      core (src/cpu/), the memory map + flash-image boot
-                      loader (src/mem/, boot.rs), and the ESP32-C3
-                      peripheral set implemented so far (src/peripherals/:
-                      SYSTIMER + interrupt matrix, GPIO, SPI2/GPSPI2 ->
-                      ST7789 framebuffer reconstruction), plus mask-ROM
-                      high-level-emulation stubs (src/rom.rs) that get the
-                      real firmware image past its early boot wall.
-emulator-wasm/        Thin wasm-bindgen shim over emulator-core, built via
-                      `bun run build:wasm` into src/cpu/wasm-pkg/ (gitignored).
-                      TS-side consumers (src/cpu/bridge.ts,
-                      src/runtime/firmware-runtime.ts, src/render/framebuffer.ts
-                      — the CPU-emulator analogs of the Lua-mode files above)
-                      exist now, wired up by src/main.ts's mode toggle.
+                      natively; the primary iteration loop for this half of
+                      the codebase.
+  src/cpu/            Generic RV32IMC decode/execute core (registers, CSRs,
+                      M-mode trap entry/mret). Deliberately knows nothing
+                      about ESP32-C3 specifics — see cpu/mod.rs's module
+                      doc. cpu/rom_stubs.rs is the chip-agnostic *mechanism*
+                      for intercepting fetches to fixed ROM addresses
+                      (paired with the chip-specific data in src/rom.rs,
+                      below).
+  src/mem/            mem/mod.rs defines the Bus trait the CPU core is
+                      generic over. mem/bus.rs's FirmwareBus is the real
+                      ESP32-C3 memory map: an ordered sequence of named
+                      regions (XIP flash, RAM-copied segments, then one
+                      concrete named field per peripheral, then a
+                      never-panics catch-all) checked in order on every
+                      access — no trait-object dispatch table (a deliberate
+                      choice; SPI needs a direct cross-peripheral read of
+                      GPIO's D/C pin state, which a trait object would
+                      fight). Unmapped *data* access never panics (reads 0,
+                      writes drop); unmapped *instruction fetches* always
+                      trap — this asymmetry is load-bearing, not an
+                      oversight (see docs/firmware-emulator-notes.md).
+                      mem/image.rs parses the ESP-IDF app-image format;
+                      mem/soc.rs holds the ESP32-C3 address-space ranges.
+  src/peripherals/    SYSTIMER + the ESP32-C3 interrupt matrix (not a
+                      standard PLIC), GPIO + an emulated 74HC165 button
+                      shift register, and SPI2/GPSPI2 + an ST7789
+                      command/pixel-stream interpreter that reconstructs a
+                      framebuffer. Each module's doc comment cites the
+                      exact ESP-IDF v5.5.3 header its register layout came
+                      from.
+  src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
+                      fixed addresses to intercept + what each pretends to
+                      have done), paired with cpu/rom_stubs.rs's generic
+                      mechanism above. Addresses sourced from ESP-IDF's own
+                      linker scripts, not guessed — see
+                      docs/firmware-emulator-notes.md.
+  src/boot.rs         "Shortcut boot": loads factory.bin directly into a
+                      Cpu/FirmwareBus pair via the app image's own header,
+                      skipping mask-ROM/2nd-stage-bootloader emulation
+                      entirely (see docs/firmware-emulator-notes.md for
+                      why this is safe to skip).
+  src/runtime.rs      FirmwareRuntime: the whole emulator as one owned,
+                      driveable object. Buttons are addressed by raw slot
+                      index here (0 = direct-GPIO START, 1..=8 = shift-
+                      register bits) — the human button-name mapping is a
+                      UI-layer concern that lives in
+                      src/runtime/firmware-runtime.ts, not here.
+emulator-wasm/        Thin wasm-bindgen shim over emulator-core — logic-free
+                      by design (see its module doc re: why framebuffer()
+                      returns an owned Vec, not a borrowed slice, to avoid a
+                      use-after-free across WASM-heap-growing calls). Built
+                      via `bun run build:wasm` into src/cpu/wasm-pkg/
+                      (gitignored). Consumed by src/cpu/bridge.ts,
+                      src/runtime/firmware-runtime.ts, and
+                      src/render/framebuffer.ts (the CPU-emulator analogs of
+                      the Lua-mode files above), wired up by src/main.ts's
+                      mode toggle.
 public/firmware/      The dumped real badge firmware: factory.bin, the app
                       partition the CPU emulator boots. Captured read-only
                       via esptool from a physical badge; publication
                       approved by Hack the North organizers ahead of their
-                      own open-sourcing of this firmware.
+                      own open-sourcing of this firmware. Do not add a full
+                      flash dump here — see docs/firmware-emulator-notes.md's
+                      "Data-handling note."
 ```
+
+See `docs/firmware-emulator-notes.md` for the forensic findings behind this
+design (why built-in apps can't be extracted as Lua, the firmware's segment
+layout, the physical button/display pin map and its sourcing), the
+mask-ROM HLE stub strategy in more detail, and the emulator's current known
+limitations (where real-firmware boot stalls today, and what's next).
 
 Module boundaries are intentionally pure where feasible (manifest parsing,
 require() path/cycle logic, sandbox global-table construction, widget-tree
