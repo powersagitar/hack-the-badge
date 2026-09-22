@@ -6,3 +6,6 @@ edition = "2021"
 [lib]
 name = "emulator_core"
 path = "src/lib.rs"
+
+[dev-dependencies]
+png = "0.17"

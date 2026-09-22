@@ -30,6 +30,7 @@
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::boot::{boot_from_factory_image_with_rom_stubs, step_with_interrupts};
@@ -118,11 +119,30 @@ impl FirmwareRuntime {
     /// [`crate::boot::step_with_interrupts`] — the correct one-poll-per-step
     /// cadence, see its doc).
     pub fn run(&mut self, budget: u32) -> RunSummary {
+        self.run_impl(budget, None)
+    }
+
+    /// Same as [`FirmwareRuntime::run`], but also tallies each step's
+    /// `pc_before` (the `pc` the CPU was at *before* that step executed)
+    /// into `pc_hist`, keyed by address with a running count — a "hot PCs"
+    /// histogram for diagnosing where a stalled boot is spinning (see
+    /// `examples/boot-probe.rs`). Kept as a separate method (rather than an
+    /// `Option` parameter on `run` itself) so `run`'s own hot path stays
+    /// allocation-free for the WASM build, which never needs this.
+    pub fn run_traced(&mut self, budget: u32, pc_hist: &mut HashMap<u32, u64>) -> RunSummary {
+        self.run_impl(budget, Some(pc_hist))
+    }
+
+    /// Shared body for [`FirmwareRuntime::run`]/[`FirmwareRuntime::run_traced`].
+    fn run_impl(&mut self, budget: u32, mut pc_hist: Option<&mut HashMap<u32, u64>>) -> RunSummary {
         let mut summary = RunSummary {
             steps: budget,
             ..RunSummary::default()
         };
         for _ in 0..budget {
+            if let Some(hist) = pc_hist.as_deref_mut() {
+                *hist.entry(self.cpu.regs.pc).or_insert(0) += 1;
+            }
             let info = step_with_interrupts(&mut self.cpu, &mut self.bus);
             if info.trap_taken {
                 summary.traps += 1;
@@ -351,6 +371,16 @@ mod tests {
             !rt.bus().gpio.pin_level(crate::peripherals::gpio::PIN_START),
             "and are re-applied to the freshly-built bus"
         );
+    }
+
+    #[test]
+    fn run_traced_tallies_pc_before_each_step_into_the_histogram() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
+        let mut hist = HashMap::new();
+        let summary = rt.run_traced(50, &mut hist);
+        assert_eq!(summary.steps, 50);
+        assert_eq!(hist.get(&0x4200_0000), Some(&50));
+        assert_eq!(hist.len(), 1, "self-branch never leaves this one pc");
     }
 
     #[test]

@@ -181,6 +181,32 @@ impl SysTimer {
         Self::default()
     }
 
+    /// `true` iff `offset`'s word-aligned offset is one of the registers
+    /// named above -- i.e. exactly the set [`SysTimer::read_byte`]/
+    /// [`SysTimer::write_byte`] give real behavior to, as opposed to falling
+    /// through to their `_ => 0`/`_ => {}` catch-all. Pure function of the
+    /// word offset (any low 2 bits in `offset` are masked off before
+    /// comparing), used by `crate::mem::bus::FirmwareBus` to additionally
+    /// log an access to a not-yet-modeled systimer register as "unmapped" --
+    /// see its module doc.
+    pub fn handles(offset: u32) -> bool {
+        matches!(
+            offset & !0b11,
+            CONF_REG
+                | UNIT0_OP_REG
+                | TARGET0_HI_REG
+                | TARGET0_LO_REG
+                | TARGET0_CONF_REG
+                | UNIT0_VALUE_HI_REG
+                | UNIT0_VALUE_LO_REG
+                | COMP0_LOAD_REG
+                | INT_ENA_REG
+                | INT_RAW_REG
+                | INT_CLR_REG
+                | INT_ST_REG
+        )
+    }
+
     /// The current live 52-bit unit0 counter value. Exposed for tests; not
     /// itself a memory-mapped register (firmware reads the *latched*
     /// `UNIT0_VALUE_HI/LO_REG` snapshot instead, via `OP_REG`'s trigger).

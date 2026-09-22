@@ -92,6 +92,32 @@ impl InterruptController {
         Self::default()
     }
 
+    /// `true` iff `offset`'s word-aligned offset is a register this module
+    /// gives real behavior to: any of the four named single registers, a
+    /// `CPU_INT_PRI_<n>_REG`, `CPU_INT_EIP_STATUS_REG` (computed by
+    /// `crate::mem::bus::FirmwareBus` directly rather than through
+    /// [`InterruptController::read_byte`] -- see that constant's doc comment
+    /// -- but still a real modeled register, not unmapped space), or
+    /// anywhere in the MAP region (every source's MAP register, real
+    /// read/write storage via [`InterruptController::other_map_regs`] even
+    /// where no signal is wired behind it yet -- see the module doc's "v1
+    /// scope" section). Pure function of the word offset, used by
+    /// `FirmwareBus` to additionally log an access past
+    /// `CPU_INT_THRESH_REG` (e.g. the DATE register) as "unmapped."
+    pub fn handles(offset: u32) -> bool {
+        let o = offset & !0b11;
+        o < MAP_REGION_END
+            || matches!(
+                o,
+                CPU_INT_ENABLE_REG
+                    | CPU_INT_TYPE_REG
+                    | CPU_INT_CLEAR_REG
+                    | CPU_INT_EIP_STATUS_REG
+                    | CPU_INT_THRESH_REG
+            )
+            || (CPU_INT_PRI_BASE_REG..CPU_INT_THRESH_REG).contains(&o)
+    }
+
     /// Looks up which CPU line `SYSTIMER_TARGET0` is currently routed to
     /// (`SYSTIMER_TARGET0_INT_MAP_REG & 0x1F`), and returns `Some(line)`
     /// only if that source is both pending (`systimer_target0_pending`) and

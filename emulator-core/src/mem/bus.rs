@@ -49,10 +49,18 @@
 //!    starts probing peripheral registers that later tasks haven't built
 //!    yet. Every such access is recorded into a small capped ring buffer
 //!    ([`FirmwareBus::unmapped_log`]) as a debugging aid for later
-//!    "why is boot stuck" investigation. (Addresses inside the SYSTIMER/
+//!    "why is boot stuck" investigation. Addresses inside the SYSTIMER/
 //!    INTERRUPT_CORE0 ranges but not backed by a named register within
-//!    those peripherals are *not* logged here — they're handled, and
-//!    silently no-op'd, one tier up; see each peripheral module's doc.)
+//!    those peripherals are *also* logged here — one tier up from this
+//!    catch-all, but the same ring buffer — via each peripheral's
+//!    `handles(offset)` pure function (`crate::peripherals::systimer::handles`,
+//!    `crate::peripherals::intc::handles`): [`FirmwareBus::read_byte`]/
+//!    [`FirmwareBus::write_byte`] call `record_unmapped` *in addition to*
+//!    dispatching into the peripheral whenever `handles` says the offset
+//!    isn't one of its modeled registers, so the peripheral still returns
+//!    its own (0-reading, dropped-write) default for it, but the access
+//!    shows up in the same "what's the firmware probing" log as truly
+//!    unmapped space.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -258,10 +266,17 @@ impl FirmwareBus {
             return region.data[offset];
         }
         if SYSTIMER_RANGE.contains(&addr) {
-            return self.systimer.read_byte(addr - SYSTIMER_RANGE.start);
+            let offset = addr - SYSTIMER_RANGE.start;
+            if !SysTimer::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.systimer.read_byte(offset);
         }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
             let offset = addr - INTERRUPT_CORE0_RANGE.start;
+            if !InterruptController::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
             if offset & !0b11 == intc::CPU_INT_EIP_STATUS_REG {
                 // Cross-peripheral read: needs systimer's live pending
                 // state. Both fields are concrete on `self`, so this is
@@ -298,11 +313,18 @@ impl FirmwareBus {
             return;
         }
         if SYSTIMER_RANGE.contains(&addr) {
-            self.systimer.write_byte(addr - SYSTIMER_RANGE.start, val);
+            let offset = addr - SYSTIMER_RANGE.start;
+            if !SysTimer::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.systimer.write_byte(offset, val);
             return;
         }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
             let offset = addr - INTERRUPT_CORE0_RANGE.start;
+            if !InterruptController::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
             if offset & !0b11 != intc::CPU_INT_EIP_STATUS_REG {
                 // CPU_INT_EIP_STATUS_REG is read-only; writes to it drop,
                 // matching real hardware.
@@ -541,6 +563,27 @@ mod tests {
         let mut bus = bus_with(vec![]);
         bus.write32(0x6004_3000, b'Z' as u32);
         assert_eq!(bus.console.bytes(), b"Z");
+    }
+
+    #[test]
+    fn unhandled_systimer_and_intc_offsets_are_logged() {
+        let mut bus = bus_with(vec![]);
+        bus.write32(0x6002_3000 + 0x0FC, 1); // not a modeled SYSTIMER register
+        bus.read32(0x600c_2000 + 0x800); // not a modeled INTC register
+        let log: Vec<_> = bus
+            .unmapped_log()
+            .iter()
+            .map(|a| (a.addr & !3, a.is_write))
+            .collect();
+        assert!(log.contains(&(0x6002_30FC, true)));
+        assert!(log.contains(&(0x600c_2800, false)));
+    }
+
+    #[test]
+    fn handled_systimer_offsets_are_not_logged() {
+        let mut bus = bus_with(vec![]);
+        bus.read32(0x6002_3000); // CONF_REG
+        assert!(bus.unmapped_log().is_empty());
     }
 
     #[test]
