@@ -1,22 +1,14 @@
 {
-  "name": "hack-the-badge",
-  "version": "0.1.0",
+  "name": "hack-the-badge-root",
   "private": true,
-  "type": "module",
-  "description": "Browser-based emulator for the Hack the North 2026 hacker badge (ESP32-C3 Lua sandbox + LVGL-style UI).",
+  "description": "Convenience proxy: forwards scripts to the frontend/ module so they can be run from the repo root.",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "test": "bun test",
-    "build:wasm": "wasm-pack build emulator-wasm --target web --out-dir ../src/cpu/wasm-pkg"
-  },
-  "dependencies": {
-    "fengari": "^0.1.5",
-    "fengari-interop": "^0.1.4"
-  },
-  "devDependencies": {
-    "typescript": "^7.0.2",
-    "vite": "^8.3.0"
+    "install:frontend": "bun install --cwd frontend",
+    "dev": "bun run --cwd frontend dev",
+    "build": "bun run --cwd frontend build",
+    "preview": "bun run --cwd frontend preview",
+    "test": "bun run --cwd frontend test",
+    "typecheck": "bun run --cwd frontend typecheck",
+    "build:wasm": "bun run --cwd frontend build:wasm"
   }
 }

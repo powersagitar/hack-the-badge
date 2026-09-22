@@ -12,7 +12,7 @@
 //! addresses, and does so within its first handful of instructions
 //! (`rtc_get_reset_reason` at `0x4000_0018`, for instance).
 //!
-//! We have the badge's *flash* contents (`public/firmware/factory.bin`), so
+//! We have the badge's *flash* contents (`frontend/public/firmware/factory.bin`), so
 //! we can execute everything the app image itself carries. We do **not**
 //! have the mask ROM's bytes, and never will via flash dumping — it isn't
 //! in flash at all. Without help, the first such call runs `pc` into

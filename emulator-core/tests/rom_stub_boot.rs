@@ -1,5 +1,5 @@
 //! Integration test: boot the *real* dumped firmware
-//! (`public/firmware/factory.bin`) with the ESP32-C3 mask-ROM
+//! (`frontend/public/firmware/factory.bin`) with the ESP32-C3 mask-ROM
 //! high-level-emulation stub table installed, and record exactly how far it
 //! gets.
 //!
@@ -21,13 +21,13 @@ use std::path::PathBuf;
 fn factory_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("public/firmware/factory.bin")
+        .join("frontend/public/firmware/factory.bin")
 }
 
 fn read_factory_bin() -> Vec<u8> {
     std::fs::read(factory_bin_path()).expect(
-        "reading public/firmware/factory.bin \
-         (expected to be committed at the repo root's public/firmware/)",
+        "reading frontend/public/firmware/factory.bin \
+         (expected to be committed at the repo's frontend/public/firmware/)",
     )
 }
 

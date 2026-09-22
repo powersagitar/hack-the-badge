@@ -1,5 +1,5 @@
 //! "Shortcut boot": load a real ESP-IDF app image (as dumped from a
-//! physical badge into `public/firmware/factory.bin`) directly into a
+//! physical badge into `frontend/public/firmware/factory.bin`) directly into a
 //! [`Cpu`]/[`FirmwareBus`] pair, skipping the ROM/2nd-stage-bootloader
 //! entirely.
 //!
@@ -21,7 +21,7 @@ use crate::mem::image::{parse_image, ImageParseError};
 use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, RTC_RANGE};
 
 /// Parses `image` (expected to be the raw bytes of an ESP-IDF app image,
-/// e.g. `public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
+/// e.g. `frontend/public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
 /// map from its segments, and returns a [`Cpu`] with `pc` set to the
 /// image's `entry_addr` — ready for the caller to start calling
 /// `cpu.step(&mut bus)`.

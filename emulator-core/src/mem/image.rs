@@ -1,5 +1,5 @@
 //! Parser for the ESP-IDF app image format (`esp_image_header_t` +
-//! interleaved segment headers/data), as used by `public/firmware/factory.bin`.
+//! interleaved segment headers/data), as used by `frontend/public/firmware/factory.bin`.
 //!
 //! This is a from-scratch reimplementation of the *shape* of ESP-IDF's
 //! `esp_image_header_t`/`esp_image_segment_header_t` structs (documented in
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn matches_real_factory_bin_first_32_bytes() {
-        // Exactly the first 32 bytes of public/firmware/factory.bin, per the
+        // Exactly the first 32 bytes of frontend/public/firmware/factory.bin, per the
         // task brief's confirmed ground truth: 24-byte header + segment 0's
         // 8-byte header (load_addr=0x3c130020, data_len=1_277_576).
         let bytes: [u8; 32] = [

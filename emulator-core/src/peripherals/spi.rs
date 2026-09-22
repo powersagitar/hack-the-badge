@@ -133,7 +133,7 @@
 //!     into `CASET`/`RASET`/`RAMWR` logic) but has no framebuffer side
 //!     effect. `MADCTL` orientation/mirroring is explicitly out of scope —
 //!     this module hardcodes the natural unrotated `320x240` orientation
-//!     (matching `SCREEN_WIDTH`/`SCREEN_HEIGHT` in `src/badge/ui.ts`, the
+//!     (matching `SCREEN_WIDTH`/`SCREEN_HEIGHT` in `frontend/src/badge/ui.ts`, the
 //!     same physical panel), per the brief.
 //!
 //! **Default write window**: before any `CASET`/`RASET`, the window

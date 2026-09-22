@@ -17,7 +17,7 @@
 //! button sits on which shift-register bit (Task 4 established the 74HC165
 //! model with generically-numbered slots for exactly this reason — see
 //! `crate::peripherals::gpio`'s module doc). The name→slot mapping is a
-//! UI-layer concern and lives in `src/runtime/firmware-runtime.ts`.
+//! UI-layer concern and lives in `frontend/src/runtime/firmware-runtime.ts`.
 //!
 //! Slot numbering here matches that module's split:
 //! - **slot 0** is `PIN_START` (GPIO9), a direct GPIO line, not part of the
@@ -26,7 +26,7 @@
 //!   [`crate::peripherals::gpio::Hc165::set_button`]'s index `n - 1`.
 //!
 //! See [`FirmwareRuntime::set_raw_button`]. [`NUM_RAW_BUTTON_SLOTS`] is the
-//! total (9) — which is exactly the number of names in `src/badge/input.ts`'s
+//! total (9) — which is exactly the number of names in `frontend/src/badge/input.ts`'s
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
 
@@ -80,7 +80,7 @@ pub struct FirmwareRuntime {
 
 impl FirmwareRuntime {
     /// Boots `image` (the raw bytes of an ESP-IDF app image, i.e.
-    /// `public/firmware/factory.bin`) through
+    /// `frontend/public/firmware/factory.bin`) through
     /// [`boot_from_factory_image_with_rom_stubs`].
     pub fn from_image(image: &[u8]) -> Result<Self, ImageParseError> {
         let image: Arc<[u8]> = Arc::from(image.to_vec().into_boxed_slice());

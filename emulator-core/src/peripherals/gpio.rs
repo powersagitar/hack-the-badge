@@ -85,7 +85,7 @@
 //!
 //! This module still addresses slots purely by index — nothing here knows
 //! those names, because the name→slot mapping is a UI concern (see
-//! `src/runtime/firmware-runtime.ts`, which owns the table above). What
+//! `frontend/src/runtime/firmware-runtime.ts`, which owns the table above). What
 //! changed for Task 6 is that slot 7 is now a **real, settable slot**. Task 4
 //! modeled it as a constant always-released bit, on the reasonable-at-the-time
 //! grounds that nothing was known about the 8th parallel input; the reference

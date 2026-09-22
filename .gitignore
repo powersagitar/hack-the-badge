@@ -5,4 +5,4 @@ dist/
 .vite/
 .claude/worktrees/
 target/
-src/cpu/wasm-pkg/
+frontend/src/cpu/wasm-pkg/

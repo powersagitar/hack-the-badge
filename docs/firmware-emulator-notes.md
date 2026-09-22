@@ -40,7 +40,7 @@ and forensic analysis disproved this:
   path needed no rework.
 
 Given this, Milestone 2 built a real ESP32-C3 processor emulator (RV32IMC
-core + a minimal peripheral set) that boots `public/firmware/factory.bin`
+core + a minimal peripheral set) that boots `frontend/public/firmware/factory.bin`
 unmodified, rather than trying to hand-extract or recreate any built-in app.
 
 ### `factory.bin` segment table
@@ -162,7 +162,7 @@ Human button name → raw shift-register/GPIO slot (composed from
 `emulator-core/src/runtime.rs`'s slot numbering and
 `emulator-core/src/peripherals/gpio.rs`'s `Hc165` slot→button table, both
 sourced from the same third-party firmware; see
-`src/runtime/firmware-runtime.ts`'s `RAW_SLOT_BY_BUTTON` for the composed
+`frontend/src/runtime/firmware-runtime.ts`'s `RAW_SLOT_BY_BUTTON` for the composed
 table used by the TS side):
 
 | Button | Raw slot | Source |
@@ -242,7 +242,7 @@ rediscovering each one by stepping through a debugger again.
 ## Data-handling note: what NOT to re-add
 
 An earlier commit on the Milestone 2 branch briefly included
-`public/firmware/full_flash_dump.bin` (the complete 4MB flash dump, as
+`frontend/public/firmware/full_flash_dump.bin` (the complete 4MB flash dump, as
 opposed to `factory.bin`, just the app partition). That file was found to
 contain the dumping device owner's personal identity data, a likely
 credential, and other people's contact information (received via badge

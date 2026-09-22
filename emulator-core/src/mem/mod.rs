@@ -7,7 +7,7 @@
 //! test modules for an example: a flat `Vec<u8>`-backed `Bus`). The
 //! submodules here build the real ESP32-C3 memory map on top of it:
 //! - [`image`]: parser for the ESP-IDF app image format (header + segment
-//!   table) bundled in `public/firmware/factory.bin`.
+//!   table) bundled in `frontend/public/firmware/factory.bin`.
 //! - [`soc`]: the ESP32-C3 address-space regions used to categorize each
 //!   segment as flash-mapped (XIP) vs. RAM-copied.
 //! - [`bus`]: [`bus::FirmwareBus`], the concrete `Bus` implementation that

@@ -6,8 +6,8 @@
 //! only the boundary — type marshalling, and turning Rust `Result`s into JS
 //! exceptions.
 //!
-//! Built into `src/cpu/wasm-pkg/` (gitignored) by `bun run build:wasm`;
-//! consumed by `src/cpu/bridge.ts`.
+//! Built into `frontend/src/cpu/wasm-pkg/` (gitignored) by `bun run build:wasm`;
+//! consumed by `frontend/src/cpu/bridge.ts`.
 //!
 //! ## Framebuffer aliasing safety
 //!
@@ -24,7 +24,7 @@
 //! (`getArrayU16FromWasm0(ptr, len).slice()`) and frees the Rust allocation
 //! before returning. What crosses the boundary is therefore a plain JS array
 //! with no relationship to WASM memory at all, safe to hold indefinitely.
-//! `src/cpu/bridge.ts` restates this contract on the TS side.
+//! `frontend/src/cpu/bridge.ts` restates this contract on the TS side.
 //!
 //! The cost is one 150 KiB copy per frame (320 × 240 × 2 bytes), which is
 //! cheap next to the RGB565→RGBA8888 conversion `blitFramebuffer` already does
@@ -34,7 +34,7 @@ use emulator_core::runtime::{FirmwareRuntime, RunSummary};
 use wasm_bindgen::prelude::*;
 
 /// Kept from the Task 1 scaffolding: the smoke test that proves the
-/// Rust→WASM→TS round trip itself works (see `test/cpu-wasm.test.ts`).
+/// Rust→WASM→TS round trip itself works (see `frontend/test/cpu-wasm.test.ts`).
 #[wasm_bindgen]
 pub fn add(a: u32, b: u32) -> u32 {
     emulator_core::add(a, b)
@@ -93,7 +93,7 @@ pub struct FirmwareEmulator {
 
 #[wasm_bindgen]
 impl FirmwareEmulator {
-    /// Boots `image` — the raw bytes of `public/firmware/factory.bin`.
+    /// Boots `image` — the raw bytes of `frontend/public/firmware/factory.bin`.
     /// Throws if the bytes aren't a parseable ESP-IDF app image.
     #[wasm_bindgen(constructor)]
     pub fn new(image: &[u8]) -> Result<FirmwareEmulator, JsError> {
@@ -120,7 +120,7 @@ impl FirmwareEmulator {
 
     /// Presses/releases a raw button slot — slot 0 is `PIN_START` (GPIO9),
     /// slots 1..=8 are the 74HC165's button bits. The human-name→slot mapping
-    /// lives in `src/runtime/firmware-runtime.ts`; see
+    /// lives in `frontend/src/runtime/firmware-runtime.ts`; see
     /// `emulator_core::runtime`'s module doc for why it isn't in Rust.
     #[wasm_bindgen(js_name = setButton)]
     pub fn set_button(&mut self, slot: usize, pressed: bool) {

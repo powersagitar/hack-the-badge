@@ -1,12 +1,12 @@
 //! Integration test: boot the *real* dumped firmware
-//! (`public/firmware/factory.bin`) through `boot_from_factory_image` and run
+//! (`frontend/public/firmware/factory.bin`) through `boot_from_factory_image` and run
 //! it for a bounded number of `cpu.step()` calls, asserting it doesn't hang
 //! or panic. This is the primary evidence for whether the "shortcut boot"
 //! approach (skip the ROM/2nd-stage bootloader, jump straight to the app
 //! image's `entry_addr`) is viable — see the task report for a detailed
 //! account of what was observed.
 //!
-//! Reads `factory.bin` directly from `../public/firmware/factory.bin`
+//! Reads `factory.bin` directly from `../frontend/public/firmware/factory.bin`
 //! (relative to this crate) rather than duplicating the 2.7 MB file into
 //! `tests/fixtures/`.
 
@@ -18,14 +18,14 @@ use std::path::PathBuf;
 fn factory_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("public/firmware/factory.bin")
+        .join("frontend/public/firmware/factory.bin")
 }
 
 #[test]
 fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
     let image = std::fs::read(factory_bin_path()).expect(
-        "reading public/firmware/factory.bin \
-         (expected to be committed at the repo root's public/firmware/)",
+        "reading frontend/public/firmware/factory.bin \
+         (expected to be committed at the repo's frontend/public/firmware/)",
     );
     assert_eq!(image.len(), 2_752_512, "unexpected factory.bin size");
 
