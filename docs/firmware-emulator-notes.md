@@ -234,9 +234,44 @@ predicted these blockers would surface once TIMG unblocks further boot:
    the latched snapshot), per
    `components/soc/esp32c3/register/soc/rtc_cntl_reg.h` — a trigger/poll/
    read-latch pattern structurally identical to SYSTIMER's `OP_REG`/
-   `UNIT0_VALUE_HI/LO_REG` this codebase already knows how to model. This is
-   the natural next Milestone 3 candidate (RTCCNTL isn't modeled at all
-   yet), likely used by ESP-IDF's `esp_log`/timestamp path or `rtc_time_get()`.
+   `UNIT0_VALUE_HI/LO_REG` this codebase already knows how to model.
+   **Resolved in Milestone 3, Task D1** (`emulator-core/src/peripherals/rtc_cntl.rs`).
+   `RTC_CNTL_TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG` are now
+   modeled per `components/hal/esp32c3/include/hal/rtc_cntl_ll.h`'s
+   `rtc_cntl_ll_get_rtc_time()` (which this task confirmed has **no**
+   ready/valid bit on the ESP32-C3, unlike TIMG's calibration — the trigger
+   write latches synchronously): a write setting `TIME_UPDATE` (bit 31)
+   latches a 48-bit snapshot derived from the emulator's own elapsed step
+   count (SYSTIMER's live `unit0_counter`, the same "notion of elapsed
+   time" SYSTIMER itself uses), scaled by `RC_SLOW_HZ / XTAL_HZ` (reused
+   from `crate::peripherals::timg`, not duplicated). This unblocked the
+   pre-Task-D1 stall (confirmed via a throwaway experiment: the specific
+   scaling ratio doesn't matter — even a 1:1 ratio reaches the exact same
+   next fault, just sooner — so this is a deterministic *next* boundary in
+   the firmware, not an artifact of the tick-rate placeholder).
+   **Where boot now stalls**: no longer a spin at all — boot runs past this
+   point and, for the first time, prints real console output: a full
+   ESP-IDF "Guru Meditation Error" panic dump (generic text, confirmed via
+   `emulator-core/tests/boot_progress.rs`'s
+   `first_console_output_is_the_firmware_s_own_panic_report`). The panic is
+   a genuine `INSTRUCTION_ACCESS_FAULT` at a fixed call target,
+   `0x4000_0358` (step 401,761 from a cold boot), which does **not**
+   correspond to any named symbol in ESP-IDF v5.5.3's esp32c3 ROM linker
+   scripts (`components/esp_rom/esp32c3/ld/esp32c3.rom*.ld` — every file
+   under that directory was checked, including the BLE/BT variants) —
+   flagged here rather than guessed at, per this task's brief. The
+   firmware's own panic handler catches it, prints the dump, and then tries
+   to reboot via a *second* unstubbed ROM call, `software_reset_cpu`
+   (`0x4000_0094`, a real named symbol in `esp32c3.rom.ld` this time), which
+   also faults — re-entering the panic handler's re-entrancy guard ("Panic
+   handler entered multiple times...") and retrying forever (this emulator
+   has no real reboot mechanism). Pinned down exactly in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`.
+   This is the natural next Milestone 3 candidate: identify what
+   `0x4000_0358` actually is (likely needs disassembling the real mask ROM
+   image itself, not just its documented linker-script symbol table, since
+   that table doesn't cover it) and add a stub for it.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

@@ -37,7 +37,18 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     let (mut cpu, mut bus) =
         boot_from_factory_image_with_rom_stubs(&image).expect("real factory.bin should boot");
 
-    const STEP_BUDGET: usize = 2_000_000;
+    // Milestone 3 Task D1: reduced from 2,000,000. Modeling RTC_CNTL's RTC
+    // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
+    // terminate instead of spinning forever, and boot now runs past this
+    // budget into a *new*, later, unstubbed-ROM-call fault at step 401,761
+    // (see `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
+    // below, which pins that exact new stall). 350,000 keeps this test's
+    // original claim -- "gets past the mask ROM wall with zero faults, and
+    // reaches every one of the named early-boot ROM calls below" -- true
+    // and comfortably clear of the new fault (~51,761-step/~13% margin),
+    // without this test needing to also pin the new, later stall (that's
+    // the other test's job).
+    const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
     // per-address hit count -- together these say what the firmware asked the
@@ -159,61 +170,75 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     }
 }
 
-/// Where boot currently *stops*: a tight polling loop inside SoC clock
-/// initialization, now waiting on RTCCNTL's RTC-timer latch registers this
-/// emulator doesn't model. Pinned down as a test so the next task on this
-/// code has an exact, checkable starting point rather than a prose
-/// description — and so that modelling that peripheral produces a visible,
-/// deliberate failure here instead of quietly changing behavior.
+/// Where boot currently *stops*: **not** a spin loop any more. Modeling
+/// RTC_CNTL's RTC timer (`crate::peripherals::rtc_cntl`, Milestone 3 Task
+/// D1) let `rtc_cntl_ll_get_rtc_time()`'s caller's busy-wait actually
+/// terminate, so boot now runs hundreds of thousands of steps further and
+/// prints a full ESP-IDF boot log — but then hits a **new, unstubbed ROM
+/// call** at a fixed address (`0x4000_0358`) that doesn't correspond to any
+/// named symbol in ESP-IDF v5.5.3's esp32c3 ROM linker scripts (checked
+/// exhaustively: every `esp32c3.rom*.ld` file under
+/// `components/esp_rom/esp32c3/ld/`, including the BLE/BT variants — see
+/// the Task D1 report). This is a real `INSTRUCTION_ACCESS_FAULT`, caught by
+/// the firmware's own already-working panic handler (it prints a full "Guru
+/// Meditation Error" register dump via `ets_printf`, confirming `mtvec`,
+/// `ets_printf`, and this emulator's console capture are all working
+/// correctly). The panic handler's own reboot attempt then calls a second
+/// unstubbed ROM function, `software_reset_cpu` (`0x4000_0094`, named in
+/// `esp32c3.rom.ld`), which faults too, re-entering the panic handler's
+/// re-entrancy guard ("Panic handler entered multiple times...") and
+/// retrying forever — this emulator has no way to actually reboot, so this
+/// retry loop is the terminal state within any reasonable step budget.
 ///
-/// **History**: until Milestone 3 Task 3
-/// (`emulator-core/src/peripherals/timg.rs`), this test pinned an *earlier*
-/// stall one peripheral back — an unmodelled TIMERGROUP0
-/// (`TIMG_RTCCALICFG_REG`/`TIMG_RTCCALICFG2_REG`) that `rtc_clk_cal()`
-/// polled forever. That peripheral is now modeled (see
-/// `emulator-core/tests/boot_progress.rs` and
-/// `docs/firmware-emulator-notes.md`'s "Known limitations" item 1), so this
-/// test's expected stall point moved forward to RTCCNTL, the next
-/// not-yet-modelled peripheral boot reaches.
+/// Per Task D1's brief, no new ROM stub was added for either address in
+/// that task: the probe here doesn't demonstrate *which* stub the firmware
+/// actually needs at `0x4000_0358` (its symbol name wasn't identified), so
+/// guessing one would risk silently corrupting the panic/reboot path rather
+/// than the loud, diagnosable fault this test pins down instead. Confirmed
+/// (via a throwaway experiment, not committed) that this exact fault address
+/// and PC are reached regardless of the specific numeric value
+/// `crate::peripherals::rtc_cntl::RtcCntl`'s latch derives — i.e. this is a
+/// deterministic *next* boundary in the firmware itself, not an artifact of
+/// this task's specific RTC-tick-rate placeholder.
+///
+/// **History**: until Milestone 3 Task D1
+/// (`emulator-core/src/peripherals/rtc_cntl.rs`), this test pinned an
+/// *earlier* stall — a spin on RTCCNTL's then-unmodeled
+/// `TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`. That peripheral is
+/// now modeled (see `emulator-core/tests/boot_progress.rs` and
+/// `docs/firmware-emulator-notes.md`'s "Known limitations"), so this test's
+/// expected stall point moved forward to this new unstubbed-ROM-call fault.
 #[test]
-fn boot_currently_stalls_polling_unmodelled_rtccntl_time_registers() {
+fn boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Well past the ~700 steps it takes to get here.
+    // Comfortably past the fault (step 401,761) but well before the second
+    // fault (`software_reset_cpu`, first observed between 500,000 and
+    // 750,000 steps in a throwaway measurement) -- a single, stable
+    // snapshot: exactly one trap has occurred, at exactly this address.
     let summary = rt.run(500_000);
-    assert_eq!(summary.last_instruction_fault, None);
-    assert_eq!(summary.traps, 0);
-
-    // Every catch-all (not-yet-modelled MMIO) access still in the bus's capped
-    // log is a read or write of one of three registers in the RTCCNTL page
-    // (`DR_REG_RTCCNTL_BASE = 0x6000_8000`, per
-    // `components/soc/esp32c3/register/soc/reg_base.h`):
-    // `RTC_CNTL_TIME_UPDATE_REG` (`+0x0c`, both read and written -- the
-    // trigger-a-snapshot/poll-for-done register) and
-    // `RTC_CNTL_TIME_LOW0_REG`/`RTC_CNTL_TIME_HIGH0_REG` (`+0x10`/`+0x14`,
-    // read-only -- the latched RTC-timer snapshot), per
-    // `components/soc/esp32c3/register/soc/rtc_cntl_reg.h`. With no RTCCNTL
-    // model, the snapshot never appears "done", so whatever's waiting on it
-    // spins forever.
-    let polled: std::collections::BTreeSet<(u32, bool)> = rt
-        .bus()
-        .unmapped_log()
-        .iter()
-        .map(|e| (e.addr & !3, e.is_write))
-        .collect();
     assert_eq!(
-        polled,
-        [
-            (0x6000_800c, false),
-            (0x6000_800c, true),
-            (0x6000_8010, false),
-            (0x6000_8014, false),
-        ]
-        .into_iter()
-        .collect(),
-        "expected the stall to be reads/writes of RTC_CNTL_TIME_UPDATE_REG / \
-         RTC_CNTL_TIME_LOW0_REG / RTC_CNTL_TIME_HIGH0_REG and nothing else"
+        summary.last_instruction_fault,
+        Some(0x4000_0358),
+        "expected the new unstubbed-ROM-call fault at 0x4000_0358"
+    );
+    assert_eq!(
+        summary.traps, 1,
+        "expected exactly one trap so far (the fault above) -- the second \
+         fault (software_reset_cpu, during the panic handler's own reboot \
+         attempt) isn't reached until somewhere between 500,000 and 750,000 \
+         steps, per a throwaway measurement"
+    );
+
+    // The firmware's own panic handler ran and printed a full crash report
+    // -- generic ESP-IDF text, never identity data (see this file's module
+    // doc and `docs/firmware-emulator-notes.md`'s data-handling note).
+    assert!(
+        rt.console_output().contains("Guru Meditation Error"),
+        "expected the firmware's panic handler to have printed its crash \
+         report; got:\n{}",
+        rt.console_output()
     );
 
     // And nothing has been drawn, because the display driver is never reached.

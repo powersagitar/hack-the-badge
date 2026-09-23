@@ -12,6 +12,10 @@
 //! - [`intc`]: [`intc::InterruptController`], the ESP32-C3's non-PLIC
 //!   interrupt matrix (`INTERRUPT_CORE0`) — per-source MAP registers routing
 //!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG`.
+//! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
+//!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
+//!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
+//!   from `systimer`'s live counter scaled to the RTC slow clock.
 //! - [`gpio`]: [`gpio::Gpio`], the GPIO peripheral plus an emulated 74HC165
 //!   shift register (`gpio::Hc165`) the real badge uses to read 7 of its 8
 //!   buttons.
@@ -40,6 +44,7 @@
 pub mod console;
 pub mod gpio;
 pub mod intc;
+pub mod rtc_cntl;
 pub mod spi;
 pub mod systimer;
 pub mod timg;

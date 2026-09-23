@@ -136,6 +136,18 @@ pub const TIMG0_RANGE: Range<u32> = 0x6001_F000..0x6002_0000;
 /// `crate::peripherals::timg`.
 pub const TIMG1_RANGE: Range<u32> = 0x6002_0000..0x6002_1000;
 
+/// RTC_CNTL peripheral registers (`DR_REG_RTCCNTL_BASE`, confirmed via
+/// ESP-IDF v5.5.3's `components/soc/esp32c3/register/soc/reg_base.h`). Same
+/// one-4KiB-page rationale as [`SYSTIMER_RANGE`] (the header's
+/// highest-cited `RTC_CNTL_*_REG` offset is `0x1FC`, comfortably inside one
+/// page). This is the peripheral `rtc_cntl_ll_get_rtc_time()` reads at boot
+/// (`RTC_CNTL_TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) — see
+/// `crate::peripherals::rtc_cntl` for what's actually modeled within it.
+/// Not to be confused with [`RTC_RANGE`] above (`0x5000_0000`), which is RTC
+/// *slow memory* — a completely different address-space region from this
+/// peripheral's MMIO registers.
+pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_9000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +241,28 @@ mod tests {
 
         assert!(!is_xip_addr(TIMG0_RANGE.start));
         assert!(!is_xip_addr(TIMG1_RANGE.start));
+    }
+
+    #[test]
+    fn rtc_cntl_range_is_disjoint_from_every_other_peripheral_range_and_xip_iram_and_rtc_slow_memory(
+    ) {
+        assert!(RTC_CNTL_RANGE.contains(&0x6000_8000));
+        assert!(!RTC_CNTL_RANGE.contains(&0x6000_9000)); // exclusive end
+
+        for other in [
+            SYSTIMER_RANGE.start,
+            INTERRUPT_CORE0_RANGE.start,
+            GPIO_RANGE.start,
+            SPI2_RANGE.start,
+            USB_SERIAL_JTAG_RANGE.start,
+            TIMG0_RANGE.start,
+            TIMG1_RANGE.start,
+        ] {
+            assert!(!RTC_CNTL_RANGE.contains(&other));
+        }
+        assert!(!GPIO_RANGE.contains(&RTC_CNTL_RANGE.start));
+        assert!(!RTC_RANGE.contains(&RTC_CNTL_RANGE.start));
+        assert!(!RTC_CNTL_RANGE.contains(&RTC_RANGE.start));
+        assert!(!is_xip_addr(RTC_CNTL_RANGE.start));
     }
 }

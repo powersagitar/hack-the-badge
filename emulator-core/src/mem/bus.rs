@@ -49,7 +49,22 @@
 //! 9. **TIMG1** ([`crate::mem::soc::TIMG1_RANGE`]): routed to
 //!    [`FirmwareBus::timg1`], same peripheral model as TIMG0 (a second,
 //!    independent instance) — same ruling.
-//! 10. **Catch-all**: any address covered by none of the above (every
+//! 10. **RTC_CNTL** ([`crate::mem::soc::RTC_CNTL_RANGE`]): routed to
+//!    [`FirmwareBus::rtc_cntl`], same ruling — see
+//!    `crate::peripherals::rtc_cntl` for the RTC timer latch model
+//!    `rtc_cntl_ll_get_rtc_time()` polls at boot. A triggering write (one
+//!    that sets `TIME_UPDATE_REG`'s `TIME_UPDATE` bit) needs `systimer`'s
+//!    live unit0 counter as its "elapsed time" source — another
+//!    cross-peripheral read the "no trait-object dispatch" ruling
+//!    anticipated: [`FirmwareBus::write_byte`] reads `self.systimer.counter()`
+//!    directly and hands it to
+//!    [`crate::peripherals::rtc_cntl::RtcCntl::write_byte`], no trait object
+//!    involved. Like SYSTIMER/INTC, not-yet-modeled RTC_CNTL registers are
+//!    still logged into [`FirmwareBus::unmapped_log`] via
+//!    [`crate::peripherals::rtc_cntl::RtcCntl::handles`], even though the
+//!    peripheral itself gives them real (if inert) storage — see that
+//!    module's doc.
+//! 11. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -75,6 +90,7 @@ use std::sync::Arc;
 use crate::peripherals::console::Console;
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
+use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::systimer::SysTimer;
 use crate::peripherals::timg::Timg;
@@ -82,8 +98,8 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, SPI2_RANGE, SYSTIMER_RANGE, TIMG0_RANGE,
-    TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SYSTIMER_RANGE,
+    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -163,6 +179,10 @@ pub struct FirmwareBus {
     /// TIMG1 (`crate::peripherals::timg`), a second independent instance of
     /// the same peripheral model, same ruling.
     pub timg1: Timg,
+    /// The RTC_CNTL peripheral (`crate::peripherals::rtc_cntl`), same
+    /// ruling — the RTC timer latch (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/
+    /// `TIME_HIGH0_REG`) `rtc_cntl_ll_get_rtc_time()` polls at boot.
+    pub rtc_cntl: RtcCntl,
     /// Capped sink for everything the firmware prints
     /// (`crate::peripherals::console`), fed by
     /// [`FirmwareBus::usb_serial_jtag`]'s TX-byte writes.
@@ -228,6 +248,7 @@ impl FirmwareBus {
             usb_serial_jtag: UsbSerialJtag::new(),
             timg0: Timg::new(),
             timg1: Timg::new(),
+            rtc_cntl: RtcCntl::new(),
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
@@ -320,6 +341,13 @@ impl FirmwareBus {
         if TIMG1_RANGE.contains(&addr) {
             return self.timg1.read_byte(addr - TIMG1_RANGE.start);
         }
+        if RTC_CNTL_RANGE.contains(&addr) {
+            let offset = addr - RTC_CNTL_RANGE.start;
+            if !RtcCntl::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.rtc_cntl.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -386,6 +414,21 @@ impl FirmwareBus {
         }
         if TIMG1_RANGE.contains(&addr) {
             self.timg1.write_byte(addr - TIMG1_RANGE.start, val);
+            return;
+        }
+        if RTC_CNTL_RANGE.contains(&addr) {
+            let offset = addr - RTC_CNTL_RANGE.start;
+            if !RtcCntl::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            // Cross-peripheral read: the RTC timer's "elapsed time" source
+            // is systimer's own live counter (no free-running clock of its
+            // own to model) -- both fields are concrete on `self`, so this
+            // is just direct field access, the same pattern the
+            // INTERRUPT_CORE0/SPI2 tiers above already use. See
+            // `crate::peripherals::rtc_cntl`'s module doc.
+            let elapsed_steps = self.systimer.counter();
+            self.rtc_cntl.write_byte(offset, val, elapsed_steps);
             return;
         }
         self.record_unmapped(addr, true);
@@ -603,6 +646,46 @@ mod tests {
         assert_ne!(bus.read32(0x6001_F000 + 0x68) & (1 << 15), 0);
         // TIMG1 must be a completely separate, still-unstarted instance.
         assert_eq!(bus.read32(0x6002_0000 + 0x68) & (1 << 15), 0);
+    }
+
+    #[test]
+    fn rtc_cntl_time_update_reachable_through_the_bus_and_advances_with_systimer() {
+        let mut bus = bus_with(vec![]);
+        // Advance the live SYSTIMER counter (the RTC timer's "elapsed time"
+        // source -- see `crate::peripherals::rtc_cntl`'s module doc) well
+        // past the ~294-step quotient threshold before triggering.
+        for _ in 0..1_000_000 {
+            bus.systimer.advance();
+        }
+        // TIME_UPDATE_REG (+0x0c): set bit 31 (RTC_CNTL_TIME_UPDATE).
+        bus.write32(0x6000_8000 + 0x0c, 1 << 31);
+        let low0 = bus.read32(0x6000_8000 + 0x10);
+        let high0 = bus.read32(0x6000_8000 + 0x14);
+        assert_ne!(
+            (low0, high0),
+            (0, 0),
+            "expected a non-zero RTC timer latch after 1,000,000 systimer ticks"
+        );
+    }
+
+    #[test]
+    fn unhandled_rtc_cntl_offsets_are_logged_but_still_backed_by_storage() {
+        let mut bus = bus_with(vec![]);
+        // RTC_CNTL_OPTIONS0_REG (+0x00): not one of the three named
+        // registers `RtcCntl::handles` reports.
+        bus.write32(0x6000_8000, 0xDEAD_BEEF);
+        assert_eq!(
+            bus.read32(0x6000_8000),
+            0xDEAD_BEEF,
+            "still real storage, not a hard catch-all"
+        );
+        let log: Vec<_> = bus
+            .unmapped_log()
+            .iter()
+            .map(|a| (a.addr & !3, a.is_write))
+            .collect();
+        assert!(log.contains(&(0x6000_8000, true)));
+        assert!(log.contains(&(0x6000_8000, false)));
     }
 
     #[test]

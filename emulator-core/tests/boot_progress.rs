@@ -4,15 +4,21 @@
 //!
 //! Task 3 status: TIMG0/TIMG1 (`crate::peripherals::timg`) unblocked
 //! `rtc_clk_cal_internal()`'s spin loop (the pre-Task-3 stall — see Task 2's
-//! `boot-probe` report), but boot still doesn't print anything to the
-//! console within 20,000,000 steps (see `docs/firmware-emulator-notes.md`'s
-//! updated "Known limitations" for the current stall signature, now inside
-//! `RTCCNTL` register territory, `0x6000_8000`-range). Per this task's brief
-//! ("if *no* console line is reached yet, add instead a test asserting the
-//! hot-PC set no longer sits in the pre-fix `rtc_clk_cal` loop"), this file
-//! has exactly one ratchet test for now: [`timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop`].
-//! The next task is expected to add the first real console-line rung, using
-//! [`boot_until_console_contains`] below.
+//! `boot-probe` report), but boot still didn't print anything to the console
+//! within 20,000,000 steps, so Task 3 added only the hot-PC-escape fallback
+//! test ([`timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop`]), per
+//! its brief's explicit contingency for that case.
+//!
+//! Task D1 status: RTC_CNTL's RTC timer (`crate::peripherals::rtc_cntl`)
+//! unblocked the *next* stall (a busy-wait on `rtc_cntl_ll_get_rtc_time()`),
+//! and boot now genuinely reaches the console for the first time — a full
+//! ESP-IDF panic dump ("Guru Meditation Error...", from a *later*,
+//! not-yet-fixed stall this task explicitly leaves for the next one; see
+//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
+//! and `docs/firmware-emulator-notes.md`). [`first_console_output_is_the_firmware_s_own_panic_report`]
+//! is this file's first real console-line rung, using
+//! [`boot_until_console_contains`] below exactly as Task 3 anticipated.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,11 +32,9 @@ fn factory() -> Vec<u8> {
 
 /// Runs the real firmware in `CHUNK`-step increments (checking the console
 /// after each) until either `needle` appears in [`FirmwareRuntime::console_output`]
-/// or `max_steps` is exhausted. Shared plumbing for every future
-/// console-line ratchet test in this file — unused by Task 3's own test
-/// (see the module doc: no console line is reached yet), kept `pub` per the
-/// brief's interface for the next task to call directly.
-#[allow(dead_code)]
+/// or `max_steps` is exhausted. Shared plumbing for every console-line
+/// ratchet test in this file, kept `pub` per Task 3's brief for later tasks
+/// to call directly too.
 pub fn boot_until_console_contains(needle: &str, max_steps: u64) -> (FirmwareRuntime, bool) {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     const CHUNK: u32 = 250_000;
@@ -44,10 +48,7 @@ pub fn boot_until_console_contains(needle: &str, max_steps: u64) -> (FirmwareRun
 }
 
 /// Asserts `needle` is reached within `max_steps`, printing the final pc and
-/// full console buffer on failure for debugging. Unused by Task 3's own
-/// test for the same reason as [`boot_until_console_contains`] — kept for
-/// the next task.
-#[allow(dead_code)]
+/// full console buffer on failure for debugging.
 fn assert_reaches(needle: &str, max_steps: u64) {
     let (rt, ok) = boot_until_console_contains(needle, max_steps);
     assert!(
@@ -99,4 +100,22 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
         PRE_FIX_RTC_CLK_CAL_LOOP.end(),
         rt.pc(),
     );
+}
+
+/// The first real console-line ratchet: modeling RTC_CNTL's RTC timer
+/// (Task D1) lets boot's `rtc_cntl_ll_get_rtc_time()`-based busy-wait
+/// actually terminate, and boot now runs far enough to print real text —
+/// specifically, a full ESP-IDF panic dump from the *next* stall (an
+/// unstubbed ROM call; see `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`).
+/// "Guru Meditation Error" is ESP-IDF's own generic panic-header string
+/// (`components/esp_system/panic.c`), present in every ESP-IDF crash
+/// report — not badge-specific or identity data. 500,000 steps is
+/// comfortably past the fault (measured at step 401,761 in a throwaway
+/// experiment) and matches the exact budget
+/// `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
+/// uses, for an apples-to-apples comparison between the two tests.
+#[test]
+fn first_console_output_is_the_firmware_s_own_panic_report() {
+    assert_reaches("Guru Meditation Error", 500_000);
 }

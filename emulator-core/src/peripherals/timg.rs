@@ -123,9 +123,16 @@ const RTC_CALI_TIMEOUT: u32 = 1;
 
 /// The XTAL frequency this badge is confirmed to run at (40 MHz — see the
 /// plan's handoff notes), used as the calibration's reference clock.
-const XTAL_HZ: u64 = 40_000_000;
-/// `SOC_CLK_RC_SLOW_FREQ_APPROX` (`clk_tree_defs.h`).
-const RC_SLOW_HZ: u64 = 136_000;
+///
+/// `pub(crate)`: also reused by `crate::peripherals::rtc_cntl` to derive its
+/// RTC timer's tick rate from the emulator's step count, per Milestone 3
+/// Task D1's brief ("reuse ... rather than duplicating them") — see that
+/// module's doc for why the same XTAL-cycle-per-step placeholder applies
+/// there.
+pub(crate) const XTAL_HZ: u64 = 40_000_000;
+/// `SOC_CLK_RC_SLOW_FREQ_APPROX` (`clk_tree_defs.h`). `pub(crate)` for the
+/// same reuse as [`XTAL_HZ`].
+pub(crate) const RC_SLOW_HZ: u64 = 136_000;
 /// `SOC_CLK_RC_FAST_FREQ_APPROX / 256` (`clk_tree_defs.h`'s
 /// `SOC_CLK_RC_FAST_D256_FREQ_APPROX`), integer-divided exactly as the C
 /// macro itself is (an `int`/`int` division), not rounded.
