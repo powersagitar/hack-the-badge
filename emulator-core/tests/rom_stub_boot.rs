@@ -41,15 +41,17 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later, unstubbed-ROM-call fault (see
-    // `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`
+    // `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
     // below, which pins that exact new stall). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
     // Task D2 (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`)
     // moved the fault this budget stays clear of from step 401,761 (an
     // unstubbed `memcpy`) to step 402,113 (an unstubbed
-    // `ets_efuse_get_spiconfig`) -- comfortably clear either way
-    // (~52,113-step/~15% margin at the new fault), without this test
+    // `ets_efuse_get_spiconfig`); Task D3 (`emulator_core::rom`'s module doc,
+    // entry 10) moved it further still, to step 405,806 (an unstubbed
+    // `esprv_intc_int_enable`) -- comfortably clear either way
+    // (~55,806-step/~16% margin at the new fault), without this test
     // needing to also pin the new, later stall (that's the other test's
     // job).
     const STEP_BUDGET: usize = 350_000;
@@ -175,19 +177,25 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// Where boot currently *stops*: **not** a spin loop any more. Milestone 3
-/// Task D2 (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`)
-/// unblocked the fault this test used to pin (an unstubbed ROM `memcpy` call
-/// at `0x4000_0358`, from
-/// `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld` — see the Task D1 and
-/// D2 reports), so boot now runs further still and hits a **new** unstubbed
-/// ROM call, this time at a fixed address (`0x4000_071c`) that *does*
-/// correspond to a named symbol: `ets_efuse_get_spiconfig`, in the main
-/// `esp32c3.rom.ld` symbol table (confirmed by fetching that file at tag
-/// `v5.5.3` — see `emulator_core::rom`'s module doc). Per Task D2's
-/// brief/orchestrator ruling, this address is deliberately **not** stubbed
-/// by that task: it isn't a ROM libc/string function (the only family that
-/// task was scoped to extend), so implementing it is left for the next
-/// task. This is a real `INSTRUCTION_ACCESS_FAULT`, caught by the
+/// Task D3 (`emulator-core/src/rom.rs`'s module doc, entry 10) unblocked the
+/// fault this test used to pin (an unstubbed `ets_efuse_get_spiconfig` call
+/// at `0x4000_071c`) and five more it exposed one at a time
+/// (`ets_efuse_get_wp_pad`, `uart_tx_wait_idle`, `intr_matrix_set`,
+/// `esprv_intc_int_disable`, `esprv_intc_int_set_type`,
+/// `esprv_intc_int_set_priority`), so boot now runs further still and hits a
+/// **new** unstubbed ROM call: `esprv_intc_int_enable` (`0x4000_05e8`, named
+/// in `esp32c3.rom.ld`, deprecated alias declared in
+/// `components/riscv/include/esp_private/interrupt_deprecated.h` — confirmed
+/// by fetching both at tag `v5.5.3`, see `emulator_core::rom`'s module doc).
+/// Per Task D3's brief/orchestrator ruling, this address is deliberately
+/// **not** stubbed by that task: unlike its four `esprv_intc_int_*` siblings
+/// (which the boot-probe evidence showed writing already-zero registers, a
+/// provably inert no-op), this call sets a bit in `CPU_INT_ENABLE_REG` — a
+/// register `crate::peripherals::intc::InterruptController::poll` genuinely
+/// consults — so a `void` no-op here isn't a safe default the way it was for
+/// its siblings, and a real register write would need new stub-mechanism
+/// plumbing the task's brief scoped out ("peripherals are out of scope
+/// here"). This is a real `INSTRUCTION_ACCESS_FAULT`, caught by the
 /// firmware's own already-working panic handler (it prints a full "Guru
 /// Meditation Error" register dump via `ets_printf`, confirming `mtvec`,
 /// `ets_printf`, and this emulator's console capture are all working
@@ -199,30 +207,30 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// retry loop is the terminal state within any reasonable step budget. Per
 /// the brief, `software_reset_cpu` is not stubbed either (it's only reached
 /// via the panic path, and stubbing it wouldn't fix the root cause at
-/// `0x4000_071c`).
+/// `0x4000_05e8`).
 ///
-/// **History**: until Milestone 3 Task D2, this test pinned an *earlier*
-/// stall — an unstubbed ROM `memcpy` call at `0x4000_0358` whose symbol
-/// wasn't identified at the time (see the Task D1 report). That call is now
-/// stubbed (`emulator-core/src/rom.rs`'s `MEMCPY` entry), so this test's
+/// **History**: until Milestone 3 Task D3, this test pinned an *earlier*
+/// stall — an unstubbed `ets_efuse_get_spiconfig` call at `0x4000_071c` (see
+/// the Task D2 report). That call, and five more it led to, are now stubbed
+/// (`emulator-core/src/rom.rs`'s module doc, entry 10), so this test's
 /// expected stall point moved forward to this new unstubbed-ROM-call fault.
 #[test]
-fn boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call() {
+fn boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Comfortably past the fault (step 402,113) but well before the second
+    // Comfortably past the fault (step 405,806) but well before the second
     // fault (`software_reset_cpu`, during the panic handler's own reboot
     // attempt) -- a single, stable snapshot: exactly one trap has occurred,
-    // at exactly this address. 500,000 is the same budget the pre-Task-D2
+    // at exactly this address. 500,000 is the same budget the pre-Task-D3
     // version of this test used, re-measured to still land in the same
-    // single-trap window after this task's fix.
+    // single-trap window after this task's fixes.
     let summary = rt.run(500_000);
     assert_eq!(
         summary.last_instruction_fault,
-        Some(0x4000_071c),
-        "expected the new unstubbed-ROM-call fault at 0x4000_071c \
-         (ets_efuse_get_spiconfig)"
+        Some(0x4000_05e8),
+        "expected the new unstubbed-ROM-call fault at 0x4000_05e8 \
+         (esprv_intc_int_enable)"
     );
     assert_eq!(
         summary.traps, 1,

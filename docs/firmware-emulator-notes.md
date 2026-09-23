@@ -283,10 +283,42 @@ predicted these blockers would surface once TIMG unblocks further boot:
    (`0x4000_0094`) as before, which also faults and loops. Pinned down
    exactly in `emulator-core/tests/rom_stub_boot.rs`'s
    `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`.
-   This is the natural next Milestone 3 candidate: decide `ets_efuse_get_spiconfig`'s
-   HLE semantics (it reads SPI flash pin/mode configuration out of eFuse;
-   `components/esp_rom/esp32c3/ld/esp32c3.rom.ld` names it but this codebase
-   models no eFuse block at all yet) and stub it.
+   **Resolved in Milestone 3, Task D3** (`emulator-core/src/rom.rs`'s module
+   doc, entry 10). `ets_efuse_get_spiconfig` returns `0` ("default SPI
+   pins" — the documented sentinel from `esp32c3/rom/efuse.h`, and correct
+   for the badge's flash, which sits on the default SPI pads; the eFuse
+   block itself remains unmodeled). That unblocked a chain of five more
+   observed ROM calls in turn, each stubbed per the same task: eFuse's WP
+   pad accessor (`ets_efuse_get_wp_pad`, returns the header's documented
+   `0x3f` "invalid" sentinel), a UART TX-flush busy-wait
+   (`uart_tx_wait_idle`, `void` no-op, same reasoning as `ets_delay_us`),
+   and four ESP-IDF interrupt-controller bring-up calls
+   (`intr_matrix_set`, `esprv_intc_int_disable`, `esprv_intc_int_set_type`,
+   `esprv_intc_int_set_priority`, all `void` no-ops — a throwaway boot-probe
+   confirmed each one's real target register was still at its power-on
+   value for every observed call, so a real write and a no-op are
+   byte-identical for what boot actually asks of them).
+   **Where boot now stalls**: still not a spin, still the same "Guru
+   Meditation Error" panic text as the first console output (no new line to
+   ratchet on), but the fault has moved forward again, into the middle of
+   ESP-IDF's interrupt-controller bring-up: a **new**
+   `INSTRUCTION_ACCESS_FAULT` at `0x4000_05e8` (step 405,806),
+   `esprv_intc_int_enable`. Unlike its four `esprv_intc_int_*` siblings
+   above, this one *sets* a bit in `CPU_INT_ENABLE_REG` — a register
+   `emulator-core/src/peripherals/intc.rs`'s `InterruptController::poll`
+   genuinely consults to decide whether a pending, routed interrupt source
+   reaches the CPU — so treating it as an inert no-op isn't provably safe
+   the way its siblings were, and a real fix means reaching into that
+   already-modeled peripheral's register from a ROM stub, new
+   stub-mechanism plumbing Task D3's brief scoped out. Pinned down exactly
+   in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`.
+   This is the natural next Milestone 3 candidate: decide whether
+   `esprv_intc_int_enable` needs a real register-write HLE (and, if so, what
+   `RomStubEffect` shape lets a stub reach a specific peripheral's register
+   without hard-coding SoC addresses into the chip-agnostic
+   `cpu::rom_stubs` mechanism), or whether it's still safe to no-op given
+   how little of the interrupt-delivery path is otherwise wired up yet.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

@@ -42,9 +42,16 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // unblocked the Task-D1-era fault (at step 401,761) -- boot now runs
       // further and hits a *different* unstubbed ROM call
       // (ets_efuse_get_spiconfig, step 402,113), still well within this
+      // 500,000-step budget.
+      //
+      // Milestone 3 Task D3: ets_efuse_get_spiconfig and five more ROM
+      // calls it led to are now HLE-stubbed (emulator-core/src/rom.rs's
+      // module doc, entry 10), which unblocked the Task-D2-era fault --
+      // boot now runs further still and hits a *different* unstubbed ROM
+      // call (esprv_intc_int_enable, step 405,806), still well within this
       // 500,000-step budget, so the trap count here stays 1. See
       // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call
+      // boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call
       // and docs/firmware-emulator-notes.md for the full story.
       expect(report.traps).toBe(1);
 

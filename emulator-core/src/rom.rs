@@ -30,9 +30,11 @@
 //! The *driving loop* was empirical, not speculative: boot the real image,
 //! see which address the PC faults on, look that address up in the linker
 //! scripts, add the smallest stub that lets boot proceed, repeat.
-//! `tests/rom_stub_boot.rs` records the resulting call sequence, and each of
-//! the 6 `NAMED_STUBS` entries (`rtc_get_reset_reason`, `ets_delay_us`,
-//! `memset`, `ets_get_cpu_frequency` + its setter, `ets_printf`) was chosen
+//! `tests/rom_stub_boot.rs` records the resulting call sequence, and each
+//! `NAMED_STUBS` entry (`rtc_get_reset_reason`, `ets_delay_us`, `memset`,
+//! `memcpy`, `ets_efuse_get_spiconfig`, `ets_efuse_get_wp_pad`,
+//! `uart_tx_wait_idle`, `intr_matrix_set`, the `esprv_intc_int_*` family,
+//! `ets_get_cpu_frequency` + its setter, `ets_printf`, …) was chosen
 //! because the real boot run was observed calling that exact address and the
 //! generic zero-return default either stalled it or would have silently
 //! corrupted a caller. The bulk of the table's ~69 entries, though — the
@@ -165,6 +167,79 @@
 //!    task's report for the exact re-probe evidence — so, per this module's
 //!    own "only stub what's observed" rule, they remain unstubbed for now.
 //!
+//! 10. **Milestone 3 Task D3's chain of six ROM calls** — boot's next stall
+//!     after `memcpy`, and the five it exposed one at a time once each was
+//!     unblocked in turn (this task's brief authorized exactly this:
+//!     "if the next stall is another unstubbed ROM function call whose
+//!     semantics are documented in a header, implement it too... repeat"):
+//!     - **[`ETS_EFUSE_GET_SPICONFIG`] (`0x4000_071c`)** — returns
+//!       [`EFUSE_SPICONFIG_DEFAULT_SPI_PINS`] = **`0`**, the documented
+//!       "default SPI pins" value (`esp32c3/rom/efuse.h`), per the
+//!       orchestrator's explicit ruling: not the generic zero-return
+//!       default by coincidence, but the correct answer for a chip (like
+//!       the badge) whose flash sits on the default SPI pads. The eFuse
+//!       block itself remains entirely unmodeled.
+//!     - **[`ETS_EFUSE_GET_WP_PAD`] (`0x4000_072c`)** — returns
+//!       [`EFUSE_WP_PAD_INVALID`] = **`0x3f`**, the documented "invalid"
+//!       sentinel (`esp32c3/rom/efuse.h`: "0x3f for invalid, 0~46 is
+//!       valid") for "no WP pad override has been fused" — again a
+//!       documented value, not a guessed pad number.
+//!     - **[`UART_TX_WAIT_IDLE`] (`0x4000_0084`)** — a **`void` no-op**.
+//!       `uart_tx_wait_idle(uint8_t uart_no)` busy-waits for real UART
+//!       hardware to finish transmitting
+//!       (`components/esp_rom/esp32c3/include/esp32c3/rom/uart.h`); this
+//!       emulator models no UART TX-busy state to wait on, so — same
+//!       reasoning as `ets_delay_us` — returning immediately is correct
+//!       HLE, not a shortcut.
+//!     - **[`INTR_MATRIX_SET`], [`ESPRV_INTC_INT_DISABLE`],
+//!       [`ESPRV_INTC_INT_SET_TYPE`], [`ESPRV_INTC_INT_SET_PRIORITY`]
+//!       (`0x4000_05e0`..=`0x4000_05f4`)** — four **`void` no-ops**, all
+//!       from ESP-IDF's interrupt-controller bring-up
+//!       (`components/riscv/include/esp_private/interrupt_deprecated.h`
+//!       for the `esprv_intc_int_*` family; `intr_matrix_set` from
+//!       `esp32c3/rom/ets_sys.h`). Each really does write a register
+//!       `crate::peripherals::intc::InterruptController` models (MAP
+//!       registers, `CPU_INT_TYPE_REG`, `CPU_INT_PRI_<n>_REG`), so this
+//!       isn't the generic "no effect" case by default — it's justified
+//!       per-function: a throwaway, uncommitted boot-probe (this task's
+//!       report has the trace) observed `intr_matrix_set` called 62 times
+//!       in a loop as `intr_matrix_set(0, model_num, 0)` for
+//!       `model_num` = 0..=0x3d, `esprv_intc_int_disable(1 << 25)`, and
+//!       `esprv_intc_int_set_type(25, INTR_TYPE_LEVEL)` once each — in
+//!       every one of these calls the register being written is still at
+//!       its power-on-reset value (`0`) at that point in boot, so a real
+//!       write and a no-op are byte-identical for the *observed* calls,
+//!       not merely assumed to be. `esprv_intc_int_set_priority(25, 4)` is
+//!       different — its write value (`4`) is not `0`, so a real write and
+//!       a no-op genuinely differ in what ends up stored — but
+//!       `InterruptController`'s own module doc already documents
+//!       `CPU_INT_PRI_<n>_REG` as real storage this emulator's interrupt
+//!       arbitration doesn't consult in v1 (only `SYSTIMER_TARGET0` has a
+//!       real signal wired), so the divergence has no effect this
+//!       emulator's current fidelity observes — the same "we model no
+//!       consumer for this yet" reasoning the `Cache_Get_*` family already
+//!       relies on, not a fresh guess.
+//!
+//!     **Where this chain stops, and why**: the very next call at the same
+//!     address family, `esprv_intc_int_enable(1 << 25)` (`0x4000_05e8`),
+//!     is qualitatively different from its four siblings above: it *sets*
+//!     bit 25 of `CPU_INT_ENABLE_REG`, a register
+//!     `InterruptController::poll` genuinely *does* consult (`self.cpu_int_enable
+//!     & (1 << line) != 0`) to decide whether a pending, routed source is
+//!     allowed through to the CPU. Skipping this write is not a
+//!     provably-inert no-op the way its four siblings are (their target
+//!     registers all stayed at `0`, this one is asking to leave a register
+//!     at `0` a real call would set to a nonzero value with a documented
+//!     purpose), and doing the write for real would mean reaching into an
+//!     already-modeled peripheral's register from a stub effect — new
+//!     mechanism work this task's brief scopes out ("peripherals are out
+//!     of scope here"). This is also the boundary the brief's own stop
+//!     condition names directly ("a peripheral register"). So Task D3
+//!     stops here and leaves `esprv_intc_int_enable` unstubbed for a later
+//!     task's judgment call — see `tests/rom_stub_boot.rs`'s
+//!     `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
+//!     and this task's report.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -184,16 +259,19 @@
 //!
 //! ## Where this gets boot to
 //!
-//! With this table installed (as of Milestone 3 Task D2), the real
+//! With this table installed (as of Milestone 3 Task D3), the real
 //! `factory.bin` runs past the mask-ROM wall, `.bss` clear, flash cache/MMU
 //! bring-up, analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay
-//! loop (Task D1), and the `memcpy` call above (step 401,761) to print a
-//! full ESP-IDF "Guru Meditation Error" boot log, then stalls at step
-//! 402,113 on a **new** unstubbed ROM call — `ets_efuse_get_spiconfig`
-//! (`0x4000_071c`, a named symbol in `esp32c3.rom.ld`, not a libc/string
-//! function, so out of this task's scope per its brief's ruling). See
-//! `tests/rom_stub_boot.rs`'s
-//! `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`
+//! loop (Task D1), the `memcpy` call (Task D2), prints a full ESP-IDF
+//! "Guru Meditation Error" boot log, and now runs straight through that
+//! panic dump's own eFuse queries, UART flush, and the start of
+//! interrupt-controller bring-up (entry 10's six-function chain above),
+//! stalling at step 405,806 on `esprv_intc_int_enable` (`0x4000_05e8`,
+//! `unmask = 1 << 25` observed) — the first call in that chain whose real
+//! effect this emulator's own peripheral model (`InterruptController::poll`)
+//! actually consults, so it's deliberately left unstubbed rather than
+//! guessed at. See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
 //! and `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
 //! story.
 
@@ -223,6 +301,64 @@ pub const MEMSET: u32 = 0x4000_0354;
 /// section).
 pub const MEMCPY: u32 = 0x4000_0358;
 
+/// `ets_efuse_get_spiconfig`'s fixed ROM address (`esp32c3.rom.ld`).
+pub const ETS_EFUSE_GET_SPICONFIG: u32 = 0x4000_071c;
+
+/// [`ETS_EFUSE_GET_SPICONFIG`]'s stub return value: `0`, the documented
+/// "default SPI pins" sentinel from `ets_efuse_get_spiconfig`'s doc comment
+/// (`components/esp_rom/esp32c3/include/esp32c3/rom/efuse.h`: "0 for default
+/// SPI pins. 1 for default HSPI pins. Other values define a custom pin
+/// configuration mask."). See the module doc's entry 10 for why this is a
+/// chosen, cited value rather than the generic zero-return default landing
+/// here by coincidence.
+pub const EFUSE_SPICONFIG_DEFAULT_SPI_PINS: u32 = 0;
+
+/// `ets_efuse_get_wp_pad`'s fixed ROM address (`esp32c3.rom.ld`). The very
+/// next ROM call boot makes after [`ETS_EFUSE_GET_SPICONFIG`] returns (see
+/// the module doc's entry 10).
+pub const ETS_EFUSE_GET_WP_PAD: u32 = 0x4000_072c;
+
+/// [`ETS_EFUSE_GET_WP_PAD`]'s stub return value: `0x3f`, the documented
+/// "invalid" sentinel from `ets_efuse_get_wp_pad`'s doc comment
+/// (`components/esp_rom/esp32c3/include/esp32c3/rom/efuse.h`: "0x3f for
+/// invalid. 0~46 is valid."). This emulator models no eFuse block, so "no WP
+/// pad override has been fused" (the invalid sentinel) is the correct
+/// answer, not a guessed pad number.
+pub const EFUSE_WP_PAD_INVALID: u32 = 0x3f;
+
+/// `uart_tx_wait_idle`'s fixed ROM address (`esp32c3.rom.ld`). Called by the
+/// firmware's panic handler to flush its crash dump before rebooting (see
+/// the module doc's entry 10).
+pub const UART_TX_WAIT_IDLE: u32 = 0x4000_0084;
+
+/// `intr_matrix_set`'s fixed ROM address (`esp32c3.rom.ld`). Routes a
+/// peripheral interrupt source onto a CPU interrupt line by writing the
+/// source's MAP register in `crate::peripherals::intc::InterruptController`
+/// (see the module doc's entry 10 for why this is a `void` no-op rather
+/// than a real register write).
+pub const INTR_MATRIX_SET: u32 = 0x4000_05f4;
+
+/// `esprv_intc_int_disable`'s fixed ROM address (`esp32c3.rom.ld`). Clears
+/// bits in `CPU_INT_ENABLE_REG`
+/// (`crate::peripherals::intc::InterruptController`); see the module doc's
+/// entry 10 for why this is a `void` no-op rather than a real register
+/// write.
+pub const ESPRV_INTC_INT_DISABLE: u32 = 0x4000_05ec;
+
+/// `esprv_intc_int_set_type`'s fixed ROM address (`esp32c3.rom.ld`). Sets or
+/// clears a bit in `CPU_INT_TYPE_REG`
+/// (`crate::peripherals::intc::InterruptController`); see the module doc's
+/// entry 10 for why this is a `void` no-op rather than a real register
+/// write.
+pub const ESPRV_INTC_INT_SET_TYPE: u32 = 0x4000_05f0;
+
+/// `esprv_intc_int_set_priority`'s fixed ROM address (`esp32c3.rom.ld`).
+/// Writes a `CPU_INT_PRI_<n>_REG` entry
+/// (`crate::peripherals::intc::InterruptController`); see the module doc's
+/// entry 10 for why this is a `void` no-op (that register is real storage
+/// but not yet consulted by this emulator's interrupt arbitration).
+pub const ESPRV_INTC_INT_SET_PRIORITY: u32 = 0x4000_05e0;
+
 /// `ets_get_cpu_frequency`'s fixed ROM address (`esp32c3.rom.ld`).
 pub const ETS_GET_CPU_FREQUENCY: u32 = 0x4000_0584;
 
@@ -248,6 +384,28 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (ETS_DELAY_US, RomStub::void("ets_delay_us")),
     (MEMSET, RomStub::memset("memset")),
     (MEMCPY, RomStub::memcpy("memcpy")),
+    (
+        ETS_EFUSE_GET_SPICONFIG,
+        RomStub::returning("ets_efuse_get_spiconfig", EFUSE_SPICONFIG_DEFAULT_SPI_PINS),
+    ),
+    (
+        ETS_EFUSE_GET_WP_PAD,
+        RomStub::returning("ets_efuse_get_wp_pad", EFUSE_WP_PAD_INVALID),
+    ),
+    (UART_TX_WAIT_IDLE, RomStub::void("uart_tx_wait_idle")),
+    (INTR_MATRIX_SET, RomStub::void("intr_matrix_set")),
+    (
+        ESPRV_INTC_INT_DISABLE,
+        RomStub::void("esprv_intc_int_disable"),
+    ),
+    (
+        ESPRV_INTC_INT_SET_TYPE,
+        RomStub::void("esprv_intc_int_set_type"),
+    ),
+    (
+        ESPRV_INTC_INT_SET_PRIORITY,
+        RomStub::void("esprv_intc_int_set_priority"),
+    ),
     (
         ETS_GET_CPU_FREQUENCY,
         RomStub::returning("ets_get_cpu_frequency", CPU_FREQ_MHZ),
@@ -526,6 +684,137 @@ mod tests {
             table.lookup(MEMCPY).unwrap().effect,
             RomStubEffect::Memcpy,
             "one of the ROM libc functions that IS stubbed must be a real one"
+        );
+    }
+
+    #[test]
+    fn efuse_get_spiconfig_stub_returns_default_spi_pins() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(ETS_EFUSE_GET_SPICONFIG).expect("registered");
+        assert_eq!(stub.name, "ets_efuse_get_spiconfig");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Return(EFUSE_SPICONFIG_DEFAULT_SPI_PINS),
+            "0 is the documented 'default SPI pins' return value \
+             (esp32c3/rom/efuse.h), not the generic zero-return default by \
+             coincidence -- the badge's flash sits on the default SPI pads"
+        );
+    }
+
+    #[test]
+    fn efuse_get_wp_pad_stub_returns_the_documented_invalid_sentinel() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(ETS_EFUSE_GET_WP_PAD).expect("registered");
+        assert_eq!(stub.name, "ets_efuse_get_wp_pad");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Return(EFUSE_WP_PAD_INVALID),
+            "0x3f is the documented 'invalid' sentinel (esp32c3/rom/efuse.h) \
+             for 'no WP pad override fused' -- the correct answer for an \
+             unmodeled eFuse block, not a guess at a pad number"
+        );
+    }
+
+    #[test]
+    fn intr_matrix_set_is_a_void_noop() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(INTR_MATRIX_SET).expect("registered");
+        assert_eq!(stub.name, "intr_matrix_set");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Void,
+            "intr_matrix_set(cpu_no, model_num, intr_num) routes a \
+             peripheral interrupt source onto a CPU interrupt line by \
+             writing that source's MAP register in the interrupt matrix \
+             (esp32c3/rom/ets_sys.h; register layout confirmed against \
+             crate::peripherals::intc); this task's boot-probe observed the \
+             sole call within budget as intr_matrix_set(0, 0, 0), which \
+             writes 0 into a MAP register whose reset value is already 0 \
+             -- a real write and a no-op are byte-identical for this \
+             observed call, so this is an exact match, not a guess. See the \
+             module doc's entry 10 for the caveat if a later, non-trivial \
+             call is ever observed."
+        );
+    }
+
+    #[test]
+    fn esprv_intc_int_disable_is_a_void_noop() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(ESPRV_INTC_INT_DISABLE).expect("registered");
+        assert_eq!(stub.name, "esprv_intc_int_disable");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Void,
+            "esprv_intc_int_disable(mask) clears bits in \
+             CPU_INT_ENABLE_REG, a register crate::peripherals::intc models \
+             (components/riscv/include/esp_private/interrupt_deprecated.h). \
+             This task's boot-probe observed the sole call within budget as \
+             esprv_intc_int_disable(1 << 25), clearing a bit in a register \
+             that is still at its reset value (0) at this point in boot --  \
+             a real clear-bit and a no-op are byte-identical for this \
+             observed call."
+        );
+    }
+
+    #[test]
+    fn esprv_intc_int_set_type_is_a_void_noop() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(ESPRV_INTC_INT_SET_TYPE).expect("registered");
+        assert_eq!(stub.name, "esprv_intc_int_set_type");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Void,
+            "esprv_intc_int_set_type(intr_num, type) sets or clears \
+             intr_num's bit in CPU_INT_TYPE_REG, a register \
+             crate::peripherals::intc models \
+             (components/riscv/include/esp_private/interrupt_deprecated.h). \
+             This task's boot-probe observed the sole call within budget as \
+             esprv_intc_int_set_type(25, INTR_TYPE_LEVEL=0), clearing a bit \
+             in a register still at its reset value (0) -- a real clear-bit \
+             and a no-op are byte-identical for this observed call."
+        );
+    }
+
+    #[test]
+    fn esprv_intc_int_set_priority_is_a_void_noop() {
+        let table = esp32c3_rom_stubs();
+        let stub = table
+            .lookup(ESPRV_INTC_INT_SET_PRIORITY)
+            .expect("registered");
+        assert_eq!(stub.name, "esprv_intc_int_set_priority");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Void,
+            "esprv_intc_int_set_priority(rv_int_num, priority) writes a \
+             CPU_INT_PRI_<n>_REG entry \
+             (components/riscv/include/esp_private/interrupt_deprecated.h). \
+             This task's boot-probe observed the sole call within budget as \
+             esprv_intc_int_set_priority(25, 4) -- a non-trivial write \
+             (unlike this task's other no-ops, the stored value really \
+             would differ from a skipped write), but \
+             crate::peripherals::intc::InterruptController's own module doc \
+             already documents CPU_INT_PRI_<n>_REG as real storage that \
+             `poll()`'s arbitration doesn't consult in v1 (only one source, \
+             systimer target0, is wired to a real signal), so skipping the \
+             store has no effect this emulator's current fidelity level \
+             observes -- the same reasoning already used for the bulk \
+             Cache_* family, not a guess at what the value should be."
+        );
+    }
+
+    #[test]
+    fn uart_tx_wait_idle_is_a_void_noop() {
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(UART_TX_WAIT_IDLE).expect("registered");
+        assert_eq!(stub.name, "uart_tx_wait_idle");
+        assert_eq!(
+            stub.effect,
+            RomStubEffect::Void,
+            "uart_tx_wait_idle(uint8_t uart_no) busy-waits for real UART \
+             hardware to finish transmitting (esp32c3/rom/uart.h); this \
+             emulator models no UART TX-busy state to wait on, so returning \
+             immediately without touching a0 is correct HLE, same reasoning \
+             as ets_delay_us"
         );
     }
 }

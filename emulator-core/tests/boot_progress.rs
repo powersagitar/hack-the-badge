@@ -34,6 +34,19 @@
 //! *old* Task-D1-era fault's step count, i.e. concrete, measurable evidence
 //! that this task's fix moved the wall forward rather than just moving a
 //! test's expected number.
+//!
+//! Task D3 status: `emulator_core::rom`'s module doc (entry 10) unblocked
+//! the Task-D2-era fault at `0x4000_071c` (`ets_efuse_get_spiconfig`) and
+//! five more ROM calls it led to in turn, but — same situation as Task D2 —
+//! boot's console is still the same generic "Guru Meditation Error" text no
+//! *new* line to ratchet on, since the chain runs straight into another
+//! unstubbed ROM call (`esprv_intc_int_enable`, `0x4000_05e8` — see
+//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`).
+//! [`boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site`]
+//! is this file's no-fault-before-step-N rung for this task: it asserts zero
+//! traps through the *old* Task-D2-era fault's exact step count (402,113),
+//! concrete, measurable evidence this task's fixes moved the wall forward.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -142,11 +155,9 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// now intercepts that call for real, so a run just past the old fault's
 /// step count should show **zero** traps of any kind -- concrete, measured
 /// evidence the fix bought real forward progress, not just a relabeled
-/// stall. (Boot does still stall shortly after -- at step 402,113, on a
-/// *different*, unstubbed ROM call, `ets_efuse_get_spiconfig` -- pinned
-/// exactly by `emulator-core/tests/rom_stub_boot.rs`'s
-/// `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`,
-/// which is this task's job to leave accurately pinned, not this rung's.)
+/// stall. (Boot did still stall shortly after -- at step 402,113, on a
+/// *different*, unstubbed ROM call, `ets_efuse_get_spiconfig` -- that was
+/// Task D3's stall to fix, not this one's; see this file's next rung.)
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -159,6 +170,37 @@ fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
         "expected zero traps through the pre-Task-D2 memcpy fault's exact \
          step count (401,761) now that memcpy is HLE-stubbed; got \
          {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
+        summary.traps, summary.last_instruction_fault, summary.pc
+    );
+}
+
+/// Milestone 3 Task D3's no-new-console-line fallback rung (see the module
+/// doc). Before this task, boot faulted on an unstubbed
+/// `ets_efuse_get_spiconfig` call at a fixed address reached at step 402,113
+/// from a cold boot (Task D2 report). `emulator-core/src/rom.rs`'s module
+/// doc (entry 10) now stubs that call, and five more it led to, for real, so
+/// a run just past the old fault's step count should show **zero** traps of
+/// any kind -- concrete, measured evidence the fixes bought real forward
+/// progress, not just a relabeled stall. (Boot does still stall shortly
+/// after -- at step 405,806, on a *different*, unstubbed ROM call,
+/// `esprv_intc_int_enable` -- pinned exactly by
+/// `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`,
+/// which is this task's job to leave accurately pinned, not this rung's.)
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    // 402,113: the exact step the pre-Task-D3 `ets_efuse_get_spiconfig`
+    // fault occurred at. Running exactly that many steps and finding zero
+    // traps proves the call that used to fault right at this boundary now
+    // completes.
+    let summary = rt.run(402_113);
+    assert_eq!(
+        summary.traps, 0,
+        "expected zero traps through the pre-Task-D3 \
+         ets_efuse_get_spiconfig fault's exact step count (402,113) now \
+         that it's HLE-stubbed; got {} traps, last_instruction_fault = \
+         {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
 }
