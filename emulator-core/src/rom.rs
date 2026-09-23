@@ -135,6 +135,36 @@
 //!    **Real implementations**, for `memset`'s reason: their results feed
 //!    straight into the caller's next computation.
 //!
+//! 9. **`memcpy` (`0x4000_0358`, from
+//!    `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`, not the plain
+//!    `esp32c3.rom.libc.ld` — see below)** — Milestone 3 Task D2's stall:
+//!    real boot faults on an unmapped instruction fetch here at step 401,761
+//!    (a fixed, deterministic call target reached via `auipc`+`jalr` with a
+//!    valid `ra`, confirmed by inspecting CPU state at the fault: `a0 =
+//!    0x3fcdc67c` (`dst`), `a1 = 0x3fcdc670` (`src`), `a2 = 3` (`n`) — a
+//!    small, in-RAM, unaligned 3-byte copy). This address is **not** in the
+//!    "well-labeled" `esp32c3.rom.libc.ld` (which defines `strlen`/`strstr`/
+//!    `bzero` at `0x4000_0374`/`0x378`/`0x37c` but nothing at `0x358`);
+//!    it's in the sibling
+//!    `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld` script, which
+//!    ESP-IDF's `esp_rom`
+//!    `CMakeLists.txt` links instead whenever
+//!    `CONFIG_ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY` is set and
+//!    `CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS` is *not* — the ESP32-C3's
+//!    default configuration — and which defines `memcpy = 0x4000_0358`
+//!    exactly (plus `memmove`/`memcmp`/`strcpy`/`strncpy`/`strcmp`/`strncmp`
+//!    contiguously after it; see [`MEMCPY`]'s doc). Like `memset`, this is
+//!    stubbed with a **real implementation**
+//!    ([`crate::cpu::rom_stubs::RomStubEffect::Memcpy`]): a generic
+//!    zero/status return would silently corrupt whatever the copied bytes
+//!    were meant to become, which is worse than the loud fault it replaces.
+//!    The sibling functions in that same linker script (`memmove`, `memcmp`,
+//!    `strcpy`, `strncpy`, `strcmp`, `strncmp`) were checked against a
+//!    post-fix boot-probe re-run and were **not** observed being called
+//!    within the tested budget — see `tests/rom_stub_boot.rs` and this
+//!    task's report for the exact re-probe evidence — so, per this module's
+//!    own "only stub what's observed" rule, they remain unstubbed for now.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -142,9 +172,10 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`memcpy`, `strlen`, `qsort`, …) and the float
-//! half of ROM libgcc are **absent by design**, for the same reason `memset`
-//! and `__udivdi3` are special-cased rather than defaulted: a generic
+//! The rest of ROM libc/newlib (`memmove`, `memcmp`, `strcpy`, `strncpy`,
+//! `strcmp`, `strncmp`, `strlen`, `qsort`, …) and the float half of ROM
+//! libgcc are **absent by design**, for the same reason `memset` and
+//! `__udivdi3` are special-cased rather than defaulted: a generic
 //! "return 0, do nothing" stub for a function whose *output* the caller uses
 //! silently corrupts it. Each one gets a real HLE implementation when — and
 //! only when — a boot run is actually observed to call it. Faulting on an
@@ -153,13 +184,18 @@
 //!
 //! ## Where this gets boot to
 //!
-//! With this table installed, the real `factory.bin` runs 2,000,000
-//! instructions with zero traps of any kind (versus faulting ~20 instructions
-//! in without it), getting through `.bss` clear, flash cache/MMU bring-up,
-//! analog/PLL config and its first log line, and stalls inside SoC clock
-//! initialization — spinning on a TIMERGROUP0 calibration register that no
-//! peripheral module models yet. `tests/rom_stub_boot.rs` pins down both the
-//! progress and the stall.
+//! With this table installed (as of Milestone 3 Task D2), the real
+//! `factory.bin` runs past the mask-ROM wall, `.bss` clear, flash cache/MMU
+//! bring-up, analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay
+//! loop (Task D1), and the `memcpy` call above (step 401,761) to print a
+//! full ESP-IDF "Guru Meditation Error" boot log, then stalls at step
+//! 402,113 on a **new** unstubbed ROM call — `ets_efuse_get_spiconfig`
+//! (`0x4000_071c`, a named symbol in `esp32c3.rom.ld`, not a libc/string
+//! function, so out of this task's scope per its brief's ruling). See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`
+//! and `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
+//! story.
 
 use crate::cpu::rom_stubs::{Int64Op, RomStub, RomStubTable};
 
@@ -176,6 +212,16 @@ pub const ETS_DELAY_US: u32 = 0x4000_0050;
 
 /// ROM libc `memset`'s fixed address (`esp32c3.rom.libc.ld`).
 pub const MEMSET: u32 = 0x4000_0354;
+
+/// ROM libc `memcpy`'s fixed address (`esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`
+/// — the variant this firmware links, per that script's build-config gate;
+/// see the module doc's entry 9 below). That same script defines
+/// `memmove = 0x4000_035c`, `memcmp = 0x4000_0360`, `strcpy = 0x4000_0364`,
+/// `strncpy = 0x4000_0368`, `strcmp = 0x4000_036c`, `strncmp = 0x4000_0370`
+/// contiguously after it — none observed called in this task's boot-probe
+/// re-run, so none are stubbed (see the module doc's "What is NOT stubbed"
+/// section).
+pub const MEMCPY: u32 = 0x4000_0358;
 
 /// `ets_get_cpu_frequency`'s fixed ROM address (`esp32c3.rom.ld`).
 pub const ETS_GET_CPU_FREQUENCY: u32 = 0x4000_0584;
@@ -201,6 +247,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (ETS_PRINTF, RomStub::returning("ets_printf", 0)),
     (ETS_DELAY_US, RomStub::void("ets_delay_us")),
     (MEMSET, RomStub::memset("memset")),
+    (MEMCPY, RomStub::memcpy("memcpy")),
     (
         ETS_GET_CPU_FREQUENCY,
         RomStub::returning("ets_get_cpu_frequency", CPU_FREQ_MHZ),
@@ -352,6 +399,12 @@ mod tests {
             "memset must really write the bytes -- a zero return would \
              silently corrupt the caller"
         );
+        assert_eq!(
+            table.lookup(MEMCPY).expect("registered").effect,
+            RomStubEffect::Memcpy,
+            "memcpy must really copy the bytes -- a zero return would \
+             silently corrupt the caller"
+        );
     }
 
     #[test]
@@ -443,14 +496,20 @@ mod tests {
     #[test]
     fn no_rom_libc_function_carries_a_generic_zero_return_stub() {
         // Guard for the module doc's "NOT stubbed, on purpose" section: a
-        // zero-returning `strlen`/`memcpy` would silently corrupt boot rather
+        // zero-returning `strlen`/`strcpy` would silently corrupt boot rather
         // than unblock it, so ROM libc entries are either absent or carry a
         // real implementation -- never the generic default. Addresses from
-        // esp32c3.rom.libc.ld.
+        // esp32c3.rom.libc.ld / esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld.
         let table = esp32c3_rom_stubs();
         for addr in [
             0x4000_0374u32, /* strlen */
             0x4000_03c8,    /* memchr */
+            0x4000_035c,    /* memmove */
+            0x4000_0360,    /* memcmp */
+            0x4000_0364,    /* strcpy */
+            0x4000_0368,    /* strncpy */
+            0x4000_036c,    /* strcmp */
+            0x4000_0370,    /* strncmp */
         ] {
             assert_eq!(
                 table.lookup(addr),
@@ -461,7 +520,12 @@ mod tests {
         assert_eq!(
             table.lookup(MEMSET).unwrap().effect,
             RomStubEffect::Memset,
-            "the one ROM libc function that IS stubbed must be a real one"
+            "one of the ROM libc functions that IS stubbed must be a real one"
+        );
+        assert_eq!(
+            table.lookup(MEMCPY).unwrap().effect,
+            RomStubEffect::Memcpy,
+            "one of the ROM libc functions that IS stubbed must be a real one"
         );
     }
 }

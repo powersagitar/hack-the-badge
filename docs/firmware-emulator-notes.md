@@ -253,25 +253,40 @@ predicted these blockers would surface once TIMG unblocks further boot:
    point and, for the first time, prints real console output: a full
    ESP-IDF "Guru Meditation Error" panic dump (generic text, confirmed via
    `emulator-core/tests/boot_progress.rs`'s
-   `first_console_output_is_the_firmware_s_own_panic_report`). The panic is
+   `first_console_output_is_the_firmware_s_own_panic_report`). The panic was
    a genuine `INSTRUCTION_ACCESS_FAULT` at a fixed call target,
-   `0x4000_0358` (step 401,761 from a cold boot), which does **not**
+   `0x4000_0358` (step 401,761 from a cold boot), which did **not**
    correspond to any named symbol in ESP-IDF v5.5.3's esp32c3 ROM linker
-   scripts (`components/esp_rom/esp32c3/ld/esp32c3.rom*.ld` — every file
-   under that directory was checked, including the BLE/BT variants) —
-   flagged here rather than guessed at, per this task's brief. The
-   firmware's own panic handler catches it, prints the dump, and then tries
-   to reboot via a *second* unstubbed ROM call, `software_reset_cpu`
-   (`0x4000_0094`, a real named symbol in `esp32c3.rom.ld` this time), which
-   also faults — re-entering the panic handler's re-entrancy guard ("Panic
-   handler entered multiple times...") and retrying forever (this emulator
-   has no real reboot mechanism). Pinned down exactly in
-   `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`.
-   This is the natural next Milestone 3 candidate: identify what
-   `0x4000_0358` actually is (likely needs disassembling the real mask ROM
-   image itself, not just its documented linker-script symbol table, since
-   that table doesn't cover it) and add a stub for it.
+   scripts — flagged rather than guessed at, per Task D1's brief.
+   **Resolved in Milestone 3, Task D2**
+   (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`,
+   `emulator-core/src/rom.rs`'s `MEMCPY` entry). The orchestrator identified
+   `0x4000_0358` as ROM libc `memcpy`, defined not in the "obvious"
+   `esp32c3.rom.libc.ld` but in the sibling
+   `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld` (the variant ESP-IDF's
+   `esp_rom` `CMakeLists.txt` links whenever
+   `CONFIG_ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY` is set and
+   `CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS` is not — the ESP32-C3's default),
+   which is why Task D1's exhaustive linker-script search missed it. Like
+   `memset`, `memcpy` is stubbed with a real byte-for-byte implementation,
+   not a generic status return, since a fabricated return value would
+   silently corrupt the copy's destination rather than unblock the caller.
+   **Where boot now stalls**: still not a spin — the same "Guru Meditation
+   Error" panic text is still the first console output (no new line to
+   ratchet on), but the fault has moved forward, from the old `memcpy`
+   call to a **new** `INSTRUCTION_ACCESS_FAULT` at `0x4000_071c` (step
+   402,113), which this time **does** resolve to a named symbol:
+   `ets_efuse_get_spiconfig`, in the main `esp32c3.rom.ld` table (not a
+   libc/string function, so out of Task D2's scope per its brief's explicit
+   ruling). As before, the firmware's own panic handler catches it, prints
+   the dump, and tries to reboot via the same unstubbed `software_reset_cpu`
+   (`0x4000_0094`) as before, which also faults and loops. Pinned down
+   exactly in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`.
+   This is the natural next Milestone 3 candidate: decide `ets_efuse_get_spiconfig`'s
+   HLE semantics (it reads SPI flash pin/mode configuration out of eFuse;
+   `components/esp_rom/esp32c3/ld/esp32c3.rom.ld` names it but this codebase
+   models no eFuse block at all yet) and stub it.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

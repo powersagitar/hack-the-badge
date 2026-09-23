@@ -35,11 +35,16 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // RTC_CNTL's RTC timer (emulator-core/src/peripherals/rtc_cntl.rs)
       // let boot's rtc_cntl_ll_get_rtc_time()-based busy-wait actually
       // terminate, so boot now runs past a spin loop that previously kept
-      // it fault-free forever, and hits a genuine (and, for now,
-      // deliberately not yet stubbed -- see the module doc there) ROM-call
-      // fault at step 401,761. See
+      // it fault-free forever, and hits a genuine ROM-call fault.
+      //
+      // Milestone 3 Task D2: ROM libc memcpy is now HLE-stubbed
+      // (emulator-core/src/cpu/rom_stubs.rs's RomStubEffect::Memcpy), which
+      // unblocked the Task-D1-era fault (at step 401,761) -- boot now runs
+      // further and hits a *different* unstubbed ROM call
+      // (ets_efuse_get_spiconfig, step 402,113), still well within this
+      // 500,000-step budget, so the trap count here stays 1. See
       // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call
+      // boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call
       // and docs/firmware-emulator-notes.md for the full story.
       expect(report.traps).toBe(1);
 

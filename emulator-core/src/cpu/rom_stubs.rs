@@ -133,6 +133,25 @@ pub enum RomStubEffect {
     /// caller immediately uses, so a fabricated answer is worse than a fault.
     /// See [`Int64Op`] for the operand/result register convention.
     Int64(Int64Op),
+    /// `void *memcpy(void *dst, const void *src, size_t n)`: copies `n = a2`
+    /// bytes from `src = a1` to `dst = a0`, through the bus, one byte at a
+    /// time (this project's whole `Bus` interface is byte/half/word
+    /// addressed with no bulk-copy primitive, and a byte-at-a-time copy is
+    /// simplest and gives correct results regardless of alignment), and
+    /// returns `dst` — already sitting in `a0`, so nothing else needs
+    /// writing. Length is clamped to [`MAX_STUB_MEMORY_BYTES`], same as
+    /// [`RomStubEffect::Memset`].
+    ///
+    /// Real `memcpy`'s behavior is undefined for overlapping `dst`/`src`
+    /// ranges (that's what `memmove` is for), so a forward byte-by-byte copy
+    /// is a conforming implementation regardless of whether the ranges
+    /// happen to overlap.
+    ///
+    /// Real, not a generic status stub, for the same reason as
+    /// [`RomStubEffect::Memset`]: a `memcpy` that returned a plausible value
+    /// without copying the bytes wouldn't unblock the caller, it would
+    /// silently corrupt it.
+    Memcpy,
 }
 
 /// The libgcc 64-bit integer helpers this project emulates.
@@ -249,6 +268,14 @@ impl RomStub {
         }
     }
 
+    /// A real high-level-emulated `memcpy` — see [`RomStubEffect::Memcpy`].
+    pub const fn memcpy(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Memcpy,
+        }
+    }
+
     /// A real high-level-emulated libgcc 64-bit helper — see [`Int64Op`].
     pub const fn int64(name: &'static str, op: Int64Op) -> Self {
         Self {
@@ -334,6 +361,7 @@ mod tests {
     fn constructors_map_to_the_expected_effects() {
         assert_eq!(RomStub::void("ets_delay_us").effect, RomStubEffect::Void);
         assert_eq!(RomStub::memset("memset").effect, RomStubEffect::Memset);
+        assert_eq!(RomStub::memcpy("memcpy").effect, RomStubEffect::Memcpy);
         assert_eq!(RomStub::returning("x", 7).effect, RomStubEffect::Return(7));
     }
 

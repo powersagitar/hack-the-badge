@@ -236,6 +236,19 @@ impl Cpu {
                 }
                 // `memset` returns `dst`, which is already in `a0`.
             }
+            RomStubEffect::Memcpy => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                for i in 0..len {
+                    let byte = bus.read8(src.wrapping_add(i));
+                    bus.write8(dst.wrapping_add(i), byte);
+                }
+                // `memcpy` returns `dst`, which is already in `a0`.
+            }
             RomStubEffect::Int64(op) => {
                 // RV32 ABI: 64-bit values live in aligned register pairs, low
                 // word first -- see `Int64Op`'s doc.
@@ -1309,6 +1322,112 @@ mod tests {
         assert_eq!(&bus.mem[0x200..0x205], &[0xab; 5]);
         assert_eq!(bus.mem[0x205], 0x11, "must not write past n bytes");
         assert_eq!(cpu.regs.read(10), 0x200, "memset returns dst");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn memcpy_rom_stub_really_copies_the_bytes_through_the_bus() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memcpy("memcpy"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        // memcpy(dst = 0x200, src = 0x300, n = 5)
+        for (i, b) in [0xde, 0xad, 0xbe, 0xef, 0x42].iter().enumerate() {
+            bus.mem[0x300 + i] = *b;
+        }
+        bus.mem[0x205] = 0x11; // sentinel just past dst's end
+        cpu.regs.write(10, 0x200); // a0 = dst
+        cpu.regs.write(11, 0x300); // a1 = src
+        cpu.regs.write(12, 5); // a2 = n
+        cpu.regs.write(1, 0x40); // ra
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[0x200..0x205], &[0xde, 0xad, 0xbe, 0xef, 0x42]);
+        assert_eq!(bus.mem[0x205], 0x11, "must not write past n bytes");
+        assert_eq!(cpu.regs.read(10), 0x200, "memcpy returns dst");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn memcpy_rom_stub_with_n_zero_copies_nothing_but_still_returns_dst() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memcpy("memcpy"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.mem[0x200] = 0x99; // must survive untouched
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0x300);
+        cpu.regs.write(12, 0); // n = 0
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(bus.mem[0x200], 0x99, "n = 0 must copy nothing");
+        assert_eq!(
+            cpu.regs.read(10),
+            0x200,
+            "memcpy returns dst even for n = 0"
+        );
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn memcpy_rom_stub_handles_unaligned_src_and_dst_and_a_length_not_a_multiple_of_4() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memcpy("memcpy"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        // src and dst both deliberately not 4-byte aligned; n = 7 (not a
+        // multiple of 4 either) -- real memcpy must handle both correctly
+        // since there's no alignment guarantee on a real `void *` call.
+        let src = 0x301usize;
+        let dst = 0x202usize;
+        let payload = [1u8, 2, 3, 4, 5, 6, 7];
+        bus.mem[src..src + payload.len()].copy_from_slice(&payload);
+        bus.mem[dst + payload.len()] = 0xaa; // sentinel just past dst's end
+
+        cpu.regs.write(10, dst as u32);
+        cpu.regs.write(11, src as u32);
+        cpu.regs.write(12, payload.len() as u32);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[dst..dst + payload.len()], &payload);
+        assert_eq!(bus.mem[dst + payload.len()], 0xaa, "must not overrun");
+        assert_eq!(cpu.regs.read(10), dst as u32);
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn memcpy_rom_stub_length_is_capped_so_a_garbage_argument_cannot_hang() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::memcpy("memcpy"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0x300);
+        cpu.regs.write(12, u32::MAX); // nonsense length
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        // Completes rather than looping ~4 billion times.
+        cpu.step(&mut bus);
         assert_eq!(cpu.regs.pc, 0x40);
     }
 

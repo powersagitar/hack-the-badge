@@ -40,14 +40,18 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // Milestone 3 Task D1: reduced from 2,000,000. Modeling RTC_CNTL's RTC
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
-    // budget into a *new*, later, unstubbed-ROM-call fault at step 401,761
-    // (see `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
+    // budget into a *new*, later, unstubbed-ROM-call fault (see
+    // `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`
     // below, which pins that exact new stall). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
-    // reaches every one of the named early-boot ROM calls below" -- true
-    // and comfortably clear of the new fault (~51,761-step/~13% margin),
-    // without this test needing to also pin the new, later stall (that's
-    // the other test's job).
+    // reaches every one of the named early-boot ROM calls below" -- true.
+    // Task D2 (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`)
+    // moved the fault this budget stays clear of from step 401,761 (an
+    // unstubbed `memcpy`) to step 402,113 (an unstubbed
+    // `ets_efuse_get_spiconfig`) -- comfortably clear either way
+    // (~52,113-step/~15% margin at the new fault), without this test
+    // needing to also pin the new, later stall (that's the other test's
+    // job).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -170,17 +174,21 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     }
 }
 
-/// Where boot currently *stops*: **not** a spin loop any more. Modeling
-/// RTC_CNTL's RTC timer (`crate::peripherals::rtc_cntl`, Milestone 3 Task
-/// D1) let `rtc_cntl_ll_get_rtc_time()`'s caller's busy-wait actually
-/// terminate, so boot now runs hundreds of thousands of steps further and
-/// prints a full ESP-IDF boot log — but then hits a **new, unstubbed ROM
-/// call** at a fixed address (`0x4000_0358`) that doesn't correspond to any
-/// named symbol in ESP-IDF v5.5.3's esp32c3 ROM linker scripts (checked
-/// exhaustively: every `esp32c3.rom*.ld` file under
-/// `components/esp_rom/esp32c3/ld/`, including the BLE/BT variants — see
-/// the Task D1 report). This is a real `INSTRUCTION_ACCESS_FAULT`, caught by
-/// the firmware's own already-working panic handler (it prints a full "Guru
+/// Where boot currently *stops*: **not** a spin loop any more. Milestone 3
+/// Task D2 (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`)
+/// unblocked the fault this test used to pin (an unstubbed ROM `memcpy` call
+/// at `0x4000_0358`, from
+/// `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld` — see the Task D1 and
+/// D2 reports), so boot now runs further still and hits a **new** unstubbed
+/// ROM call, this time at a fixed address (`0x4000_071c`) that *does*
+/// correspond to a named symbol: `ets_efuse_get_spiconfig`, in the main
+/// `esp32c3.rom.ld` symbol table (confirmed by fetching that file at tag
+/// `v5.5.3` — see `emulator_core::rom`'s module doc). Per Task D2's
+/// brief/orchestrator ruling, this address is deliberately **not** stubbed
+/// by that task: it isn't a ROM libc/string function (the only family that
+/// task was scoped to extend), so implementing it is left for the next
+/// task. This is a real `INSTRUCTION_ACCESS_FAULT`, caught by the
+/// firmware's own already-working panic handler (it prints a full "Guru
 /// Meditation Error" register dump via `ets_printf`, confirming `mtvec`,
 /// `ets_printf`, and this emulator's console capture are all working
 /// correctly). The panic handler's own reboot attempt then calls a second
@@ -188,47 +196,39 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// `esp32c3.rom.ld`), which faults too, re-entering the panic handler's
 /// re-entrancy guard ("Panic handler entered multiple times...") and
 /// retrying forever — this emulator has no way to actually reboot, so this
-/// retry loop is the terminal state within any reasonable step budget.
+/// retry loop is the terminal state within any reasonable step budget. Per
+/// the brief, `software_reset_cpu` is not stubbed either (it's only reached
+/// via the panic path, and stubbing it wouldn't fix the root cause at
+/// `0x4000_071c`).
 ///
-/// Per Task D1's brief, no new ROM stub was added for either address in
-/// that task: the probe here doesn't demonstrate *which* stub the firmware
-/// actually needs at `0x4000_0358` (its symbol name wasn't identified), so
-/// guessing one would risk silently corrupting the panic/reboot path rather
-/// than the loud, diagnosable fault this test pins down instead. Confirmed
-/// (via a throwaway experiment, not committed) that this exact fault address
-/// and PC are reached regardless of the specific numeric value
-/// `crate::peripherals::rtc_cntl::RtcCntl`'s latch derives — i.e. this is a
-/// deterministic *next* boundary in the firmware itself, not an artifact of
-/// this task's specific RTC-tick-rate placeholder.
-///
-/// **History**: until Milestone 3 Task D1
-/// (`emulator-core/src/peripherals/rtc_cntl.rs`), this test pinned an
-/// *earlier* stall — a spin on RTCCNTL's then-unmodeled
-/// `TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`. That peripheral is
-/// now modeled (see `emulator-core/tests/boot_progress.rs` and
-/// `docs/firmware-emulator-notes.md`'s "Known limitations"), so this test's
+/// **History**: until Milestone 3 Task D2, this test pinned an *earlier*
+/// stall — an unstubbed ROM `memcpy` call at `0x4000_0358` whose symbol
+/// wasn't identified at the time (see the Task D1 report). That call is now
+/// stubbed (`emulator-core/src/rom.rs`'s `MEMCPY` entry), so this test's
 /// expected stall point moved forward to this new unstubbed-ROM-call fault.
 #[test]
-fn boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call() {
+fn boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Comfortably past the fault (step 401,761) but well before the second
-    // fault (`software_reset_cpu`, first observed between 500,000 and
-    // 750,000 steps in a throwaway measurement) -- a single, stable
-    // snapshot: exactly one trap has occurred, at exactly this address.
+    // Comfortably past the fault (step 402,113) but well before the second
+    // fault (`software_reset_cpu`, during the panic handler's own reboot
+    // attempt) -- a single, stable snapshot: exactly one trap has occurred,
+    // at exactly this address. 500,000 is the same budget the pre-Task-D2
+    // version of this test used, re-measured to still land in the same
+    // single-trap window after this task's fix.
     let summary = rt.run(500_000);
     assert_eq!(
         summary.last_instruction_fault,
-        Some(0x4000_0358),
-        "expected the new unstubbed-ROM-call fault at 0x4000_0358"
+        Some(0x4000_071c),
+        "expected the new unstubbed-ROM-call fault at 0x4000_071c \
+         (ets_efuse_get_spiconfig)"
     );
     assert_eq!(
         summary.traps, 1,
         "expected exactly one trap so far (the fault above) -- the second \
          fault (software_reset_cpu, during the panic handler's own reboot \
-         attempt) isn't reached until somewhere between 500,000 and 750,000 \
-         steps, per a throwaway measurement"
+         attempt) is not reached within this budget"
     );
 
     // The firmware's own panic handler ran and printed a full crash report

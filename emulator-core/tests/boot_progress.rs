@@ -19,6 +19,21 @@
 //! and `docs/firmware-emulator-notes.md`). [`first_console_output_is_the_firmware_s_own_panic_report`]
 //! is this file's first real console-line rung, using
 //! [`boot_until_console_contains`] below exactly as Task 3 anticipated.
+//!
+//! Task D2 status: ROM libc `memcpy` (`emulator-core/src/cpu/rom_stubs.rs`'s
+//! `RomStubEffect::Memcpy`) unblocked the Task-D1-era fault at `0x4000_0358`,
+//! but boot's first console line is still the same generic "Guru Meditation
+//! Error" text — no *new* line to ratchet on, since the very next instruction
+//! after the unblocked `memcpy` call runs straight into another unstubbed
+//! ROM call (`ets_efuse_get_spiconfig`, `0x4000_071c` — see
+//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`).
+//! Per this file's own contingency for that case (see Task 3's note above),
+//! [`boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site`] is a
+//! no-fault-before-step-N rung instead: it asserts zero traps through the
+//! *old* Task-D1-era fault's step count, i.e. concrete, measurable evidence
+//! that this task's fix moved the wall forward rather than just moving a
+//! test's expected number.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -118,4 +133,32 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 #[test]
 fn first_console_output_is_the_firmware_s_own_panic_report() {
     assert_reaches("Guru Meditation Error", 500_000);
+}
+
+/// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
+/// doc). Before this task, boot faulted on an unstubbed ROM `memcpy` call at
+/// a fixed address reached at step 401,761 from a cold boot (Task D1
+/// report). `emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`
+/// now intercepts that call for real, so a run just past the old fault's
+/// step count should show **zero** traps of any kind -- concrete, measured
+/// evidence the fix bought real forward progress, not just a relabeled
+/// stall. (Boot does still stall shortly after -- at step 402,113, on a
+/// *different*, unstubbed ROM call, `ets_efuse_get_spiconfig` -- pinned
+/// exactly by `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_on_the_unstubbed_ets_efuse_get_spiconfig_rom_call`,
+/// which is this task's job to leave accurately pinned, not this rung's.)
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    // 401,761: the exact step the pre-Task-D2 `memcpy` fault occurred at.
+    // Running exactly that many steps and finding zero traps proves the
+    // call that used to fault right at this boundary now completes.
+    let summary = rt.run(401_761);
+    assert_eq!(
+        summary.traps, 0,
+        "expected zero traps through the pre-Task-D2 memcpy fault's exact \
+         step count (401,761) now that memcpy is HLE-stubbed; got \
+         {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
+        summary.traps, summary.last_instruction_fault, summary.pc
+    );
 }
