@@ -311,7 +311,16 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// badge-specific or identity data). Measured reaching the console at step
 /// 648,457 -- close to the pre-Task-D5 measurement (645,410) purely by
 /// coincidence of similar code-path length, not because the cause is the
-/// same. 650,000 remains a comfortable budget.
+/// same.
+///
+/// **Fix round 1, M3**: the original 650,000 budget was mislabeled
+/// "comfortable" when its actual margin over 648,457 was 1,543 steps
+/// (~0.2%) -- genuinely tight, not comfortable. Bumped to 660,000 (margin
+/// 11,543 steps, ~1.8%), still comfortably clear of the next event in this
+/// trace (the panic handler's own reboot-retry fault, measured at step
+/// 649,072 -- see `emulator-core/tests/rom_stub_boot.rs`'s renamed pinned-
+/// stall test, which pins that fault step directly) and of the loop's next
+/// iteration (measured at step 889,556).
 ///
 /// This rung is **deliberately expected to break** once a later task fixes
 /// (or stubs around) the unstubbed `qsort` ROM call: at that point this
@@ -319,7 +328,7 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// delete or replace this test rather than chase a new pinned value here.
 #[test]
 fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault() {
-    assert_reaches("Rebooting...", 650_000);
+    assert_reaches("Rebooting...", 660_000);
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module

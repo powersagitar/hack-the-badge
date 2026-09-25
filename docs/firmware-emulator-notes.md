@@ -659,6 +659,23 @@ predicted these blockers would surface once TIMG unblocks further boot:
 6. **`TICKS_PER_STEP = 1`** (the emulator's steps-to-real-cycles ratio) is
    roughly 10× the real SYSTIMER/CPU clock ratio — harmless while boot never
    reaches timing-sensitive code, but will need recalibrating once it does.
+7. **The real bootloader's extra "boot partition lookup" DROM page isn't
+   modeled** (Task D5 fix round 1, M4). Beyond widening each XIP segment to
+   its own containing page (item 1 above), `set_cache_and_start_app()`
+   (`bootloader_support/src/bootloader_utility.c:1084-1086`, v5.5.3) also
+   maps one *extra*, unrelated MMU entry: `MMU_DROM_END_ENTRY_VADDR`
+   (`hal/esp32c3/include/hal/mmu_ll.h`: `SOC_DRAM_FLASH_ADDRESS_HIGH -
+   0x10000`, i.e. the very last page of the whole DROM flash-cache
+   aperture) mapped to the *same physical page* as the DROM segment's own
+   aligned start (`drom_addr_aligned`) — the source comment says this is
+   "for app to find the boot partition." `crate::mem::bus::FirmwareBus`
+   doesn't add this extra mapping at all today; nothing in the observed
+   boot trace through Task D5's own new stall (the unstubbed `qsort` call)
+   has touched that fixed high address, so it's not yet a confirmed
+   blocker — but it's a plausible **candidate cause of a later
+   partition-table/`esp_partition_find`-style stall**, worth checking first
+   if boot ever gets past `qsort` and stalls again on an unmapped read
+   inside the DROM aperture near its top end.
 
 None of the above are correctness bugs *today* — they're dormant because
 boot doesn't reach the code paths that would exercise them. They're

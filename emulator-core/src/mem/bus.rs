@@ -10,7 +10,10 @@
 //!    own `[load_addr, load_addr + len)` -- see
 //!    [`FirmwareBus::from_segments`]'s doc for why (page-granular flash-
 //!    cache MMU mapping, matching what the real 2nd-stage bootloader's
-//!    `set_cache_and_start_app()` programs; Task D5).
+//!    `set_cache_and_start_app()` programs; Task D5). A byte inside that
+//!    mapped window but past the actual `flash` buffer's own length reads
+//!    `0xFF` (Task D5 fix round 1, M2) -- real NOR flash's erased state,
+//!    not the catch-all tier's `0`.
 //! 2. **RAM-copied**: a real, mutable, per-segment `Vec<u8>` that the
 //!    segment's bytes were copied into at boot. Reads/writes go straight to
 //!    it.
@@ -213,6 +216,47 @@ pub struct FirmwareBus {
 /// always has *some* bytes there (it's one contiguous chip), but a
 /// synthetic or browser-supplied partial image sometimes won't.
 ///
+/// ## The window's end is computed from the true page grid, not from the
+/// ## (possibly clamped) leading extension
+///
+/// **Fix round 1, Important finding**: an earlier version computed the end
+/// as `aligned_load_addr + round_up(back_extend + len, page_size)`. That is
+/// only correct when the leading extension reached the full `gap` (i.e.
+/// `aligned_load_addr` really is page-aligned). When it was clamped short
+/// (no earlier bytes available -- see above), `aligned_load_addr` is
+/// *not* page-aligned, so rounding up from it lands on the wrong grid and
+/// overshoots into the *next* page by up to `gap - back_extend` bytes --
+/// concretely, `load_addr=0x4200_0020, file_offset=0, len=2` used to
+/// produce `[0x4200_0020, 0x4201_0020)`, 0x20 bytes into the next page,
+/// silently mapping address space that must stay a genuine catch-all miss.
+/// Fixed by computing the end independently, directly from the *true*
+/// (unclamped) page grid -- `round_up(load_addr + len, page_size)` -- which
+/// is always 0-grid-aligned regardless of where the clamped start landed,
+/// then subtracting `aligned_load_addr` to get the length. See
+/// `xip_page_window_clamps_gracefully_when_no_earlier_flash_bytes_exist`'s
+/// assertion that the next page is still a catch-all miss.
+///
+/// ## `aligned_file_offset`'s assumption
+///
+/// `aligned_file_offset = file_offset - back_extend` implicitly assumes the
+/// segment's flash *file offset* and its *virtual load address* have the
+/// same low bits mod `page_size` -- i.e. that subtracting the vaddr gap from
+/// `file_offset` lands on that same offset's own page-aligned start. Real
+/// hardware doesn't need this (`set_cache_and_start_app` page-aligns the
+/// physical flash paddr *independently* of the vaddr,
+/// `bootloader_utility.c:1068`ish: `drom_addr_aligned = drom_addr &
+/// MMU_FLASH_MASK_FROM_VAL(mmu_page_size)`), but this emulator's `flash`
+/// buffer is indexed by a single flat `file_offset`, not by a separate
+/// paddr, so the two must coincide for this subtraction to land on the
+/// right byte. This holds for every segment `esptool`-produced app images
+/// (and specifically `factory.bin`) actually contain: an app image's
+/// segments are written contiguously into the flash partition in link
+/// order with no gaps, so each segment's flash offset within the partition
+/// equals `load_addr`'s own low bits by construction (confirmed directly:
+/// segment 0's `load_addr=0x3c13_0020` and `file_offset=0x20` already agree
+/// mod 64 KiB). Not re-derived from first principles here -- flagged as an
+/// assumption specific to esptool-style images, not a general property.
+///
 /// All arithmetic here is checked -- this must never panic on adversarial
 /// input. `FirmwareEmulator::new` (`emulator-wasm`) reaches
 /// [`FirmwareBus::from_segments`] directly with a browser-supplied image,
@@ -246,11 +290,18 @@ fn xip_page_window(
     let aligned_load_addr = load_addr - back_extend_u32;
     let aligned_file_offset = file_offset - back_extend;
 
-    let Some(raw_len) = back_extend_u32.checked_add(len_u32) else {
+    // The end must come from the TRUE (unclamped) page grid -- see this
+    // function's doc comment's "Fix round 1" note -- not from rounding up
+    // `back_extend + len` starting at `aligned_load_addr`, which is only
+    // grid-aligned when `back_extend == gap`.
+    let Some(true_end) = load_addr.checked_add(len_u32) else {
         return fallback;
     };
-    let page_count = raw_len.div_ceil(page_size);
-    let Some(aligned_len) = page_count.checked_mul(page_size) else {
+    let page_count_end = true_end.div_ceil(page_size);
+    let Some(page_end) = page_count_end.checked_mul(page_size) else {
+        return fallback;
+    };
+    let Some(aligned_len) = page_end.checked_sub(aligned_load_addr) else {
         return fallback;
     };
 
@@ -393,7 +444,17 @@ impl FirmwareBus {
     fn read_byte(&mut self, addr: u32) -> u8 {
         if let Some(region) = self.xip_regions.iter().find(|r| r.contains(addr)) {
             let offset = region.file_offset + (addr - region.load_addr) as usize;
-            return self.flash.get(offset).copied().unwrap_or(0);
+            // Fix round 1, M2: a byte inside a *mapped* XIP window but past
+            // the end of the actual `flash` buffer (e.g. the trailing part
+            // of a page-widened region this emulator's reconstructed image
+            // doesn't carry real bytes for -- see
+            // `xip_page_window`'s doc) reads as `0xFF`, not `0`: real NOR
+            // flash's erased/blank state is all-ones, not all-zeros. This
+            // is distinct from the bus's never-panic *catch-all* tier below
+            // (genuinely unmapped address space), which still reads `0` --
+            // that's a different, deliberate convention (see the module
+            // doc), not flash-specific.
+            return self.flash.get(offset).copied().unwrap_or(0xFF);
         }
         if let Some(region) = self.ram_regions.iter().find(|r| r.contains(addr)) {
             let offset = (addr - region.load_addr) as usize;
@@ -693,10 +754,12 @@ mod tests {
         // A trailing same-page address past the segment's own declared end
         // must also be mapped now (real hardware's MMU maps the whole
         // page): this synthetic flash buffer has no real bytes there, so it
-        // reads 0, but via the mapped region's own out-of-bounds fallback,
-        // not the catch-all.
+        // reads 0xFF (Task D5 fix round 1, M2 -- real NOR flash's erased
+        // state), via the mapped region's own out-of-bounds fallback, not
+        // the catch-all (which would read 0 instead -- a different,
+        // deliberate convention for genuinely unmapped space).
         let just_past_segment = load_addr + seg_data.len() as u32;
-        assert_eq!(bus.read8(just_past_segment), 0);
+        assert_eq!(bus.read8(just_past_segment), 0xFF);
         assert!(
             bus.unmapped_log().is_empty(),
             "trailing same-page bytes must be mapped too, not fall through to the catch-all"
@@ -741,6 +804,25 @@ mod tests {
 
         assert_eq!(bus.read8(0x4200_0020), 0x01);
         assert_eq!(bus.read8(0x4200_0021), 0x02);
+
+        // Fix round 1, Important finding: when the leading extension is
+        // clamped short (no earlier bytes available, as here), the window's
+        // START isn't page-aligned, so its END must be computed from the
+        // TRUE (unclamped) page grid -- `round_up(load_addr + len,
+        // page_size)` -- not by rounding up from the clamped, unaligned
+        // start. An earlier version got this wrong and produced a window
+        // extending 0x20 bytes into the NEXT page (`[0x4200_0020,
+        // 0x4201_0020)` instead of `[0x4200_0020, 0x4201_0000)`). Assert the
+        // true page boundary is still a genuine catch-all miss.
+        assert_eq!(bus.read8(0x4201_0000), 0);
+        assert!(
+            bus.unmapped_log()
+                .iter()
+                .any(|a| a.addr == 0x4201_0000 && !a.is_write),
+            "0x4201_0000 (the next page after this clamped window's TRUE \
+             page-grid end) must show up in unmapped_log as a genuine \
+             catch-all miss, not silently be swept into the XIP window"
+        );
     }
 
     #[test]

@@ -236,13 +236,27 @@ fn boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handl
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // 650,000 steps is a single, stable, two-trap snapshot: comfortably
-    // past both the qsort INSTRUCTION_ACCESS_FAULT (measured at step
-    // 408,481) and the software_reset_cpu INSTRUCTION_ACCESS_FAULT it
-    // leads to (measured reaching the console at step 648,457), but well
-    // before the panic handler's re-entrancy guard kicks in and the
-    // "Rebooting"/panic text starts repeating many more times.
-    let summary = rt.run(650_000);
+    // 660,000 steps is a single, stable, two-trap snapshot: past both the
+    // qsort INSTRUCTION_ACCESS_FAULT (measured at step 408,481) and the
+    // software_reset_cpu INSTRUCTION_ACCESS_FAULT it leads to (measured at
+    // step 649,072 -- NOT the same as the step the console *text*
+    // "Rebooting..." appears at, 648,457: that print happens inside
+    // panic_restart(), just *before* the call into the still-unstubbed
+    // software_reset_cpu that actually faults, so the two steps are close
+    // but distinct events -- see
+    // `emulator-core/tests/boot_progress.rs`'s
+    // `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`
+    // for the console-text rung), well before the panic handler's
+    // re-entrancy guard kicks in and the "Rebooting"/panic text starts
+    // repeating many more times (the next iteration's fault was measured at
+    // step 889,556).
+    //
+    // Fix round 1, M3: this budget used to be 650,000, whose actual margin
+    // over the real fault step (649,072) was 928 steps (~0.14%) -- tight,
+    // not "comfortable" as an earlier version of this comment claimed.
+    // 660,000 gives 10,928 steps (~1.7%) margin instead, still nowhere near
+    // the next loop iteration at 889,556.
+    let summary = rt.run(660_000);
     assert_eq!(
         summary.traps, 2,
         "expected exactly two traps so far: the unstubbed qsort call's \
