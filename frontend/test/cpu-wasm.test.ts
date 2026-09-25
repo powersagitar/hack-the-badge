@@ -94,7 +94,21 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // ~step 648,457, past this budget). See
       // emulator-core/tests/rom_stub_boot.rs's
       // boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message
-      // and docs/firmware-emulator-notes.md for the full story.
+      // (renamed in Task D6, below) and docs/firmware-emulator-notes.md for
+      // the full story.
+      //
+      // Milestone 3 Task D6: ROM qsort is now real guest-executed RV32 code
+      // mapped into the ROM address space (emulator-core/src/rom.rs's
+      // module doc, entry 14), so the step-408,481 fault is gone. Its
+      // caller, ESP-IDF's s_prepare_reserved_regions(), then finds that
+      // the sorted reserved-region list overlaps. Entry 0 comes from the
+      // unbacked ROM layout table (ets_rom_layout_p reads 0). The firmware
+      // logs the overlap and calls abort(), which reaches panic_abort()'s
+      // ILLEGAL_INSTRUCTION trap at step 409,071. That is still the only
+      // trap within this 500,000-step budget. The software_reset_cpu
+      // reboot-retry fault follows at step 647,238, past this budget. See
+      // emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message.
       expect(report.traps).toBe(1);
 
       const fb = handle.framebuffer();

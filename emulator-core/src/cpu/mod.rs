@@ -8,10 +8,16 @@
 //! ESP32-C3-specific interrupt controller/timer up to [`Cpu::raise_interrupt`].
 
 mod decode;
+pub mod encode;
 mod execute;
 mod registers;
 pub mod rom_stubs;
 
+/// Crate-internal access to the raw decoder, so guest-executed code blobs
+/// assembled with [`encode`] (see `crate::rom`) can prove every word they
+/// emit decodes through this core's own decoder.
+#[cfg(test)]
+pub(crate) use decode::decode_32;
 pub use decode::{AluOp, BranchKind, CsrOp, CsrSrc, Instruction, LoadKind, MulDivOp, StoreKind};
 pub use registers::{csr_addr, exception_code, mstatus_bits, Csrs, Registers};
 pub use rom_stubs::{RomStub, RomStubTable};

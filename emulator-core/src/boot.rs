@@ -108,7 +108,13 @@ pub fn initial_stack_pointer() -> u32 {
 
 /// Same as [`boot_from_factory_image`], plus the ESP32-C3 mask-ROM
 /// high-level-emulation stub table ([`crate::rom::esp32c3_rom_stubs`])
-/// installed on the returned [`Cpu`].
+/// installed on the returned [`Cpu`], and the ESP32-C3's guest-executed ROM
+/// code blobs ([`crate::rom::install_esp32c3_rom_code`] -- currently ROM
+/// libc `qsort`, Milestone 3 Task D6) mapped onto the returned
+/// [`FirmwareBus`]. The two are complementary halves of "the ROM": stubs for
+/// routines whose effect can be applied atomically, real guest code for the
+/// ones that must call back into firmware (see [`crate::rom`]'s module doc,
+/// entry 14).
 ///
 /// ## Why this is a separate entry point rather than the default
 ///
@@ -128,8 +134,9 @@ pub fn initial_stack_pointer() -> u32 {
 pub fn boot_from_factory_image_with_rom_stubs(
     image: &[u8],
 ) -> Result<(Cpu, FirmwareBus), ImageParseError> {
-    let (mut cpu, bus) = boot_from_factory_image(image)?;
+    let (mut cpu, mut bus) = boot_from_factory_image(image)?;
     cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs());
+    crate::rom::install_esp32c3_rom_code(&mut bus);
     Ok((cpu, bus))
 }
 

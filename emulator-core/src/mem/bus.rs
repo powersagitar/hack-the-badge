@@ -17,22 +17,30 @@
 //! 2. **RAM-copied**: a real, mutable, per-segment `Vec<u8>` that the
 //!    segment's bytes were copied into at boot. Reads/writes go straight to
 //!    it.
-//! 3. **SYSTIMER** ([`crate::mem::soc::SYSTIMER_RANGE`]): routed to
+//! 3. **ROM code** ([`RomCodeBlob`]s installed via
+//!    [`FirmwareBus::map_rom_code`]): small, fixed, read-only, *executable*
+//!    code blobs at fixed mask-ROM addresses (Milestone 3 Task D6) -- the
+//!    guest-executed ROM routines that `crate::rom` can't HLE-stub
+//!    atomically because they call back into firmware (ROM `qsort`). Reads
+//!    and fetches return the blob's bytes; writes are dropped silently, like
+//!    XIP flash. Only each blob's own bytes are mapped: every other ROM
+//!    address stays unmapped, so its fetch still traps.
+//! 4. **SYSTIMER** ([`crate::mem::soc::SYSTIMER_RANGE`]): routed to
 //!    [`FirmwareBus::systimer`], a concrete named field per this plan's
 //!    pre-flight "no trait-object peripheral dispatch" ruling — see
 //!    `crate::peripherals` and `crate::peripherals::systimer`.
-//! 4. **INTERRUPT_CORE0** ([`crate::mem::soc::INTERRUPT_CORE0_RANGE`]):
+//! 5. **INTERRUPT_CORE0** ([`crate::mem::soc::INTERRUPT_CORE0_RANGE`]):
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
 //!    (`CPU_INT_EIP_STATUS_REG`) needs `systimer`'s live pending state to
 //!    answer a read, which is exactly the cross-peripheral access the
 //!    ruling anticipated: [`FirmwareBus::read_byte`] reads both concrete
 //!    fields directly, no trait object involved.
-//! 5. **GPIO** ([`crate::mem::soc::GPIO_RANGE`]): routed to
+//! 6. **GPIO** ([`crate::mem::soc::GPIO_RANGE`]): routed to
 //!    [`FirmwareBus::gpio`], same ruling — see `crate::peripherals::gpio`
 //!    for the register model and the emulated 74HC165 button shift
 //!    register.
-//! 6. **SPI2/GPSPI2** ([`crate::mem::soc::SPI2_RANGE`]): routed to
+//! 7. **SPI2/GPSPI2** ([`crate::mem::soc::SPI2_RANGE`]): routed to
 //!    [`FirmwareBus::spi`], same ruling — see `crate::peripherals::spi` for
 //!    the register model and the ST7789 command/pixel-stream interpreter.
 //!    A triggering write (one that sets `SPI_CMD_REG`'s `SPI_USR` bit)
@@ -42,21 +50,21 @@
 //!    [`FirmwareBus::write_byte`] reads `self.gpio.pin_level(0)` directly
 //!    and hands it to [`crate::peripherals::spi::Spi::process_transaction`],
 //!    no trait object involved.
-//! 7. **USB-Serial-JTAG** ([`crate::mem::soc::USB_SERIAL_JTAG_RANGE`]):
+//! 8. **USB-Serial-JTAG** ([`crate::mem::soc::USB_SERIAL_JTAG_RANGE`]):
 //!    routed to [`FirmwareBus::usb_serial_jtag`], same ruling — see
 //!    `crate::peripherals::usb_serial_jtag`. TX-byte writes also need a
 //!    live mutable reference to [`FirmwareBus::console`] (the capped sink
 //!    that firmware console output accumulates into); `FirmwareBus::write_byte`
 //!    passes `&mut self.console` straight through, another instance of the
 //!    "no trait object" ruling's direct concrete-field access.
-//! 8. **TIMG0** ([`crate::mem::soc::TIMG0_RANGE`]): routed to
+//! 9. **TIMG0** ([`crate::mem::soc::TIMG0_RANGE`]): routed to
 //!    [`FirmwareBus::timg0`], same ruling — see `crate::peripherals::timg`
 //!    for the RTC slow-clock calibration model `rtc_clk_cal_internal()`
 //!    polls at boot, plus inert MWDT watchdog storage.
-//! 9. **TIMG1** ([`crate::mem::soc::TIMG1_RANGE`]): routed to
+//! 10. **TIMG1** ([`crate::mem::soc::TIMG1_RANGE`]): routed to
 //!    [`FirmwareBus::timg1`], same peripheral model as TIMG0 (a second,
 //!    independent instance) — same ruling.
-//! 10. **RTC_CNTL** ([`crate::mem::soc::RTC_CNTL_RANGE`]): routed to
+//! 11. **RTC_CNTL** ([`crate::mem::soc::RTC_CNTL_RANGE`]): routed to
 //!    [`FirmwareBus::rtc_cntl`], same ruling — see
 //!    `crate::peripherals::rtc_cntl` for the RTC timer latch model
 //!    `rtc_cntl_ll_get_rtc_time()` polls at boot. A triggering write (one
@@ -71,7 +79,7 @@
 //!    [`crate::peripherals::rtc_cntl::RtcCntl::handles`], even though the
 //!    peripheral itself gives them real (if inert) storage — see that
 //!    module's doc.
-//! 11. **Catch-all**: any address covered by none of the above (every
+//! 12. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -153,16 +161,55 @@ impl RamRegion {
     }
 }
 
+/// A small, fixed, read-only, **executable** code blob mapped at a fixed
+/// address: `[base, base + 4 * words.len())` reads (and fetches) `words` as
+/// little-endian 32-bit instruction words. Writes are dropped, like XIP flash
+/// (real mask ROM is read-only).
+///
+/// This is the generic, chip-agnostic half of "guest-executed ROM
+/// routines" (Milestone 3 Task D6): some ROM functions can't be HLE-stubbed
+/// atomically by `crate::cpu::rom_stubs` because they call back into
+/// firmware code mid-flight (ROM libc `qsort` calls its `compar` argument),
+/// so instead the CPU really executes a small hand-assembled body placed at
+/// a fixed ROM address. Which addresses and which words is chip-specific data
+/// and lives in `crate::rom` (see its module doc); this type only knows how
+/// to back them on the bus. The words are `&'static` because every blob is a
+/// compile-time constant (assembled with `crate::cpu::encode`'s `const fn`s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RomCodeBlob {
+    /// Address of `words[0]`. Must be 4-byte aligned.
+    pub base: u32,
+    pub words: &'static [u32],
+}
+
+impl RomCodeBlob {
+    fn contains(&self, addr: u32) -> bool {
+        let start = self.base as u64;
+        let end = start + 4 * self.words.len() as u64;
+        (addr as u64) >= start && (addr as u64) < end
+    }
+
+    fn byte_at(&self, addr: u32) -> u8 {
+        let offset = (addr - self.base) as usize;
+        self.words[offset / 4].to_le_bytes()[offset % 4]
+    }
+}
+
 /// The concrete [`Bus`] implementation used to boot a real ESP-IDF app
 /// image. See the module-level docs for the ordered-sequence-of-named-
-/// regions read/write dispatch (XIP, RAM, SYSTIMER, INTERRUPT_CORE0, GPIO,
-/// SPI2/GPSPI2, then a never-panic catch-all).
+/// regions read/write dispatch (XIP, RAM, ROM code, then one concrete field
+/// per peripheral, then a never-panic catch-all).
 pub struct FirmwareBus {
     /// The original flash image bytes, kept once and shared (never copied)
     /// — XIP regions index directly into this.
     flash: Arc<[u8]>,
     xip_regions: Vec<XipRegion>,
     ram_regions: Vec<RamRegion>,
+    /// Read-only executable ROM code blobs ([`RomCodeBlob`]), installed by
+    /// [`FirmwareBus::map_rom_code`]. Empty unless a caller installs some
+    /// (`crate::boot::boot_from_factory_image_with_rom_stubs` installs
+    /// `crate::rom`'s ESP32-C3 set).
+    rom_code: Vec<RomCodeBlob>,
     /// The SYSTIMER peripheral (`crate::peripherals::systimer`), a concrete
     /// named field per this plan's pre-flight design ruling — see the
     /// module doc.
@@ -389,6 +436,7 @@ impl FirmwareBus {
             flash,
             xip_regions,
             ram_regions,
+            rom_code: Vec::new(),
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             gpio: Gpio::new(),
@@ -426,6 +474,38 @@ impl FirmwareBus {
         });
     }
 
+    /// Maps a read-only, executable [`RomCodeBlob`] onto the bus (see that
+    /// type's doc). Only the blob's own `4 * words.len()` bytes become
+    /// mapped: every other address in the surrounding ROM aperture stays
+    /// exactly as it was -- data reads fall through to the catch-all, and
+    /// instruction fetches still trap.
+    ///
+    /// # Panics
+    ///
+    /// If `blob.base` is not 4-byte aligned, or the blob overlaps one
+    /// already mapped. Both are programming errors in a compile-time
+    /// constant table (`crate::rom`), never reachable from firmware or a
+    /// browser-supplied image, so failing loudly beats a silently shadowed
+    /// blob.
+    pub fn map_rom_code(&mut self, blob: RomCodeBlob) {
+        assert!(
+            blob.base.is_multiple_of(4),
+            "ROM code blob base {:#x} is not word-aligned",
+            blob.base
+        );
+        let end = blob.base as u64 + 4 * blob.words.len() as u64;
+        for other in &self.rom_code {
+            let other_end = other.base as u64 + 4 * other.words.len() as u64;
+            assert!(
+                end <= other.base as u64 || other_end <= blob.base as u64,
+                "ROM code blob at {:#x} overlaps the one at {:#x}",
+                blob.base,
+                other.base
+            );
+        }
+        self.rom_code.push(blob);
+    }
+
     /// The most recent catch-all accesses (oldest first), capped at
     /// [`UNMAPPED_LOG_CAPACITY`] entries. Empty in a run that never touched
     /// unmapped/not-yet-modeled address space.
@@ -459,6 +539,9 @@ impl FirmwareBus {
         if let Some(region) = self.ram_regions.iter().find(|r| r.contains(addr)) {
             let offset = (addr - region.load_addr) as usize;
             return region.data[offset];
+        }
+        if let Some(blob) = self.rom_code.iter().find(|b| b.contains(addr)) {
+            return blob.byte_at(addr);
         }
         if SYSTIMER_RANGE.contains(&addr) {
             let offset = addr - SYSTIMER_RANGE.start;
@@ -518,6 +601,11 @@ impl FirmwareBus {
         if let Some(region) = self.ram_regions.iter_mut().find(|r| r.contains(addr)) {
             let offset = (addr - region.load_addr) as usize;
             region.data[offset] = val;
+            return;
+        }
+        if self.rom_code.iter().any(|b| b.contains(addr)) {
+            // Mask ROM is read-only on real hardware; drop silently, same as
+            // the XIP tier above.
             return;
         }
         if SYSTIMER_RANGE.contains(&addr) {
@@ -592,13 +680,14 @@ impl FirmwareBus {
         self.record_unmapped(addr, true);
     }
 
-    /// `true` if `addr` falls inside an XIP or RAM-copied region — i.e. is
+    /// `true` if `addr` falls inside an XIP, RAM-copied or ROM-code region — i.e. is
     /// "genuinely executable" per [`Bus::fetch16`]'s contract. Reuses the
     /// same region-membership checks [`FirmwareBus::read_byte`]/
     /// [`FirmwareBus::write_byte`] use, rather than duplicating them.
     fn is_mapped(&self, addr: u32) -> bool {
         self.xip_regions.iter().any(|r| r.contains(addr))
             || self.ram_regions.iter().any(|r| r.contains(addr))
+            || self.rom_code.iter().any(|b| b.contains(addr))
     }
 }
 
@@ -921,6 +1010,81 @@ mod tests {
             "0x0000 is a reserved RVC encoding, not a valid instruction"
         );
         assert_eq!(cpu.regs.pc, 0x9000, "pc must redirect to mtvec");
+    }
+
+    // ---- Task D6: read-only executable ROM code blobs ----
+
+    static TWO_WORDS: [u32; 2] = [0x0000_0013 /* nop */, 0x0000_8067 /* ret */];
+
+    #[test]
+    fn rom_code_blob_is_readable_fetchable_and_read_only() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1000,
+            words: &TWO_WORDS,
+        });
+
+        assert_eq!(bus.read32(0x4000_1000), 0x0000_0013);
+        assert_eq!(bus.read32(0x4000_1004), 0x0000_8067);
+        assert_eq!(bus.read8(0x4000_1005), 0x80);
+        assert_eq!(bus.fetch16(0x4000_1000), Some(0x0013));
+        assert_eq!(bus.fetch16(0x4000_1006), Some(0x0000));
+
+        bus.write32(0x4000_1000, 0xdead_beef);
+        assert_eq!(
+            bus.read32(0x4000_1000),
+            0x0000_0013,
+            "ROM code must be read-only"
+        );
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "blob accesses are mapped, not catch-all traffic"
+        );
+    }
+
+    #[test]
+    fn rom_code_blob_maps_only_its_own_bytes() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1000,
+            words: &TWO_WORDS,
+        });
+
+        // One halfword either side: still unexecutable, still a catch-all
+        // data miss -- the surrounding ROM aperture is unchanged.
+        assert_eq!(bus.fetch16(0x4000_0ffe), None);
+        assert_eq!(bus.fetch16(0x4000_1008), None);
+        assert_eq!(bus.read32(0x4000_1008), 0);
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == 0x4000_1008));
+    }
+
+    #[test]
+    fn a_cpu_executes_a_rom_code_blob() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1000,
+            words: &TWO_WORDS,
+        });
+        let mut cpu = crate::cpu::Cpu::new();
+        cpu.regs.pc = 0x4000_1000;
+        cpu.regs.write(1, 0x1234_5678);
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert_eq!(cpu.regs.pc, 0x1234_5678, "the blob's `ret` returned to ra");
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn overlapping_rom_code_blobs_are_rejected() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1000,
+            words: &TWO_WORDS,
+        });
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1004,
+            words: &TWO_WORDS,
+        });
     }
 
     #[test]

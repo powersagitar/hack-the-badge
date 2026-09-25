@@ -160,6 +160,39 @@ stub can have is one of `RomStubEffect`'s variants
   apply unchanged. Output and format-string-scan length are both capped
   (1 KiB) so a garbage format-string pointer can't hang the emulator.
 
+**Guest-executed ROM routines (Milestone 3 Task D6).** A stub's effect runs
+atomically inside one CPU step, so it cannot run guest code. ROM libc
+`qsort` has to call its `compar` argument, which is firmware code, over and
+over in the middle of the sort, so it can't be a stub. Computing the
+comparison in Rust would mean PC-intercepting an ESP-IDF function, which
+this emulator never does. So `qsort` is real RV32 machine code in the
+emulated ROM address space, and the CPU runs it like any other code:
+
+- `qsort`'s ROM address (`0x4000_0434`) is a 4-byte jump-table slot. It
+  holds one `jal x0, <body>`, so execution can't run on into `rand_r`'s slot
+  at `0x4000_0438`.
+- The body is a byte-swapping insertion sort at `0x4003_f000`
+  (`emulator-core/src/rom.rs`'s `QSORT_BODY`). It is assembled at compile
+  time from `emulator-core/src/cpu/encode.rs`'s `const fn` encoders, and a
+  test decodes every word through the crate's own decoder. It saves `ra`
+  and `s0..s5` in a 16-byte-aligned frame, per the RISC-V psABI.
+- `0x4003_f000..0x4004_0000` is free by the linker scripts. Across all 21
+  `components/esp_rom/esp32c3/ld/esp32c3.rom*.ld` scripts (v5.5.3), every
+  IROM-mask symbol is at or below `0x4000_4680`
+  (`r_lld_res_list_rem`, `esp32c3.rom.eco7_bt_funcs.ld`). The only other
+  ROM-aperture symbols are DROM-mask data at `0x3ff1_ee3c..=0x3ff1_fffc`.
+  The range also ends below `0x4004_0000`, so it stays clear of the top
+  128 KiB of the IROM mask either way.
+- Mechanism and data are split the same way as for stubs.
+  `emulator-core/src/mem/bus.rs`'s `RomCodeBlob`/`FirmwareBus::map_rom_code`
+  is a generic read-only, executable region in the bus's ordered region
+  list. `rom.rs`'s `ESP32C3_ROM_CODE` names the addresses and words.
+  `boot_from_factory_image_with_rom_stubs` installs both. Every other ROM
+  address still traps on fetch, exactly as before.
+- Equal elements may end up in a different order than on real silicon
+  (`qsort` isn't stable either way). The one observed caller has no equal
+  elements, so this doesn't affect it.
+
 This is split across two files on purpose:
 
 - `emulator-core/src/cpu/rom_stubs.rs` — the **generic mechanism** (a stub
@@ -172,7 +205,9 @@ This is split across two files on purpose:
 - `emulator-core/src/rom.rs` — the **chip-specific data**: which of the
   ~1200 ROM addresses ESP-IDF's own `components/esp_rom/esp32c3/ld/*.ld`
   linker scripts (fetched at tag `v5.5.3`) name, and which `RomStubEffect`
-  each one gets. 80 addresses total: 17 individually named/justified —
+  each one gets (plus, since Task D6, which ROM addresses hold
+  guest-executed code blobs: currently just `qsort`, see above). 80 stub
+  addresses total: 17 individually named/justified —
   `rtc_get_reset_reason`, `ets_printf`, `ets_delay_us`, ROM libc
   `memset`/`memcpy`/`itoa`/`strcat`, the CPU-frequency getter/setter pair,
   the two eFuse queries, the UART-flush call, and the five interrupt-matrix/
@@ -628,6 +663,41 @@ predicted these blockers would surface once TIMG unblocks further boot:
    category as `memcpy`/`memset`/`itoa`/`strcat` — a fabricated return
    would leave the array unsorted rather than unblock the caller) and
    re-probe.
+
+   **Task D6 (`qsort`) and the current stall.** `qsort` is now real
+   guest-executed code (see "Guest-executed ROM routines" above), so the
+   step-408,481 fault is gone. Task D6's Step 1 captured the call:
+   `a0 = 0x3fcdc4d0` (a stack array), `nmemb = 5`, `size = 8`,
+   `compar = 0x420029bc`, `ra = 0x42002a18`. The comparator's bytes in
+   `factory.bin` are `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5; c.ret`.
+   That is ESP-IDF v5.5.3's `s_prepare_reserved_regions()`
+   (`components/heap/port/memory_layout_utils.c`) sorting its
+   `soc_reserved_region_t {start, end}` array with
+   `s_compare_reserved_regions`. **The `do_system_init_fn()` guess above
+   was wrong.** The sort returns at step 408,906, correctly sorted.
+
+   The firmware's own validity check on the sorted array then fails. Entry 0
+   is `{ets_rom_layout_p->dram0_rtos_reserved_start, SOC_DIRAM_DRAM_HIGH}`
+   (`ESP_ROM_HAS_LAYOUT_TABLE` is set for the ESP32-C3). `ets_rom_layout_p`
+   is a ROM **data** pointer (`esp32c3.rom.ld`: `ets_rom_layout_p =
+   0x3ff1fffc;`) that the emulator doesn't back. It reads `0` from the bus
+   catch-all, and so does the field load at `NULL + 4`. The region becomes
+   `0x00000000 - 0x3fce0000`, so the firmware logs `E (0) memory_layout:
+   SOC_RESERVE_MEMORY_REGION region range 0x00000000 - 0x3fce0000 overlaps
+   with 0x3fc80000 - 0x3fc99c00` (step 408,970) and calls `abort()`. That
+   reaches `panic_abort()`'s `ILLEGAL_INSTRUCTION` at `0x4038e4fa` (step
+   409,071). The panic handler prints `abort() was called at PC 0x42002acf
+   on core 0` and "Rebooting...", faults on the unstubbed
+   `software_reset_cpu` (step 647,238), prints "Guru Meditation Error" and
+   loops. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`.
+
+   **Next candidate**: give the ROM layout table real contents. That means
+   backing `ets_rom_layout_p` (`0x3ff1_fffc`) with a pointer to an
+   `ets_rom_layout_t` (`components/esp_rom/esp32c3/include/esp32c3/rom/rom_layout.h`)
+   whose fields hold values that can be cited, not guessed. Other fields of
+   the same struct may be read later too. This is ROM *data*, not a ROM
+   call, so it was outside Task D6's scope.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -670,12 +740,12 @@ predicted these blockers would surface once TIMG unblocks further boot:
    aligned start (`drom_addr_aligned`) — the source comment says this is
    "for app to find the boot partition." `crate::mem::bus::FirmwareBus`
    doesn't add this extra mapping at all today; nothing in the observed
-   boot trace through Task D5's own new stall (the unstubbed `qsort` call)
-   has touched that fixed high address, so it's not yet a confirmed
+   boot trace through Task D6's stall (the unbacked ROM layout table, item
+   1) has touched that fixed high address, so it's not yet a confirmed
    blocker — but it's a plausible **candidate cause of a later
    partition-table/`esp_partition_find`-style stall**, worth checking first
-   if boot ever gets past `qsort` and stalls again on an unmapped read
-   inside the DROM aperture near its top end.
+   if boot gets past the reserved-region check and stalls again on an
+   unmapped read inside the DROM aperture near its top end.
 
 None of the above are correctness bugs *today* — they're dormant because
 boot doesn't reach the code paths that would exercise them. They're

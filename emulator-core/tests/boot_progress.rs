@@ -183,6 +183,32 @@
 //! is renamed to
 //! [`boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`]
 //! below -- same budget, corrected narrative.
+//!
+//! **Task D6 status**: ROM libc `qsort` (`0x4000_0434`) is now real
+//! guest-executed RV32 code mapped into the ROM address space
+//! (`emulator_core::rom::QSORT_BODY`; see `emulator-core/src/rom.rs`'s
+//! module doc, entry 14), not an HLE stub, because it has to call its
+//! firmware comparator. Step 1 of that task **refuted** the Task D5 guess
+//! above: the caller is not `do_system_init_fn()` but ESP-IDF v5.5.3's
+//! `s_prepare_reserved_regions()` (`components/heap/port/memory_layout_utils.c`),
+//! which sorts 5 `soc_reserved_region_t` entries with
+//! `s_compare_reserved_regions`. The sort now runs and returns (steps
+//! 408,481 to 408,906). The very next thing the firmware does is its own
+//! overlap check on the sorted array, which fails because entry 0 comes from
+//! the ROM layout table through the unbacked ROM *data* pointer
+//! `ets_rom_layout_p` (`0x3ff1fffc`). It reads `0`, so the region becomes
+//! `0x00000000 - 0x3fce0000`. The firmware logs
+//! `E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range 0x00000000 -
+//! 0x3fce0000 overlaps with 0x3fc80000 - 0x3fc99c00` (step 408,970) and calls
+//! `abort()`. [`boot_reaches_memory_layouts_reserved_region_check_past_rom_qsort`]
+//! is the new rung for that line, and
+//! [`boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site`] pins the
+//! fault-free run through `qsort`. The panic path that follows is an
+//! `abort()` again, not a hardware exception. So "Guru Meditation Error"
+//! now prints only after the failed `software_reset_cpu` reboot retry
+//! (step ~648,960), and "Rebooting..." prints before it (step ~646,656).
+//! The two panic-text rungs below keep their budgets, with corrected
+//! narratives; one is renamed.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -286,6 +312,14 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// pass), printing "Guru Meditation Error" right away (measured at step
 /// 410,197) instead of only after a failed reboot retry.
 ///
+/// **Task D6 update**: `qsort` is now real guest code, so that exception is
+/// gone. The cause is an `abort()` again, this time from
+/// `s_prepare_reserved_regions()`'s overlap check (see the module doc's
+/// "Task D6 status"). An `abort()` enters the panic handler with
+/// `info->reason == NULL`, so "Guru Meditation Error" once again prints only
+/// after the failed `software_reset_cpu` reboot retry, measured at step
+/// ~648,960. That is still well within the 750,000 budget.
+///
 /// **Pre-Task-D5 history** (kept for context): 500,000 steps used to be
 /// comfortably past this (measured at step 401,761, back when `itoa`
 /// faulted mid-format and the truncated abort path printed this header
@@ -322,12 +356,21 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// stall test, which pins that fault step directly) and of the loop's next
 /// iteration (measured at step 889,556).
 ///
-/// This rung is **deliberately expected to break** once a later task fixes
-/// (or stubs around) the unstubbed `qsort` ROM call: at that point this
-/// panic path is never reached either, and whoever makes that fix should
-/// delete or replace this test rather than chase a new pinned value here.
+/// **Renamed again in Task D6** (from
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`):
+/// `qsort` is now real guest code, so this panic is no longer reached via
+/// its fault. It is reached via `s_prepare_reserved_regions()`'s `abort()`
+/// over the unbacked ROM layout table (see the module doc's "Task D6
+/// status"). "Rebooting..." now prints at step ~646,656, still inside the
+/// 660,000 budget, and the reboot-retry fault follows at step 647,238.
+///
+/// This rung is **deliberately expected to break** once a later task backs
+/// `ets_rom_layout_p` (or otherwise gets boot past the reserved-region
+/// check): at that point this panic path is never reached either, and
+/// whoever makes that fix should delete or replace this test rather than
+/// chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault() {
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_reserved_region_overlap_abort() {
     assert_reaches("Rebooting...", 660_000);
 }
 
@@ -493,5 +536,46 @@ fn boot_reaches_efuse_inits_chip_rev_line() {
         "cpu_start's header check should now pass for real -- this line \
          must never appear; got console:\n{}",
         rt.console_output()
+    );
+}
+
+/// Milestone 3 Task D6's no-fault rung. Before this task, boot faulted on
+/// the unstubbed ROM `qsort` at step 408,481. `qsort` is now guest-executed
+/// ROM code (`emulator_core::rom::QSORT_BODY`), and after exactly 408,906
+/// steps its `ret` has executed and `pc` is back at the caller. That run must
+/// show zero traps. The first trap after it is `panic_abort()`'s, at
+/// step 409,071 (see the module doc's "Task D6 status").
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(408_906);
+    assert_eq!(
+        summary.traps, 0,
+        "expected zero traps through ROM qsort's return (408,906 steps); got \
+         {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
+        summary.traps, summary.last_instruction_fault, summary.pc
+    );
+    assert_eq!(
+        rt.pc(),
+        0x4200_2a18,
+        "qsort must have returned to its caller in s_prepare_reserved_regions()"
+    );
+}
+
+/// Milestone 3 Task D6's ratchet rung: the newest console line boot
+/// reaches. This is an **error** line, not normal boot progress. It is the
+/// firmware's own validity check, run on the array ROM `qsort` just sorted,
+/// failing because entry 0 comes from the unbacked ROM layout table (see the
+/// module doc's "Task D6 status"). It proves two things. `qsort` returned
+/// into the firmware. And it really sorted: the region printed second,
+/// `0x3fc80000 - 0x3fc99c00`, was the 4th element before sorting. Measured
+/// at step 408,970. The 420,000 budget matches
+/// [`boot_reaches_efuse_inits_chip_rev_line`]'s.
+#[test]
+fn boot_reaches_memory_layouts_reserved_region_check_past_rom_qsort() {
+    assert_reaches(
+        "E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range 0x00000000 - 0x3fce0000 \
+         overlaps with 0x3fc80000 - 0x3fc99c00",
+        420_000,
     );
 }

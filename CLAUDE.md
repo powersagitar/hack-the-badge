@@ -28,12 +28,15 @@ ESP32-C3 device), in two complementary modes:
    start user code`, `cpu_start: cpu freq: ...`, and a generic
    `app_init`/`efuse_init` build-metadata block, all visible on the emulated
    console since ROM `ets_printf` is HLE-stubbed as a real C-printf
-   formatter (Milestone 3 Task 7). Boot then hits a **new, unrelated**
-   stall: an unstubbed ROM `qsort` call (step ~408,481), whose
-   `INSTRUCTION_ACCESS_FAULT` is a genuine hardware exception (not an
-   `abort()`), so it reaches ESP-IDF's panic handler and loops in
+   formatter (Milestone 3 Task 7). ROM libc `qsort` then runs as real
+   guest-executed code (Milestone 3 Task D6). Its caller, ESP-IDF's
+   `s_prepare_reserved_regions()`, then fails its own overlap check,
+   because the ROM layout table pointer `ets_rom_layout_p` (ROM *data* at
+   `0x3ff1_fffc`) isn't backed and reads 0. The firmware logs `E (0)
+   memory_layout: SOC_RESERVE_MEMORY_REGION ... overlaps ...` (step
+   ~408,970) and calls `abort()`, so the panic handler runs and loops in
    `software_reset_cpu` retry — well before reaching any built-in app. The
-   current blocker is this missing `qsort` ROM stub (a known, documented
+   current blocker is this unbacked ROM layout table (a known, documented
    gap — see `docs/firmware-emulator-notes.md`'s "Known limitations"
    section before assuming a built-in app is reachable in this mode).
 
@@ -140,12 +143,17 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       or (as of Milestone 3's Task D3 fix round) a
                       runtime-computed peripheral-register write via
                       `RomStubEffect::BusRegisterWrite` — paired with the
-                      chip-specific data in src/rom.rs, below.
+                      chip-specific data in src/rom.rs, below. A stub
+                      can't run guest code, so ROM routines that call
+                      back into firmware (qsort's comparator) are real
+                      RV32 code instead; cpu/encode.rs is the const-fn
+                      RV32IM encoder those code blobs are assembled with.
   src/mem/            mem/mod.rs defines the Bus trait the CPU core is
                       generic over. mem/bus.rs's FirmwareBus is the real
                       ESP32-C3 memory map: an ordered sequence of named
-                      regions (XIP flash, RAM-copied segments, then one
-                      concrete named field per peripheral, then a
+                      regions (XIP flash, RAM-copied segments, ROM code
+                      blobs, then one concrete named field per
+                      peripheral, then a
                       never-panics catch-all) checked in order on every
                       access — no trait-object dispatch table (a deliberate
                       choice; SPI needs a direct cross-peripheral read of
@@ -153,7 +161,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       fight). Unmapped *data* access never panics (reads 0,
                       writes drop); unmapped *instruction fetches* always
                       trap — this asymmetry is load-bearing, not an
-                      oversight (see docs/firmware-emulator-notes.md). Each
+                      oversight (see docs/firmware-emulator-notes.md).
+                      A `RomCodeBlob` region (Milestone 3 Task D6,
+                      `FirmwareBus::map_rom_code`) maps small read-only,
+                      executable code blobs at fixed ROM addresses; only
+                      the blob's own bytes become fetchable. Each
                       XIP (DROM/IROM) segment is widened to its containing
                       64 KiB flash-cache MMU page (Milestone 3 Task D5,
                       `xip_page_window`), not just its own declared
@@ -178,9 +190,13 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       interrupt-controller ROM calls, a real read/write of
                       the `peripherals::intc` registers those calls target),
                       paired with cpu/rom_stubs.rs's generic mechanism
-                      above. Addresses sourced from ESP-IDF's own linker
-                      scripts, not guessed — see
-                      docs/firmware-emulator-notes.md.
+                      above. Also the guest-executed ROM code blobs
+                      (`ESP32C3_ROM_CODE`: qsort's one-`jal` jump-table
+                      slot plus its insertion-sort body in a ROM range no
+                      linker-script symbol points into), installed on the
+                      bus by boot.rs alongside the stub table. Addresses
+                      sourced from ESP-IDF's own linker scripts, not
+                      guessed — see docs/firmware-emulator-notes.md.
   src/boot.rs         "Shortcut boot": loads factory.bin directly into a
                       Cpu/FirmwareBus pair via the app image's own header,
                       skipping mask-ROM/2nd-stage-bootloader emulation

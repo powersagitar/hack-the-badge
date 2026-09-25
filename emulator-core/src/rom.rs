@@ -428,6 +428,68 @@
 //!     boot *does* reach instead
 //!     (`boot_reaches_cpu_starts_own_header_check_error_line`).
 //!
+//! 14. **Milestone 3 Task D6: ROM libc `qsort`, the first *guest-executed*
+//!     ROM routine** — Task D5's stall: an instruction-access fault at
+//!     `0x4000_0434` (`esp32c3.rom.libc.ld`: `qsort = 0x40000434;`) at step
+//!     408,481. Step 1 of that task captured the call: `a0 = 0x3fcdc4d0`
+//!     (a stack array), `a1 = 5` (`nmemb`), `a2 = 8` (`size`), `a3 =
+//!     0x420029bc` (`compar`), `ra = 0x42002a18`. The comparator's bytes in
+//!     `factory.bin` are `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5;
+//!     c.ret`, and the 5 elements are `{start, end}` address pairs. That
+//!     matches ESP-IDF v5.5.3's `s_prepare_reserved_regions()`
+//!     (`components/heap/port/memory_layout_utils.c`): `qsort(reserved,
+//!     count, sizeof(soc_reserved_region_t), s_compare_reserved_regions)`,
+//!     where the comparator returns `(int)r_a->start - (int)r_b->start`.
+//!     Task D5's unconfirmed guess (`do_system_init_fn()`) was wrong.
+//!
+//!     **Why this is not a [`RomStubEffect`](crate::cpu::rom_stubs::RomStubEffect)**:
+//!     every stub runs atomically inside one `step()` and then jumps to
+//!     `ra`. `qsort` has to call `compar`, which is *firmware* code, many
+//!     times in the middle of the sort. An atomic stub cannot run guest
+//!     code, and computing the comparison in Rust would mean PC-intercepting
+//!     an ESP-IDF function, which this emulator never does. So `qsort` is
+//!     real RV32 machine code that the CPU executes like any other code,
+//!     calling `compar` with an ordinary `jalr`:
+//!     - `0x4000_0434` itself is a jump-table slot (the `esp32c3.rom*.ld`
+//!       symbols are 4 bytes apart). It holds exactly one instruction,
+//!       [`QSORT_SLOT`] = `jal x0, QSORT_BODY_ADDR`, so execution can never
+//!       run on into `rand_r`'s slot at `0x4000_0438`. That slot and every
+//!       other unstubbed ROM address still traps on fetch, as before.
+//!     - The body, [`QSORT_BODY`], sits at [`QSORT_BODY_ADDR`] =
+//!       `0x4003_f000`, inside [`ROM_CODE_FREE_RANGE`]. That range's doc has
+//!       the evidence that no symbol in any of the 21 `esp32c3.rom*.ld`
+//!       scripts points into it.
+//!     - The body is a byte-swapping insertion sort, assembled at compile
+//!       time with `crate::cpu::encode`'s `const fn`s (no external
+//!       assembler). A test decodes every word through this crate's own
+//!       decoder. See [`QSORT_BODY`]'s doc for the calling convention and
+//!       the note on equal elements. That note does not matter for this
+//!       caller: its regions have distinct `start`s (the function itself
+//!       `assert`s `reserved[i + 1].start > reserved[i].start`), so there
+//!       are no equal elements to order.
+//!     - Mapping: the generic, chip-agnostic mechanism is
+//!       [`RomCodeBlob`]/[`FirmwareBus::map_rom_code`], a read-only
+//!       executable region in `FirmwareBus`'s ordered region list. The
+//!       ESP32-C3 data is [`ESP32C3_ROM_CODE`] here, installed by
+//!       [`install_esp32c3_rom_code`] from
+//!       `crate::boot::boot_from_factory_image_with_rom_stubs`.
+//!
+//!     With `qsort` running, the call returns to the caller (step 408,906)
+//!     with the array correctly sorted. **The next stall is not a ROM libc
+//!     call.** The array's entry 0 is `{ets_rom_layout_p->
+//!     dram0_rtos_reserved_start, SOC_DIRAM_DRAM_HIGH}`
+//!     (`ESP_ROM_HAS_LAYOUT_TABLE` is set for the ESP32-C3). But
+//!     `ets_rom_layout_p` is a ROM *data* pointer (`esp32c3.rom.ld`:
+//!     `ets_rom_layout_p = 0x3ff1fffc;`) that nothing here backs, so it
+//!     reads `0` from the catch-all, and so does the field load at `NULL +
+//!     4`. The region becomes `0x00000000 - 0x3fce0000`, which overlaps the
+//!     next sorted region. The firmware logs `E (0) memory_layout:
+//!     SOC_RESERVE_MEMORY_REGION region range 0x00000000 - 0x3fce0000
+//!     overlaps with 0x3fc80000 - 0x3fc99c00` and calls `abort()` (step
+//!     408,970, then `panic_abort()`'s `ILLEGAL_INSTRUCTION` at step
+//!     409,071). That is a missing ROM *data table*, outside Task D6's
+//!     "atomic ROM libc call" continuation rule, so the task stopped there.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -436,7 +498,7 @@
 //! ## What is NOT stubbed, on purpose
 //!
 //! The rest of ROM libc/newlib (`memmove`, `memcmp`, `strcpy`, `strncpy`,
-//! `strcmp`, `strncmp`, `strlen`, `qsort`, …) and the float half of ROM
+//! `strcmp`, `strncmp`, `strlen`, `atoi`, …) and the float half of ROM
 //! libgcc are **absent by design**, for the same reason `memset` and
 //! `__udivdi3` are special-cased rather than defaulted: a generic
 //! "return 0, do nothing" stub for a function whose *output* the caller uses
@@ -446,6 +508,18 @@
 //! stub is not.
 //!
 //! ## Where this gets boot to
+//!
+//! **As of Task D6** (this table, 80 stubs, plus one guest-executed
+//! routine, `qsort`, from [`ESP32C3_ROM_CODE`]): boot passes `cpu_start`'s
+//! header check (Task D5), prints the full `cpu_start`/`app_init`/
+//! `efuse_init` log up to `efuse_init: Chip rev: v0.0`, runs ROM `qsort`
+//! (entry 14), and then aborts in `s_prepare_reserved_regions()` because
+//! the ROM layout table (`ets_rom_layout_p`) is not backed. The panic
+//! handler prints the abort report, faults on the still-unstubbed
+//! `software_reset_cpu` and loops. **The actual blocker is now the unbacked
+//! ROM layout table.** See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`.
+//! The rest of this section is the Task 7 snapshot, kept as history.
 //!
 //! With this table installed (as of Task 7), the real `factory.bin` runs
 //! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up, analog/
@@ -479,9 +553,14 @@
 //! leading up to it, and the abort/panic path following it, actually
 //! readable.
 
+use crate::cpu::encode::{
+    add, addi, beq, bge, bgeu, bne, jal, jalr, lbu, lw, mul, sb, sub, sw, A0, A1, A2, A3, RA, S0,
+    S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
+};
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,
 };
+use crate::mem::bus::{FirmwareBus, RomCodeBlob};
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
 use crate::peripherals::intc::{CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_TYPE_REG};
 
@@ -599,6 +678,170 @@ pub const ITOA: u32 = 0x4000_0448;
 /// (see the module doc's entry 12) -- a real HLE implementation
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strcat`]), same reasoning.
 pub const STRCAT: u32 = 0x4000_03d8;
+
+/// ROM libc `qsort`'s fixed address (`esp32c3.rom.libc.ld`: `qsort =
+/// 0x40000434;`, between `ldiv = 0x40000430;` and `rand_r = 0x40000438;`).
+/// Unlike every [`NAMED_STUBS`] entry, this is **not** an HLE stub: it is a
+/// 4-byte jump-table slot holding one real `jal x0, <body>` instruction
+/// ([`QSORT_SLOT`]) into a guest-executed body at [`QSORT_BODY_ADDR`] — see
+/// the module doc's entry 14 for why.
+pub const QSORT: u32 = 0x4000_0434;
+
+/// The ROM addresses guest-executed ROM routine *bodies* may occupy
+/// (Milestone 3 Task D6). Chosen so that no symbol in any of ESP-IDF
+/// v5.5.3's 21 `components/esp_rom/esp32c3/ld/esp32c3.rom*.ld` scripts
+/// points into it, and no [`esp32c3_rom_stubs`] entry uses it:
+///
+/// - Every IROM-mask symbol across all 21 scripts (including
+///   `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`, the `eco3`/`eco7`
+///   patch scripts and all the `bt`/`ble_*` scripts) lies in
+///   `0x4000_0000..=0x4000_4680`; the two highest are
+///   `r_lld_res_list_clear = 0x40004638` and `r_lld_res_list_rem =
+///   0x40004680` (`esp32c3.rom.eco7_bt_funcs.ld`). This range starts ~235 KiB
+///   past the last of them.
+/// - The only other ROM-aperture symbols are data in the DROM mask
+///   (`SOC_DROM_MASK_LOW..SOC_DROM_MASK_HIGH` = `0x3ff0_0000..0x3ff2_0000`,
+///   `components/soc/esp32c3/include/soc/soc.h`), all within
+///   `0x3ff1_ee3c..=0x3ff1_fffc`. The range ends at `0x4004_0000`, so it
+///   stays clear of the top 128 KiB of the IROM mask
+///   (`SOC_IROM_MASK_LOW..SOC_IROM_MASK_HIGH` = `0x4000_0000..0x4006_0000`)
+///   whether or not that part aliases the DROM mask.
+/// - Every stub address in this module is below `0x4000_2000`
+///   (`rom_code_never_overlaps_a_stub_and_stays_inside_the_free_rom_range`
+///   checks this).
+///
+/// On silicon these addresses hold *some* real ROM code (the mask ROM is
+/// full of unexported internals); they're "free" only in the sense that
+/// matters here: nothing ESP-IDF links can reach them by name, so firmware
+/// never jumps there except through our own slot.
+pub const ROM_CODE_FREE_RANGE: core::ops::Range<u32> = 0x4003_f000..0x4004_0000;
+
+/// Where [`QSORT_BODY`] is mapped: the start of [`ROM_CODE_FREE_RANGE`].
+pub const QSORT_BODY_ADDR: u32 = ROM_CODE_FREE_RANGE.start;
+
+/// `qsort`'s jump-table slot: exactly one 4-byte instruction, so linear
+/// execution can never run on into `rand_r`'s slot at `0x4000_0438`.
+pub const QSORT_SLOT: [u32; 1] = [jal(ZERO, (QSORT_BODY_ADDR - QSORT) as i32)];
+
+// Instruction indices of the branch targets in QSORT_BODY (each
+// instruction is 4 bytes, so a branch at index `i` to label `L` has byte
+// offset `(L - i) * 4`).
+const QS_OUTER: i32 = 13;
+const QS_INNER: i32 = 16;
+const QS_SWAP: i32 = 23;
+const QS_NEXT_I: i32 = 32;
+const QS_DONE: i32 = 34;
+
+/// Byte offset from instruction index `from` to label `to`.
+const fn rel(from: i32, to: i32) -> i32 {
+    (to - from) * 4
+}
+
+/// `void qsort(void *base, size_t nmemb, size_t size,
+///             int (*compar)(const void *, const void *))`
+///
+/// A straight insertion sort, run by the CPU as ordinary guest code (see the
+/// module doc's entry 14). Correct per C11 §7.22.5.2: afterwards the array
+/// is in ascending order according to `compar`, which is called only with
+/// pointers to elements of the array. Not the newlib ROM's algorithm, so
+/// elements that compare equal may end up in a different relative order
+/// than on real silicon (`qsort` is not stable either way; this insertion
+/// sort happens to be).
+///
+/// Elements are swapped byte by byte, so any `size` works (`size == 0` or
+/// `nmemb < 2` returns without calling `compar` or writing the array).
+/// Calling convention (RISC-V psABI, ILP32): `s0..s5` and `ra` are saved
+/// in a 32-byte frame (keeping `sp` 16-byte aligned) and restored; only
+/// `t0..t3` and `a0/a1` are used as scratch, and never across a `compar`
+/// call, which may clobber any caller-saved register. Returns `void`.
+///
+/// Register roles: `s0` = base, `s1` = nmemb, `s2` = size, `s3` = compar,
+/// `s4` = i (1..nmemb), `s5` = p = &base[j] (the element being sunk).
+pub const QSORT_BODY: [u32; 43] = [
+    // 0: prologue
+    addi(SP, SP, -32), // 0  addi sp, sp, -32
+    sw(RA, SP, 28),    // 1  sw   ra, 28(sp)
+    sw(S0, SP, 24),    // 2  sw   s0, 24(sp)
+    sw(S1, SP, 20),    // 3  sw   s1, 20(sp)
+    sw(S2, SP, 16),    // 4  sw   s2, 16(sp)
+    sw(S3, SP, 12),    // 5  sw   s3, 12(sp)
+    sw(S4, SP, 8),     // 6  sw   s4, 8(sp)
+    sw(S5, SP, 4),     // 7  sw   s5, 4(sp)
+    addi(S0, A0, 0),   // 8  mv   s0, a0        # base
+    addi(S1, A1, 0),   // 9  mv   s1, a1        # nmemb
+    addi(S2, A2, 0),   // 10 mv   s2, a2        # size
+    addi(S3, A3, 0),   // 11 mv   s3, a3        # compar
+    addi(S4, ZERO, 1), // 12 li   s4, 1         # i = 1
+    // OUTER:
+    bgeu(S4, S1, rel(13, QS_DONE)), // 13 bgeu s4, s1, DONE  # i >= nmemb
+    mul(S5, S4, S2),                // 14 mul  s5, s4, s2
+    add(S5, S0, S5),                // 15 add  s5, s0, s5    # p = &base[i]
+    // INNER:
+    beq(S5, S0, rel(16, QS_NEXT_I)), // 16 beq s5, s0, NEXT_I  # p == base
+    sub(A0, S5, S2),                 // 17 sub  a0, s5, s2    # &p[-1]
+    addi(A1, S5, 0),                 // 18 mv   a1, s5        # p
+    jalr(RA, S3, 0),                 // 19 jalr ra, 0(s3)     # compar(p-1, p)
+    bge(ZERO, A0, rel(20, QS_NEXT_I)), // 20 blez a0, NEXT_I  # in order
+    sub(T0, S5, S2),                 // 21 sub  t0, s5, s2    # left = p - size
+    addi(T1, S5, 0),                 // 22 mv   t1, s5        # right = p
+    // SWAP: (left runs up to p)
+    lbu(T2, T0, 0),                // 23 lbu  t2, 0(t0)
+    lbu(T3, T1, 0),                // 24 lbu  t3, 0(t1)
+    sb(T3, T0, 0),                 // 25 sb   t3, 0(t0)
+    sb(T2, T1, 0),                 // 26 sb   t2, 0(t1)
+    addi(T0, T0, 1),               // 27 addi t0, t0, 1
+    addi(T1, T1, 1),               // 28 addi t1, t1, 1
+    bne(T0, S5, rel(29, QS_SWAP)), // 29 bne  t0, s5, SWAP
+    sub(S5, S5, S2),               // 30 sub  s5, s5, s2    # p -= size
+    jal(ZERO, rel(31, QS_INNER)),  // 31 j    INNER
+    // NEXT_I:
+    addi(S4, S4, 1),              // 32 addi s4, s4, 1     # i++
+    jal(ZERO, rel(33, QS_OUTER)), // 33 j    OUTER
+    // DONE: epilogue
+    lw(RA, SP, 28),    // 34 lw   ra, 28(sp)
+    lw(S0, SP, 24),    // 35 lw   s0, 24(sp)
+    lw(S1, SP, 20),    // 36 lw   s1, 20(sp)
+    lw(S2, SP, 16),    // 37 lw   s2, 16(sp)
+    lw(S3, SP, 12),    // 38 lw   s3, 12(sp)
+    lw(S4, SP, 8),     // 39 lw   s4, 8(sp)
+    lw(S5, SP, 4),     // 40 lw   s5, 4(sp)
+    addi(SP, SP, 32),  // 41 addi sp, sp, 32
+    jalr(ZERO, RA, 0), // 42 ret
+];
+
+// The label indices above must match the listing (a compile-time check, so
+// an edit that shifts instructions can't silently mis-target a branch).
+const _: () = {
+    assert!(QSORT_BODY[QS_OUTER as usize] == bgeu(S4, S1, rel(QS_OUTER, QS_DONE)));
+    assert!(QSORT_BODY[QS_INNER as usize] == beq(S5, S0, rel(QS_INNER, QS_NEXT_I)));
+    assert!(QSORT_BODY[QS_SWAP as usize] == lbu(T2, T0, 0));
+    assert!(QSORT_BODY[QS_NEXT_I as usize] == addi(S4, S4, 1));
+    assert!(QSORT_BODY[QS_DONE as usize] == lw(RA, SP, 28));
+    assert!(QSORT_BODY_ADDR + 4 * QSORT_BODY.len() as u32 <= ROM_CODE_FREE_RANGE.end);
+};
+
+/// Every guest-executed ROM code blob this module maps (see the module
+/// doc's entry 14), installed by [`install_esp32c3_rom_code`].
+pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
+    RomCodeBlob {
+        base: QSORT,
+        words: &QSORT_SLOT,
+    },
+    RomCodeBlob {
+        base: QSORT_BODY_ADDR,
+        words: &QSORT_BODY,
+    },
+];
+
+/// Maps every [`ESP32C3_ROM_CODE`] blob onto `bus` as read-only executable
+/// memory ([`FirmwareBus::map_rom_code`]). The ROM-code counterpart of
+/// [`esp32c3_rom_stubs`]; `crate::boot::boot_from_factory_image_with_rom_stubs`
+/// installs both.
+pub fn install_esp32c3_rom_code(bus: &mut FirmwareBus) {
+    for blob in ESP32C3_ROM_CODE {
+        bus.map_rom_code(*blob);
+    }
+}
 
 /// The CPU frequency (MHz) [`ETS_GET_CPU_FREQUENCY`]'s stub reports. 160 MHz
 /// is the ESP32-C3's maximum and ESP-IDF's default
@@ -1282,7 +1525,10 @@ mod tests {
         let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
         bus.add_scratch_ram(fmt_addr, 64);
         bus.add_scratch_ram(tag_addr, 16);
-        for (i, b) in b"E (%lu) %s: Invalid app image header\n\0".iter().enumerate() {
+        for (i, b) in b"E (%lu) %s: Invalid app image header\n\0"
+            .iter()
+            .enumerate()
+        {
             bus.write8(fmt_addr + i as u32, *b);
         }
         for (i, b) in b"cpu_start\0".iter().enumerate() {
@@ -1351,5 +1597,398 @@ mod tests {
         assert!(!info.trap_taken);
         assert_eq!(info.rom_stub, Some(ETS_PRINTF));
         assert_eq!(bus.console.text(), "10 20 30 40 50 60 70 80 90");
+    }
+
+    // ---- Milestone 3 Task D6: guest-executed ROM `qsort` ----
+    //
+    // These run the real blob through a real `Cpu` + `FirmwareBus`,
+    // installed exactly the way `crate::boot` installs it, against a
+    // comparator that is itself guest code in RAM -- so every `compar` call
+    // is a genuine `jalr` into firmware-style code and back, never a Rust
+    // callback.
+
+    use crate::cpu::encode::*;
+    use crate::cpu::exception_code;
+
+    /// Guest comparator code (IRAM scratch).
+    const CMP_ADDR: u32 = 0x4038_0000;
+    /// `ra` handed to `qsort`; reaching it means `qsort` returned. Never
+    /// executed.
+    const RET_SENTINEL: u32 = 0x4038_0f00;
+    /// Incremented by every comparator call (DRAM scratch).
+    const CALLS_ADDR: u32 = 0x3fc9_0000;
+    const ARRAY_ADDR: u32 = 0x3fc9_1000;
+    const STACK_TOP: u32 = 0x3fc9_8000;
+
+    /// Bumps the call counter at [`CALLS_ADDR`] (`0x3fc9_0000`).
+    const COUNT_CALL: [u32; 4] = [
+        lui(T0, 0x3fc90), // t0 = &calls
+        lw(T1, T0, 0),    // t1 = calls
+        addi(T1, T1, 1),  // t1 += 1
+        sw(T1, T0, 0),    // calls = t1
+    ];
+
+    /// Then trashes every caller-saved register the psABI lets a callee
+    /// trash (except a0, the result, and ra, needed to return) and returns.
+    const CLOBBER_AND_RET: [u32; 15] = [
+        addi(A1, ZERO, -1),
+        addi(A2, ZERO, -1),
+        addi(A3, ZERO, -1),
+        addi(A4, ZERO, -1),
+        addi(A5, ZERO, -1),
+        addi(A6, ZERO, -1),
+        addi(A7, ZERO, -1),
+        addi(T0, ZERO, -1),
+        addi(T1, ZERO, -1),
+        addi(T2, ZERO, -1),
+        addi(T3, ZERO, -1),
+        addi(T4, ZERO, -1),
+        addi(T5, ZERO, -1),
+        addi(T6, ZERO, -1),
+        jalr(ZERO, RA, 0), // ret
+    ];
+
+    /// `int cmp(const int32_t *a, const int32_t *b)` returning
+    /// `(*a > *b) - (*a < *b)` -- overflow-free, unlike `*a - *b`.
+    fn int32_comparator() -> Vec<u32> {
+        let mut code = COUNT_CALL.to_vec();
+        code.extend([
+            lw(T0, A0, 0),   // t0 = *a
+            lw(T1, A1, 0),   // t1 = *b
+            slt(A0, T1, T0), // a0 = *b < *a
+            slt(T2, T0, T1), // t2 = *a < *b
+            sub(A0, A0, T2), // a0 = (a>b) - (a<b)
+        ]);
+        code.extend(CLOBBER_AND_RET);
+        code
+    }
+
+    /// Same, but on each element's *first byte* only (unsigned), for the
+    /// odd-`size` test: the other bytes are payload that must travel with
+    /// their key.
+    fn first_byte_comparator() -> Vec<u32> {
+        let mut code = COUNT_CALL.to_vec();
+        code.extend([
+            lbu(T0, A0, 0),
+            lbu(T1, A1, 0),
+            slt(A0, T1, T0),
+            slt(T2, T0, T1),
+            sub(A0, A0, T2),
+        ]);
+        code.extend(CLOBBER_AND_RET);
+        code
+    }
+
+    enum Comparator {
+        /// 32-bit words, written into RAM as-is.
+        Words(Vec<u32>),
+        /// Raw 16-bit (RVC) halfwords, as they appear in `factory.bin`.
+        Halfwords(Vec<u16>),
+    }
+
+    struct QsortRun {
+        array: Vec<u8>,
+        calls: u32,
+    }
+
+    /// Calls ROM `qsort(ARRAY_ADDR, nmemb, size, CMP_ADDR)` on `bytes` and
+    /// runs it to completion, asserting on the way the psABI contract:
+    /// no trap, `sp` 16-byte aligned at every comparator entry, and on
+    /// return `pc == ra`, `sp` and `s0..s11` (plus `gp`/`tp`) unchanged.
+    fn run_qsort(bytes: &[u8], nmemb: u32, size: u32, cmp: Comparator) -> QsortRun {
+        use crate::cpu::rom_stubs::{REG_A3, REG_RA, REG_SP};
+
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.add_scratch_ram(CALLS_ADDR, (STACK_TOP - CALLS_ADDR) as usize);
+        bus.add_scratch_ram(CMP_ADDR, 0x1000);
+        install_esp32c3_rom_code(&mut bus);
+        match cmp {
+            Comparator::Words(words) => {
+                for (i, w) in words.iter().enumerate() {
+                    bus.write32(CMP_ADDR + 4 * i as u32, *w);
+                }
+            }
+            Comparator::Halfwords(halves) => {
+                for (i, h) in halves.iter().enumerate() {
+                    bus.write16(CMP_ADDR + 2 * i as u32, *h);
+                }
+            }
+        }
+        for (i, b) in bytes.iter().enumerate() {
+            bus.write8(ARRAY_ADDR + i as u32, *b);
+        }
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        // Distinctive values in every register qsort must preserve.
+        const PRESERVED: [u8; 14] = [3, 4, 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+        for r in PRESERVED {
+            cpu.regs.write(r, 0x5a00_0000 | u32::from(r));
+        }
+        cpu.regs.write(REG_A0, ARRAY_ADDR);
+        cpu.regs.write(REG_A1, nmemb);
+        cpu.regs.write(REG_A2, size);
+        cpu.regs.write(REG_A3, CMP_ADDR);
+        cpu.regs.write(REG_RA, RET_SENTINEL);
+        cpu.regs.write(REG_SP, STACK_TOP);
+        cpu.regs.pc = QSORT;
+
+        let mut steps = 0u32;
+        while cpu.regs.pc != RET_SENTINEL {
+            assert!(steps < 200_000, "qsort did not return within 200,000 steps");
+            if cpu.regs.pc == CMP_ADDR {
+                assert_eq!(
+                    cpu.regs.read(REG_SP) % 16,
+                    0,
+                    "sp must be 16-byte aligned at every compar call"
+                );
+            }
+            let info = cpu.step(&mut bus);
+            assert!(
+                !info.trap_taken,
+                "qsort trapped at {:#x} (mcause {}, mtval {:#x})",
+                info.pc_before, cpu.csr.mcause, cpu.csr.mtval
+            );
+            steps += 1;
+        }
+
+        assert_eq!(cpu.regs.read(REG_SP), STACK_TOP, "sp must be restored");
+        for r in PRESERVED {
+            assert_eq!(
+                cpu.regs.read(r),
+                0x5a00_0000 | u32::from(r),
+                "callee-saved/reserved x{r} must be preserved"
+            );
+        }
+
+        let array = (0..bytes.len() as u32)
+            .map(|i| bus.read8(ARRAY_ADDR + i))
+            .collect();
+        QsortRun {
+            array,
+            calls: bus.read32(CALLS_ADDR),
+        }
+    }
+
+    fn i32_bytes(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn sort_i32(values: &[i32]) -> (Vec<i32>, u32) {
+        let run = run_qsort(
+            &i32_bytes(values),
+            values.len() as u32,
+            4,
+            Comparator::Words(int32_comparator()),
+        );
+        let sorted = run
+            .array
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
+            .collect();
+        (sorted, run.calls)
+    }
+
+    #[test]
+    fn qsort_sorts_int32_ascending() {
+        let (sorted, calls) = sort_i32(&[5, -3, 17, 0, -3_000_000, 42, 7, i32::MIN, i32::MAX]);
+        assert_eq!(
+            sorted,
+            [i32::MIN, -3_000_000, -3, 0, 5, 7, 17, 42, i32::MAX]
+        );
+        assert!(calls > 0);
+    }
+
+    #[test]
+    fn qsort_with_zero_or_one_element_never_calls_compar_or_writes_the_array() {
+        let bytes = i32_bytes(&[0x1122_3344, 0x5566_7788]);
+        for nmemb in [0, 1] {
+            let run = run_qsort(&bytes, nmemb, 4, Comparator::Words(int32_comparator()));
+            assert_eq!(run.calls, 0, "nmemb {nmemb}: compar must not be called");
+            assert_eq!(run.array, bytes, "nmemb {nmemb}: array must be untouched");
+        }
+    }
+
+    #[test]
+    fn qsort_handles_already_sorted_and_reverse_sorted_input() {
+        let ascending: Vec<i32> = (0..12).collect();
+        let (sorted, calls) = sort_i32(&ascending);
+        assert_eq!(sorted, ascending);
+        assert_eq!(
+            calls, 11,
+            "sorted input: one comparison per element after the first"
+        );
+
+        let descending: Vec<i32> = (0..12).rev().collect();
+        let (sorted, _) = sort_i32(&descending);
+        assert_eq!(sorted, ascending);
+    }
+
+    #[test]
+    fn qsort_handles_duplicates() {
+        let (sorted, _) = sort_i32(&[3, 1, 3, 2, 1, 3, -1, 2]);
+        assert_eq!(sorted, [-1, 1, 1, 2, 2, 3, 3, 3]);
+    }
+
+    #[test]
+    fn qsort_sorts_the_observed_boot_call_with_the_firmwares_own_comparator() {
+        // The exact call boot makes (Task D6 Step 1): ESP-IDF v5.5.3's
+        // `s_prepare_reserved_regions()` (components/heap/port/
+        // memory_layout_utils.c) sorting 5 `soc_reserved_region_t {start,
+        // end}` (size 8) with `s_compare_reserved_regions`, whose compiled
+        // body in factory.bin at 0x420029bc is these four RVC halfwords:
+        // `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5; c.ret` --
+        // `(int)r_a->start - (int)r_b->start`. The input is the array's
+        // exact contents at the observed call.
+        let regions: [(u32, u32); 5] = [
+            (0x0000_0000, 0x3fce_0000),
+            (0x5000_1fe8, 0x5000_2000),
+            (0x5000_0000, 0x5000_0020),
+            (0x3fc8_0000, 0x3fc9_9c00),
+            (0x3fc9_9c00, 0x3fcb_d180),
+        ];
+        let bytes: Vec<u8> = regions
+            .iter()
+            .flat_map(|(s, e)| s.to_le_bytes().into_iter().chain(e.to_le_bytes()))
+            .collect();
+        let run = run_qsort(
+            &bytes,
+            5,
+            8,
+            Comparator::Halfwords(vec![0x4108, 0x419c, 0x8d1d, 0x8082]),
+        );
+        let sorted: Vec<(u32, u32)> = run
+            .array
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| {
+                (
+                    u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                    u32::from_le_bytes([c[4], c[5], c[6], c[7]]),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sorted,
+            [
+                (0x0000_0000, 0x3fce_0000),
+                (0x3fc8_0000, 0x3fc9_9c00),
+                (0x3fc9_9c00, 0x3fcb_d180),
+                (0x5000_0000, 0x5000_0020),
+                (0x5000_1fe8, 0x5000_2000),
+            ],
+            "each 8-byte element must move whole, `end` travelling with `start`"
+        );
+    }
+
+    #[test]
+    fn qsort_swaps_bytewise_for_an_odd_element_size() {
+        // size 3: [key, payload, payload].
+        let bytes = [
+            9, 0x90, 0x91, //
+            2, 0x20, 0x21, //
+            7, 0x70, 0x71, //
+            0, 0x00, 0x01, //
+            5, 0x50, 0x51,
+        ];
+        let run = run_qsort(&bytes, 5, 3, Comparator::Words(first_byte_comparator()));
+        assert_eq!(
+            run.array,
+            [
+                0, 0x00, 0x01, //
+                2, 0x20, 0x21, //
+                5, 0x50, 0x51, //
+                7, 0x70, 0x71, //
+                9, 0x90, 0x91,
+            ]
+        );
+    }
+
+    #[test]
+    fn neighbouring_rom_libc_slots_still_fault_exactly_as_before() {
+        // qsort's slot is one 4-byte jump; its neighbours `ldiv`
+        // (0x40000430) and `rand_r` (0x40000438) are still unstubbed and
+        // unbacked, so fetching them must still raise
+        // INSTRUCTION_ACCESS_FAULT with the address in mtval.
+        for addr in [0x4000_0430u32, 0x4000_0438] {
+            let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+            install_esp32c3_rom_code(&mut bus);
+            let mut cpu = Cpu::new();
+            cpu.set_rom_stubs(esp32c3_rom_stubs());
+            cpu.csr.mtvec = 0x4038_0000;
+            cpu.regs.pc = addr;
+            let info = cpu.step(&mut bus);
+            assert!(info.trap_taken, "{addr:#x} must still trap");
+            assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+            assert_eq!(cpu.csr.mtval, addr);
+        }
+    }
+
+    #[test]
+    fn every_rom_code_word_is_a_32_bit_instruction_this_crates_decoder_accepts() {
+        assert!(!ESP32C3_ROM_CODE.is_empty());
+        for blob in ESP32C3_ROM_CODE {
+            for (i, word) in blob.words.iter().enumerate() {
+                let addr = blob.base + 4 * i as u32;
+                assert_eq!(
+                    word & 0b11,
+                    0b11,
+                    "{addr:#x}: {word:#010x} is not a 32-bit encoding"
+                );
+                assert!(
+                    !matches!(
+                        crate::cpu::decode_32(*word),
+                        crate::cpu::Instruction::Illegal(_)
+                    ),
+                    "{addr:#x}: {word:#010x} does not decode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qsort_slot_is_a_single_jump_to_the_body() {
+        let slot = ESP32C3_ROM_CODE
+            .iter()
+            .find(|b| b.base == QSORT)
+            .expect("qsort's jump-table slot is mapped");
+        assert_eq!(
+            slot.words.len(),
+            1,
+            "exactly one 4-byte slot, never spilling into 0x40000438"
+        );
+        assert_eq!(
+            crate::cpu::decode_32(slot.words[0]),
+            crate::cpu::Instruction::Jal {
+                rd: 0,
+                imm: (QSORT_BODY_ADDR - QSORT) as i32
+            }
+        );
+        assert!(ESP32C3_ROM_CODE.iter().any(|b| b.base == QSORT_BODY_ADDR));
+    }
+
+    #[test]
+    fn rom_code_never_overlaps_a_stub_and_stays_inside_the_free_rom_range() {
+        let table = esp32c3_rom_stubs();
+        for blob in ESP32C3_ROM_CODE {
+            let end = blob.base + 4 * blob.words.len() as u32;
+            for addr in (blob.base..end).step_by(2) {
+                assert_eq!(
+                    table.lookup(addr),
+                    None,
+                    "{addr:#x} is both stubbed and ROM code"
+                );
+            }
+            if blob.base != QSORT {
+                assert!(
+                    blob.base >= ROM_CODE_FREE_RANGE.start && end <= ROM_CODE_FREE_RANGE.end,
+                    "blob at {:#x} is outside ROM_CODE_FREE_RANGE",
+                    blob.base
+                );
+            }
+        }
     }
 }

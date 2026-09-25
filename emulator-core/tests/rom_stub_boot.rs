@@ -41,7 +41,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later stall (see this file's renamed
-    // `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`
+    // `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -69,6 +69,13 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // at step 408,481 (see this file's renamed test above). 350,000 remains
     // comfortably clear (~58,481-step/~17% margin, essentially unchanged
     // from Task D4's).
+    //
+    // Task D6 status: ROM `qsort` is now guest-executed code (see
+    // `emulator_core::rom`'s module doc, entry 14), so step 408,481 no
+    // longer faults; boot's first trap is now `panic_abort()`'s
+    // ILLEGAL_INSTRUCTION at step 409,071, from an `abort()` over the
+    // unbacked ROM layout table (see the pinned-stall test below). 350,000
+    // stays clear by ~59,071 steps (~17%).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -192,118 +199,127 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// This test **pins today's panic path, not boot progress past it**.
-/// **Renamed and re-pointed in Task D5** (from
-/// `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`):
-/// Task D5 (`crate::mem::bus::FirmwareBus::from_segments`'s page-granular
-/// XIP mapping, see `emulator-core/tests/boot_progress.rs`'s module doc's
-/// "Task D5 status") fixed `cpu_start`'s app-image-header check for real --
-/// it now reads the image's actual magic byte (`0xE9`) instead of a
-/// catch-all `0`, passes, and never calls `abort()`. Every fault sequence
-/// this test used to pin (newlib's `abort()`, `panic_abort()`'s
-/// `ILLEGAL_INSTRUCTION` trap at `0x4038e4fa`) is gone; boot instead runs
-/// much further -- through `cpu_start`'s remaining startup log lines and a
-/// full `app_init`/`efuse_init` block that never used to print at all --
-/// before hitting a **new, unrelated** stall this task's own scope ruling
-/// says to stop at and report, not fix: an unstubbed ROM `qsort` call
-/// (`0x4000_0434`, confirmed against `esp32c3.rom.libc.ld`'s `qsort =
-/// 0x40000434;`). The register dump at the fault (`A1=5, A2=8`, return
-/// address inside the app's own `esp_system` startup code) is consistent
-/// with ESP-IDF's `do_system_init_fn()` sorting its init-function array
-/// before running it -- a plain missing-ROM-stub gap, left for the next
-/// task.
+/// **Renamed and re-pointed in Task D6** (from
+/// `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`,
+/// itself renamed in Task D5 from
+/// `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`).
 ///
-/// That `INSTRUCTION_ACCESS_FAULT` (step 408,481) is a genuine hardware
-/// exception this time, not an `abort()`, so ESP-IDF's panic handler takes
-/// its *exception* path immediately (`info->reason` non-`NULL` from the
-/// first pass) and prints "Guru Meditation Error" right away, then
-/// `panic_restart()` calls into the still-unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`) to actually reboot -- which faults again, re-entering
-/// the panic handler and looping, same downstream shape as the old
-/// cpu_start-abort scenario (coincidentally: both are a first
-/// `INSTRUCTION_ACCESS_FAULT`-class fault immediately followed by the same
-/// unstubbed reboot-retry fault), just with a different, earlier root
-/// cause. `software_reset_cpu` remains unstubbed -- it's only reached via
-/// the panic path, per this module's own scoping, and stubbing it wouldn't
-/// address the `qsort` gap, the actual blocker now.
+/// **What changed in Task D6**: ROM libc `qsort` (`0x4000_0434`) is now
+/// real guest-executed code (`emulator_core::rom::QSORT_BODY`, see
+/// `emulator-core/src/rom.rs`'s module doc, entry 14), so the
+/// `INSTRUCTION_ACCESS_FAULT` Task D5 pinned at step 408,481 is gone: the
+/// call runs and returns (step 408,906). Task D6 Step 1 also **refuted**
+/// D5's unconfirmed guess about the caller: it is not `do_system_init_fn()`
+/// but ESP-IDF v5.5.3's `s_prepare_reserved_regions()`
+/// (`components/heap/port/memory_layout_utils.c`), sorting its 5
+/// `soc_reserved_region_t {start, end}` entries (hence `size` 8) with
+/// `s_compare_reserved_regions` (`0x420029bc`).
 ///
-/// This test is **deliberately expected to break** once a later task stubs
-/// `qsort` (or otherwise gets boot past it): at that point this exact fault
-/// sequence disappears, and whoever makes that fix should delete or
-/// replace this test rather than chase a new pinned value here.
+/// **The new stall** is that function's own validity check, right after the
+/// sort: entry 0 of the array is the ROM layout table's reserved DRAM range,
+/// `{ets_rom_layout_p->dram0_rtos_reserved_start, SOC_DIRAM_DRAM_HIGH}`
+/// (`ESP_ROM_HAS_LAYOUT_TABLE` is set for the ESP32-C3). `ets_rom_layout_p`
+/// is a **ROM data** pointer (`esp32c3.rom.ld`: `ets_rom_layout_p =
+/// 0x3ff1fffc;`) that this emulator does not back, so it reads `0` from the
+/// bus catch-all, and so does the `NULL`-relative field load after it. The
+/// region becomes `0x00000000 - 0x3fce0000`, which overlaps the next one
+/// after sorting, so the firmware logs
+/// `E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range 0x00000000 -
+/// 0x3fce0000 overlaps with 0x3fc80000 - 0x3fc99c00` (step 408,970) and calls
+/// `abort()`. That line is also end-to-end evidence that `qsort` really
+/// sorted: in the unsorted input, `0x3fc80000` was the 4th element, not the
+/// 2nd. `abort()` reaches the `ILLEGAL_INSTRUCTION` trap in `panic_abort()`
+/// at `0x4038e4fa` (step 409,071), which is the same mechanism Task D4
+/// pinned. The panic handler prints `abort() was called at PC 0x42002acf on
+/// core 0` plus a register dump, then "Rebooting..." (step ~646,656). It
+/// then faults on the still-unstubbed ROM `software_reset_cpu`
+/// (`0x4000_0094`, step 647,238), re-enters the panic handler, prints "Guru
+/// Meditation Error" (step ~648,960) and loops (next fault at step 887,681).
+/// `software_reset_cpu` stays unstubbed: it is reached only on the panic
+/// path, and stubbing it would not fix the actual blocker, the unbacked ROM
+/// layout table.
+///
+/// This test is **deliberately expected to break** once a later task gives
+/// `ets_rom_layout_p` a real value (or otherwise gets boot past this
+/// check). At that point this fault sequence disappears, and whoever makes
+/// that fix should delete or replace this test rather than chase a new
+/// pinned value here.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message()
-{
+fn boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message(
+) {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // 660,000 steps is a single, stable, two-trap snapshot: past both the
-    // qsort INSTRUCTION_ACCESS_FAULT (measured at step 408,481) and the
-    // software_reset_cpu INSTRUCTION_ACCESS_FAULT it leads to (measured at
-    // step 649,072 -- NOT the same as the step the console *text*
-    // "Rebooting..." appears at, 648,457: that print happens inside
-    // panic_restart(), just *before* the call into the still-unstubbed
-    // software_reset_cpu that actually faults, so the two steps are close
-    // but distinct events -- see
-    // `emulator-core/tests/boot_progress.rs`'s
-    // `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`
-    // for the console-text rung), well before the panic handler's
-    // re-entrancy guard kicks in and the "Rebooting"/panic text starts
-    // repeating many more times (the next iteration's fault was measured at
-    // step 889,556).
-    //
-    // Fix round 1, M3: this budget used to be 650,000, whose actual margin
-    // over the real fault step (649,072) was 928 steps (~0.14%) -- tight,
-    // not "comfortable" as an earlier version of this comment claimed.
-    // 660,000 gives 10,928 steps (~1.7%) margin instead, still nowhere near
-    // the next loop iteration at 889,556.
-    let summary = rt.run(660_000);
+    // Phase 1: through the old qsort fault (step 408,481) and past qsort's
+    // return (step 408,906) with zero traps. The first trap comes at step
+    // 409,071.
+    let summary = rt.run(409_000);
     assert_eq!(
-        summary.traps, 2,
-        "expected exactly two traps so far: the unstubbed qsort call's \
-         instruction-access fault, then the software_reset_cpu \
-         instruction-access fault it leads to"
+        summary.traps, 0,
+        "ROM qsort must run and return without any trap (pre-Task-D6 it \
+         faulted at step 408,481); got {summary:?}"
+    );
+
+    // Phase 2: the abort()'s panic_abort() trap -- ILLEGAL_INSTRUCTION at
+    // 0x4038e4fa, not an instruction-access fault.
+    let summary = rt.run(100);
+    assert_eq!(
+        summary.traps, 1,
+        "expected panic_abort()'s trap; got {summary:?}"
+    );
+    assert_eq!(summary.last_instruction_fault, None);
+    assert_eq!(
+        rt.cpu().csr.mcause,
+        emulator_core::cpu::exception_code::ILLEGAL_INSTRUCTION
+    );
+    assert_eq!(rt.cpu().csr.mepc, 0x4038_e4fa);
+
+    // Phase 3, up to 660,000 total: the panic handler's reboot attempt
+    // faults on unstubbed software_reset_cpu (step 647,238). 12,762 steps of
+    // margin, and the next fault is not until step 887,681.
+    let summary = rt.run(660_000 - 409_100);
+    assert_eq!(
+        summary.traps, 1,
+        "expected exactly one more trap: the software_reset_cpu \
+         instruction-access fault; got {summary:?}"
     );
     assert_eq!(
         summary.last_instruction_fault,
         Some(0x4000_0094),
-        "expected the most recent INSTRUCTION_ACCESS_FAULT to be \
-         software_reset_cpu -- the panic handler's own (unstubbed) reboot \
-         attempt"
+        "expected the INSTRUCTION_ACCESS_FAULT to be software_reset_cpu -- \
+         the panic handler's own (unstubbed) reboot attempt"
     );
 
-    // The firmware's own panic handler ran and printed ESP-IDF's generic
-    // pre-restart text plus a full crash report -- generic ESP-IDF text,
-    // never identity data (see this file's module doc and
-    // `docs/firmware-emulator-notes.md`'s data-handling note).
+    let console = rt.console_output();
+    // The root cause, in the firmware's own words. Generic ESP-IDF text
+    // plus SoC memory-map addresses, never identity data (see this file's
+    // module doc and `docs/firmware-emulator-notes.md`'s data-handling
+    // note).
     assert!(
-        rt.console_output().contains("Rebooting..."),
-        "expected the panic handler's generic pre-restart text; got:\n{}",
-        rt.console_output()
+        console.contains(
+            "E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range \
+             0x00000000 - 0x3fce0000 overlaps with 0x3fc80000 - 0x3fc99c00"
+        ),
+        "expected s_prepare_reserved_regions()'s overlap error, which is \
+         also proof that qsort sorted the regions; got:\n{console}"
     );
     assert!(
-        rt.console_output().contains("Guru Meditation Error"),
-        "expected the firmware's panic handler to have printed its crash \
-         report; got:\n{}",
-        rt.console_output()
+        console.contains("abort() was called at PC 0x42002acf on core 0"),
+        "expected the abort() from s_prepare_reserved_regions(); got:\n{console}"
+    );
+    assert!(
+        console.contains("Rebooting..."),
+        "expected the panic handler's generic pre-restart text; got:\n{console}"
+    );
+    assert!(
+        console.contains("Guru Meditation Error"),
+        "expected the re-entered panic handler's crash report; got:\n{console}"
     );
 
-    // Task D5's actual fix, positively confirmed: cpu_start's header check
-    // now passes for real, so its error line must never appear, and boot
-    // must reach several genuinely new lines past it (the dedicated
-    // ratchet rung for the specific budget is
-    // `tests/boot_progress.rs`'s `boot_reaches_efuse_inits_chip_rev_line`;
-    // reinforced here as one more assertion on this already-pinned trace).
+    // Task D5's fix still holds: cpu_start's header check passes.
     assert!(
-        !rt.console_output().contains("Invalid app image header"),
-        "cpu_start's header check should now pass for real -- this line \
-         must never appear; got console:\n{}",
-        rt.console_output()
-    );
-    assert!(
-        rt.console_output().contains("efuse_init: Chip rev:"),
-        "expected boot to reach the new efuse_init block past the fixed \
-         header check; got console:\n{}",
-        rt.console_output()
+        !console.contains("Invalid app image header"),
+        "cpu_start's header check should pass for real; got:\n{console}"
     );
 
     // And nothing has been drawn, because the display driver is never reached.

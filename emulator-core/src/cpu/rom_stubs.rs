@@ -33,6 +33,17 @@
 //! their chosen semantics live in `crate::rom`, one level up, alongside the
 //! rest of this crate's SoC knowledge.
 //!
+//! ## What this mechanism cannot do: call back into firmware
+//!
+//! A stub's effect runs atomically inside one `step()`, so it can never run
+//! guest code. A ROM function that must call a firmware-supplied function
+//! pointer in the middle of its work (ROM libc `qsort` calling `compar`) can't
+//! be a stub. Those are instead real, hand-assembled RV32 code the CPU
+//! executes, mapped at fixed ROM addresses as read-only
+//! `crate::mem::bus::RomCodeBlob`s (Milestone 3 Task D6; see `crate::rom`'s
+//! module doc, entry 14). The two mechanisms are complementary: every ROM
+//! address is a stub, a mapped code blob, or unmapped (fetch traps).
+//!
 //! ## Mechanism (see [`crate::cpu::Cpu::step`] for the call site)
 //!
 //! Right before `step()` fetches the instruction at `pc`, it looks `pc` up
