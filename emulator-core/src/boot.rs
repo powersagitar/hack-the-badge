@@ -9,9 +9,13 @@
 //! configured and a valid stack already set up. We don't model the mask
 //! ROM or 2nd-stage bootloader at all (out of scope for this emulator) —
 //! instead we parse this app image ourselves, set up the flash-mapped/
-//! RAM-copied regions the 2nd-stage bootloader would have set up, and jump
-//! straight to `entry_addr`, i.e. we start the emulated CPU at the exact
-//! point real hardware would be at when the 2nd-stage bootloader hands off.
+//! RAM-copied regions the 2nd-stage bootloader would have set up (as of
+//! Milestone 3 Task D5, page-granular for the flash-mapped regions, not
+//! just each segment's own declared bytes — see
+//! [`crate::mem::bus::FirmwareBus::from_segments`]'s doc comment for why
+//! that distinction is load-bearing), and jump straight to `entry_addr`,
+//! i.e. we start the emulated CPU at the exact point real hardware would
+//! be at when the 2nd-stage bootloader hands off.
 
 use std::sync::Arc;
 

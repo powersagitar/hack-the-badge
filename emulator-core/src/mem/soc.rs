@@ -71,6 +71,21 @@ pub const ROM_STACK_START: u32 = 0x3FCD_E710;
 /// Size of the mask ROM's reserved stack window — see [`ROM_STACK_START`].
 pub const ROM_STACK_SIZE: u32 = 0x2000;
 
+/// The ESP32-C3's flash-cache MMU page size: always 64 KiB, not
+/// configurable on this target (unlike some other ESP32 variants) --
+/// `hal/esp32c3/include/hal/mmu_ll.h`'s `mmu_ll_get_page_size()` hardcodes
+/// `return MMU_PAGE_64KB` with the comment "On esp32c3, MMU Page size is
+/// always 64KB"; `hal/include/hal/mmu_types.h` defines `MMU_PAGE_64KB =
+/// 0x10000`. `crate::mem::bus::FirmwareBus::from_segments` uses this to
+/// widen each XIP (DROM/IROM) segment to its containing MMU page, matching
+/// `bootloader_support/src/bootloader_utility.c`'s `set_cache_and_start_app()`
+/// (page-aligns `load_addr` down, extends the mapped size by the leading
+/// gap) composed with `hal/mmu_hal.c`'s `mmu_hal_map_region()` (rounds the
+/// total mapped length up to a whole number of pages) -- see that
+/// function's doc comment for why this matters (`cpu_start`'s app-image-
+/// header check reads bytes that live in this leading gap).
+pub const MMU_PAGE_SIZE: u32 = 0x1_0000;
+
 /// `true` if `addr` falls inside one of the flash-mapped XIP apertures
 /// ([`DROM_RANGE`] or [`IROM_RANGE`]). Everything else in the app image
 /// (DRAM/IRAM/RTC segments) is RAM-copied at boot instead — see
@@ -151,6 +166,11 @@ pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_9000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mmu_page_size_is_64kib() {
+        assert_eq!(MMU_PAGE_SIZE, 0x1_0000);
+    }
 
     #[test]
     fn drom_and_irom_addresses_are_xip() {

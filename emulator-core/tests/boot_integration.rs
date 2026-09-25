@@ -102,6 +102,58 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
     // judge "stuck vs progressing".
 }
 
+/// Task D5: ESP-IDF v5.5.3's `cpu_start` (`components/esp_system/port/
+/// cpu_start.c`) reads the running app's `esp_image_header_t` from
+/// `fhdr_src_addr = &_rodata_reserved_start - sizeof(esp_image_header_t) -
+/// sizeof(esp_image_segment_header_t)` -- a linker symbol that resolves to
+/// the DROM segment's own `load_addr` (confirmed against `factory.bin`'s
+/// real segment table: segment 0's `load_addr` is `0x3c13_0020`), so
+/// `fhdr_src_addr` is `0x3c13_0000` -- 32 bytes *before* `load_addr`, not
+/// `SOC_DROM_LOW` (`0x3c00_0000`) as the task brief's initial, unverified
+/// hypothesis guessed. Confirmed directly against a live boot trace (Task
+/// D5's report): 24 consecutive byte reads at exactly `0x3c13_0000
+/// ..0x3c13_0018` (== `sizeof(esp_image_header_t)`) right before the
+/// `abort()` this check triggers pre-fix.
+///
+/// `0x3c13_0000` is exactly `load_addr`'s containing 64 KiB flash-cache MMU
+/// page start (`0x3c13_0020 & !0xFFFF`), so this is the same page-granular
+/// XIP mapping rule `crate::mem::bus`'s `xip_regions_expose_the_full_
+/// containing_64kib_page_not_just_the_declared_segment` test pins directly:
+/// this test is that same rule's real-image regression check.
+#[test]
+fn real_factory_image_exposes_cpu_starts_header_bytes_at_the_page_aligned_drom_address() {
+    let image = std::fs::read(factory_bin_path()).expect(
+        "reading frontend/public/firmware/factory.bin \
+         (expected to be committed at the repo's frontend/public/firmware/)",
+    );
+    let (_cpu, mut bus) =
+        boot_from_factory_image(&image).expect("real factory.bin should parse and boot");
+
+    const FHDR_SRC_ADDR: u32 = 0x3c13_0000;
+
+    // Magic byte, at offset 0 -- what cpu_start's `fhdr.magic !=
+    // ESP_IMAGE_HEADER_MAGIC` check actually compares.
+    assert_eq!(
+        bus.read8(FHDR_SRC_ADDR),
+        0xE9,
+        "expected ESP_IMAGE_HEADER_MAGIC at the page-aligned header address"
+    );
+    // entry_addr, at offset 4..8 of esp_image_header_t -- confirmed ground
+    // truth from docs/firmware-emulator-notes.md.
+    assert_eq!(bus.read32(FHDR_SRC_ADDR + 4), 0x403803fc);
+
+    // And the segment's own previously-mapped bytes, starting at its real
+    // `load_addr` 0x20 bytes later, are unchanged by this widening -- this
+    // is segment 0's own first data byte (an ELF/rodata byte, not part of
+    // the image header).
+    let seg0_first_byte = bus.read8(0x3c13_0020);
+    assert_eq!(
+        seg0_first_byte, image[0x20],
+        "segment 0's own mapped bytes must be unaffected by exposing the \
+         preceding page bytes"
+    );
+}
+
 #[test]
 fn illegal_instruction_traps_are_recoverable_not_fatal() {
     // Sanity check on the trap plumbing this test relies on to interpret

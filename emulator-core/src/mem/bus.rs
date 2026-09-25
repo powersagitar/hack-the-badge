@@ -6,7 +6,11 @@
 //! 1. **XIP** (flash-mapped, [`crate::mem::soc::is_xip_addr`]): read directly
 //!    out of the original flash image bytes at `file_offset + (addr -
 //!    load_addr)`. Writes are silently dropped (real hardware: read-only
-//!    flash cache).
+//!    flash cache). Each XIP segment's *mapped window* is wider than its
+//!    own `[load_addr, load_addr + len)` -- see
+//!    [`FirmwareBus::from_segments`]'s doc for why (page-granular flash-
+//!    cache MMU mapping, matching what the real 2nd-stage bootloader's
+//!    `set_cache_and_start_app()` programs; Task D5).
 //! 2. **RAM-copied**: a real, mutable, per-segment `Vec<u8>` that the
 //!    segment's bytes were copied into at boot. Reads/writes go straight to
 //!    it.
@@ -98,8 +102,8 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SYSTIMER_RANGE,
-    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE, SPI2_RANGE,
+    SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -192,22 +196,115 @@ pub struct FirmwareBus {
     unmapped_log: VecDeque<UnmappedAccess>,
 }
 
+/// Computes the page-aligned XIP mapping window a real ESP32-C3 2nd-stage
+/// bootloader's flash-cache MMU setup would expose for one segment --
+/// see [`FirmwareBus::from_segments`]'s doc comment for the citation chain
+/// (`bootloader_support/src/bootloader_utility.c`'s
+/// `set_cache_and_start_app()` composed with `hal/mmu_hal.c`'s
+/// `mmu_hal_map_region()`). Returns `(aligned_load_addr,
+/// aligned_file_offset, aligned_len)`: the same segment, widened to the
+/// full 64 KiB page(s) it lives in, both before `load_addr` (where
+/// `cpu_start`'s header check actually reads from -- Task D5) and after
+/// `load_addr + len` (real hardware's MMU maps whole pages, not partial
+/// ones).
+///
+/// The leading extension is clamped to the bytes actually available before
+/// `file_offset` in the source buffer: real hardware's physical flash chip
+/// always has *some* bytes there (it's one contiguous chip), but a
+/// synthetic or browser-supplied partial image sometimes won't.
+///
+/// All arithmetic here is checked -- this must never panic on adversarial
+/// input. `FirmwareEmulator::new` (`emulator-wasm`) reaches
+/// [`FirmwareBus::from_segments`] directly with a browser-supplied image,
+/// and `usize` is 32 bits on that target, so a malformed `len`/
+/// `file_offset` must not be able to overflow this arithmetic and panic
+/// (the same contract `from_segments`'s existing RAM-region path already
+/// holds, see its comment). Any overflow here simply falls back to the
+/// segment's own unwidened window -- degrading gracefully, same as the
+/// bus's never-panic catch-all tier, rather than fabricating an unsound
+/// mapping.
+fn xip_page_window(
+    load_addr: u32,
+    file_offset: usize,
+    len: usize,
+    page_size: u32,
+) -> (u32, usize, u32) {
+    // `len as u32` truncates if `len` doesn't fit -- same as this
+    // function's caller did unconditionally before Task D5 (`seg.len as
+    // u32`), so the fallback preserves pre-existing behavior exactly rather
+    // than introducing a new truncation risk.
+    let fallback = (load_addr, file_offset, len as u32);
+    let Ok(len_u32) = u32::try_from(len) else {
+        return fallback;
+    };
+
+    let gap = load_addr % page_size;
+    let back_extend = (gap as usize).min(file_offset);
+    let Ok(back_extend_u32) = u32::try_from(back_extend) else {
+        return fallback;
+    };
+    let aligned_load_addr = load_addr - back_extend_u32;
+    let aligned_file_offset = file_offset - back_extend;
+
+    let Some(raw_len) = back_extend_u32.checked_add(len_u32) else {
+        return fallback;
+    };
+    let page_count = raw_len.div_ceil(page_size);
+    let Some(aligned_len) = page_count.checked_mul(page_size) else {
+        return fallback;
+    };
+
+    (aligned_load_addr, aligned_file_offset, aligned_len)
+}
+
 impl FirmwareBus {
     /// Builds a `FirmwareBus` from a flash image and its already-parsed
     /// segment table (see `crate::mem::image::parse_image`). Categorizes
     /// each segment as XIP or RAM-copied purely by `load_addr`
     /// ([`is_xip_addr`]) — XIP segments keep referencing `flash` in place;
     /// RAM segments get their bytes copied into a fresh owned buffer here.
+    ///
+    /// ## XIP segments are widened to their containing MMU page(s)
+    ///
+    /// Real hardware's flash cache is paged (`crate::mem::soc::MMU_PAGE_SIZE`,
+    /// 64 KiB on ESP32-C3): the 2nd-stage bootloader's
+    /// `set_cache_and_start_app()` page-aligns each XIP segment's `load_addr`
+    /// *down* and its mapped byte count *up* to whole pages
+    /// (`bootloader_support/src/bootloader_utility.c`, composed with
+    /// `hal/mmu_hal.c`'s `mmu_hal_map_region()` -- see
+    /// [`xip_page_window`]'s doc for the full citation), so whatever else
+    /// happens to sit in the same physical flash page as a segment --
+    /// before its `load_addr` or after `load_addr + len` -- becomes
+    /// readable at the matching virtual address too, not just the
+    /// segment's own declared bytes.
+    ///
+    /// This matters concretely: ESP-IDF v5.5.3's `cpu_start`
+    /// (`components/esp_system/port/cpu_start.c`) reads the running app's
+    /// own `esp_image_header_t` from `&_rodata_reserved_start -
+    /// sizeof(esp_image_header_t) - sizeof(esp_image_segment_header_t)` --
+    /// a linker symbol that resolves to the DROM segment's own `load_addr`,
+    /// so this read lands 32 bytes *before* `load_addr`, in this leading
+    /// page gap. Confirmed against `factory.bin`'s real segment table (Task
+    /// D5's report): DROM segment 0's `load_addr` is `0x3c13_0020` (32
+    /// bytes into its containing page, `0x3c13_0000`), and a real boot
+    /// trace shows `cpu_start` reading exactly 24 consecutive bytes
+    /// (`sizeof(esp_image_header_t)`) starting at `0x3c13_0000` -- which,
+    /// pre-fix, fell through to the bus's never-panic catch-all (reads 0)
+    /// since `[0x3c13_0000, 0x3c13_0020)` sat outside the segment's own
+    /// `[load_addr, load_addr+len)`, making the magic-byte check
+    /// (`fhdr.magic != ESP_IMAGE_HEADER_MAGIC`) fail and call `abort()`.
     pub fn from_segments(flash: Arc<[u8]>, segments: &[SegmentDescriptor]) -> Self {
         let mut xip_regions = Vec::new();
         let mut ram_regions = Vec::new();
 
         for seg in segments {
             if is_xip_addr(seg.load_addr) {
+                let (load_addr, file_offset, len) =
+                    xip_page_window(seg.load_addr, seg.file_offset, seg.len, MMU_PAGE_SIZE);
                 xip_regions.push(XipRegion {
-                    load_addr: seg.load_addr,
-                    len: seg.len as u32,
-                    file_offset: seg.file_offset,
+                    load_addr,
+                    len,
+                    file_offset,
                 });
             } else {
                 // `seg.file_offset + seg.len` used to be unchecked here. It
@@ -531,6 +628,119 @@ mod tests {
         assert_eq!(bus.read8(0x42000020), 0x01);
         bus.write8(0x42000020, 0xff);
         assert_eq!(bus.read8(0x42000020), 0x01, "IROM write must be dropped");
+    }
+
+    // Task D5: `cpu_start`'s app-image-header check reads the image header
+    // via a linker symbol (`_rodata_reserved_start`, ESP-IDF v5.5.3's
+    // `components/esp_system/port/cpu_start.c`) that resolves to the DROM
+    // segment's own `load_addr` -- i.e. bytes *before* `load_addr`, in the
+    // same 64 KiB flash-cache MMU page, per `bootloader_support/src/
+    // bootloader_utility.c`'s `set_cache_and_start_app()` (page-align
+    // `load_addr`/flash paddr down, extend size by the leading gap) and
+    // `hal/mmu_hal.c`'s `mmu_hal_map_region()` (round the total mapped
+    // length up to a whole number of pages). A segment whose `load_addr`
+    // isn't itself page-aligned must therefore expose the *whole*
+    // containing page -- both the leading gap before `load_addr` and any
+    // trailing gap after `load_addr + len` -- not just the segment's own
+    // declared bytes.
+    #[test]
+    fn xip_regions_expose_the_full_containing_64kib_page_not_just_the_declared_segment() {
+        // A segment 0x20 bytes into its containing 64 KiB page, with real
+        // flash bytes present both before (the "header") and only up to its
+        // own declared end (nothing stored past it, mirroring a real image
+        // file that simply ends there).
+        let load_addr = 0x3c13_0020u32;
+        let file_offset = 0x20usize;
+        let seg_data = [0xCCu8, 0xDD, 0xEE, 0xFF];
+        let mut flash = vec![0u8; file_offset + seg_data.len()];
+        for (i, b) in flash.iter_mut().enumerate().take(file_offset) {
+            *b = 0xA0 + i as u8;
+        }
+        flash[file_offset..file_offset + seg_data.len()].copy_from_slice(&seg_data);
+
+        let descriptors = [SegmentDescriptor {
+            load_addr,
+            file_offset,
+            len: seg_data.len(),
+        }];
+        let mut bus =
+            FirmwareBus::from_segments(Arc::from(flash.clone().into_boxed_slice()), &descriptors);
+
+        let page_start = load_addr & !0xFFFF;
+        assert_eq!(page_start, 0x3c13_0000);
+
+        // The leading gap (the page's first 0x20 bytes, including where
+        // cpu_start's header copy actually reads from) is now real, mapped
+        // flash data -- not the never-panic catch-all.
+        assert!(bus.unmapped_log().is_empty());
+        for i in 0u32..file_offset as u32 {
+            assert_eq!(
+                bus.read8(page_start + i),
+                flash[i as usize],
+                "byte at page offset 0x{i:x} (before load_addr) should come from the flash page"
+            );
+        }
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "page-prefix bytes must be mapped, not fall through to the catch-all"
+        );
+
+        // The segment's own declared bytes are unchanged.
+        for (i, b) in seg_data.iter().enumerate() {
+            assert_eq!(bus.read8(load_addr + i as u32), *b);
+        }
+
+        // A trailing same-page address past the segment's own declared end
+        // must also be mapped now (real hardware's MMU maps the whole
+        // page): this synthetic flash buffer has no real bytes there, so it
+        // reads 0, but via the mapped region's own out-of-bounds fallback,
+        // not the catch-all.
+        let just_past_segment = load_addr + seg_data.len() as u32;
+        assert_eq!(bus.read8(just_past_segment), 0);
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "trailing same-page bytes must be mapped too, not fall through to the catch-all"
+        );
+
+        // Writes anywhere in the widened window are still dropped (still
+        // XIP/read-only), same as the pre-existing segment bytes.
+        bus.write8(page_start, 0xFF);
+        assert_eq!(bus.read8(page_start), flash[0]);
+
+        // But the *next* 64 KiB page must still be a genuine catch-all miss
+        // -- this rule must not swallow unrelated address space.
+        let next_page = page_start + 0x1_0000;
+        assert_eq!(bus.read8(next_page), 0);
+        assert_eq!(
+            bus.unmapped_log().len(),
+            1,
+            "the next page must not be swept into this XIP region"
+        );
+    }
+
+    #[test]
+    fn xip_page_window_clamps_gracefully_when_no_earlier_flash_bytes_exist() {
+        // A synthetic image whose only bytes ARE the segment itself
+        // (file_offset 0), but whose load_addr isn't page-aligned. Real
+        // hardware's physical flash chip always has *some* bytes earlier in
+        // the same page; this emulator's reconstructed image sometimes
+        // won't (e.g. a browser-supplied partial image). Must not panic
+        // (no unchecked subtraction) and must not fabricate bytes it
+        // doesn't have -- it just can't expose the leading gap in this
+        // case, same as real hardware couldn't if handed a truncated image.
+        let seg_data = [0x01u8, 0x02];
+        let descriptors = [SegmentDescriptor {
+            load_addr: 0x4200_0020,
+            file_offset: 0,
+            len: seg_data.len(),
+        }];
+        let mut bus = FirmwareBus::from_segments(
+            Arc::from(seg_data.to_vec().into_boxed_slice()),
+            &descriptors,
+        );
+
+        assert_eq!(bus.read8(0x4200_0020), 0x01);
+        assert_eq!(bus.read8(0x4200_0021), 0x02);
     }
 
     #[test]

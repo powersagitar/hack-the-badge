@@ -81,6 +81,15 @@ app expects true at its own entry point is public and documented (ESP-IDF's
 `components/esp_system/startup.c`), unlike the mask ROM/bootloader's own
 internals.
 
+**Milestone 3 Task D5**: those DROM/IROM XIP regions are page-granular, not
+just `[load_addr, load_addr+len)` (`emulator-core/src/mem/bus.rs`'s
+`FirmwareBus::from_segments`/`xip_page_window`) — matching what the real
+2nd-stage bootloader's `set_cache_and_start_app()` +
+`mmu_hal_map_region()` actually expose (see the "Known limitations" entry
+below for the full citation chain and why it matters: `cpu_start`'s
+app-image-header check reads bytes that live in exactly this leading
+per-segment page gap).
+
 **Not yet done:** cross-checking computed segment/entry addresses against a
 real-hardware serial boot log transcript (the real bootloader's own boot log
 prints over USB-Serial-JTAG before the app's console takes over — passively
@@ -532,6 +541,93 @@ predicted these blockers would surface once TIMG unblocks further boot:
    this case. **This does not move the header-check wall** — it's the same
    blocker as before, just now diagnosable by reading the actual firmware
    log instead of only trap addresses and register dumps.
+
+   **Resolved in Milestone 3, Task D5** (`emulator-core/src/mem/bus.rs`'s
+   `FirmwareBus::from_segments`, `xip_page_window`;
+   `emulator-core/src/mem/soc.rs`'s `MMU_PAGE_SIZE`). Task 7's own
+   orchestrator hypothesis (quoted above: `cpu_start` reads the header
+   through `SOC_DROM_LOW`, `0x3c00_0000`) turned out to be **refuted by the
+   real ESP-IDF source**: `components/esp_system/port/cpu_start.c` reads
+   the header via `hal_memcpy(&fhdr, (void*)fhdr_src_addr, sizeof(fhdr))`
+   where `fhdr_src_addr = (uint32_t)&_rodata_reserved_start -
+   sizeof(esp_image_header_t) - sizeof(esp_image_segment_header_t)` — a
+   **linker symbol relative to the DROM segment's own `load_addr`**, not a
+   fixed SoC-wide address at all. `_rodata_reserved_start` resolves to
+   `factory.bin`'s DROM segment 0's `load_addr`, `0x3c13_0020` (see the
+   segment table above), so `fhdr_src_addr = 0x3c13_0020 - 24 - 8 =
+   0x3c13_0000` — 32 bytes *before* `load_addr`, and (not a coincidence)
+   exactly that address's containing 64 KiB flash-cache MMU page start
+   (`0x3c13_0020 & !0xFFFF`). Confirmed two ways, not just read off the
+   source: (1) disassembling `factory.bin`'s own bytes around the check
+   (`emulator-core`'s decoder, ad hoc) shows compiler-emitted `lui`
+   instructions loading the literal constant `0x3c13_0000` as a base for
+   nearby rodata string addresses; (2) instrumenting a real boot run
+   confirmed **exactly 24 consecutive byte reads** (`sizeof(esp_image_header_t)`)
+   at addresses `0x3c13_0000`..`0x3c13_0017`, immediately before the
+   pre-fix `abort()` — a direct, empirical trace of `hal_memcpy`'s own read
+   pattern, not an inference.
+
+   Real hardware exposes those bytes because the 2nd-stage bootloader's
+   `set_cache_and_start_app()` (`bootloader_support/src/bootloader_utility.c`)
+   page-aligns each XIP segment's `load_addr` *down* and widens its mapped
+   size by the leading gap before programming the flash-cache MMU, and
+   `hal/mmu_hal.c`'s `mmu_hal_map_region()` rounds the total mapped length
+   *up* to a whole number of 64 KiB pages (`MMU_PAGE_SIZE`, confirmed fixed
+   at 64 KiB on ESP32-C3 by `hal/esp32c3/include/hal/mmu_ll.h`'s
+   `mmu_ll_get_page_size()`) — so whatever else shares that physical flash
+   page as a segment (before its `load_addr` or after `load_addr + len`)
+   becomes readable at the matching virtual address too, not just the
+   segment's own declared bytes. `crate::boot`'s shortcut boot previously
+   mapped each XIP segment over only its own exact `[load_addr,
+   load_addr+len)`, so `[0x3c13_0000, 0x3c13_0020)` fell through to the
+   bus's never-panic catch-all (reads `0`), making the magic-byte check
+   fail. `FirmwareBus::from_segments` now widens every XIP segment to its
+   containing page(s) the same way, so this read now returns the image's
+   real header bytes (magic `0xE9` at offset 0).
+
+   Only the magic byte is actually validated by `cpu_start` itself (a
+   second `abort()` in the same function is gated behind
+   `CONFIG_SPI_FLASH_SIZE_OVERRIDE`, which this build doesn't define, and
+   `chip_id`/`min_chip_rev`/`max_chip_rev_full` are parsed into `fhdr` but
+   never compared against anything in this function) — so fixing the page
+   mapping was sufficient on its own; no second header-field check needed
+   fixing in the same task.
+
+   **Where boot now stalls**: the header check passes for real —
+   `cpu_start: Invalid app image header` no longer appears anywhere in the
+   console — and boot runs much further, printing several lines this
+   emulator had never reached before: `cpu_start: Pro cpu start user code`
+   (step 407,528), `cpu_start: cpu freq: 160000000 Hz` (407,586), then a
+   full `app_init`/`efuse_init` block (project name, app version, compile
+   time, ELF SHA256, ESP-IDF version, min/max/actual chip revision — all
+   generic ESP-IDF build metadata, not identity data), ending at
+   `efuse_init: Chip rev: v0.0` (408,344). It then hits a **new, unrelated**
+   stall: an unstubbed ROM `qsort` call (`0x4000_0434`, confirmed against
+   `esp32c3.rom.libc.ld`'s `qsort = 0x40000434;`) — a plain missing-ROM-stub
+   gap, not another header-field check, so per this task's own scope ruling
+   it's left for the next task rather than fixed here. The register dump at
+   the fault (`nmemb`/`size`-shaped args `A1=5, A2=8`; return address inside
+   the app's own `esp_system` startup code) is consistent with ESP-IDF's
+   `do_system_init_fn()` sorting its init-function array before running it,
+   though that caller isn't independently confirmed. The resulting
+   `INSTRUCTION_ACCESS_FAULT` (step 408,481) is a genuine hardware
+   exception, not an `abort()`, so ESP-IDF's panic handler takes its
+   *exception* path immediately (`info->reason` non-`NULL` from the first
+   pass) and prints "Guru Meditation Error" right away (step 410,197),
+   then `panic_restart()` calls into the still-unstubbed ROM
+   `software_reset_cpu` (`0x4000_0094`) to actually reboot — which faults
+   again (console shows "Rebooting..." at step 648,457), re-entering the
+   panic handler and looping, the same downstream shape as the old
+   cpu_start-abort scenario purely by coincidence (both are a first
+   `INSTRUCTION_ACCESS_FAULT`-class fault immediately followed by the same
+   unstubbed reboot-retry fault), not because the cause is related. Pinned
+   down exactly in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`.
+   This is the natural next Milestone 3 candidate: stub `qsort` (a
+   self-contained ROM libc algorithm, same "needs a real implementation"
+   category as `memcpy`/`memset`/`itoa`/`strcat` — a fabricated return
+   would leave the array unsorted rather than unblock the caller) and
+   re-probe.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

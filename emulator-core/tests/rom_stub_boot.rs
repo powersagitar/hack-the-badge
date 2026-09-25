@@ -40,8 +40,8 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // Milestone 3 Task D1: reduced from 2,000,000. Modeling RTC_CNTL's RTC
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
-    // budget into a *new*, later stall (see
-    // `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`
+    // budget into a *new*, later stall (see this file's renamed
+    // `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -60,6 +60,15 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // step) -- comfortably clear either way (~57,549-step/~16% margin),
     // without this test needing to also pin the new, later stall (that's
     // the other test's job).
+    //
+    // Task D5 status: `crate::mem::bus::FirmwareBus::from_segments`'s
+    // page-granular XIP mapping fixed `cpu_start`'s header check for real
+    // (see `emulator-core/tests/boot_progress.rs`'s module doc's "Task D5
+    // status"), so `abort()` is never reached any more -- boot's first
+    // fault is now a genuinely different one, an unstubbed ROM `qsort` call
+    // at step 408,481 (see this file's renamed test above). 350,000 remains
+    // comfortably clear (~58,481-step/~17% margin, essentially unchanged
+    // from Task D4's).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -182,111 +191,63 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     }
 }
 
-/// This test **pins today's abort/panic path, not boot progress past it**.
-/// Milestone 3 Task D4 (`emulator-core/src/rom.rs`'s module doc, entry 12)
-/// implements real HLE for both ROM calls Fix round 1 left this test
-/// pinned on: `itoa` (`0x4000_0448`) and, once that unblocked boot, the
-/// very next unstubbed call, `strcat` (`0x4000_03d8`, also
-/// `esp32c3.rom.libc.ld`). Both calls belong to newlib's own `abort()`
-/// (`components/newlib/abort.c`): `itoa` formats the caller's address and
-/// core ID, and the `strcat`-only loop that follows concatenates the fixed
-/// message `"abort() was called at PC 0x<addr> on core <n>"` — confirmed
-/// by reading the literal string bytes and the caller chain directly out
-/// of `factory.bin` (see Task D4 fix round 1's report).
+/// This test **pins today's panic path, not boot progress past it**.
+/// **Renamed and re-pointed in Task D5** (from
+/// `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`):
+/// Task D5 (`crate::mem::bus::FirmwareBus::from_segments`'s page-granular
+/// XIP mapping, see `emulator-core/tests/boot_progress.rs`'s module doc's
+/// "Task D5 status") fixed `cpu_start`'s app-image-header check for real --
+/// it now reads the image's actual magic byte (`0xE9`) instead of a
+/// catch-all `0`, passes, and never calls `abort()`. Every fault sequence
+/// this test used to pin (newlib's `abort()`, `panic_abort()`'s
+/// `ILLEGAL_INSTRUCTION` trap at `0x4038e4fa`) is gone; boot instead runs
+/// much further -- through `cpu_start`'s remaining startup log lines and a
+/// full `app_init`/`efuse_init` block that never used to print at all --
+/// before hitting a **new, unrelated** stall this task's own scope ruling
+/// says to stop at and report, not fix: an unstubbed ROM `qsort` call
+/// (`0x4000_0434`, confirmed against `esp32c3.rom.libc.ld`'s `qsort =
+/// 0x40000434;`). The register dump at the fault (`A1=5, A2=8`, return
+/// address inside the app's own `esp_system` startup code) is consistent
+/// with ESP-IDF's `do_system_init_fn()` sorting its init-function array
+/// before running it -- a plain missing-ROM-stub gap, left for the next
+/// task.
 ///
-/// **Corrected in Task D4 fix round 1** (a review caught this): the
-/// original version of this test's doc claimed `itoa`/`strcat` sat on
-/// "the normal, pre-panic boot path". That was wrong. `abort()`'s own
-/// caller, at `0x42001004`–`0x42001010`, is `ets_printf` called with the
-/// format string `"E (%lu) %s: Invalid app image header\n"` and the tag
-/// `"cpu_start"` — i.e. **ESP-IDF's own early-startup app-image-header
-/// check rejected this image and is logging that fact before aborting.**
-/// The console showed nothing at the time only because `ets_printf` is
-/// stubbed `Return(0)` and never reaches `Console` (see `rom.rs`'s entry 7
-/// caveat) — the `cpu_start` error line was logged and silently dropped,
-/// not skipped. **Boot has been aborting on this check since at least Task
-/// D3 fix round 1**; Task D4 did not move the wall, it only let this
-/// pre-existing `abort()` call finish formatting its message instead of
-/// faulting mid-format on an unstubbed `itoa`/`strcat`.
-///
-/// With both unblocked, that `abort()` call runs to completion and reaches
-/// the trap it was always going to reach: a real `ILLEGAL_INSTRUCTION`
-/// exception (RISC-V cause 2, not `INSTRUCTION_ACCESS_FAULT`) at
-/// `0x4038e4fa`, inside the app's own IRAM code -- a compiler-emitted
-/// `c.unimp` (RVC's all-zero 16-bit encoding, architecturally reserved to
-/// always trap), reached immediately after storing `g_panic_abort = true`
-/// and `g_panic_abort_details = <this abort's message>` to two fixed
-/// addresses. That's `esp_system_abort` -> `panic_abort()`'s mechanism
-/// (`components/esp_system/panic.c`) -- a deliberate, hardware-standard
-/// trap, not a decode gap. Per Task D4's own stop condition ("stop as soon
-/// as the stall is anything other than an unstubbed ROM libc/string
-/// call"), that task stopped here rather than chasing this further --
-/// correctly, since the actual blocker (`cpu_start`'s header check) isn't a
-/// ROM stub gap at all.
-///
-/// **What happens next** (all of it real, hardware-faithful behavior, not
-/// an emulator gap): the RISC-V trap delivers correctly to the firmware's
-/// own exception handler, which runs `esp_panic_handler` for the first time
-/// with a *complete* message (itoa/strcat actually built it this time).
-/// Per `panic.c`, the abort path leaves `info->reason == NULL`, so the
-/// "Guru Meditation Error" header is skipped on this first pass; ESP-IDF's
-/// generic pre-restart text prints unconditionally -- **panic output for
-/// `cpu_start`'s abort, not evidence of boot progress past it** -- then
+/// That `INSTRUCTION_ACCESS_FAULT` (step 408,481) is a genuine hardware
+/// exception this time, not an `abort()`, so ESP-IDF's panic handler takes
+/// its *exception* path immediately (`info->reason` non-`NULL` from the
+/// first pass) and prints "Guru Meditation Error" right away, then
 /// `panic_restart()` calls into the still-unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`) to actually reboot -- which faults (a real
-/// `INSTRUCTION_ACCESS_FAULT` this time), re-entering the panic handler
-/// through its *exception* path (where `info->reason` finally is non-NULL,
-/// so "Guru Meditation Error" prints for the first time), which again
-/// reaches the same unstubbed `software_reset_cpu` call and loops.
-/// `software_reset_cpu` remains unstubbed -- it's only reached via the
-/// panic path, per this module's own scoping, and stubbing it wouldn't
-/// address `cpu_start`'s header-check failure, the actual blocker.
+/// (`0x4000_0094`) to actually reboot -- which faults again, re-entering
+/// the panic handler and looping, same downstream shape as the old
+/// cpu_start-abort scenario (coincidentally: both are a first
+/// `INSTRUCTION_ACCESS_FAULT`-class fault immediately followed by the same
+/// unstubbed reboot-retry fault), just with a different, earlier root
+/// cause. `software_reset_cpu` remains unstubbed -- it's only reached via
+/// the panic path, per this module's own scoping, and stubbing it wouldn't
+/// address the `qsort` gap, the actual blocker now.
 ///
-/// This test is **deliberately expected to break** once a later task fixes
-/// (or works around) `cpu_start`'s header check: at that point `abort()`
-/// is never called, this whole panic path disappears, and this test's
-/// assertions (two traps, this exact fault sequence, this console text)
-/// stop holding. That's the correct outcome, not a regression -- whoever
-/// fixes the header check should delete or replace this test, not chase a
-/// new pinned value here.
-///
-/// **History**: until Task D4, this test pinned an *earlier* stall -- an
-/// unstubbed `itoa` call at `0x4000_0448` (see Fix round 1's report). That
-/// call, and the `strcat` call it led to, are now stubbed for real
-/// (`emulator-core/src/rom.rs`'s module doc, entry 12), so this test's
-/// expected stall point moved forward to this abort/panic sequence. It was
-/// also renamed (from `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`)
-/// in Task D4 fix round 1, since "stalls" implied a stub gap rather than a
-/// genuine firmware-triggered abort.
-///
-/// **Task 7 update**: `ets_printf` (`emulator_core::rom::ETS_PRINTF`) is no
-/// longer a `Return(0)` stub -- it's a real HLE formatter (`rom.rs`'s
-/// module doc, entry 7) -- so the `cpu_start`-rejects-this-header error
-/// line this whole abort sequence starts from is now itself visible in the
-/// console too (asserted below and by `tests/boot_progress.rs`'s
-/// `boot_reaches_cpu_starts_own_header_check_error_line`, the dedicated
-/// ratchet rung for that specific line -- not duplicated as a budget rung
-/// here, just reinforced as one more assertion on this already-pinned
-/// trace). **The actual blocker is unchanged**: `cpu_start`'s
-/// app-image-header check itself, still unresolved.
+/// This test is **deliberately expected to break** once a later task stubs
+/// `qsort` (or otherwise gets boot past it): at that point this exact fault
+/// sequence disappears, and whoever makes that fix should delete or
+/// replace this test rather than chase a new pinned value here.
 #[test]
-fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
+fn boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message()
+{
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
     // 650,000 steps is a single, stable, two-trap snapshot: comfortably
-    // past both the panic_abort() ILLEGAL_INSTRUCTION trap (measured at
-    // step 407,549) and the software_reset_cpu INSTRUCTION_ACCESS_FAULT it
-    // leads to (measured at step 645,410), but well before the panic
-    // handler's re-entrancy guard kicks in and the "Rebooting"/panic text
-    // starts repeating many more times (observed within a few million
-    // steps in this task's boot-probe re-run).
+    // past both the qsort INSTRUCTION_ACCESS_FAULT (measured at step
+    // 408,481) and the software_reset_cpu INSTRUCTION_ACCESS_FAULT it
+    // leads to (measured reaching the console at step 648,457), but well
+    // before the panic handler's re-entrancy guard kicks in and the
+    // "Rebooting"/panic text starts repeating many more times.
     let summary = rt.run(650_000);
     assert_eq!(
         summary.traps, 2,
-        "expected exactly two traps so far: the panic_abort() illegal \
-         instruction, then the software_reset_cpu instruction-access fault \
-         it leads to"
+        "expected exactly two traps so far: the unstubbed qsort call's \
+         instruction-access fault, then the software_reset_cpu \
+         instruction-access fault it leads to"
     );
     assert_eq!(
         summary.last_instruction_fault,
@@ -296,10 +257,9 @@ fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
          attempt"
     );
 
-    // The firmware's own panic handler ran to completion for the first
-    // time and printed ESP-IDF's generic pre-restart text, then a full
-    // crash report on the second (exception-path) pass -- generic ESP-IDF
-    // text, never identity data (see this file's module doc and
+    // The firmware's own panic handler ran and printed ESP-IDF's generic
+    // pre-restart text plus a full crash report -- generic ESP-IDF text,
+    // never identity data (see this file's module doc and
     // `docs/firmware-emulator-notes.md`'s data-handling note).
     assert!(
         rt.console_output().contains("Rebooting..."),
@@ -312,16 +272,23 @@ fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
          report; got:\n{}",
         rt.console_output()
     );
-    // Task 7: `ets_printf` now really formats/emits its output (see
-    // `rom.rs`'s module doc, entry 7), so the early-boot error line that
-    // triggers this whole abort/panic sequence -- previously silently
-    // dropped -- is itself visible too. Reinforces this file's pin; the
-    // dedicated ratchet rung is `tests/boot_progress.rs`'s
-    // `boot_reaches_cpu_starts_own_header_check_error_line`.
+
+    // Task D5's actual fix, positively confirmed: cpu_start's header check
+    // now passes for real, so its error line must never appear, and boot
+    // must reach several genuinely new lines past it (the dedicated
+    // ratchet rung for the specific budget is
+    // `tests/boot_progress.rs`'s `boot_reaches_efuse_inits_chip_rev_line`;
+    // reinforced here as one more assertion on this already-pinned trace).
     assert!(
-        rt.console_output().contains("cpu_start: Invalid app image header"),
-        "expected cpu_start's own header-check error line to reach the \
-         console now that ets_printf is a real formatter; got:\n{}",
+        !rt.console_output().contains("Invalid app image header"),
+        "cpu_start's header check should now pass for real -- this line \
+         must never appear; got console:\n{}",
+        rt.console_output()
+    );
+    assert!(
+        rt.console_output().contains("efuse_init: Chip rev:"),
+        "expected boot to reach the new efuse_init block past the fixed \
+         header check; got console:\n{}",
         rt.console_output()
     );
 

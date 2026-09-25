@@ -139,6 +139,50 @@
 //! `cpu_start`'s header check runs and fails before either would print --
 //! so per this task's own orchestrator contingency for that case, the new
 //! rung asserts the line boot *does* reach instead.
+//!
+//! **Task D5 status**: `crate::mem::bus::FirmwareBus::from_segments` now
+//! widens each XIP (DROM/IROM) segment to its containing 64 KiB flash-cache
+//! MMU page (see that function's doc comment), matching what the real
+//! 2nd-stage bootloader's `set_cache_and_start_app()` +
+//! `mmu_hal_map_region()` actually expose. `cpu_start`'s app-image-header
+//! check (`components/esp_system/port/cpu_start.c`) reads the header from
+//! exactly this newly-exposed leading page gap, so it now reads the real
+//! magic byte (`0xE9`) instead of a catch-all `0`, and **passes** --
+//! `cpu_start: Invalid app image header` no longer appears anywhere in the
+//! console, and boot reaches several new, genuinely later lines this file
+//! had never seen before: `cpu_start: Pro cpu start user code` (step
+//! 407,528), `cpu_start: cpu freq: 160000000 Hz` (407,586), a full
+//! `app_init`/`efuse_init` block (project name, version, compile time, SHA256,
+//! ESP-IDF version, min/max/actual chip revision), ending at `efuse_init:
+//! Chip rev: v0.0` (408,344). [`boot_reaches_cpu_starts_own_header_check_error_line`]
+//! is retired (renamed to [`boot_reaches_efuse_inits_chip_rev_line`] below,
+//! its replacement rung) since the line it pinned no longer prints at all.
+//!
+//! Boot then hits a **new, different, genuinely unrelated stall**: an
+//! unstubbed ROM `qsort` call (`0x4000_0434`, `esp32c3.rom.libc.ld`) --
+//! confirmed by symbol address, not guessed; register dump shows a
+//! `nmemb`/`size`-shaped call (`A1=5, A2=8`) with a return address inside
+//! the app's own `esp_system` startup code, consistent with ESP-IDF's
+//! `do_system_init_fn()` sorting its init-function array before running it.
+//! This is a plain missing-ROM-stub gap (this task's own scope ruling: "Stop
+//! at anything else and report it" -- a new unstubbed ROM call is not
+//! another header-field check in `cpu_start`), left for the next task. The
+//! resulting `INSTRUCTION_ACCESS_FAULT` (step 408,481) is a genuine
+//! hardware-standard exception this time (not an `abort()`), so ESP-IDF's
+//! panic handler takes its *exception* path immediately -- `info->reason`
+//! is non-`NULL` from the very first pass, so "Guru Meditation Error"
+//! prints right away (step 410,197) instead of only after a failed reboot
+//! retry. [`first_console_output_is_the_firmware_s_own_panic_report`]'s doc
+//! is corrected below to describe this new cause (the assertion/budget
+//! still held even before this correction, since both the old and new
+//! causes print the same generic string). The still-unstubbed ROM
+//! `software_reset_cpu` (`0x4000_0094`) then faults on the reboot attempt
+//! exactly as before (step within the existing 650,000 budget -- see
+//! `emulator-core/tests/rom_stub_boot.rs`'s renamed pinned-stall test), so
+//! [`boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort`]
+//! is renamed to
+//! [`boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`]
+//! below -- same budget, corrected narrative.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -222,66 +266,59 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
     );
 }
 
-/// A console-line ratchet — **but read this as pinning today's panic
-/// output, not boot progress.** "Guru Meditation Error" is ESP-IDF's own
-/// generic panic-header string (`components/esp_system/panic.c`), present
-/// in every ESP-IDF crash report — not badge-specific or identity data.
-/// This line is reached because `cpu_start` rejects this image's header
-/// and calls `abort()` (see `emulator-core/src/rom.rs`'s module doc, entry
-/// 12), *not* because boot is progressing normally; a version of this
-/// test's doc that predates Task D4 fix round 1 mischaracterized the
-/// underlying cause (see that fix round's report).
+/// A console-line ratchet — **still panic output, not boot progress, but
+/// for a different reason than before.** "Guru Meditation Error" is
+/// ESP-IDF's own generic panic-header string (`components/esp_system/
+/// panic.c`), present in every ESP-IDF crash report — not badge-specific or
+/// identity data.
 ///
-/// **Budget history**: 500,000 steps used to be comfortably past this
-/// (measured at step 401,761, back when `itoa` faulted mid-format and the
-/// truncated abort path printed this header directly). As of Task D4,
-/// `itoa`/`strcat` really execute, so this same, pre-existing `abort()`
-/// call (see `emulator-core/tests/rom_stub_boot.rs`'s
-/// `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`) now
-/// runs to completion instead of faulting mid-format — and per ESP-IDF's
-/// `panic.c`, that path leaves `info->reason == NULL`, which *skips* the
-/// "Guru Meditation Error" header (see
-/// [`boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort`]
-/// below for the line that *does* print on this first pass). The header
-/// only appears once the panic handler's own reboot attempt faults for
-/// real (the still-unstubbed `software_reset_cpu`, measured at step
-/// 645,410) and re-enters the panic handler through its *exception* path,
-/// where `info->reason` is finally non-`NULL` (measured reaching the
-/// console by step 648,000). 750,000 keeps this rung comfortably past that
-/// new point.
+/// **Corrected in Task D5** (this test's assertion/budget didn't need to
+/// change, but its cause did, so its doc would otherwise now be wrong):
+/// this line used to be reached via `cpu_start`'s header-check `abort()`
+/// (see the pre-Task-D5 history below). Task D5's fix
+/// (`crate::mem::bus::FirmwareBus::from_segments`'s page-granular XIP
+/// mapping) makes that header check pass, so `abort()` is never called any
+/// more. Boot instead runs into a **new, unrelated** stall -- an unstubbed
+/// ROM `qsort` call (`0x4000_0434`; see this file's module doc's "Task D5
+/// status") -- whose `INSTRUCTION_ACCESS_FAULT` is a genuine hardware
+/// exception, not an `abort()`, so ESP-IDF's panic handler takes its
+/// *exception* path immediately (`info->reason` non-`NULL` from the first
+/// pass), printing "Guru Meditation Error" right away (measured at step
+/// 410,197) instead of only after a failed reboot retry.
 ///
-/// Like its sibling below, this rung is **expected to break, deliberately,
-/// once a later task fixes `cpu_start`'s header check** — at that point
-/// `abort()` is never called and neither panic string is ever printed.
+/// **Pre-Task-D5 history** (kept for context): 500,000 steps used to be
+/// comfortably past this (measured at step 401,761, back when `itoa`
+/// faulted mid-format and the truncated abort path printed this header
+/// directly); after Task D4 made `itoa`/`strcat` real, the header only
+/// appeared once `cpu_start`'s abort path's own reboot attempt faulted for
+/// real (measured at step 648,000), hence the 750,000 budget. Both
+/// superseded by the cause above; 750,000 remains a comfortable budget for
+/// the new cause too (measured at 410,197, well under half the budget).
 #[test]
 fn first_console_output_is_the_firmware_s_own_panic_report() {
     assert_reaches("Guru Meditation Error", 750_000);
 }
 
-/// A console-line ratchet on `cpu_start`'s abort path — **not** a boot-
-/// progress rung. **Renamed and reframed in Task D4 fix round 1**: this
-/// test used to be named `boot_reaches_the_panic_handlers_reboot_message_for_the_first_time`
-/// and its doc claimed it was "this file's first genuinely new
-/// console-line rung" implying real forward progress. A review found that
-/// framing wrong: with `itoa`/`strcat` real
-/// (`emulator-core/src/rom.rs`'s module doc, entry 12), the *pre-existing*
-/// `cpu_start`-rejects-this-image's-header abort path (see that entry's
-/// corrected narrative) now runs its panic handler to completion for the
-/// first time and prints ESP-IDF's generic pre-restart text
-/// (`components/esp_system/panic.c`, printed unconditionally regardless of
-/// abort vs. exception, right before calling `panic_restart()`) — not
-/// badge-specific or identity data, same as "Guru Meditation Error" above,
-/// but **panic output, not evidence boot is proceeding past the header
-/// check**. Measured reaching the console somewhere in [644,000, 645,000),
-/// comfortably before 650,000.
+/// A console-line ratchet on the panic handler's reboot attempt — **not** a
+/// boot-progress rung. **Renamed in Task D5** (from
+/// `boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort`):
+/// with the header check now passing (see this file's module doc's "Task
+/// D5 status"), `cpu_start` never calls `abort()` any more, so this is no
+/// longer reached "via cpu_start's abort" -- it's reached via the *new*
+/// unstubbed-`qsort`-call panic's own reboot attempt instead (same
+/// generic ESP-IDF pre-restart text, `components/esp_system/panic.c`,
+/// printed unconditionally right before `panic_restart()`; not
+/// badge-specific or identity data). Measured reaching the console at step
+/// 648,457 -- close to the pre-Task-D5 measurement (645,410) purely by
+/// coincidence of similar code-path length, not because the cause is the
+/// same. 650,000 remains a comfortable budget.
 ///
-/// This rung is **deliberately expected to break** once a later task
-/// fixes (or works around) `cpu_start`'s header check: `abort()` would
-/// then never be called, "Rebooting..." from *this* path would never
-/// print, and whoever makes that fix should delete or replace this test
-/// rather than chase a new pinned value here.
+/// This rung is **deliberately expected to break** once a later task fixes
+/// (or stubs around) the unstubbed `qsort` ROM call: at that point this
+/// panic path is never reached either, and whoever makes that fix should
+/// delete or replace this test rather than chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort() {
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault() {
     assert_reaches("Rebooting...", 650_000);
 }
 
@@ -412,33 +449,40 @@ fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
     );
 }
 
-/// Milestone 3 Task 7's ratchet rung -- and this file's **first genuinely
-/// new early-boot console line**, not a panic-report string. Before this
-/// task, `ets_printf` (`emulator_core::rom::ETS_PRINTF`) was a `Return(0)`
-/// status stub that silently dropped every `ESP_EARLY_LOG*` line,
-/// including this exact one; now it's a real HLE formatter
-/// (`emulator_core::cpu::rom_stubs::RomStubEffect::Printf`, see
-/// `emulator-core/src/rom.rs`'s module doc, entry 7), so `cpu_start`'s own
-/// `E (%lu) %s: Invalid app image header\n` call (the one whose `itoa`/
-/// `strcat`-formatted `abort()` message this file's sibling rungs above
-/// are about) now actually reaches the console.
+/// Milestone 3 Task D5's ratchet rung -- **replaces** Task 7's
+/// `boot_reaches_cpu_starts_own_header_check_error_line`, retired here
+/// because the line it pinned (`cpu_start: Invalid app image header`) no
+/// longer ever prints: Task D5's fix
+/// (`crate::mem::bus::FirmwareBus::from_segments`'s page-granular XIP
+/// mapping, see this file's module doc's "Task D5 status") makes
+/// `cpu_start`'s header check pass for real.
 ///
-/// This module's own doc predicted the spec's original ladder rungs
-/// (`cpu_start: Pro cpu start user code`, `cpu_start: cpu freq:`) would
-/// only appear if boot reached them before aborting -- boot-probe evidence
-/// (this task's report) confirms it does not: `cpu_start`'s app-image-
-/// header check runs, fails, and calls `abort()` before either of those
-/// two lines would print, so per the orchestrator's own contingency this
-/// rung asserts the line boot *does* reach instead, and pins it as the
-/// current blocker (unchanged by this task): `cpu_start`'s app-image-
-/// header check itself.
-///
-/// Measured reaching the console at step 407,448 (just before the
-/// itoa/strcat-formatted `abort()` call at step 407,471 that this file's
-/// sibling rung above is about -- the same `cpu_start` code path, in the
-/// order the source emits them). 420,000 keeps this comfortably past that
-/// with margin, well short of the panic path's own budgets below.
+/// This is this file's first genuinely new *early-boot* console-line rung
+/// since Task 7's (as opposed to a panic-report string): the spec's
+/// original ladder rungs Task 7 predicted wouldn't be reached
+/// (`cpu_start: Pro cpu start user code`, `cpu_start: cpu freq:`) now are,
+/// plus a full `app_init`/`efuse_init` block this emulator had never
+/// printed before, ending at `efuse_init: Chip rev: v0.0` (measured
+/// reaching the console at step 408,344 -- just before the new unstubbed
+/// `qsort` stall's fault at step 408,481). 420,000 keeps this comfortably
+/// past that with margin, well short of the panic path's own budgets
+/// below. Also asserts the old, now-permanently-wrong line never appears
+/// again -- the direct, positive confirmation that the header check is
+/// actually passing, not just that boot reached some later point by
+/// coincidence.
 #[test]
-fn boot_reaches_cpu_starts_own_header_check_error_line() {
-    assert_reaches("cpu_start: Invalid app image header", 420_000);
+fn boot_reaches_efuse_inits_chip_rev_line() {
+    let (rt, ok) = boot_until_console_contains("efuse_init: Chip rev:", 420_000);
+    assert!(
+        ok,
+        "never printed \"efuse_init: Chip rev:\" within 420000 steps; pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(
+        !rt.console_output().contains("Invalid app image header"),
+        "cpu_start's header check should now pass for real -- this line \
+         must never appear; got console:\n{}",
+        rt.console_output()
+    );
 }

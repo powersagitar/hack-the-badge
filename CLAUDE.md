@@ -19,22 +19,23 @@ ESP32-C3 device), in two complementary modes:
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   Real-firmware boot currently runs past the mask-ROM wall and into the
-   app image's own runtime, and — now that ROM `ets_printf` is HLE-stubbed
-   as a real C-printf formatter (Milestone 3 Task 7), not just a
-   `Return(0)` status stub — every early boot-log line up to and including
-   `cpu_start`'s own is now visible on the emulated console, e.g. `E (0)
-   cpu_start: Invalid app image header`: `cpu_start` (ESP-IDF's early
-   startup) rejects this image's header and calls `abort()`, which — now
-   that ROM `itoa`/`strcat` are also HLE-stubbed for real — completes its
-   crash message and reaches a real, hardware-standard `panic_abort()`
-   trap at step ~407,549 (not an unstubbed-ROM-call fault), then loops in
-   the firmware's own panic handler and `software_reset_cpu` retry — well
-   before reaching any built-in app. The current blocker is still
-   `cpu_start`'s app-image-header check itself, not a missing ROM stub (a
-   known, documented gap — see `docs/firmware-emulator-notes.md`'s "Known
-   limitations" section before assuming a built-in app is reachable in
-   this mode).
+   Real-firmware boot currently runs past the mask-ROM wall, past
+   `cpu_start`'s own app-image-header check (Milestone 3 Task D5 made the
+   emulator's flash-cache XIP mapping page-granular, like the real 2nd-stage
+   bootloader's, which exposes the header bytes `cpu_start` actually reads —
+   see `docs/firmware-emulator-notes.md`'s "Known limitations" entry 1 for
+   the full story), and into a full early-boot log: `cpu_start: Pro cpu
+   start user code`, `cpu_start: cpu freq: ...`, and a generic
+   `app_init`/`efuse_init` build-metadata block, all visible on the emulated
+   console since ROM `ets_printf` is HLE-stubbed as a real C-printf
+   formatter (Milestone 3 Task 7). Boot then hits a **new, unrelated**
+   stall: an unstubbed ROM `qsort` call (step ~408,481), whose
+   `INSTRUCTION_ACCESS_FAULT` is a genuine hardware exception (not an
+   `abort()`), so it reaches ESP-IDF's panic handler and loops in
+   `software_reset_cpu` retry — well before reaching any built-in app. The
+   current blocker is this missing `qsort` ROM stub (a known, documented
+   gap — see `docs/firmware-emulator-notes.md`'s "Known limitations"
+   section before assuming a built-in app is reachable in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -152,9 +153,18 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       fight). Unmapped *data* access never panics (reads 0,
                       writes drop); unmapped *instruction fetches* always
                       trap — this asymmetry is load-bearing, not an
-                      oversight (see docs/firmware-emulator-notes.md).
+                      oversight (see docs/firmware-emulator-notes.md). Each
+                      XIP (DROM/IROM) segment is widened to its containing
+                      64 KiB flash-cache MMU page (Milestone 3 Task D5,
+                      `xip_page_window`), not just its own declared
+                      `[load_addr, load_addr+len)`, matching what the real
+                      2nd-stage bootloader's page-granular MMU setup
+                      exposes — load-bearing for `cpu_start`'s
+                      app-image-header check, which reads bytes just before
+                      the DROM segment's own `load_addr`.
                       mem/image.rs parses the ESP-IDF app-image format;
-                      mem/soc.rs holds the ESP32-C3 address-space ranges.
+                      mem/soc.rs holds the ESP32-C3 address-space ranges
+                      plus the ESP32-C3's fixed 64 KiB MMU page size.
   src/peripherals/    SYSTIMER + the ESP32-C3 interrupt matrix (not a
                       standard PLIC), GPIO + an emulated 74HC165 button
                       shift register, and SPI2/GPSPI2 + an ST7789

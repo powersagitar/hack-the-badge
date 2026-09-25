@@ -74,9 +74,27 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // *not* from "normal boot progress" as originally (incorrectly)
       // documented. This trap is panic_abort() reached via that
       // pre-existing abort() call, not evidence of progress past the
-      // header check. See emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_aborts_reaching_the_panic_handlers_reboot_message
-      // and docs/firmware-emulator-notes.md for the full corrected story.
+      // header check. See docs/firmware-emulator-notes.md for the full
+      // corrected story (superseded by Task D5 below).
+      //
+      // Milestone 3 Task D5: emulator-core/src/mem/bus.rs's
+      // FirmwareBus::from_segments now widens each XIP (DROM/IROM) segment
+      // to its containing 64 KiB flash-cache MMU page, matching what the
+      // real 2nd-stage bootloader's set_cache_and_start_app() +
+      // mmu_hal_map_region() actually expose. cpu_start's app-image-header
+      // check reads the header from exactly this newly-exposed leading page
+      // gap, so it now reads the real magic byte and passes for real --
+      // abort() is never called any more, and boot runs much further (a
+      // full app_init/efuse_init log block that never printed before) --
+      // before hitting a new, unrelated stall: an unstubbed ROM qsort call
+      // (0x4000_0434, step 408,481). That INSTRUCTION_ACCESS_FAULT is still
+      // well within this 500,000-step budget, so the trap count here stays
+      // 1 (the second fault -- the still-unstubbed software_reset_cpu the
+      // panic handler's own reboot attempt calls -- isn't reached until
+      // ~step 648,457, past this budget). See
+      // emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message
+      // and docs/firmware-emulator-notes.md for the full story.
       expect(report.traps).toBe(1);
 
       const fb = handle.framebuffer();
