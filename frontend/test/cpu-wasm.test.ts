@@ -44,7 +44,7 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // (ets_efuse_get_spiconfig, step 402,113), still well within this
       // 500,000-step budget.
       //
-      // Milestone 3 Task D3: ets_efuse_get_spiconfig and five more ROM
+      // Milestone 3 Task D3: ets_efuse_get_spiconfig and six more ROM
       // calls it led to are now HLE-stubbed (emulator-core/src/rom.rs's
       // module doc, entry 10), which unblocked the Task-D2-era fault --
       // boot now runs further still and hits a *different* unstubbed ROM

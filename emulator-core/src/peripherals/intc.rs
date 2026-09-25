@@ -3,8 +3,8 @@
 //!
 //! **This is not a standard RISC-V PLIC.** Register layout confirmed
 //! against ESP-IDF v5.5.3's
-//! `components/soc/esp32c3/register/soc/interrupt_core0_reg.h` (fetched
-//! directly via `gh api` this task). Per that header and
+//! `components/soc/esp32c3/register/soc/interrupt_core0_reg.h` (fetched at
+//! tag `v5.5.3`, not guessed). Per that header and
 //! `components/riscv/vectors_intc.S`'s documented vector-table scheme: every
 //! peripheral "interrupt source" (UART, SPI, GPIO, both timer groups, the
 //! systimer, ~60 others per the header) has its own read/write **MAP
@@ -45,6 +45,20 @@
 //! likewise real storage with no behavior wired to them yet (v1's one real
 //! source, the systimer, is cleared via its own `INT_CLR_REG`, not this
 //! one -- see `systimer::SysTimer`).
+//!
+//! ## Who else writes these registers
+//!
+//! Real firmware doesn't only reach these registers by executing its own
+//! instructions: `crate::rom`'s ESP32-C3 mask-ROM HLE stub table gives five
+//! ROM calls (`intr_matrix_set`, `esprv_intc_int_disable`,
+//! `esprv_intc_int_enable`, `esprv_intc_int_set_type`,
+//! `esprv_intc_int_set_priority` -- Milestone 3's Task D3 fix round) a real
+//! `RomStubEffect::BusRegisterWrite` effect
+//! (`crate::cpu::rom_stubs::RomStubEffect`) that reads/writes the MAP
+//! region, `CPU_INT_ENABLE_REG`, `CPU_INT_TYPE_REG`, and
+//! `CPU_INT_PRI_<n>_REG` through the same `Bus` path an executed
+//! instruction would use -- this module has no way to tell the two apart,
+//! nor does it need to.
 
 use std::collections::HashMap;
 

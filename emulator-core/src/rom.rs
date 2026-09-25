@@ -37,7 +37,7 @@
 //! `ets_get_cpu_frequency` + its setter, `ets_printf`, …) was chosen
 //! because the real boot run was observed calling that exact address and the
 //! generic zero-return default either stalled it or would have silently
-//! corrupted a caller. The bulk of the table's ~69 entries, though — the
+//! corrupted a caller. The bulk of the table's ~78 entries, though — the
 //! whole `Cache_*` family, the `rom_i2c_*` family, and (to a lesser degree,
 //! since each does get real arithmetic semantics rather than a generic
 //! zero) the libgcc 64-bit integer family — were added preemptively in one

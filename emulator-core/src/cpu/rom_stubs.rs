@@ -42,9 +42,10 @@
 //! 1. The stub's [`RomStubEffect`] runs — typically "write a plausible return
 //!    value into `a0`/`x10`", the RV32 ABI's integer return register;
 //!    sometimes nothing at all (a `void` function); and for the ROM
-//!    functions whose *actual* work matters ([`RomStubEffect::Memset`],
-//!    [`RomStubEffect::Memcpy`], [`RomStubEffect::Int64`], and
-//!    [`RomStubEffect::BusRegisterWrite`]), the real thing, through the bus.
+//!    functions whose *actual* work matters, the real thing: a real
+//!    register-only computation for [`RomStubEffect::Int64`], or a real
+//!    effect through the bus for [`RomStubEffect::Memset`],
+//!    [`RomStubEffect::Memcpy`], and [`RomStubEffect::BusRegisterWrite`].
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.

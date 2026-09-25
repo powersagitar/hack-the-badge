@@ -278,10 +278,13 @@ impl Cpu {
                         bus.write32(addr, new);
                     }
                     BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
-                        // Only the low 5 bits are architecturally meaningful
-                        // for a 32-line interrupt matrix (see
-                        // `crate::peripherals::intc::InterruptController`'s
-                        // `LINE_MASK`).
+                        // Masked to the 5 bits that address a bit position
+                        // within one 32-bit word: a shift amount of 32 or
+                        // more is out of range for `1u32 << bit` (Rust
+                        // panics on an overflowing shift in debug builds),
+                        // and this mechanism is chip-agnostic -- it has no
+                        // notion of how many bits a caller's register
+                        // *should* mean, only that a 32-bit word has 32.
                         let bit = self.regs.read(bit_reg) & 0x1F;
                         let cond = self.regs.read(cond_reg) != 0;
                         let old = bus.read32(addr);

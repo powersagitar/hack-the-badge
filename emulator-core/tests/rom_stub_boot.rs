@@ -180,7 +180,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// Where boot currently *stops*: **not** a spin loop any more. Milestone 3
 /// Task D3 (`emulator-core/src/rom.rs`'s module doc, entry 10) unblocked the
 /// fault this test used to pin (an unstubbed `ets_efuse_get_spiconfig` call
-/// at `0x4000_071c`) and five more it exposed one at a time, but left one
+/// at `0x4000_071c`) and six more it exposed one at a time, but left one
 /// last call in that same chain, `esprv_intc_int_enable` (`0x4000_05e8`),
 /// deliberately unstubbed as a real peripheral-register write that its
 /// brief scoped out. Fix round 1 (`emulator-core/src/rom.rs`'s module doc,
@@ -191,7 +191,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// calls now performing real register writes, boot runs straight past the
 /// old `0x4000_05e8` fault and hits a **new, later, genuinely different**
 /// unstubbed ROM call: `itoa` (`0x4000_0448`, named in
-/// `esp32c3.rom.ld`/`esp32c3.rom.libc.ld` — a ROM libc function, not an
+/// `esp32c3.rom.libc.ld` — a ROM libc function, not an
 /// interrupt-controller one, so per Fix round 1's own iteration ruling
 /// ("STOP at the next stall that is not one of these five functions") this
 /// is exactly where this fix round stops rather than chasing the wall

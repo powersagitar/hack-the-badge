@@ -109,27 +109,74 @@ through unmapped memory in a way that looks like progress.
 
 The fix is high-level emulation (HLE): intercept a fetch to a known ROM
 address and simulate just enough of that function's observable effect
-(typically: set `a0`, jump to `ra`) instead of trapping. This is split
-across two files on purpose:
+instead of trapping. The *default* effect is simple ("set `a0`, jump to
+`ra`"), but a growing minority of stubs need a real effect the caller's
+next instruction actually depends on, because a fabricated return value
+would silently corrupt the caller rather than unblock it. Every effect a
+stub can have is one of `RomStubEffect`'s variants
+(`emulator-core/src/cpu/rom_stubs.rs`):
+
+- `Return(value)` — the default: write a fixed value into `a0`, jump to
+  `ra`.
+- `Void` — jump to `ra` without touching `a0` (for a real ROM function
+  whose C signature is `void`, so a stray value the caller kept alive in
+  `a0` must survive the call).
+- `Memset`/`Memcpy` — a real byte-for-byte fill/copy through the bus (ROM
+  libc's `memset`/`memcpy`; their whole point is the bytes they write, so a
+  generic status return would corrupt the caller rather than unblock it).
+- `Int64` — one of libgcc's 64-bit integer helpers (`__udivdi3` and
+  siblings), computed for real in registers, no bus access.
+- `BusRegisterWrite` — a runtime-computed peripheral-register write through
+  the bus (added in Milestone 3's Task D3 fix round, for the five
+  interrupt-matrix/interrupt-controller ROM calls below): the target
+  address is a fixed or argument-register-indexed base, and the write
+  itself is one of three chip-agnostic shapes (`BusRegisterOp`) — overwrite
+  the whole word (`Store`), OR-in/AND-out a mask (`UpdateMask`), or set/clear
+  one bit chosen by another argument register (`SetOrClearBit`).
+
+This is split across two files on purpose:
 
 - `emulator-core/src/cpu/rom_stubs.rs` — the **generic mechanism** (a stub
-  table keyed by address, checked before each fetch), deliberately
-  chip-agnostic, consistent with `cpu/`'s rule that it knows nothing about
-  ESP32-C3 specifics. An empty/unpopulated stub table leaves every other
-  test byte-for-byte unaffected — verified by re-running the full pre-HLE
-  test suite as part of adding this mechanism.
+  table keyed by address, checked before each fetch, plus the
+  `RomStubEffect` vocabulary above), deliberately chip-agnostic, consistent
+  with `cpu/`'s rule that it knows nothing about ESP32-C3 specifics. An
+  empty/unpopulated stub table leaves every other test byte-for-byte
+  unaffected — verified by re-running the full pre-HLE test suite as part
+  of adding this mechanism.
 - `emulator-core/src/rom.rs` — the **chip-specific data**: which of the
   ~1200 ROM addresses ESP-IDF's own `components/esp_rom/esp32c3/ld/*.ld`
-  linker scripts (fetched at tag `v5.5.3`) name, and what each stub pretends
-  to have done. 69 addresses total (6 individually named/justified —
-  `rtc_get_reset_reason`, the `ets_printf` family, etc. — plus the
-  `Cache_*`/`rom_i2c_*`/libgcc-helper families added by symbol range as a
-  generic no-op default, not each individually verified necessary). Default
-  behavior for any stubbed address with no specific semantics: return 0 in
-  `a0`, jump to `ra`.
+  linker scripts (fetched at tag `v5.5.3`) name, and which `RomStubEffect`
+  each one gets. 78 addresses total: 15 individually named/justified —
+  `rtc_get_reset_reason`, `ets_printf`, `ets_delay_us`, ROM libc
+  `memset`/`memcpy`, the CPU-frequency getter/setter pair, the two eFuse
+  queries, the UART-flush call, and the five interrupt-matrix/
+  interrupt-controller calls below (each researched against a specific
+  ESP-IDF header/linker-script citation) — plus the
+  `Cache_*`/`rom_i2c_*`/libgcc-64-bit-helper families (63 more) added by
+  symbol range as a generic default (`Return(0)` for `Cache_*`/read-side
+  `rom_i2c_*`, `Void` for write-side `rom_i2c_*`, real `Int64` arithmetic
+  for the libgcc family), not each individually verified necessary.
 
-Result: real-firmware boot went from faulting ~20 instructions in to running
-2,000,000+ clean instructions with zero traps.
+Five of the fifteen individually-named stubs are the ESP32-C3 interrupt
+matrix's own bring-up calls, and are worth calling out on their own because
+they're the one case where "the wrong stub type would corrupt boot" bit
+concretely: `intr_matrix_set`, `esprv_intc_int_disable`,
+`esprv_intc_int_enable`, `esprv_intc_int_set_type`, and
+`esprv_intc_int_set_priority` (`0x4000_05e0`–`0x4000_05f4`,
+`esp32c3.rom.ld`/`components/riscv/include/esp_private/interrupt_deprecated.h`)
+all use `BusRegisterWrite` to perform a real read/write of
+`emulator-core/src/peripherals/intc.rs`'s `InterruptController` registers
+(the MAP region, `CPU_INT_ENABLE_REG`, `CPU_INT_TYPE_REG`,
+`CPU_INT_PRI_<n>_REG`) — an earlier revision of this table left four of
+these five as `void` no-ops (safe only because the one boot run observed
+happened to write values those registers already held) and left the fifth
+unstubbed entirely; see "Known limitations" item 1 below for the fix and
+citations.
+
+Result: real-firmware boot went from faulting ~20 instructions in to
+running past the mask-ROM wall entirely and into the app image's own
+runtime/logging code — see "Known limitations" below for exactly where it
+stalls today.
 
 ## Physical pin map (buttons, display) — third-party sourced
 

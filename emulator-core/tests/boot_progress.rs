@@ -37,7 +37,7 @@
 //!
 //! Task D3 status: `emulator_core::rom`'s module doc (entry 10) unblocked
 //! the Task-D2-era fault at `0x4000_071c` (`ets_efuse_get_spiconfig`) and
-//! five more ROM calls it led to in turn, but — same situation as Task D2 —
+//! six more ROM calls it led to in turn, but — same situation as Task D2 —
 //! boot's console is still the same generic "Guru Meditation Error" text no
 //! *new* line to ratchet on, since the chain runs straight into another
 //! unstubbed ROM call (`esprv_intc_int_enable`, `0x4000_05e8` — see
@@ -206,7 +206,7 @@ fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
 /// doc). Before this task, boot faulted on an unstubbed
 /// `ets_efuse_get_spiconfig` call at a fixed address reached at step 402,113
 /// from a cold boot (Task D2 report). `emulator-core/src/rom.rs`'s module
-/// doc (entry 10) now stubs that call, and five more it led to, for real, so
+/// doc (entry 10) now stubs that call, and six more it led to, for real, so
 /// a run just past the old fault's step count should show **zero** traps of
 /// any kind -- concrete, measured evidence the fixes bought real forward
 /// progress, not just a relabeled stall. (Boot does still stall shortly
