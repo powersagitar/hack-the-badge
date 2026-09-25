@@ -19,13 +19,14 @@ ESP32-C3 device), in two complementary modes:
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   Real-firmware boot currently runs past the mask-ROM wall and into the
-   app image's own runtime, but faults at step ~407,471 on an unstubbed ROM
-   call (`itoa`), then loops in the firmware's own panic handler and
-   `software_reset_cpu` retry — well before reaching any built-in app (a
-   known, documented gap — see `docs/firmware-emulator-notes.md`'s "Known
-   limitations" section before assuming a built-in app is reachable in
-   this mode).
+   Real-firmware boot currently runs past the mask-ROM wall, through the
+   app image's own runtime, and all the way to a real, hardware-standard
+   `panic_abort()` trap the firmware itself triggers at step ~407,549
+   (not an unstubbed-ROM-call fault), then loops in the firmware's own
+   panic handler and `software_reset_cpu` retry — well before reaching any
+   built-in app (a known, documented gap — see
+   `docs/firmware-emulator-notes.md`'s "Known limitations" section before
+   assuming a built-in app is reachable in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that

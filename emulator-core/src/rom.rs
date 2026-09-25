@@ -34,10 +34,11 @@
 //! `NAMED_STUBS` entry (`rtc_get_reset_reason`, `ets_delay_us`, `memset`,
 //! `memcpy`, `ets_efuse_get_spiconfig`, `ets_efuse_get_wp_pad`,
 //! `uart_tx_wait_idle`, `intr_matrix_set`, the `esprv_intc_int_*` family,
-//! `ets_get_cpu_frequency` + its setter, `ets_printf`, …) was chosen
+//! `ets_get_cpu_frequency` + its setter, `ets_printf`, `itoa`, `strcat`, …)
+//! was chosen
 //! because the real boot run was observed calling that exact address and the
 //! generic zero-return default either stalled it or would have silently
-//! corrupted a caller. The bulk of the table's ~78 entries, though — the
+//! corrupted a caller. The bulk of the table's ~80 entries, though — the
 //! whole `Cache_*` family, the `rom_i2c_*` family, and (to a lesser degree,
 //! since each does get real arithmetic semantics rather than a generic
 //! zero) the libgcc 64-bit integer family — were added preemptively in one
@@ -292,6 +293,52 @@
 //!     `boot_currently_stalls_on_the_unstubbed_itoa_rom_call` and this fix
 //!     round's report section for the full trace.
 //!
+//! 12. **Milestone 3 Task D4: ROM libc `itoa` and `strcat`** — Fix round 1's
+//!     stall. Step 1 of this task's own brief required first establishing
+//!     whether the `itoa` call sat on the normal boot path or an
+//!     already-active error path: disassembling the call site (IRAM,
+//!     `0x40397262`) showed a small "format one value as a string" helper
+//!     called from a 4-iteration loop, and the console had printed *nothing*
+//!     yet at the moment of the call — so this is the normal, pre-panic
+//!     boot path building its first formatted text, not a symptom of an
+//!     already-crashed system.
+//!
+//!     [`crate::cpu::rom_stubs::RomStubEffect::Itoa`] gives `itoa`
+//!     (`0x4000_0448`, [`ITOA`]) a real implementation
+//!     ([`crate::cpu::rom_stubs::compute_itoa`], mirroring newlib's
+//!     `itoa.c`+`utoa.c` byte-for-byte — see that function's doc for the
+//!     exact source cited). With `itoa` unblocked, boot immediately hits
+//!     the next unstubbed ROM libc call, `strcat` (`0x4000_03d8`,
+//!     [`STRCAT`], also `esp32c3.rom.libc.ld`) — per this task's own
+//!     iteration ruling ("if the next stall is another unstubbed ROM
+//!     libc/string call... implement that one too, and repeat"), so it gets
+//!     [`crate::cpu::rom_stubs::RomStubEffect::Strcat`] (mirroring newlib's
+//!     `strcat.c`) in the same task. The caller turned out to be the same
+//!     kind of formatting loop `itoa`'s caller was: value formatted via
+//!     `itoa`, then concatenated onto a growing buffer via `strcat` — almost
+//!     certainly building a backtrace/panic-report line piece by piece.
+//!
+//!     With *both* unblocked, boot runs on and hits a **qualitatively
+//!     different** stall: not another unmapped ROM-address fetch, but a
+//!     real `ILLEGAL_INSTRUCTION` exception (RISC-V cause 2) at
+//!     `0x4038e4fa`, inside the app's own IRAM code — a compiler-emitted
+//!     `c.unimp` (the RVC extension's all-zero 16-bit encoding, reserved to
+//!     always trap), immediately preceded by a store of a "we're aborting"
+//!     flag and the just-built message pointer to two fixed addresses. That
+//!     is ESP-IDF's own `panic_abort()`/`g_panic_abort`/
+//!     `g_panic_abort_details` mechanism (`components/esp_system/panic.c`):
+//!     a deliberate, hardware-standard trap, not a decode gap or an
+//!     unstubbed-ROM-call symptom — exactly the brief's stop condition
+//!     ("anything other than an unstubbed ROM libc/string call"), so Task
+//!     D4 stops here. See [`STRCAT`]'s and [`ITOA`]'s doc for the exact
+//!     addresses and `tests/rom_stub_boot.rs`'s
+//!     `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort` for
+//!     the full post-abort trace (the panic handler completes a real crash
+//!     report for the first time, then tries to reboot via the
+//!     still-unstubbed `software_reset_cpu`, faults again, and loops —
+//!     the same terminal shape Fix round 1 already documented, just reached
+//!     with genuine content instead of a truncated one).
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -311,21 +358,28 @@
 //!
 //! ## Where this gets boot to
 //!
-//! With this table installed (as of Fix round 1), the real `factory.bin`
-//! runs past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up,
+//! With this table installed (as of Task D4), the real `factory.bin` runs
+//! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up,
 //! analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop
 //! (Task D1), the `memcpy` call (Task D2), the eFuse queries, the UART
-//! flush, and the interrupt-controller bring-up (entries 10 and 11 above,
-//! all of it real register writes now) — **all of that runs fault-free**,
-//! as *normal pre-panic boot code*. Boot only panics once it reaches the
-//! next unstubbed ROM call, `itoa` (`0x4000_0448`), at step 407,471; *that*
-//! fault is what makes the firmware's own panic handler print its first
-//! "Guru Meditation Error" boot log (via `ets_printf`). (An earlier revision
-//! of this doc described the chain as running "straight through" a panic
-//! that had already happened — backwards: no trap of any kind occurs before
-//! this `itoa` fault; see Fix round 1's report, FINDING I2.) See
-//! `tests/rom_stub_boot.rs`'s `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`
-//! and `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
+//! flush, the interrupt-controller bring-up (entries 10/11), and now the
+//! `itoa`/`strcat` formatting calls (entry 12) — **all of that runs
+//! fault-free**, as *normal pre-panic boot code*, right up through building
+//! a complete, correctly-formatted panic/backtrace message. Boot then hits
+//! a real, hardware-standard `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own
+//! `panic_abort()` call (entry 12's `0x4038e4fa`, *not* a ROM address) —
+//! not a fault this emulator's stub table is missing something for, but
+//! the firmware genuinely, deliberately triggering its own panic path,
+//! same as real hardware would. The panic handler runs to completion for
+//! the first time (itoa/strcat let it actually build its message), prints
+//! ESP-IDF's generic pre-restart text, then tries to reboot via the
+//! still-unstubbed `software_reset_cpu` (`0x4000_0094`) — which faults
+//! (this *is* an unstubbed ROM call, but only reached via the panic path,
+//! so per this module's own scoping it stays unstubbed), re-entering the
+//! panic handler's re-entrancy guard and retrying forever. See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort` and
+//! `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
 //! story.
 
 use crate::cpu::rom_stubs::{
@@ -436,6 +490,19 @@ pub const ETS_GET_CPU_FREQUENCY: u32 = 0x4000_0584;
 /// ESP-IDF's early boot log.
 pub const ETS_PRINTF: u32 = 0x4000_0040;
 
+/// ROM libc `itoa`'s fixed address (`esp32c3.rom.libc.ld`: `itoa =
+/// 0x40000448;`, immediately after `utoa = 0x40000444;`). See the module
+/// doc's entry 12 for the boot-probe evidence and why this is a real HLE
+/// implementation ([`crate::cpu::rom_stubs::RomStubEffect::Itoa`]), not a
+/// generic status stub.
+pub const ITOA: u32 = 0x4000_0448;
+
+/// ROM libc `strcat`'s fixed address (`esp32c3.rom.libc.ld`: `strcat =
+/// 0x400003d8;`). The very next ROM call boot makes once `itoa` returns
+/// (see the module doc's entry 12) -- a real HLE implementation
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strcat`]), same reasoning.
+pub const STRCAT: u32 = 0x4000_03d8;
+
 /// The CPU frequency (MHz) [`ETS_GET_CPU_FREQUENCY`]'s stub reports. 160 MHz
 /// is the ESP32-C3's maximum and ESP-IDF's default
 /// (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`). See the module doc for why this can't
@@ -536,6 +603,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         RomStub::returning("ets_get_cpu_frequency", CPU_FREQ_MHZ),
     ),
     (0x4000_0588, RomStub::void("ets_update_cpu_frequency")),
+    (ITOA, RomStub::itoa("itoa")),
+    (STRCAT, RomStub::strcat("strcat")),
 ];
 
 /// libgcc's 64-bit integer helpers, which this firmware also links out of ROM
@@ -987,6 +1056,90 @@ mod tests {
             bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG + 24 * 4),
             0
         );
+    }
+
+    #[test]
+    fn itoa_stub_writes_the_hex_string_through_a_real_firmware_bus() {
+        // The exact observed boot-probe call (Task D4 brief):
+        // itoa(value = 0x42001011, str = 0x3fcdc694, base = 0x10). RAM
+        // addresses (0x3fcd_xxxx is DRAM) are real, dispatchable
+        // `FirmwareBus` regions, unlike `run_stub_call`'s helper's empty-flash
+        // bus used for the INTERRUPT_CORE0-only tests above -- so this test
+        // seeds a `FirmwareBus` with a DRAM segment covering the target
+        // string buffer.
+        use crate::mem::soc::DRAM_RANGE;
+        let str_addr = 0x3fcd_c694u32;
+        assert!(
+            DRAM_RANGE.contains(&str_addr),
+            "the observed str pointer must fall inside DRAM"
+        );
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        // The plain no-segments bus (see `empty_firmware_bus` above) leaves
+        // DRAM unmapped, and this bus's catch-all silently drops writes to
+        // unmapped data addresses -- real, so this test needs a real
+        // writable region at the target buffer to observe anything.
+        bus.add_scratch_ram(str_addr, 16);
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 0x4200_1011); // value
+        cpu.regs.write(REG_A1, str_addr); // str
+        cpu.regs.write(REG_A2, 0x10); // base
+        cpu.regs.pc = ITOA;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken, "a stub call must never trap");
+        assert_eq!(info.rom_stub, Some(ITOA));
+        assert_eq!(cpu.regs.pc, 0x4000_1000, "pc must return to ra");
+        assert_eq!(cpu.regs.read(REG_A0), str_addr, "itoa returns str in a0");
+
+        let mut written = Vec::new();
+        for i in 0..9u32 {
+            written.push(bus.read8(str_addr + i));
+        }
+        assert_eq!(&written, b"42001011\0");
+    }
+
+    #[test]
+    fn strcat_stub_appends_through_a_real_firmware_bus() {
+        // Same call shape as the real boot-probe evidence (Task D4 report):
+        // strcat(dst = 0x3fcdc65c-ish DRAM buffer, src = a literal string in
+        // DRAM) -- both real, dispatchable `FirmwareBus` addresses seeded
+        // with scratch RAM the same way the itoa test above does.
+        use crate::mem::soc::DRAM_RANGE;
+        let dst = 0x3fcd_c65cu32;
+        let src = 0x3fca_7614u32;
+        assert!(DRAM_RANGE.contains(&dst) && DRAM_RANGE.contains(&src));
+
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.add_scratch_ram(dst, 32);
+        bus.add_scratch_ram(src, 32);
+        for (i, b) in b"Hello\0".iter().enumerate() {
+            bus.write8(dst + i as u32, *b);
+        }
+        for (i, b) in b"World\0".iter().enumerate() {
+            bus.write8(src + i as u32, *b);
+        }
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, dst);
+        cpu.regs.write(REG_A1, src);
+        cpu.regs.pc = STRCAT;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(STRCAT));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(cpu.regs.read(REG_A0), dst, "strcat returns dst");
+
+        let mut written = Vec::new();
+        for i in 0..11u32 {
+            written.push(bus.read8(dst + i));
+        }
+        assert_eq!(&written, b"HelloWorld\0");
     }
 
     #[test]

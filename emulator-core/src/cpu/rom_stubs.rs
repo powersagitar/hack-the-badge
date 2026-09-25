@@ -176,6 +176,33 @@ pub enum RomStubEffect {
     /// (from `crate::mem::soc`/`crate::peripherals::intc` constants), per
     /// this module's chip-agnostic/chip-specific split.
     BusRegisterWrite(BusRegisterWrite),
+    /// ROM libc's `char *itoa(int value, char *str, int base)`: writes the
+    /// NUL-terminated string [`compute_itoa`] computes for `value = a0`/
+    /// `base = a2` starting at `str = a1`, through the bus, then sets `a0`
+    /// to `str` on a valid base or `0` (`NULL`) on an invalid one — see
+    /// [`compute_itoa`]'s doc for the exact newlib semantics mirrored.
+    ///
+    /// Unlike [`RomStubEffect::Memset`]/[`RomStubEffect::Memcpy`], the
+    /// return value is *not* already sitting in `a0` (the first argument is
+    /// `value`, not `str`), so this effect writes `a0` explicitly. Real,
+    /// not a generic status stub, for the same reason as `memset`/`memcpy`:
+    /// the caller uses both the written string and the returned pointer.
+    Itoa,
+    /// `char *strcat(char *dst, const char *src)`: appends NUL-terminated
+    /// `src = a1` onto the end of NUL-terminated `dst = a0` -- found by
+    /// scanning `dst` for its own terminator, then copying `src` (including
+    /// its own NUL) there, through the bus -- and returns `dst`, already
+    /// sitting in `a0` (same as [`RomStubEffect::Memcpy`]/
+    /// [`RomStubEffect::Memset`], so nothing else needs writing). Mirrors
+    /// newlib's `strcat.c` slow/portable path (`newlib/libc/string/strcat.c`).
+    ///
+    /// Real, not a generic status stub, for the same reason as `memcpy`.
+    /// Both the dst-NUL-scan and the src-copy are capped at
+    /// [`MAX_STUB_MEMORY_BYTES`] bytes -- unlike the fixed-length stubs
+    /// above, this one's "length" is data-dependent (found by scanning for
+    /// a NUL, not given as an argument), so a corrupt/unterminated string
+    /// could otherwise hang this emulator forever.
+    Strcat,
 }
 
 /// The address/value computation for [`RomStubEffect::BusRegisterWrite`].
@@ -290,6 +317,106 @@ impl Int64Op {
     }
 }
 
+/// The digit alphabet newlib's `__utoa` uses
+/// (`newlib/libc/stdlib/utoa.c`): lowercase, supporting bases up to 36.
+const ITOA_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// Upper bound on the bytes [`compute_itoa`] can write: 1 sign byte (base
+/// 10, negative values only) + 32 base-2 digits (the worst case: any 32-bit
+/// value in base 2) + 1 NUL terminator.
+pub const ITOA_MAX_LEN: usize = 34;
+
+/// [`compute_itoa`]'s result: the exact bytes ROM's `itoa` would write to
+/// `str` (`bytes[..len]`, NUL-terminated) and whether `base` was valid.
+/// [`RomStubEffect::Itoa`]'s execution uses `valid_base` to decide whether
+/// `a0` becomes the `str` pointer or `0`/`NULL`, matching `itoa.c`'s "return
+/// NULL on an invalid base" behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItoaResult {
+    pub bytes: [u8; ITOA_MAX_LEN],
+    pub len: usize,
+    pub valid_base: bool,
+}
+
+/// Pure re-implementation of ROM libc's `itoa(value, str, base)`, mirroring
+/// newlib's own source byte-for-byte:
+/// `newlib/libc/stdlib/itoa.c` (`__itoa`) composed with
+/// `newlib/libc/stdlib/utoa.c` (`__utoa`) — fetched from
+/// `https://sourceware.org/git/?p=newlib-cygwin.git;a=blob_plain;f=newlib/libc/stdlib/<itoa|utoa>.c;hb=HEAD`
+/// for this task; see `crate::rom`'s module doc for the ROM address this
+/// pairs with.
+///
+/// Semantics, straight from that source:
+/// - **Invalid base** (`base < 2 || base > 36`): `str[0] = '\0'`, return
+///   `NULL` (`0`). This is documented in `itoa.c` itself, not guessed.
+/// - **Base 10 with a negative `value`**: write a leading `-`, then the
+///   digits of `value`'s magnitude. `itoa.c` computes that magnitude as
+///   `(unsigned)-value`; negating `i32::MIN` overflows and (two's
+///   complement) wraps back to `i32::MIN`, whose bit pattern cast to
+///   unsigned is `0x8000_0000` — numerically the correct magnitude despite
+///   the C-level UB. `value.wrapping_neg() as u32` reproduces that exact
+///   bit pattern.
+/// - **Every other base**, regardless of sign: `value` is reinterpreted as
+///   unsigned (`value as u32` — the same bit pattern C's implicit
+///   `int`→`unsigned` conversion produces), so a negative `value` in, say,
+///   base 16 prints the unsigned hex of its two's-complement bit pattern,
+///   not a sign.
+/// - Digits come from [`ITOA_DIGITS`], written least-significant first via
+///   repeated mod/div then reversed in place — exactly `utoa.c`'s loop
+///   shape (the sign byte, if any, is written by `itoa` before calling into
+///   this digit loop and is never part of the reversed range, matching how
+///   `__itoa` calls `__utoa(uvalue, &str[i], base)` at an offset past its
+///   own sign byte).
+/// - Always NUL-terminated, on both the valid- and invalid-base paths.
+pub fn compute_itoa(value: i32, base: i32) -> ItoaResult {
+    if !(2..=36).contains(&base) {
+        let mut bytes = [0u8; ITOA_MAX_LEN];
+        bytes[0] = 0;
+        return ItoaResult {
+            bytes,
+            len: 1,
+            valid_base: false,
+        };
+    }
+    let base = base as u32;
+
+    let mut bytes = [0u8; ITOA_MAX_LEN];
+    let negative = base == 10 && value < 0;
+    let digits_start = if negative {
+        bytes[0] = b'-';
+        1
+    } else {
+        0
+    };
+    let mut uvalue: u32 = if negative {
+        // itoa.c: `uvalue = (unsigned)-value;` -- see this function's doc
+        // for why wrapping_neg reproduces that exact (UB-but-consistent)
+        // bit pattern for `i32::MIN` too.
+        value.wrapping_neg() as u32
+    } else {
+        value as u32
+    };
+
+    let mut pos = digits_start;
+    loop {
+        let remainder = (uvalue % base) as usize;
+        bytes[pos] = ITOA_DIGITS[remainder];
+        pos += 1;
+        uvalue /= base;
+        if uvalue == 0 {
+            break;
+        }
+    }
+    bytes[pos] = 0; // NUL terminator, per utoa.c's `str[i] = '\0'`.
+    bytes[digits_start..pos].reverse();
+
+    ItoaResult {
+        bytes,
+        len: pos + 1,
+        valid_base: true,
+    }
+}
+
 /// One high-level-emulated ROM function: a name (for diagnostics) and an
 /// effect.
 ///
@@ -337,6 +464,22 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Memcpy,
+        }
+    }
+
+    /// A real high-level-emulated `itoa` — see [`RomStubEffect::Itoa`].
+    pub const fn itoa(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Itoa,
+        }
+    }
+
+    /// A real high-level-emulated `strcat` — see [`RomStubEffect::Strcat`].
+    pub const fn strcat(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strcat,
         }
     }
 
@@ -435,6 +578,8 @@ mod tests {
         assert_eq!(RomStub::void("ets_delay_us").effect, RomStubEffect::Void);
         assert_eq!(RomStub::memset("memset").effect, RomStubEffect::Memset);
         assert_eq!(RomStub::memcpy("memcpy").effect, RomStubEffect::Memcpy);
+        assert_eq!(RomStub::itoa("itoa").effect, RomStubEffect::Itoa);
+        assert_eq!(RomStub::strcat("strcat").effect, RomStubEffect::Strcat);
         assert_eq!(RomStub::returning("x", 7).effect, RomStubEffect::Return(7));
         assert_eq!(
             RomStub::bus_register_write(
@@ -484,6 +629,93 @@ mod tests {
         assert_eq!(Int64Op::Shl.apply(1, 64), 1);
         assert_eq!(Int64Op::Shl.apply(1, u64::MAX), 1u64 << 63);
         assert_eq!(Int64Op::LShr.apply(u64::MAX, 100), u64::MAX >> 36);
+    }
+
+    /// Decodes a [`compute_itoa`] result's written bytes (`bytes[..len]`,
+    /// NUL-terminated) back to a `&str`, for readable test assertions.
+    fn itoa_str(result: ItoaResult) -> String {
+        String::from_utf8(result.bytes[..result.len - 1].to_vec()).expect("ascii digits")
+    }
+
+    #[test]
+    fn compute_itoa_base16_matches_the_observed_boot_probe_call() {
+        // itoa(value = 0x42001011, str, base = 0x10) -- Task D4's exact
+        // observed stall (see the task brief/rom.rs's module doc).
+        let result = compute_itoa(0x4200_1011u32 as i32, 16);
+        assert!(result.valid_base);
+        assert_eq!(itoa_str(result), "42001011");
+    }
+
+    #[test]
+    fn compute_itoa_base10_negative_gets_a_minus_sign() {
+        let result = compute_itoa(-123, 10);
+        assert!(result.valid_base);
+        assert_eq!(itoa_str(result), "-123");
+    }
+
+    #[test]
+    fn compute_itoa_base16_negative_is_unsigned_twos_complement() {
+        // itoa.c: "Negative numbers are only supported for decimal" -- every
+        // other base treats `value` as unsigned, so this is the hex of
+        // -1i32's bit pattern, not "-1".
+        let result = compute_itoa(-1, 16);
+        assert!(result.valid_base);
+        assert_eq!(itoa_str(result), "ffffffff");
+    }
+
+    #[test]
+    fn compute_itoa_i32_min_base10_matches_newlibs_wrapping_negate() {
+        // itoa.c casts `(unsigned)-value`; negating i32::MIN overflows and
+        // (two's complement) wraps back to i32::MIN, whose bit pattern cast
+        // to unsigned is 0x8000_0000 = 2147483648 -- numerically correct
+        // despite the C-level UB. `value.wrapping_neg() as u32` reproduces
+        // that exact bit pattern.
+        let result = compute_itoa(i32::MIN, 10);
+        assert!(result.valid_base);
+        assert_eq!(itoa_str(result), "-2147483648");
+    }
+
+    #[test]
+    fn compute_itoa_zero_is_the_single_digit_zero() {
+        let result = compute_itoa(0, 10);
+        assert!(result.valid_base);
+        assert_eq!(itoa_str(result), "0");
+    }
+
+    #[test]
+    fn compute_itoa_base2_and_base36_use_correct_lowercase_digits() {
+        let base2 = compute_itoa(10, 2);
+        assert!(base2.valid_base);
+        assert_eq!(itoa_str(base2), "1010");
+
+        // 36^2 = 1296 -> "100" in base 36; and a value that exercises the
+        // letter digits: 35 -> "z" (the last of the 36 symbols).
+        let base36 = compute_itoa(1296, 36);
+        assert!(base36.valid_base);
+        assert_eq!(itoa_str(base36), "100");
+
+        let base36_letters = compute_itoa(35, 36);
+        assert!(base36_letters.valid_base);
+        assert_eq!(itoa_str(base36_letters), "z");
+    }
+
+    #[test]
+    fn compute_itoa_always_nul_terminates() {
+        let result = compute_itoa(255, 16);
+        assert_eq!(result.bytes[result.len - 1], 0);
+    }
+
+    #[test]
+    fn compute_itoa_rejects_bases_outside_2_to_36() {
+        // itoa.c: `if ((base < 2) || (base > 36)) { str[0] = '\0'; return
+        // NULL; }`. Confirmed from newlib's own source
+        // (newlib/libc/stdlib/itoa.c) -- not guessed.
+        for bad_base in [-1, 0, 1, 37, 100] {
+            let result = compute_itoa(42, bad_base);
+            assert!(!result.valid_base, "base {bad_base} should be invalid");
+            assert_eq!(result.len, 1, "only the NUL byte is written");
+            assert_eq!(result.bytes[0], 0);
+        }
     }
 
     #[test]

@@ -65,7 +65,7 @@
 //! Boot now runs straight past `0x4000_05e8` and hits a **new**, later,
 //! genuinely different unstubbed ROM call: `itoa` (`0x4000_0448`, a ROM
 //! libc function, not an interrupt-controller one — see
-//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `emulator-core/tests/rom_stub_boot.rs`'s (then-current)
 //! `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`). Same situation
 //! as Task D2/D3 once more — the console's first line is still the same
 //! generic "Guru Meditation Error" text, no *new* line to ratchet on, since
@@ -75,6 +75,33 @@
 //! zero traps through the *old* Task-D3-era fault's exact step count
 //! (405,806), concrete, measurable evidence this fix round's changes moved
 //! the wall forward.
+//!
+//! Task D4 status: `emulator-core/src/rom.rs`'s module doc (entry 12) gives
+//! `itoa` (`0x4000_0448`) and the very next unstubbed call it led to,
+//! `strcat` (`0x4000_03d8`, also `esp32c3.rom.libc.ld`), real HLE
+//! implementations. Unlike every earlier task in this chain, this one
+//! actually changes what the console prints: `itoa`/`strcat` now really
+//! execute (instead of faulting mid-call), so the panic-formatting loop
+//! they're part of *completes* -- and per ESP-IDF's own `panic.c`, an
+//! abort-path panic (which this is: a real `ILLEGAL_INSTRUCTION` trap at
+//! `panic_abort()`, `0x4038e4fa`, not a ROM-call fault at all — see
+//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`) skips
+//! the "Guru Meditation Error" header on its first pass (`info->reason` is
+//! `NULL` for an abort) and instead prints unconditionally, right before
+//! trying to reboot: ESP-IDF's generic "Rebooting..." text
+//! (`components/esp_system/panic.c`). That's this file's first genuinely
+//! *new* console-line rung since Task D1
+//! ([`boot_reaches_the_panic_handlers_reboot_message_for_the_first_time`]).
+//! The still-unstubbed `software_reset_cpu` ROM call the reboot attempt
+//! makes then faults for real, re-entering the panic handler through its
+//! *exception* path (where `info->reason` is finally non-`NULL`), which is
+//! when "Guru Meditation Error" prints for the first time — so
+//! [`first_console_output_is_the_firmware_s_own_panic_report`]'s budget
+//! moves out to 750,000 (from 500,000) to stay past that later point.
+//! [`boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site`] is this
+//! file's no-fault-before-step-N rung for this task: it asserts zero traps
+//! through the *old* Fix-round-1-era fault's exact step count (407,471).
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -161,19 +188,47 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// The first real console-line ratchet: modeling RTC_CNTL's RTC timer
 /// (Task D1) lets boot's `rtc_cntl_ll_get_rtc_time()`-based busy-wait
 /// actually terminate, and boot now runs far enough to print real text —
-/// specifically, a full ESP-IDF panic dump from the *next* stall (an
-/// unstubbed ROM call; see `emulator-core/tests/rom_stub_boot.rs`'s
-/// `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`).
-/// "Guru Meditation Error" is ESP-IDF's own generic panic-header string
-/// (`components/esp_system/panic.c`), present in every ESP-IDF crash
-/// report — not badge-specific or identity data. 500,000 steps is
-/// comfortably past the fault (measured at step 401,761 in a throwaway
-/// experiment) and matches the exact budget
-/// `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
-/// uses, for an apples-to-apples comparison between the two tests.
+/// specifically, a full ESP-IDF panic dump. "Guru Meditation Error" is
+/// ESP-IDF's own generic panic-header string (`components/esp_system/panic.c`),
+/// present in every ESP-IDF crash report — not badge-specific or identity
+/// data.
+///
+/// **Budget history**: 500,000 steps used to be comfortably past this
+/// (measured at step 401,761, back when `itoa` faulted mid-format and the
+/// truncated abort path printed this header directly). As of Task D4,
+/// `itoa`/`strcat` really execute, so the abort-path panic (`panic_abort()`,
+/// see `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`) now
+/// runs to completion instead of faulting mid-format — and per ESP-IDF's
+/// `panic.c`, that path leaves `info->reason == NULL`, which *skips* the
+/// "Guru Meditation Error" header (see
+/// [`boot_reaches_the_panic_handlers_reboot_message_for_the_first_time`]
+/// below for the line that *does* print on this first pass). The header
+/// only appears once the panic handler's own reboot attempt faults for
+/// real (the still-unstubbed `software_reset_cpu`, measured at step
+/// 645,410) and re-enters the panic handler through its *exception* path,
+/// where `info->reason` is finally non-`NULL` (measured reaching the
+/// console by step 648,000). 750,000 keeps this rung comfortably past that
+/// new point.
 #[test]
 fn first_console_output_is_the_firmware_s_own_panic_report() {
-    assert_reaches("Guru Meditation Error", 500_000);
+    assert_reaches("Guru Meditation Error", 750_000);
+}
+
+/// Task D4's new console-line ratchet: the first genuinely *new* line this
+/// file has been able to ratchet on since Task D1, because it's the first
+/// task in this chain whose fix changes what the console prints rather than
+/// just how soon a stall recurs. With `itoa`/`strcat` real
+/// (`emulator-core/src/rom.rs`'s module doc, entry 12), the abort-path panic
+/// handler runs to completion for the first time and prints ESP-IDF's
+/// generic pre-restart text (`components/esp_system/panic.c`, printed
+/// unconditionally regardless of abort vs. exception, right before calling
+/// `panic_restart()`) — not badge-specific or identity data, same as "Guru
+/// Meditation Error" above. Measured reaching the console somewhere in
+/// [644,000, 645,000), comfortably before 650,000.
+#[test]
+fn boot_reaches_the_panic_handlers_reboot_message_for_the_first_time() {
+    assert_reaches("Rebooting...", 650_000);
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -260,6 +315,40 @@ fn boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site(
          esprv_intc_int_enable fault's exact step count (405,806) now that \
          it's HLE-stubbed; got {} traps, last_instruction_fault = {:?}, \
          pc = 0x{:08x}",
+        summary.traps, summary.last_instruction_fault, summary.pc
+    );
+}
+
+/// Milestone 3 Task D4's no-new-console-line-yet fallback rung (see the
+/// module doc) -- though this task's own
+/// [`boot_reaches_the_panic_handlers_reboot_message_for_the_first_time`]
+/// rung above *does* have a new console line to ratchet on, so this one is
+/// belt-and-suspenders: a fine-grained, step-exact proof the old fault site
+/// specifically is gone, independent of anything downstream. Before this
+/// task, boot faulted on an unstubbed `itoa` call at a fixed address
+/// reached at step 407,471 from a cold boot (Fix round 1's report).
+/// `emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Itoa` now
+/// intercepts that call for real, so a run just past the old fault's step
+/// count should show **zero** traps of any kind -- concrete, measured
+/// evidence the fix bought real forward progress, not just a relabeled
+/// stall. (Boot does still stall shortly after -- at step 407,549, but this
+/// time on a real `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own
+/// `panic_abort()`, not an unstubbed ROM call at all -- pinned exactly by
+/// `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`, which
+/// is this task's job to leave accurately pinned, not this rung's.)
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    // 407,471: the exact step the pre-Task-D4 `itoa` fault occurred at.
+    // Running exactly that many steps and finding zero traps proves the
+    // call that used to fault right at this boundary now completes.
+    let summary = rt.run(407_471);
+    assert_eq!(
+        summary.traps, 0,
+        "expected zero traps through the pre-Task-D4 itoa fault's exact \
+         step count (407,471) now that it's HLE-stubbed; got {} traps, \
+         last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
 }

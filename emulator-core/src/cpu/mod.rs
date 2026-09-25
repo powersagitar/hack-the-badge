@@ -300,6 +300,47 @@ impl Cpu {
                 // signature (see `RomStubEffect::BusRegisterWrite`'s doc) --
                 // `a0` is left untouched, same as `RomStubEffect::Void`.
             }
+            RomStubEffect::Itoa => {
+                let value = self.regs.read(rom_stubs::REG_A0) as i32;
+                let str_ptr = self.regs.read(rom_stubs::REG_A1);
+                let base = self.regs.read(rom_stubs::REG_A2) as i32;
+                let result = rom_stubs::compute_itoa(value, base);
+                for i in 0..result.len {
+                    bus.write8(str_ptr.wrapping_add(i as u32), result.bytes[i]);
+                }
+                // itoa returns `str` on a valid base, `NULL` (0) otherwise --
+                // unlike memset/memcpy, this isn't already sitting in a0
+                // (a0 held `value`, the first argument), so it's written
+                // explicitly.
+                self.regs.write(
+                    rom_stubs::REG_A0,
+                    if result.valid_base { str_ptr } else { 0 },
+                );
+            }
+            RomStubEffect::Strcat => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                // Scan dst for its own NUL terminator, capped -- see
+                // RomStubEffect::Strcat's doc.
+                let mut dst_len: u32 = 0;
+                while dst_len < rom_stubs::MAX_STUB_MEMORY_BYTES
+                    && bus.read8(dst.wrapping_add(dst_len)) != 0
+                {
+                    dst_len += 1;
+                }
+                // Copy src (including its own NUL) starting at dst + dst_len,
+                // capped the same way.
+                let mut i: u32 = 0;
+                loop {
+                    let byte = bus.read8(src.wrapping_add(i));
+                    bus.write8(dst.wrapping_add(dst_len).wrapping_add(i), byte);
+                    if byte == 0 || i >= rom_stubs::MAX_STUB_MEMORY_BYTES {
+                        break;
+                    }
+                    i += 1;
+                }
+                // strcat returns dst, which is already in a0.
+            }
         }
         self.regs.pc = self.regs.read(rom_stubs::REG_RA);
     }
@@ -1696,6 +1737,135 @@ mod tests {
         // Completes rather than looping ~4 billion times. (TestBus drops
         // out-of-range writes, so the only thing being asserted here is that
         // the call terminates at all, and does so at the documented cap.)
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn itoa_rom_stub_writes_the_hex_string_and_returns_str_in_a0() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::itoa("itoa"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        // itoa(value = 0x42001011, str = 0x200, base = 16) -- the exact
+        // observed boot-probe call (Task D4 brief).
+        cpu.regs.write(10, 0x4200_1011); // a0 = value
+        cpu.regs.write(11, 0x200); // a1 = str
+        cpu.regs.write(12, 16); // a2 = base
+        cpu.regs.write(1, 0x40); // ra
+        cpu.regs.pc = ROM_STUB_ADDR;
+        bus.mem[0x209] = 0x11; // sentinel just past the expected NUL
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[0x200..0x209], b"42001011\0");
+        assert_eq!(bus.mem[0x209], 0x11, "must not write past the NUL");
+        assert_eq!(cpu.regs.read(10), 0x200, "itoa returns str in a0");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn itoa_rom_stub_with_an_invalid_base_writes_a_lone_nul_and_returns_null() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::itoa("itoa"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.mem[0x200] = 0xaa;
+        cpu.regs.write(10, 123);
+        cpu.regs.write(11, 0x200);
+        cpu.regs.write(12, 37); // out of range: newlib requires 2..=36
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(
+            bus.mem[0x200], 0,
+            "itoa.c writes str[0] = '\\0' even on an invalid base"
+        );
+        assert_eq!(cpu.regs.read(10), 0, "itoa returns NULL on an invalid base");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn strcat_rom_stub_appends_src_to_dst_through_the_bus() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::strcat("strcat"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.mem[0x200..0x206].copy_from_slice(b"Hello\0");
+        bus.mem[0x300..0x306].copy_from_slice(b"World\0");
+        bus.mem[0x20b] = 0x11; // sentinel just past the expected result
+
+        cpu.regs.write(10, 0x200); // a0 = dst
+        cpu.regs.write(11, 0x300); // a1 = src
+        cpu.regs.write(1, 0x40); // ra
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[0x200..0x20b], b"HelloWorld\0");
+        assert_eq!(bus.mem[0x20b], 0x11, "must not write past src's NUL");
+        assert_eq!(cpu.regs.read(10), 0x200, "strcat returns dst");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn strcat_rom_stub_with_an_empty_dst_just_copies_src() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::strcat("strcat"));
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.mem[0x200] = 0; // dst is the empty string
+        bus.mem[0x300..0x304].copy_from_slice(b"Hi\0\0"); // src, NUL at 0x302
+
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0x300);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(&bus.mem[0x200..0x203], b"Hi\0");
+        assert_eq!(cpu.regs.read(10), 0x200);
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn strcat_rom_stub_scan_and_copy_are_capped_so_unterminated_strings_cannot_hang() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::strcat("strcat"));
+        cpu.set_rom_stubs(table);
+
+        // A backing buffer bigger than the cap, filled with a non-zero
+        // byte throughout -- so `TestBus`'s own "past-the-end reads return
+        // 0" behavior can't be what stops the scan/copy short, the way it
+        // would with the small default buffer. Only
+        // `rom_stubs::MAX_STUB_MEMORY_BYTES` can end this loop.
+        let big = (rom_stubs::MAX_STUB_MEMORY_BYTES as usize) * 2 + 0x1000;
+        let mut bus = TestBus::new(big);
+        for b in bus.mem.iter_mut() {
+            *b = 0xff;
+        }
+        cpu.regs.write(10, 0x200);
+        cpu.regs.write(11, 0x300);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+
+        // Completes rather than looping forever.
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.pc, 0x40);
     }

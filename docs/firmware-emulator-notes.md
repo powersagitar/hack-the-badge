@@ -146,10 +146,10 @@ This is split across two files on purpose:
 - `emulator-core/src/rom.rs` — the **chip-specific data**: which of the
   ~1200 ROM addresses ESP-IDF's own `components/esp_rom/esp32c3/ld/*.ld`
   linker scripts (fetched at tag `v5.5.3`) name, and which `RomStubEffect`
-  each one gets. 78 addresses total: 15 individually named/justified —
+  each one gets. 80 addresses total: 17 individually named/justified —
   `rtc_get_reset_reason`, `ets_printf`, `ets_delay_us`, ROM libc
-  `memset`/`memcpy`, the CPU-frequency getter/setter pair, the two eFuse
-  queries, the UART-flush call, and the five interrupt-matrix/
+  `memset`/`memcpy`/`itoa`/`strcat`, the CPU-frequency getter/setter pair,
+  the two eFuse queries, the UART-flush call, and the five interrupt-matrix/
   interrupt-controller calls below (each researched against a specific
   ESP-IDF header/linker-script citation) — plus the
   `Cache_*`/`rom_i2c_*`/libgcc-64-bit-helper families (63 more) added by
@@ -157,7 +157,7 @@ This is split across two files on purpose:
   `rom_i2c_*`, `Void` for write-side `rom_i2c_*`, real `Int64` arithmetic
   for the libgcc family), not each individually verified necessary.
 
-Five of the fifteen individually-named stubs are the ESP32-C3 interrupt
+Five of the seventeen individually-named stubs are the ESP32-C3 interrupt
 matrix's own bring-up calls, and are worth calling out on their own because
 they're the one case where "the wrong stub type would corrupt boot" bit
 concretely: `intr_matrix_set`, `esprv_intc_int_disable`,
@@ -402,25 +402,71 @@ predicted these blockers would surface once TIMG unblocks further boot:
    remain `void` C functions (per
    `components/riscv/include/esp_private/interrupt_deprecated.h`), so `a0`
    is still never touched.
-   **Where boot now stalls**: with `esprv_intc_int_enable` performing a real
-   write, boot runs straight past the old `0x4000_05e8` fault — still zero
-   new console output, still the same first "Guru Meditation Error" text
-   (that fault simply moved later) — and hits a **new, genuinely different**
-   unstubbed ROM call: `itoa` (`0x4000_0448`, `esp32c3.rom.libc.ld`, step
-   407,471). This is a ROM libc function, not an interrupt-controller one,
-   so per this fix round's own iteration ruling ("STOP at the next stall
-   that is not one of these five functions") it's exactly where the round
-   stopped. Boot-probe evidence: `itoa(value = 0x4200_1011, buf =
-   0x3fcd_c694, base = 0x10)` — a real int-to-hex-string conversion whose
-   *output* the caller uses, in the same "needs a real implementation, not
-   a guessed status return" category as `memset`/`memcpy` (see `rom.rs`'s
-   "What is NOT stubbed, on purpose" section). Pinned down exactly in
+   **Where boot then stalled**: with `esprv_intc_int_enable` performing a
+   real write, boot ran straight past the old `0x4000_05e8` fault and hit a
+   **new, genuinely different** unstubbed ROM call: `itoa` (`0x4000_0448`,
+   `esp32c3.rom.libc.ld`, step 407,471). Boot-probe evidence:
+   `itoa(value = 0x4200_1011, buf = 0x3fcd_c694, base = 0x10)` — a real
+   int-to-hex-string conversion whose *output* the caller uses, in the same
+   "needs a real implementation, not a guessed status return" category as
+   `memset`/`memcpy` (see `rom.rs`'s "What is NOT stubbed, on purpose"
+   section).
+
+   **Task D4** gave `itoa` a real HLE implementation
+   (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Itoa`, mirroring
+   newlib's `itoa.c`/`utoa.c` byte-for-byte). Step 1 of that task's brief
+   required first checking whether this call sat on the normal boot path or
+   an already-active error path: disassembling the call site showed a
+   small "format one value as a string" helper inside a loop, called with
+   zero console output printed yet — the normal, pre-panic boot path, not a
+   symptom of an already-crashed system. With `itoa` unblocked, boot
+   immediately hit the very next unstubbed ROM libc call, `strcat`
+   (`0x4000_03d8`, also `esp32c3.rom.libc.ld`) — the same task's own
+   iteration ruling ("if the next stall is another unstubbed ROM
+   libc/string call, implement that one too") authorized fixing it in the
+   same task, so it also got a real HLE implementation
+   (`RomStubEffect::Strcat`, mirroring newlib's `strcat.c`). Both turned out
+   to belong to the same "format a value, concatenate it onto a growing
+   buffer" loop — almost certainly assembling a backtrace/panic-report line.
+
+   **Where boot now stalls**: no longer on an unmapped ROM-address fetch at
+   all. With `itoa`/`strcat` real, boot hits a **qualitatively different**
+   kind of fault: a real `ILLEGAL_INSTRUCTION` exception (RISC-V cause 2,
+   step 407,549) at `0x4038e4fa`, inside the app's own IRAM code — a
+   compiler-emitted `c.unimp` (the RVC extension's all-zero 16-bit encoding,
+   architecturally reserved to always trap), reached right after storing an
+   "aborting" flag and a message pointer to two fixed addresses. That is
+   ESP-IDF's own `panic_abort()` mechanism
+   (`components/esp_system/panic.c`'s `g_panic_abort`/
+   `g_panic_abort_details`) — a deliberate, hardware-standard trap the
+   firmware itself designed to always fault, not a decode gap or an
+   unstubbed-ROM-call symptom. Per Task D4's own stop condition ("stop as
+   soon as the stall is anything other than an unstubbed ROM libc/string
+   call"), this is exactly where that task stopped.
+
+   What happens next is all real, hardware-faithful behavior, not an
+   emulator gap: the trap delivers correctly to the firmware's own
+   exception handler, which runs `esp_panic_handler` to completion for the
+   first time (`itoa`/`strcat` actually built the message this time,
+   instead of faulting mid-format). Per `panic.c`, the abort path leaves
+   `info->reason == NULL`, so the "Guru Meditation Error" header is
+   *skipped* on this first pass; ESP-IDF's generic pre-restart text prints
+   unconditionally (a new, real console line — the first genuinely new one
+   since Task D1), then `panic_restart()` calls into the still-unstubbed ROM
+   `software_reset_cpu` (`0x4000_0094`) to actually reboot — which faults
+   for real (step 645,410), re-entering the panic handler through its
+   *exception* path (where `info->reason` is finally non-`NULL`, so "Guru
+   Meditation Error" prints for the first time, by step 648,000), which
+   again reaches the same unstubbed `software_reset_cpu` call and loops.
+   `software_reset_cpu` remains unstubbed — it's only reached via the panic
+   path, and stubbing it wouldn't address the `panic_abort()` call that is
+   the actual new wall. Pinned down exactly in
    `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`. This is the
-   natural next Milestone 3 candidate: research `itoa`'s real ROM behavior
-   (or confirm a documented libc `itoa(value, buf, base)` signature/behavior
-   is safe to reimplement) and give it a real HLE, the same way `memset`/
-   `memcpy` were handled.
+   `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`. This is
+   the natural next Milestone 3 candidate: find out *why* the firmware is
+   calling `panic_abort()` at all this early in boot (what condition it's
+   asserting on), since that — not another ROM stub — is what stands
+   between here and a built-in app / the first real pixels.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

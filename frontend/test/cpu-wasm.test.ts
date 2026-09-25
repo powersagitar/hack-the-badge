@@ -55,10 +55,20 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // siblings now perform real InterruptController register writes
       // (emulator-core/src/rom.rs's module doc, entry 11), which unblocked
       // the Task-D3-era fault -- boot now runs further still and hits a
-      // *different* unstubbed ROM call (itoa, step 407,471), still well
-      // within this 500,000-step budget, so the trap count here stays 1.
-      // See emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_stalls_on_the_unstubbed_itoa_rom_call and
+      // *different* unstubbed ROM call (itoa, step 407,471).
+      //
+      // Milestone 3 Task D4: itoa, and the very next unstubbed ROM libc
+      // call it led to (strcat, step ~407,498), are now HLE-stubbed
+      // (emulator-core/src/rom.rs's module doc, entry 12). With both real,
+      // boot no longer stalls on an unmapped ROM-address fetch at all --
+      // it hits a *qualitatively different* fault: a real
+      // ILLEGAL_INSTRUCTION trap (step 407,549) at ESP-IDF's own
+      // panic_abort(), still well within this 500,000-step budget, so the
+      // trap count here stays 1 (the second fault -- the still-unstubbed
+      // software_reset_cpu the panic handler's own reboot attempt calls --
+      // isn't reached until step 645,410, past this budget). See
+      // emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_stalls_retrying_reboot_after_a_real_panic_abort and
       // docs/firmware-emulator-notes.md for the full story.
       expect(report.traps).toBe(1);
 
