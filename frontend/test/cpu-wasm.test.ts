@@ -49,10 +49,17 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // module doc, entry 10), which unblocked the Task-D2-era fault --
       // boot now runs further still and hits a *different* unstubbed ROM
       // call (esprv_intc_int_enable, step 405,806), still well within this
-      // 500,000-step budget, so the trap count here stays 1. See
-      // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call
-      // and docs/firmware-emulator-notes.md for the full story.
+      // 500,000-step budget, so the trap count here stays 1.
+      //
+      // Milestone 3 Task D3 fix round 1: esprv_intc_int_enable and its four
+      // siblings now perform real InterruptController register writes
+      // (emulator-core/src/rom.rs's module doc, entry 11), which unblocked
+      // the Task-D3-era fault -- boot now runs further still and hits a
+      // *different* unstubbed ROM call (itoa, step 407,471), still well
+      // within this 500,000-step budget, so the trap count here stays 1.
+      // See emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_stalls_on_the_unstubbed_itoa_rom_call and
+      // docs/firmware-emulator-notes.md for the full story.
       expect(report.traps).toBe(1);
 
       const fb = handle.framebuffer();

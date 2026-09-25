@@ -41,9 +41,10 @@
 //!
 //! 1. The stub's [`RomStubEffect`] runs — typically "write a plausible return
 //!    value into `a0`/`x10`", the RV32 ABI's integer return register;
-//!    sometimes nothing at all (a `void` function); and for the one ROM
-//!    function whose *actual* work matters ([`RomStubEffect::Memset`]), the
-//!    real thing, through the bus.
+//!    sometimes nothing at all (a `void` function); and for the ROM
+//!    functions whose *actual* work matters ([`RomStubEffect::Memset`],
+//!    [`RomStubEffect::Memcpy`], [`RomStubEffect::Int64`], and
+//!    [`RomStubEffect::BusRegisterWrite`]), the real thing, through the bus.
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.
@@ -152,6 +153,68 @@ pub enum RomStubEffect {
     /// without copying the bytes wouldn't unblock the caller, it would
     /// silently corrupt it.
     Memcpy,
+    /// A runtime-computed 32-bit peripheral-register write through the bus,
+    /// driven entirely by the ROM call's own argument registers plus a base
+    /// address the chip-specific table supplies. See [`BusRegisterWrite`]
+    /// for the address/value computation and [`BusRegisterOp`] for the three
+    /// write shapes.
+    ///
+    /// This is the mechanism for a ROM stub whose real effect is "write a
+    /// register a peripheral model already exposes through `Bus`" rather
+    /// than a status/data return or a raw memory copy — e.g. routing an
+    /// interrupt-matrix MAP register, or setting/clearing bits in a shared
+    /// enable/type register. Like [`RomStubEffect::Void`], it never touches
+    /// `a0`: every ROM function using this effect has a `void` C signature,
+    /// so a stray value in the caller's kept-alive `a0` must survive the
+    /// call.
+    ///
+    /// Deliberately **chip-agnostic**: this variant and [`BusRegisterWrite`]
+    /// only know "read some argument registers, compute an address and a new
+    /// word, write it through the bus" — never which peripheral or SoC that
+    /// resolves to. `crate::rom` supplies the actual ESP32-C3 base addresses
+    /// (from `crate::mem::soc`/`crate::peripherals::intc` constants), per
+    /// this module's chip-agnostic/chip-specific split.
+    BusRegisterWrite(BusRegisterWrite),
+}
+
+/// The address/value computation for [`RomStubEffect::BusRegisterWrite`].
+///
+/// The word address touched is `base + a[index_reg] * 4` when `index_reg` is
+/// `Some` (a ROM call that indexes into an array of same-sized registers,
+/// one per source/line — e.g. one MAP register per interrupt source, one
+/// `CPU_INT_PRI_<n>_REG` per CPU interrupt line), or just `base` when
+/// `index_reg` is `None` (a single fixed-address register shared across
+/// calls, e.g. `CPU_INT_ENABLE_REG`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BusRegisterWrite {
+    pub base: u32,
+    pub index_reg: Option<u8>,
+    pub op: BusRegisterOp,
+}
+
+/// The three register-write shapes [`BusRegisterWrite`] supports, chosen
+/// per-call to match that ROM function's actual argument meaning (see
+/// `crate::rom`'s citations for which shape each of the five
+/// interrupt-controller ROM calls uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusRegisterOp {
+    /// Overwrite the whole word with `a[value_reg]` — used when the ROM
+    /// call's argument *is* the register's new value outright (e.g.
+    /// `intr_matrix_set`'s `intr_num`, `esprv_intc_int_set_priority`'s
+    /// `priority`).
+    Store { value_reg: u8 },
+    /// Read-modify-write: OR the mask from `mask_reg` into the register if
+    /// `set`, else AND its complement out — used for a call whose argument
+    /// is a bitmask of several lines at once (`esprv_intc_int_enable`/
+    /// `esprv_intc_int_disable`'s `mask`/`unmask`).
+    UpdateMask { mask_reg: u8, set: bool },
+    /// Read-modify-write a single bit at position `a[bit_reg]`: set it if
+    /// `a[cond_reg]` is nonzero, clear it otherwise — used for a call that
+    /// takes a bit index plus a boolean-ish flag for that one bit
+    /// (`esprv_intc_int_set_type`'s `(intr_num, type)`, where `type`'s only
+    /// architecturally meaningful states are `INTR_TYPE_LEVEL = 0` and
+    /// `INTR_TYPE_EDGE = 1`).
+    SetOrClearBit { bit_reg: u8, cond_reg: u8 },
 }
 
 /// The libgcc 64-bit integer helpers this project emulates.
@@ -283,6 +346,15 @@ impl RomStub {
             effect: RomStubEffect::Int64(op),
         }
     }
+
+    /// A real high-level-emulated peripheral-register write — see
+    /// [`RomStubEffect::BusRegisterWrite`].
+    pub const fn bus_register_write(name: &'static str, write: BusRegisterWrite) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::BusRegisterWrite(write),
+        }
+    }
 }
 
 /// Address → [`RomStub`] table. An empty table (the default) makes the CPU's
@@ -363,6 +435,22 @@ mod tests {
         assert_eq!(RomStub::memset("memset").effect, RomStubEffect::Memset);
         assert_eq!(RomStub::memcpy("memcpy").effect, RomStubEffect::Memcpy);
         assert_eq!(RomStub::returning("x", 7).effect, RomStubEffect::Return(7));
+        assert_eq!(
+            RomStub::bus_register_write(
+                "x",
+                BusRegisterWrite {
+                    base: 0x100,
+                    index_reg: Some(REG_A0),
+                    op: BusRegisterOp::Store { value_reg: REG_A1 },
+                }
+            )
+            .effect,
+            RomStubEffect::BusRegisterWrite(BusRegisterWrite {
+                base: 0x100,
+                index_reg: Some(REG_A0),
+                op: BusRegisterOp::Store { value_reg: REG_A1 },
+            })
+        );
     }
 
     #[test]

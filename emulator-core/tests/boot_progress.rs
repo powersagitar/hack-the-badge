@@ -47,6 +47,34 @@
 //! is this file's no-fault-before-step-N rung for this task: it asserts zero
 //! traps through the *old* Task-D2-era fault's exact step count (402,113),
 //! concrete, measurable evidence this task's fixes moved the wall forward.
+//! (Note this task's own boot/panic-order text was itself corrected in Fix
+//! round 1 — see below and `docs/firmware-emulator-notes.md`: the whole
+//! eFuse/UART/interrupt-controller chain, including the `esprv_intc_int_*`
+//! calls, is normal *pre*-panic boot code, not something that ran "after" a
+//! panic that hadn't actually happened yet.)
+//!
+//! Fix round 1 status (review of Task D3): the review found
+//! `esprv_intc_int_enable` and its four siblings were writing real
+//! `crate::peripherals::intc::InterruptController` registers only in
+//! *theory* — the siblings were left as `void` no-ops, silently dropping
+//! state a later interrupt-arbitration consumer could observe, and
+//! `esprv_intc_int_enable` itself was left unstubbed entirely (the
+//! Task-D3-era fault above). `emulator_core::rom`'s module doc (entry 11)
+//! gives all five real register writes via a new generic
+//! `RomStubEffect::BusRegisterWrite` (`emulator-core/src/cpu/rom_stubs.rs`).
+//! Boot now runs straight past `0x4000_05e8` and hits a **new**, later,
+//! genuinely different unstubbed ROM call: `itoa` (`0x4000_0448`, a ROM
+//! libc function, not an interrupt-controller one — see
+//! `emulator-core/tests/rom_stub_boot.rs`'s
+//! `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`). Same situation
+//! as Task D2/D3 once more — the console's first line is still the same
+//! generic "Guru Meditation Error" text, no *new* line to ratchet on, since
+//! this is still the very first fault of the run.
+//! [`boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site`]
+//! is this file's no-fault-before-step-N rung for this fix round: it asserts
+//! zero traps through the *old* Task-D3-era fault's exact step count
+//! (405,806), concrete, measurable evidence this fix round's changes moved
+//! the wall forward.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -201,6 +229,37 @@ fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() 
          ets_efuse_get_spiconfig fault's exact step count (402,113) now \
          that it's HLE-stubbed; got {} traps, last_instruction_fault = \
          {:?}, pc = 0x{:08x}",
+        summary.traps, summary.last_instruction_fault, summary.pc
+    );
+}
+
+/// Fix round 1's no-new-console-line fallback rung (see the module doc).
+/// Before this fix round, boot faulted on an unstubbed
+/// `esprv_intc_int_enable` call at a fixed address reached at step 405,806
+/// from a cold boot (Task D3 report). `emulator-core/src/rom.rs`'s module
+/// doc (entry 11) now gives that call, and its four siblings, a real
+/// register write via `RomStubEffect::BusRegisterWrite`, so a run just past
+/// the old fault's step count should show **zero** traps of any kind --
+/// concrete, measured evidence the fixes bought real forward progress, not
+/// just a relabeled stall. (Boot does still stall shortly after -- at step
+/// 407,471, on a *different*, unstubbed ROM call, `itoa` -- pinned exactly
+/// by `emulator-core/tests/rom_stub_boot.rs`'s
+/// `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`, which is this fix
+/// round's job to leave accurately pinned, not this rung's.)
+#[test]
+fn boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    // 405,806: the exact step the pre-fix-round-1 `esprv_intc_int_enable`
+    // fault occurred at. Running exactly that many steps and finding zero
+    // traps proves the call that used to fault right at this boundary now
+    // completes.
+    let summary = rt.run(405_806);
+    assert_eq!(
+        summary.traps, 0,
+        "expected zero traps through the pre-fix-round-1 \
+         esprv_intc_int_enable fault's exact step count (405,806) now that \
+         it's HLE-stubbed; got {} traps, last_instruction_fault = {:?}, \
+         pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
 }

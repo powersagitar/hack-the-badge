@@ -121,9 +121,13 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       M-mode trap entry/mret). Deliberately knows nothing
                       about ESP32-C3 specifics — see cpu/mod.rs's module
                       doc. cpu/rom_stubs.rs is the chip-agnostic *mechanism*
-                      for intercepting fetches to fixed ROM addresses
-                      (paired with the chip-specific data in src/rom.rs,
-                      below).
+                      for intercepting fetches to fixed ROM addresses and
+                      running a stub's effect in place of the real
+                      instruction — a return value, a real memcpy/memset,
+                      or (as of Milestone 3's Task D3 fix round) a
+                      runtime-computed peripheral-register write via
+                      `RomStubEffect::BusRegisterWrite` — paired with the
+                      chip-specific data in src/rom.rs, below.
   src/mem/            mem/mod.rs defines the Bus trait the CPU core is
                       generic over. mem/bus.rs's FirmwareBus is the real
                       ESP32-C3 memory map: an ordered sequence of named
@@ -148,9 +152,12 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       from.
   src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
                       fixed addresses to intercept + what each pretends to
-                      have done), paired with cpu/rom_stubs.rs's generic
-                      mechanism above. Addresses sourced from ESP-IDF's own
-                      linker scripts, not guessed — see
+                      have done — including, for the five interrupt-matrix/
+                      interrupt-controller ROM calls, a real read/write of
+                      the `peripherals::intc` registers those calls target),
+                      paired with cpu/rom_stubs.rs's generic mechanism
+                      above. Addresses sourced from ESP-IDF's own linker
+                      scripts, not guessed — see
                       docs/firmware-emulator-notes.md.
   src/boot.rs         "Shortcut boot": loads factory.bin directly into a
                       Cpu/FirmwareBus pair via the app image's own header,

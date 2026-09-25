@@ -260,6 +260,43 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, result as u32);
                 self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
             }
+            RomStubEffect::BusRegisterWrite(write) => {
+                use rom_stubs::BusRegisterOp;
+                let addr = match write.index_reg {
+                    Some(r) => write.base.wrapping_add(self.regs.read(r).wrapping_mul(4)),
+                    None => write.base,
+                };
+                match write.op {
+                    BusRegisterOp::Store { value_reg } => {
+                        let value = self.regs.read(value_reg);
+                        bus.write32(addr, value);
+                    }
+                    BusRegisterOp::UpdateMask { mask_reg, set } => {
+                        let mask = self.regs.read(mask_reg);
+                        let old = bus.read32(addr);
+                        let new = if set { old | mask } else { old & !mask };
+                        bus.write32(addr, new);
+                    }
+                    BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
+                        // Only the low 5 bits are architecturally meaningful
+                        // for a 32-line interrupt matrix (see
+                        // `crate::peripherals::intc::InterruptController`'s
+                        // `LINE_MASK`).
+                        let bit = self.regs.read(bit_reg) & 0x1F;
+                        let cond = self.regs.read(cond_reg) != 0;
+                        let old = bus.read32(addr);
+                        let new = if cond {
+                            old | (1 << bit)
+                        } else {
+                            old & !(1 << bit)
+                        };
+                        bus.write32(addr, new);
+                    }
+                }
+                // Every ROM function using this effect has a `void` C
+                // signature (see `RomStubEffect::BusRegisterWrite`'s doc) --
+                // `a0` is left untouched, same as `RomStubEffect::Void`.
+            }
         }
         self.regs.pc = self.regs.read(rom_stubs::REG_RA);
     }
@@ -1429,6 +1466,184 @@ mod tests {
         // Completes rather than looping ~4 billion times.
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    // ---- BusRegisterWrite: chip-agnostic mechanism tests ----
+    //
+    // These exercise the generic `RomStubEffect::BusRegisterWrite` machinery
+    // in isolation, against `TestBus`'s plain byte array -- no ESP32-C3
+    // peripheral involved. `crate::rom`'s own tests separately exercise the
+    // real ESP32-C3 wiring (the five interrupt-controller ROM stubs) against
+    // a real `FirmwareBus`/`InterruptController`.
+
+    use rom_stubs::{BusRegisterOp, BusRegisterWrite};
+
+    #[test]
+    fn bus_register_write_store_writes_the_indexed_word_and_leaves_a0_untouched() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_indexed_store",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: Some(11), // a1 selects the word
+                    op: BusRegisterOp::Store { value_reg: 12 }, // a2 is the value
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 0xdead_beef); // must survive -- the real call is void
+        cpu.regs.write(11, 3); // index 3 -> base + 12
+        cpu.regs.write(12, 0x1234_5678); // value
+        cpu.regs.write(1, 0x40); // ra
+
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let info = cpu.step(&mut bus);
+
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(bus.read32(0x200 + 3 * 4), 0x1234_5678);
+        assert_eq!(cpu.regs.read(10), 0xdead_beef, "must not clobber a0");
+        assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn bus_register_write_store_with_no_index_targets_the_fixed_base_address() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_fixed_store",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    op: BusRegisterOp::Store { value_reg: 10 },
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 0x77);
+        cpu.regs.write(1, 0x40);
+
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+
+        assert_eq!(bus.read32(0x200), 0x77, "no index_reg means addr == base");
+    }
+
+    #[test]
+    fn bus_register_write_update_mask_ors_in_the_mask_when_set() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_enable",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    op: BusRegisterOp::UpdateMask {
+                        mask_reg: 10,
+                        set: true,
+                    },
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.write32(0x200, 0b0000_0001);
+        cpu.regs.write(10, 0b0010_0000); // mask
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.read32(0x200),
+            0b0010_0001,
+            "OR-in must preserve other bits"
+        );
+    }
+
+    #[test]
+    fn bus_register_write_update_mask_ands_out_the_mask_when_clearing() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_disable",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    op: BusRegisterOp::UpdateMask {
+                        mask_reg: 10,
+                        set: false,
+                    },
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table);
+
+        let mut bus = rom_stub_test_bus();
+        bus.write32(0x200, 0b0011_0001);
+        cpu.regs.write(10, 0b0010_0000); // mask
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.read32(0x200),
+            0b0001_0001,
+            "AND-out must clear only the masked bits"
+        );
+    }
+
+    #[test]
+    fn bus_register_write_set_or_clear_bit_toggles_only_the_named_bit() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_set_type",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    op: BusRegisterOp::SetOrClearBit {
+                        bit_reg: 10,
+                        cond_reg: 11,
+                    },
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table.clone());
+
+        // Setting bit 5, leaving bit 2 (already set) untouched.
+        let mut bus = rom_stub_test_bus();
+        bus.write32(0x200, 1 << 2);
+        cpu.regs.write(10, 5); // bit_reg
+        cpu.regs.write(11, 1); // cond_reg (nonzero -> set)
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x200), (1 << 2) | (1 << 5));
+
+        // Clearing that same bit back out.
+        let mut cpu2 = Cpu::new();
+        cpu2.set_rom_stubs(table);
+        let mut bus2 = rom_stub_test_bus();
+        bus2.write32(0x200, (1 << 2) | (1 << 5));
+        cpu2.regs.write(10, 5);
+        cpu2.regs.write(11, 0); // cond_reg (zero -> clear)
+        cpu2.regs.write(1, 0x40);
+        cpu2.regs.pc = ROM_STUB_ADDR;
+        cpu2.step(&mut bus2);
+        assert_eq!(bus2.read32(0x200), 1 << 2);
     }
 
     #[test]

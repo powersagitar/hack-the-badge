@@ -167,9 +167,9 @@
 //!    task's report for the exact re-probe evidence — so, per this module's
 //!    own "only stub what's observed" rule, they remain unstubbed for now.
 //!
-//! 10. **Milestone 3 Task D3's chain of six ROM calls** — boot's next stall
-//!     after `memcpy`, and the five it exposed one at a time once each was
-//!     unblocked in turn (this task's brief authorized exactly this:
+//! 10. **Milestone 3 Task D3's chain of seven ROM calls** — boot's next
+//!     stall after `memcpy`, and the six more it exposed one at a time once
+//!     each was unblocked in turn (this task's brief authorized exactly this:
 //!     "if the next stall is another unstubbed ROM function call whose
 //!     semantics are documented in a header, implement it too... repeat"):
 //!     - **[`ETS_EFUSE_GET_SPICONFIG`] (`0x4000_071c`)** — returns
@@ -193,52 +193,104 @@
 //!       HLE, not a shortcut.
 //!     - **[`INTR_MATRIX_SET`], [`ESPRV_INTC_INT_DISABLE`],
 //!       [`ESPRV_INTC_INT_SET_TYPE`], [`ESPRV_INTC_INT_SET_PRIORITY`]
-//!       (`0x4000_05e0`..=`0x4000_05f4`)** — four **`void` no-ops**, all
-//!       from ESP-IDF's interrupt-controller bring-up
-//!       (`components/riscv/include/esp_private/interrupt_deprecated.h`
+//!       (`0x4000_05e0`..=`0x4000_05f4`)** — originally landed as four
+//!       **`void` no-ops**, all from ESP-IDF's interrupt-controller
+//!       bring-up (`components/riscv/include/esp_private/interrupt_deprecated.h`
 //!       for the `esprv_intc_int_*` family; `intr_matrix_set` from
-//!       `esp32c3/rom/ets_sys.h`). Each really does write a register
+//!       `esp32c3/rom/ets_sys.h` — note that name, unlike the other three,
+//!       is *not* one of the `esprv_intc_int_*` family, even though this
+//!       task grouped all four together). Each really does write a register
 //!       `crate::peripherals::intc::InterruptController` models (MAP
-//!       registers, `CPU_INT_TYPE_REG`, `CPU_INT_PRI_<n>_REG`), so this
-//!       isn't the generic "no effect" case by default — it's justified
-//!       per-function: a throwaway, uncommitted boot-probe (this task's
-//!       report has the trace) observed `intr_matrix_set` called 62 times
-//!       in a loop as `intr_matrix_set(0, model_num, 0)` for
-//!       `model_num` = 0..=0x3d, `esprv_intc_int_disable(1 << 25)`, and
-//!       `esprv_intc_int_set_type(25, INTR_TYPE_LEVEL)` once each — in
-//!       every one of these calls the register being written is still at
-//!       its power-on-reset value (`0`) at that point in boot, so a real
-//!       write and a no-op are byte-identical for the *observed* calls,
-//!       not merely assumed to be. `esprv_intc_int_set_priority(25, 4)` is
-//!       different — its write value (`4`) is not `0`, so a real write and
-//!       a no-op genuinely differ in what ends up stored — but
-//!       `InterruptController`'s own module doc already documents
-//!       `CPU_INT_PRI_<n>_REG` as real storage this emulator's interrupt
-//!       arbitration doesn't consult in v1 (only `SYSTIMER_TARGET0` has a
-//!       real signal wired), so the divergence has no effect this
-//!       emulator's current fidelity observes — the same "we model no
-//!       consumer for this yet" reasoning the `Cache_Get_*` family already
-//!       relies on, not a fresh guess.
+//!       registers, `CPU_INT_TYPE_REG`, `CPU_INT_PRI_<n>_REG`), so
+//!       "no-op" wasn't the generic "no effect" case by default — it was
+//!       justified per-function on the *observed* boot-probe evidence: a
+//!       throwaway, uncommitted probe (this task's report has the trace)
+//!       observed `intr_matrix_set` called 62 times in a loop as
+//!       `intr_matrix_set(0, model_num, 0)` for `model_num` = 0..=0x3d,
+//!       `esprv_intc_int_disable(1 << 25)`, and
+//!       `esprv_intc_int_set_type(25, INTR_TYPE_LEVEL)` once each, with the
+//!       register being written still at its power-on-reset value (`0`) at
+//!       that point in boot for every one of those calls — so a real write
+//!       and a no-op were byte-identical *for the calls observed*, not
+//!       merely assumed to be. `esprv_intc_int_set_priority(25, 4)` was the
+//!       one exception (its write value, `4`, is not `0`), justified instead
+//!       on `InterruptController`'s "v1 scope" doc: `CPU_INT_PRI_<n>_REG` is
+//!       real storage this emulator's interrupt arbitration didn't consult
+//!       at the time. **Superseded by Fix round 1 (entry 11 below)**, which
+//!       replaced all four no-ops with real register writes — the
+//!       "byte-identical for the observed calls" argument was never a
+//!       reason these four were safe *in general* (a later, non-trivial
+//!       call, or a later task that starts consulting `CPU_INT_PRI_<n>_REG`,
+//!       would have silently exposed the gap), only a reason boot could
+//!       proceed for now.
 //!
-//!     **Where this chain stops, and why**: the very next call at the same
+//!     **Where this chain stopped, and why**: the very next call at the same
 //!     address family, `esprv_intc_int_enable(1 << 25)` (`0x4000_05e8`),
-//!     is qualitatively different from its four siblings above: it *sets*
+//!     was qualitatively different from its four siblings above: it *sets*
 //!     bit 25 of `CPU_INT_ENABLE_REG`, a register
 //!     `InterruptController::poll` genuinely *does* consult (`self.cpu_int_enable
 //!     & (1 << line) != 0`) to decide whether a pending, routed source is
-//!     allowed through to the CPU. Skipping this write is not a
-//!     provably-inert no-op the way its four siblings are (their target
-//!     registers all stayed at `0`, this one is asking to leave a register
+//!     allowed through to the CPU. Skipping this write was not a
+//!     provably-inert no-op the way its four siblings were (their target
+//!     registers all stayed at `0`; this one was asking to leave a register
 //!     at `0` a real call would set to a nonzero value with a documented
-//!     purpose), and doing the write for real would mean reaching into an
-//!     already-modeled peripheral's register from a stub effect — new
-//!     mechanism work this task's brief scopes out ("peripherals are out
-//!     of scope here"). This is also the boundary the brief's own stop
-//!     condition names directly ("a peripheral register"). So Task D3
-//!     stops here and leaves `esprv_intc_int_enable` unstubbed for a later
-//!     task's judgment call — see `tests/rom_stub_boot.rs`'s
-//!     `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
-//!     and this task's report.
+//!     purpose), and doing the write for real needed new stub-mechanism
+//!     plumbing this task's brief scoped out ("peripherals are out of scope
+//!     here") — exactly the boundary the brief's own stop condition named
+//!     ("a peripheral register"). So Task D3 stopped here and left
+//!     `esprv_intc_int_enable` unstubbed for a later task's judgment
+//!     call — resolved by Fix round 1, entry 11 below.
+//!
+//! 11. **Fix round 1: real register writes for all five interrupt-controller
+//!     calls, via a new generic effect** — a review of Task D3 found the
+//!     four `void` no-ops above (FINDING I1) genuinely risky: ESP-IDF's real
+//!     `esp_intr_alloc` -> `esp_rom_route_intr_matrix` path calls the very
+//!     same ROM `intr_matrix_set`, and once a later task wires up
+//!     `CPU_INT_PRI_<n>_REG`/priority arbitration or a second real interrupt
+//!     source, a firmware `intr_matrix_set`/`esprv_intc_int_set_priority`
+//!     call with a *non-zero* argument would be silently dropped — plus
+//!     `esprv_intc_int_enable` (`0x4000_05e8`, [`ESPRV_INTC_INT_ENABLE`])
+//!     itself was still unstubbed, the exact stall Task D3 left behind.
+//!     This fix round adds [`crate::cpu::rom_stubs::RomStubEffect::BusRegisterWrite`]
+//!     (chip-agnostic mechanism in `cpu/rom_stubs.rs`: compute an address
+//!     from a base plus an optional argument-register-indexed offset, then
+//!     either overwrite the word, OR-in/AND-out a mask, or set/clear one
+//!     bit — see [`crate::cpu::rom_stubs::BusRegisterOp`]) and rewires all
+//!     five calls onto it, with addresses computed from
+//!     [`crate::mem::soc::INTERRUPT_CORE0_RANGE`] and
+//!     `crate::peripherals::intc`'s own register-offset constants (both
+//!     already cited there against
+//!     `components/soc/esp32c3/register/soc/interrupt_core0_reg.h`):
+//!     - `intr_matrix_set(cpu_no, model_num, intr_num)` (`esp32c3/rom/ets_sys.h`)
+//!       writes `intr_num` into the MAP register at
+//!       `INTERRUPT_CORE0_RANGE.start + model_num * 4` — the MAP region
+//!       starts at that range's offset `0x000`, one word per source, per
+//!       the header's `..._MAP_REG` list.
+//!     - `esprv_intc_int_disable(mask)`/`esprv_intc_int_enable(unmask)`
+//!       (`components/riscv/include/esp_private/interrupt_deprecated.h`)
+//!       AND-out/OR-in `mask`/`unmask` at `CPU_INT_ENABLE_REG`.
+//!     - `esprv_intc_int_set_type(intr_num, type)` (same header; `enum
+//!       intr_type { INTR_TYPE_LEVEL = 0, INTR_TYPE_EDGE = 1 }` per
+//!       `components/riscv/include/riscv/interrupt.h`) sets `intr_num`'s bit
+//!       in `CPU_INT_TYPE_REG` when `type` is nonzero, clears it otherwise.
+//!     - `esprv_intc_int_set_priority(rv_int_num, priority)` (same header)
+//!       writes `priority` into the `CPU_INT_PRI_<n>_REG` at
+//!       `CPU_INT_PRI_BASE_REG + rv_int_num * 4`.
+//!
+//!     Every one of these five is still a `void` C function (see the
+//!     deprecated-header signatures above), so `a0` is left untouched, same
+//!     as [`crate::cpu::rom_stubs::RomStubEffect::Void`] — only the register
+//!     write is new. With `esprv_intc_int_enable` now performing a real
+//!     write, boot runs straight past the old `0x4000_05e8` fault and hits
+//!     a **new, later, genuinely different** unstubbed ROM call: `itoa`
+//!     (`0x4000_0448`, `esp32c3.rom.libc.ld`) — a ROM libc function, not an
+//!     interrupt-controller one, so per this fix round's own iteration
+//!     ruling ("STOP at the next stall that is not one of these five
+//!     functions") this is exactly where the round stops. Boot-probe
+//!     evidence: `itoa(value = 0x4200_1011, buf = 0x3fcd_c694, base = 0x10)`
+//!     at step 407,471 — see `tests/rom_stub_boot.rs`'s
+//!     `boot_currently_stalls_on_the_unstubbed_itoa_rom_call` and this fix
+//!     round's report section for the full trace.
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -259,23 +311,28 @@
 //!
 //! ## Where this gets boot to
 //!
-//! With this table installed (as of Milestone 3 Task D3), the real
-//! `factory.bin` runs past the mask-ROM wall, `.bss` clear, flash cache/MMU
-//! bring-up, analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay
-//! loop (Task D1), the `memcpy` call (Task D2), prints a full ESP-IDF
-//! "Guru Meditation Error" boot log, and now runs straight through that
-//! panic dump's own eFuse queries, UART flush, and the start of
-//! interrupt-controller bring-up (entry 10's six-function chain above),
-//! stalling at step 405,806 on `esprv_intc_int_enable` (`0x4000_05e8`,
-//! `unmask = 1 << 25` observed) — the first call in that chain whose real
-//! effect this emulator's own peripheral model (`InterruptController::poll`)
-//! actually consults, so it's deliberately left unstubbed rather than
-//! guessed at. See `tests/rom_stub_boot.rs`'s
-//! `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
+//! With this table installed (as of Fix round 1), the real `factory.bin`
+//! runs past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up,
+//! analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop
+//! (Task D1), the `memcpy` call (Task D2), the eFuse queries, the UART
+//! flush, and the interrupt-controller bring-up (entries 10 and 11 above,
+//! all of it real register writes now) — **all of that runs fault-free**,
+//! as *normal pre-panic boot code*. Boot only panics once it reaches the
+//! next unstubbed ROM call, `itoa` (`0x4000_0448`), at step 407,471; *that*
+//! fault is what makes the firmware's own panic handler print its first
+//! "Guru Meditation Error" boot log (via `ets_printf`). (An earlier revision
+//! of this doc described the chain as running "straight through" a panic
+//! that had already happened — backwards: no trap of any kind occurs before
+//! this `itoa` fault; see Fix round 1's report, FINDING I2.) See
+//! `tests/rom_stub_boot.rs`'s `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`
 //! and `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
 //! story.
 
-use crate::cpu::rom_stubs::{Int64Op, RomStub, RomStubTable};
+use crate::cpu::rom_stubs::{
+    BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,
+};
+use crate::mem::soc::INTERRUPT_CORE0_RANGE;
+use crate::peripherals::intc::{CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_TYPE_REG};
 
 /// `rtc_get_reset_reason`'s return value: `POWERON_RESET` from ESP-IDF's
 /// `RESET_REASON` enum (`esp32c3/rom/rtc.h`). See the module doc for why a
@@ -326,37 +383,49 @@ pub const ETS_EFUSE_GET_WP_PAD: u32 = 0x4000_072c;
 /// answer, not a guessed pad number.
 pub const EFUSE_WP_PAD_INVALID: u32 = 0x3f;
 
-/// `uart_tx_wait_idle`'s fixed ROM address (`esp32c3.rom.ld`). Called by the
-/// firmware's panic handler to flush its crash dump before rebooting (see
-/// the module doc's entry 10).
+/// `uart_tx_wait_idle`'s fixed ROM address (`esp32c3.rom.ld`). Called during
+/// normal boot (UART flush ahead of a clock change), well before the panic
+/// this chain eventually leads to (see the module doc's entry 10 and Fix
+/// round 1's note on the corrected boot/panic ordering).
 pub const UART_TX_WAIT_IDLE: u32 = 0x4000_0084;
 
 /// `intr_matrix_set`'s fixed ROM address (`esp32c3.rom.ld`). Routes a
-/// peripheral interrupt source onto a CPU interrupt line by writing the
+/// peripheral interrupt source onto a CPU interrupt line by writing that
 /// source's MAP register in `crate::peripherals::intc::InterruptController`
-/// (see the module doc's entry 10 for why this is a `void` no-op rather
-/// than a real register write).
+/// — a **real** register write as of Fix round 1
+/// ([`BusRegisterOp::Store`], see the module doc's entry 11).
 pub const INTR_MATRIX_SET: u32 = 0x4000_05f4;
 
 /// `esprv_intc_int_disable`'s fixed ROM address (`esp32c3.rom.ld`). Clears
 /// bits in `CPU_INT_ENABLE_REG`
-/// (`crate::peripherals::intc::InterruptController`); see the module doc's
-/// entry 10 for why this is a `void` no-op rather than a real register
-/// write.
+/// (`crate::peripherals::intc::InterruptController`) — a **real**
+/// read-modify-write as of Fix round 1 ([`BusRegisterOp::UpdateMask`], see
+/// the module doc's entry 11).
 pub const ESPRV_INTC_INT_DISABLE: u32 = 0x4000_05ec;
+
+/// `esprv_intc_int_enable`'s fixed ROM address (`esp32c3.rom.ld`). Sets bits
+/// in `CPU_INT_ENABLE_REG`
+/// (`crate::peripherals::intc::InterruptController`) — the boot stall Task
+/// D3 left unstubbed and Fix round 1 resolves with a **real**
+/// read-modify-write ([`BusRegisterOp::UpdateMask`], see the module doc's
+/// entry 11).
+pub const ESPRV_INTC_INT_ENABLE: u32 = 0x4000_05e8;
 
 /// `esprv_intc_int_set_type`'s fixed ROM address (`esp32c3.rom.ld`). Sets or
 /// clears a bit in `CPU_INT_TYPE_REG`
-/// (`crate::peripherals::intc::InterruptController`); see the module doc's
-/// entry 10 for why this is a `void` no-op rather than a real register
-/// write.
+/// (`crate::peripherals::intc::InterruptController`) — a **real**
+/// read-modify-write as of Fix round 1 ([`BusRegisterOp::SetOrClearBit`],
+/// see the module doc's entry 11).
 pub const ESPRV_INTC_INT_SET_TYPE: u32 = 0x4000_05f0;
 
 /// `esprv_intc_int_set_priority`'s fixed ROM address (`esp32c3.rom.ld`).
 /// Writes a `CPU_INT_PRI_<n>_REG` entry
-/// (`crate::peripherals::intc::InterruptController`); see the module doc's
-/// entry 10 for why this is a `void` no-op (that register is real storage
-/// but not yet consulted by this emulator's interrupt arbitration).
+/// (`crate::peripherals::intc::InterruptController`) — a **real** register
+/// write as of Fix round 1 ([`BusRegisterOp::Store`], see the module doc's
+/// entry 11). That register is real storage but not yet consulted by this
+/// emulator's interrupt arbitration (`InterruptController`'s own "v1 scope"
+/// doc) — writing it for real costs nothing and keeps this stub honest
+/// regardless.
 pub const ESPRV_INTC_INT_SET_PRIORITY: u32 = 0x4000_05e0;
 
 /// `ets_get_cpu_frequency`'s fixed ROM address (`esp32c3.rom.ld`).
@@ -393,18 +462,74 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         RomStub::returning("ets_efuse_get_wp_pad", EFUSE_WP_PAD_INVALID),
     ),
     (UART_TX_WAIT_IDLE, RomStub::void("uart_tx_wait_idle")),
-    (INTR_MATRIX_SET, RomStub::void("intr_matrix_set")),
+    (
+        INTR_MATRIX_SET,
+        RomStub::bus_register_write(
+            "intr_matrix_set",
+            BusRegisterWrite {
+                // MAP registers start at INTERRUPT_CORE0_RANGE's offset
+                // 0x000, one per source, indexed by `model_num` -- see
+                // interrupt_core0_reg.h's MAC_INTR_MAP_REG..
+                // CACHE_CORE0_ACS_INT_MAP_REG run and the module doc's
+                // entry 11.
+                base: INTERRUPT_CORE0_RANGE.start,
+                index_reg: Some(REG_A1),                        // model_num
+                op: BusRegisterOp::Store { value_reg: REG_A2 }, // intr_num
+            },
+        ),
+    ),
     (
         ESPRV_INTC_INT_DISABLE,
-        RomStub::void("esprv_intc_int_disable"),
+        RomStub::bus_register_write(
+            "esprv_intc_int_disable",
+            BusRegisterWrite {
+                base: INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG,
+                index_reg: None,
+                op: BusRegisterOp::UpdateMask {
+                    mask_reg: REG_A0, // mask
+                    set: false,
+                },
+            },
+        ),
+    ),
+    (
+        ESPRV_INTC_INT_ENABLE,
+        RomStub::bus_register_write(
+            "esprv_intc_int_enable",
+            BusRegisterWrite {
+                base: INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG,
+                index_reg: None,
+                op: BusRegisterOp::UpdateMask {
+                    mask_reg: REG_A0, // unmask
+                    set: true,
+                },
+            },
+        ),
     ),
     (
         ESPRV_INTC_INT_SET_TYPE,
-        RomStub::void("esprv_intc_int_set_type"),
+        RomStub::bus_register_write(
+            "esprv_intc_int_set_type",
+            BusRegisterWrite {
+                base: INTERRUPT_CORE0_RANGE.start + CPU_INT_TYPE_REG,
+                index_reg: None,
+                op: BusRegisterOp::SetOrClearBit {
+                    bit_reg: REG_A0,  // intr_num
+                    cond_reg: REG_A1, // type: INTR_TYPE_LEVEL=0, INTR_TYPE_EDGE=1
+                },
+            },
+        ),
     ),
     (
         ESPRV_INTC_INT_SET_PRIORITY,
-        RomStub::void("esprv_intc_int_set_priority"),
+        RomStub::bus_register_write(
+            "esprv_intc_int_set_priority",
+            BusRegisterWrite {
+                base: INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG,
+                index_reg: Some(REG_A0),                        // rv_int_num
+                op: BusRegisterOp::Store { value_reg: REG_A1 }, // priority
+            },
+        ),
     ),
     (
         ETS_GET_CPU_FREQUENCY,
@@ -715,90 +840,152 @@ mod tests {
         );
     }
 
-    #[test]
-    fn intr_matrix_set_is_a_void_noop() {
-        let table = esp32c3_rom_stubs();
-        let stub = table.lookup(INTR_MATRIX_SET).expect("registered");
-        assert_eq!(stub.name, "intr_matrix_set");
+    // ---- Fix round 1 (FINDING I1): the five interrupt-controller ROM
+    // calls now perform real register writes, not void no-ops. Each test
+    // below runs the actual stub table through `Cpu::step` against a real
+    // `FirmwareBus` (so a real `InterruptController` backs the registers),
+    // sets the exact argument registers a real firmware call would carry,
+    // and asserts both the resulting register state (read back through the
+    // bus, at `InterruptController`'s real offsets, not re-derived) and that
+    // control returns to `ra`.
+
+    use crate::cpu::rom_stubs::{REG_A0, REG_A1, REG_A2, REG_RA};
+    use crate::cpu::Cpu;
+    use crate::mem::bus::FirmwareBus;
+    use crate::mem::Bus;
+    use std::sync::Arc;
+
+    /// An empty-flash `FirmwareBus` -- no XIP/RAM segments, just the real
+    /// peripheral models (including `InterruptController`) every SoC
+    /// address range dispatches to regardless of what's loaded. Sufficient
+    /// for these tests, which only touch `INTERRUPT_CORE0` registers.
+    fn empty_firmware_bus() -> FirmwareBus {
+        FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[])
+    }
+
+    /// Runs one ROM stub call: installs the real ESP32-C3 table, points
+    /// `pc` at `addr` with `ra` and the given argument registers set, steps
+    /// once, and returns the bus for the caller to inspect.
+    fn run_stub_call(addr: u32, args: &[(u8, u32)]) -> (Cpu, FirmwareBus) {
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000); // arbitrary but distinctive return address
+        for (reg, val) in args {
+            cpu.regs.write(*reg, *val);
+        }
+        cpu.regs.pc = addr;
+        let mut bus = empty_firmware_bus();
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken, "a stub call must never trap");
         assert_eq!(
-            stub.effect,
-            RomStubEffect::Void,
-            "intr_matrix_set(cpu_no, model_num, intr_num) routes a \
-             peripheral interrupt source onto a CPU interrupt line by \
-             writing that source's MAP register in the interrupt matrix \
-             (esp32c3/rom/ets_sys.h; register layout confirmed against \
-             crate::peripherals::intc); this task's boot-probe observed the \
-             sole call within budget as intr_matrix_set(0, 0, 0), which \
-             writes 0 into a MAP register whose reset value is already 0 \
-             -- a real write and a no-op are byte-identical for this \
-             observed call, so this is an exact match, not a guess. See the \
-             module doc's entry 10 for the caveat if a later, non-trivial \
-             call is ever observed."
+            info.rom_stub,
+            Some(addr),
+            "expected {addr:#x} to be stubbed"
+        );
+        assert_eq!(cpu.regs.pc, 0x4000_1000, "pc must return to ra");
+        (cpu, bus)
+    }
+
+    #[test]
+    fn intr_matrix_set_writes_the_indexed_map_register() {
+        // intr_matrix_set(cpu_no = 0, model_num = 5, intr_num = 3): writes
+        // 3 into the 6th MAP register (interrupt_core0_reg.h's MAP region
+        // starts at INTERRUPT_CORE0_RANGE's offset 0x000, one word per
+        // source).
+        let (_cpu, mut bus) =
+            run_stub_call(INTR_MATRIX_SET, &[(REG_A0, 0), (REG_A1, 5), (REG_A2, 3)]);
+        assert_eq!(bus.read32(INTERRUPT_CORE0_RANGE.start + 5 * 4), 3);
+        // A neighbouring MAP register must be untouched.
+        assert_eq!(bus.read32(INTERRUPT_CORE0_RANGE.start + 4 * 4), 0);
+    }
+
+    #[test]
+    fn esprv_intc_int_disable_clears_only_the_masked_bits() {
+        let addr = INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG;
+        let mut seed = empty_firmware_bus();
+        seed.write32(addr, 0b0110); // lines 1 and 2 enabled
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 1 << 1); // mask: disable line 1 only
+        cpu.regs.pc = ESPRV_INTC_INT_DISABLE;
+        let info = cpu.step(&mut seed);
+
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(ESPRV_INTC_INT_DISABLE));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(seed.read32(addr), 0b0100, "line 2 must stay enabled");
+    }
+
+    #[test]
+    fn esprv_intc_int_enable_sets_only_the_unmasked_bits() {
+        // This is the address Task D3 left unstubbed and this fix round
+        // resolves -- see the module doc's entry 11.
+        let addr = INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG;
+        let mut seed = empty_firmware_bus();
+        seed.write32(addr, 0b0100); // line 2 already enabled
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 1 << 25); // the real boot-probe's observed unmask
+        cpu.regs.pc = ESPRV_INTC_INT_ENABLE;
+        let info = cpu.step(&mut seed);
+
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(ESPRV_INTC_INT_ENABLE));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(
+            seed.read32(addr),
+            0b0100 | (1 << 25),
+            "line 2 must stay enabled while line 25 becomes enabled too"
         );
     }
 
     #[test]
-    fn esprv_intc_int_disable_is_a_void_noop() {
-        let table = esp32c3_rom_stubs();
-        let stub = table.lookup(ESPRV_INTC_INT_DISABLE).expect("registered");
-        assert_eq!(stub.name, "esprv_intc_int_disable");
+    fn esprv_intc_int_set_type_sets_the_bit_for_edge() {
+        // INTR_TYPE_EDGE = 1 (riscv/interrupt.h) sets intr_num's bit.
+        let (_cpu, mut bus) = run_stub_call(ESPRV_INTC_INT_SET_TYPE, &[(REG_A0, 25), (REG_A1, 1)]);
         assert_eq!(
-            stub.effect,
-            RomStubEffect::Void,
-            "esprv_intc_int_disable(mask) clears bits in \
-             CPU_INT_ENABLE_REG, a register crate::peripherals::intc models \
-             (components/riscv/include/esp_private/interrupt_deprecated.h). \
-             This task's boot-probe observed the sole call within budget as \
-             esprv_intc_int_disable(1 << 25), clearing a bit in a register \
-             that is still at its reset value (0) at this point in boot --  \
-             a real clear-bit and a no-op are byte-identical for this \
-             observed call."
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_TYPE_REG),
+            1 << 25
         );
     }
 
     #[test]
-    fn esprv_intc_int_set_type_is_a_void_noop() {
-        let table = esp32c3_rom_stubs();
-        let stub = table.lookup(ESPRV_INTC_INT_SET_TYPE).expect("registered");
-        assert_eq!(stub.name, "esprv_intc_int_set_type");
+    fn esprv_intc_int_set_type_clears_the_bit_for_level() {
+        let addr = INTERRUPT_CORE0_RANGE.start + CPU_INT_TYPE_REG;
+        let mut bus = empty_firmware_bus();
+        bus.write32(addr, (1 << 25) | (1 << 3)); // line 25 edge, line 3 edge
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 25); // intr_num
+        cpu.regs.write(REG_A1, 0); // INTR_TYPE_LEVEL = 0
+        cpu.regs.pc = ESPRV_INTC_INT_SET_TYPE;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken);
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
         assert_eq!(
-            stub.effect,
-            RomStubEffect::Void,
-            "esprv_intc_int_set_type(intr_num, type) sets or clears \
-             intr_num's bit in CPU_INT_TYPE_REG, a register \
-             crate::peripherals::intc models \
-             (components/riscv/include/esp_private/interrupt_deprecated.h). \
-             This task's boot-probe observed the sole call within budget as \
-             esprv_intc_int_set_type(25, INTR_TYPE_LEVEL=0), clearing a bit \
-             in a register still at its reset value (0) -- a real clear-bit \
-             and a no-op are byte-identical for this observed call."
+            bus.read32(addr),
+            1 << 3,
+            "line 25's bit must clear while line 3's stays set"
         );
     }
 
     #[test]
-    fn esprv_intc_int_set_priority_is_a_void_noop() {
-        let table = esp32c3_rom_stubs();
-        let stub = table
-            .lookup(ESPRV_INTC_INT_SET_PRIORITY)
-            .expect("registered");
-        assert_eq!(stub.name, "esprv_intc_int_set_priority");
+    fn esprv_intc_int_set_priority_writes_the_indexed_priority_register() {
+        let (_cpu, mut bus) =
+            run_stub_call(ESPRV_INTC_INT_SET_PRIORITY, &[(REG_A0, 25), (REG_A1, 4)]);
         assert_eq!(
-            stub.effect,
-            RomStubEffect::Void,
-            "esprv_intc_int_set_priority(rv_int_num, priority) writes a \
-             CPU_INT_PRI_<n>_REG entry \
-             (components/riscv/include/esp_private/interrupt_deprecated.h). \
-             This task's boot-probe observed the sole call within budget as \
-             esprv_intc_int_set_priority(25, 4) -- a non-trivial write \
-             (unlike this task's other no-ops, the stored value really \
-             would differ from a skipped write), but \
-             crate::peripherals::intc::InterruptController's own module doc \
-             already documents CPU_INT_PRI_<n>_REG as real storage that \
-             `poll()`'s arbitration doesn't consult in v1 (only one source, \
-             systimer target0, is wired to a real signal), so skipping the \
-             store has no effect this emulator's current fidelity level \
-             observes -- the same reasoning already used for the bulk \
-             Cache_* family, not a guess at what the value should be."
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG + 25 * 4),
+            4
+        );
+        // A neighbouring priority register must be untouched.
+        assert_eq!(
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG + 24 * 4),
+            0
         );
     }
 

@@ -287,38 +287,93 @@ predicted these blockers would surface once TIMG unblocks further boot:
    doc, entry 10). `ets_efuse_get_spiconfig` returns `0` ("default SPI
    pins" — the documented sentinel from `esp32c3/rom/efuse.h`, and correct
    for the badge's flash, which sits on the default SPI pads; the eFuse
-   block itself remains unmodeled). That unblocked a chain of five more
+   block itself remains unmodeled). That unblocked a chain of six more
    observed ROM calls in turn, each stubbed per the same task: eFuse's WP
    pad accessor (`ets_efuse_get_wp_pad`, returns the header's documented
    `0x3f` "invalid" sentinel), a UART TX-flush busy-wait
    (`uart_tx_wait_idle`, `void` no-op, same reasoning as `ets_delay_us`),
    and four ESP-IDF interrupt-controller bring-up calls
    (`intr_matrix_set`, `esprv_intc_int_disable`, `esprv_intc_int_set_type`,
-   `esprv_intc_int_set_priority`, all `void` no-ops — a throwaway boot-probe
-   confirmed each one's real target register was still at its power-on
-   value for every observed call, so a real write and a no-op are
-   byte-identical for what boot actually asks of them).
-   **Where boot now stalls**: still not a spin, still the same "Guru
+   `esprv_intc_int_set_priority`, originally landed as `void` no-ops — a
+   throwaway boot-probe confirmed each one's real target register was still
+   at its power-on value for every observed call, so a real write and a
+   no-op were byte-identical for what boot actually asked of them *at the
+   time*). **Boot/panic ordering, corrected**: all of this — the eFuse
+   queries, the UART flush, the whole interrupt-controller chain — is
+   *normal pre-panic boot code*; it runs with **zero** traps of any kind
+   (confirmed: 0 traps through step 402,113, exactly 1 trap by step
+   500,000). An earlier revision of this doc and of `rom.rs`'s module doc
+   described this chain as running "straight through" an already-printed
+   panic dump; that had the order backwards — no panic has happened yet at
+   this point in boot. The panic dump described below is the *direct
+   result* of the very next fault, not something the chain ran through
+   after the fact.
+   **Where boot then stalled**: still not a spin, still the same "Guru
    Meditation Error" panic text as the first console output (no new line to
-   ratchet on), but the fault has moved forward again, into the middle of
+   ratchet on), but the fault had moved forward again, into the middle of
    ESP-IDF's interrupt-controller bring-up: a **new**
    `INSTRUCTION_ACCESS_FAULT` at `0x4000_05e8` (step 405,806),
-   `esprv_intc_int_enable`. Unlike its four `esprv_intc_int_*` siblings
-   above, this one *sets* a bit in `CPU_INT_ENABLE_REG` — a register
+   `esprv_intc_int_enable`. Unlike its four `esprv_intc_int_*`-*and*-`intr_matrix_set`
+   siblings above (`intr_matrix_set` itself is from `esp32c3/rom/ets_sys.h`,
+   not the `esprv_intc_int_*` family, despite this task grouping all four
+   together), this one *sets* a bit in `CPU_INT_ENABLE_REG` — a register
    `emulator-core/src/peripherals/intc.rs`'s `InterruptController::poll`
    genuinely consults to decide whether a pending, routed interrupt source
-   reaches the CPU — so treating it as an inert no-op isn't provably safe
-   the way its siblings were, and a real fix means reaching into that
+   reaches the CPU — so treating it as an inert no-op wasn't provably safe
+   the way its siblings were, and a real fix meant reaching into that
    already-modeled peripheral's register from a ROM stub, new
    stub-mechanism plumbing Task D3's brief scoped out. Pinned down exactly
-   in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`.
-   This is the natural next Milestone 3 candidate: decide whether
-   `esprv_intc_int_enable` needs a real register-write HLE (and, if so, what
-   `RomStubEffect` shape lets a stub reach a specific peripheral's register
-   without hard-coding SoC addresses into the chip-agnostic
-   `cpu::rom_stubs` mechanism), or whether it's still safe to no-op given
-   how little of the interrupt-delivery path is otherwise wired up yet.
+   in `emulator-core/tests/rom_stub_boot.rs` (superseded below).
+   **Resolved in Milestone 3, Task D3 Fix round 1**
+   (`emulator-core/src/rom.rs`'s module doc, entry 11;
+   `emulator-core/src/cpu/rom_stubs.rs`'s new
+   `RomStubEffect::BusRegisterWrite`). A review of Task D3 raised two
+   findings: (1) the four `void` no-ops above were justified only by the
+   *one* call each observed in that boot run — ESP-IDF's real
+   `esp_intr_alloc` path calls the same `intr_matrix_set` with non-zero
+   arguments once a hacker app (or a later milestone's built-in app)
+   actually registers an interrupt, and a `void` no-op would silently drop
+   that; and (2) `esprv_intc_int_enable` itself was still unstubbed — the
+   stall directly above. The fix adds a chip-agnostic
+   `RomStubEffect::BusRegisterWrite` (an address computed from a base plus
+   an optional argument-register-indexed offset, then a whole-word store, a
+   mask OR/AND-out, or a single set/clear bit — see `cpu/rom_stubs.rs`'s
+   `BusRegisterOp`) and rewires all **five** interrupt-controller calls onto
+   it, with addresses computed from `INTERRUPT_CORE0_RANGE`
+   (`emulator-core/src/mem/soc.rs`) plus `crate::peripherals::intc`'s own
+   register-offset constants (`CPU_INT_ENABLE_REG`, `CPU_INT_TYPE_REG`,
+   `CPU_INT_PRI_BASE_REG`, all already cited there against
+   `components/soc/esp32c3/register/soc/interrupt_core0_reg.h`):
+   `intr_matrix_set(cpu_no, model_num, intr_num)` now really writes
+   `intr_num` into the MAP register at offset `model_num * 4`;
+   `esprv_intc_int_disable`/`esprv_intc_int_enable` really AND-out/OR-in
+   their mask into `CPU_INT_ENABLE_REG`; `esprv_intc_int_set_type` really
+   sets or clears `intr_num`'s bit in `CPU_INT_TYPE_REG` depending on
+   whether `type` is `INTR_TYPE_EDGE` (`1`) or `INTR_TYPE_LEVEL` (`0`,
+   `components/riscv/include/riscv/interrupt.h`); `esprv_intc_int_set_priority`
+   really writes `priority` into the indexed `CPU_INT_PRI_<n>_REG`. All five
+   remain `void` C functions (per
+   `components/riscv/include/esp_private/interrupt_deprecated.h`), so `a0`
+   is still never touched.
+   **Where boot now stalls**: with `esprv_intc_int_enable` performing a real
+   write, boot runs straight past the old `0x4000_05e8` fault — still zero
+   new console output, still the same first "Guru Meditation Error" text
+   (that fault simply moved later) — and hits a **new, genuinely different**
+   unstubbed ROM call: `itoa` (`0x4000_0448`, `esp32c3.rom.libc.ld`, step
+   407,471). This is a ROM libc function, not an interrupt-controller one,
+   so per this fix round's own iteration ruling ("STOP at the next stall
+   that is not one of these five functions") it's exactly where the round
+   stopped. Boot-probe evidence: `itoa(value = 0x4200_1011, buf =
+   0x3fcd_c694, base = 0x10)` — a real int-to-hex-string conversion whose
+   *output* the caller uses, in the same "needs a real implementation, not
+   a guessed status return" category as `memset`/`memcpy` (see `rom.rs`'s
+   "What is NOT stubbed, on purpose" section). Pinned down exactly in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_stalls_on_the_unstubbed_itoa_rom_call`. This is the
+   natural next Milestone 3 candidate: research `itoa`'s real ROM behavior
+   (or confirm a documented libc `itoa(value, buf, base)` signature/behavior
+   is safe to reimplement) and give it a real HLE, the same way `memset`/
+   `memcpy` were handled.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

@@ -41,19 +41,20 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later, unstubbed-ROM-call fault (see
-    // `boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call`
-    // below, which pins that exact new stall). 350,000 keeps this test's
-    // original claim -- "gets past the mask ROM wall with zero faults, and
-    // reaches every one of the named early-boot ROM calls below" -- true.
-    // Task D2 (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`)
-    // moved the fault this budget stays clear of from step 401,761 (an
-    // unstubbed `memcpy`) to step 402,113 (an unstubbed
-    // `ets_efuse_get_spiconfig`); Task D3 (`emulator_core::rom`'s module doc,
-    // entry 10) moved it further still, to step 405,806 (an unstubbed
-    // `esprv_intc_int_enable`) -- comfortably clear either way
-    // (~55,806-step/~16% margin at the new fault), without this test
-    // needing to also pin the new, later stall (that's the other test's
-    // job).
+    // `boot_currently_stalls_on_the_unstubbed_itoa_rom_call` below, which
+    // pins that exact new stall). 350,000 keeps this test's original claim
+    // -- "gets past the mask ROM wall with zero faults, and reaches every
+    // one of the named early-boot ROM calls below" -- true. Task D2
+    // (`emulator-core/src/cpu/rom_stubs.rs`'s `RomStubEffect::Memcpy`) moved
+    // the fault this budget stays clear of from step 401,761 (an unstubbed
+    // `memcpy`) to step 402,113 (an unstubbed `ets_efuse_get_spiconfig`);
+    // Task D3 (`emulator_core::rom`'s module doc, entry 10) moved it further
+    // still, to step 405,806 (an unstubbed `esprv_intc_int_enable`); Fix
+    // round 1 (entry 11 -- a real register write for that call and its four
+    // siblings) moved it further again, to step 407,471 (an unstubbed
+    // `itoa`) -- comfortably clear either way (~57,471-step/~16% margin at
+    // the new fault), without this test needing to also pin the new, later
+    // stall (that's the other test's job).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -179,58 +180,66 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// Where boot currently *stops*: **not** a spin loop any more. Milestone 3
 /// Task D3 (`emulator-core/src/rom.rs`'s module doc, entry 10) unblocked the
 /// fault this test used to pin (an unstubbed `ets_efuse_get_spiconfig` call
-/// at `0x4000_071c`) and five more it exposed one at a time
-/// (`ets_efuse_get_wp_pad`, `uart_tx_wait_idle`, `intr_matrix_set`,
-/// `esprv_intc_int_disable`, `esprv_intc_int_set_type`,
-/// `esprv_intc_int_set_priority`), so boot now runs further still and hits a
-/// **new** unstubbed ROM call: `esprv_intc_int_enable` (`0x4000_05e8`, named
-/// in `esp32c3.rom.ld`, deprecated alias declared in
-/// `components/riscv/include/esp_private/interrupt_deprecated.h` — confirmed
-/// by fetching both at tag `v5.5.3`, see `emulator_core::rom`'s module doc).
-/// Per Task D3's brief/orchestrator ruling, this address is deliberately
-/// **not** stubbed by that task: unlike its four `esprv_intc_int_*` siblings
-/// (which the boot-probe evidence showed writing already-zero registers, a
-/// provably inert no-op), this call sets a bit in `CPU_INT_ENABLE_REG` — a
-/// register `crate::peripherals::intc::InterruptController::poll` genuinely
-/// consults — so a `void` no-op here isn't a safe default the way it was for
-/// its siblings, and a real register write would need new stub-mechanism
-/// plumbing the task's brief scoped out ("peripherals are out of scope
-/// here"). This is a real `INSTRUCTION_ACCESS_FAULT`, caught by the
-/// firmware's own already-working panic handler (it prints a full "Guru
-/// Meditation Error" register dump via `ets_printf`, confirming `mtvec`,
-/// `ets_printf`, and this emulator's console capture are all working
-/// correctly). The panic handler's own reboot attempt then calls a second
-/// unstubbed ROM function, `software_reset_cpu` (`0x4000_0094`, named in
-/// `esp32c3.rom.ld`), which faults too, re-entering the panic handler's
+/// at `0x4000_071c`) and five more it exposed one at a time, but left one
+/// last call in that same chain, `esprv_intc_int_enable` (`0x4000_05e8`),
+/// deliberately unstubbed as a real peripheral-register write that its
+/// brief scoped out. Fix round 1 (`emulator-core/src/rom.rs`'s module doc,
+/// entry 11) implements that write for real — plus real writes for its four
+/// siblings, previously `void` no-ops — via a new generic, chip-agnostic
+/// `RomStubEffect::BusRegisterWrite` mechanism
+/// (`emulator-core/src/cpu/rom_stubs.rs`). With all five interrupt-controller
+/// calls now performing real register writes, boot runs straight past the
+/// old `0x4000_05e8` fault and hits a **new, later, genuinely different**
+/// unstubbed ROM call: `itoa` (`0x4000_0448`, named in
+/// `esp32c3.rom.ld`/`esp32c3.rom.libc.ld` — a ROM libc function, not an
+/// interrupt-controller one, so per Fix round 1's own iteration ruling
+/// ("STOP at the next stall that is not one of these five functions") this
+/// is exactly where this fix round stops rather than chasing the wall
+/// further. Boot-probe evidence: `itoa(value = 0x4200_1011, buf =
+/// 0x3fcd_c694, base = 0x10)` at step 407,471 — a real int-to-hex-string
+/// conversion, most likely formatting an address for a log or backtrace
+/// line, whose *output* the caller uses (same "real effect required"
+/// category as `memset`/`memcpy`, not a safe-to-guess status return).
+///
+/// This is a real `INSTRUCTION_ACCESS_FAULT`, caught by the firmware's own
+/// already-working panic handler (it prints a full "Guru Meditation Error"
+/// register dump via `ets_printf`). **Boot/panic ordering** (see Fix round
+/// 1's report and `docs/firmware-emulator-notes.md`'s corrected text): this
+/// panic is the *direct, immediate* result of the `itoa` fault — nothing
+/// before it panics. All of the interrupt-controller chain above (eFuse
+/// queries, the UART flush, the `intr_matrix_set` loop, and now the enable
+/// write too) is normal pre-panic boot code that now runs fault-free, right
+/// up to this new wall. The panic handler's own reboot attempt then calls a
+/// second unstubbed ROM function, `software_reset_cpu` (`0x4000_0094`, named
+/// in `esp32c3.rom.ld`), which faults too, re-entering the panic handler's
 /// re-entrancy guard ("Panic handler entered multiple times...") and
 /// retrying forever — this emulator has no way to actually reboot, so this
-/// retry loop is the terminal state within any reasonable step budget. Per
-/// the brief, `software_reset_cpu` is not stubbed either (it's only reached
-/// via the panic path, and stubbing it wouldn't fix the root cause at
-/// `0x4000_05e8`).
+/// retry loop is the terminal state within any reasonable step budget.
+/// `software_reset_cpu` remains unstubbed (it's only reached via the panic
+/// path, and stubbing it wouldn't fix the root cause at `0x4000_0448`).
 ///
-/// **History**: until Milestone 3 Task D3, this test pinned an *earlier*
-/// stall — an unstubbed `ets_efuse_get_spiconfig` call at `0x4000_071c` (see
-/// the Task D2 report). That call, and five more it led to, are now stubbed
-/// (`emulator-core/src/rom.rs`'s module doc, entry 10), so this test's
+/// **History**: until Fix round 1, this test pinned an *earlier* stall — an
+/// unstubbed `esprv_intc_int_enable` call at `0x4000_05e8` (see the Task D3
+/// report). That call is now stubbed for real
+/// (`emulator-core/src/rom.rs`'s module doc, entry 11), so this test's
 /// expected stall point moved forward to this new unstubbed-ROM-call fault.
 #[test]
-fn boot_currently_stalls_on_the_unstubbed_esprv_intc_int_enable_rom_call() {
+fn boot_currently_stalls_on_the_unstubbed_itoa_rom_call() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Comfortably past the fault (step 405,806) but well before the second
+    // Comfortably past the fault (step 407,471) but well before the second
     // fault (`software_reset_cpu`, during the panic handler's own reboot
-    // attempt) -- a single, stable snapshot: exactly one trap has occurred,
-    // at exactly this address. 500,000 is the same budget the pre-Task-D3
-    // version of this test used, re-measured to still land in the same
-    // single-trap window after this task's fixes.
+    // attempt, first observed at step 647,734) -- a single, stable
+    // snapshot: exactly one trap has occurred, at exactly this address.
+    // 500,000 is the same budget the pre-Fix-round-1 version of this test
+    // used, re-measured to still land in the same single-trap window after
+    // this fix round's changes.
     let summary = rt.run(500_000);
     assert_eq!(
         summary.last_instruction_fault,
-        Some(0x4000_05e8),
-        "expected the new unstubbed-ROM-call fault at 0x4000_05e8 \
-         (esprv_intc_int_enable)"
+        Some(0x4000_0448),
+        "expected the new unstubbed-ROM-call fault at 0x4000_0448 (itoa)"
     );
     assert_eq!(
         summary.traps, 1,
