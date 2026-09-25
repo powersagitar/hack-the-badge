@@ -132,6 +132,21 @@
 //!    how `tests/rom_stub_boot.rs`'s trace recovers boot-log text without any
 //!    of this code needing an output sink.
 //!
+//!    **Load-bearing caveat (Task D4 fix round 1, finding I2)**: because
+//!    this stub is `Return(0)` and never touches [`crate::peripherals::console::Console`],
+//!    *every* `ets_printf`/`ESP_EARLY_LOG*` call this firmware makes is
+//!    currently invisible to [`crate::runtime::FirmwareRuntime::console_output`]
+//!    — including, as it turns out, an actual `E (...) cpu_start: Invalid
+//!    app image header` error line (see entry 12 below). **Console
+//!    emptiness at any point during boot is therefore not evidence that
+//!    nothing was logged** — it only proves nothing was logged *through a
+//!    path this emulator doesn't route through `ets_printf`* (there is
+//!    none yet). Implementing `ets_printf` for real (writing through
+//!    `Console` the way a real UART/USB-Serial-JTAG TX would) is left to a
+//!    later task (plan Task 7) — deliberately not attempted here per that
+//!    task's own orchestrator ruling, to keep this round's diff to the
+//!    stubs it actually needed.
+//!
 //! 8. **libgcc's 64-bit integer helpers** ([`LIBGCC_INT64_FAMILY`]) — 32-bit
 //!    RISC-V has no 64-bit divide instruction, so `uint64_t` arithmetic
 //!    compiles into calls to these, and this firmware links them from ROM.
@@ -296,48 +311,84 @@
 //! 12. **Milestone 3 Task D4: ROM libc `itoa` and `strcat`** — Fix round 1's
 //!     stall. Step 1 of this task's own brief required first establishing
 //!     whether the `itoa` call sat on the normal boot path or an
-//!     already-active error path: disassembling the call site (IRAM,
-//!     `0x40397262`) showed a small "format one value as a string" helper
-//!     called from a 4-iteration loop, and the console had printed *nothing*
-//!     yet at the moment of the call — so this is the normal, pre-panic
-//!     boot path building its first formatted text, not a symptom of an
-//!     already-crashed system.
+//!     already-active error path. **Corrected in Task D4 fix round 1**
+//!     (a review found the original conclusion wrong — see below): it is
+//!     the *latter*. Disassembling the call site (IRAM, `0x40397262`) and
+//!     its caller chain, cross-checked against `factory.bin`'s own bytes at
+//!     every address, shows this is newlib's `abort()`
+//!     (`components/newlib/abort.c`, ESP-IDF's override, not the ROM
+//!     libc): `mv s0, ra` captures `abort()`'s own return address, then
+//!     `itoa(s0 - 3, addr_buf, 16)` at `0x40397262` formats "the calling
+//!     instruction's address" (`s0 - 3`, a backtrace convention) and a
+//!     second `itoa(0, core_buf, 10)` at `0x40397272` formats the core ID —
+//!     both *before* the loop, not inside it. The loop that follows is
+//!     `strcat`-only: it concatenates a fixed 4-piece message —
+//!     `"abort() was called at PC 0x"`, `addr_buf`, `" on core "`,
+//!     `core_buf` (all four confirmed by reading the actual string bytes
+//!     out of `factory.bin` at their literal addresses) — then calls
+//!     `esp_system_abort` → `panic_abort` (the `c.unimp` trap described
+//!     below).
+//!
+//!     `abort()`'s own caller, at `0x42001004`–`0x42001010` (confirmed via
+//!     `auipc`+`jalr` target computation against the same image bytes), is
+//!     `ets_printf(0x40000040)` called with the format string
+//!     `"E (%lu) %s: Invalid app image header\n"` and the tag `"cpu_start"`
+//!     (again, both read directly out of the image at their literal
+//!     addresses) — i.e. **`cpu_start`'s own app-image-header validation
+//!     rejected this image and is logging that fact before aborting.**
+//!     The console showed nothing at the moment of the `itoa` call not
+//!     because nothing had been logged yet, but because [`ETS_PRINTF`]'s
+//!     stub is `Return(0)` and never reaches [`crate::peripherals::console::Console`]
+//!     (see entry 7's caveat, added in this same fix round) — so the
+//!     `cpu_start` error line was logged and silently dropped. **Boot has
+//!     therefore been aborting on this check since at least Task D3 fix
+//!     round 1** (whichever fix first let execution reach `cpu_start`'s
+//!     header check); Task D4 did not move this wall, it only let the
+//!     *existing* abort's message finish formatting instead of faulting
+//!     mid-format.
 //!
 //!     [`crate::cpu::rom_stubs::RomStubEffect::Itoa`] gives `itoa`
 //!     (`0x4000_0448`, [`ITOA`]) a real implementation
 //!     ([`crate::cpu::rom_stubs::compute_itoa`], mirroring newlib's
 //!     `itoa.c`+`utoa.c` byte-for-byte — see that function's doc for the
-//!     exact source cited). With `itoa` unblocked, boot immediately hits
-//!     the next unstubbed ROM libc call, `strcat` (`0x4000_03d8`,
-//!     [`STRCAT`], also `esp32c3.rom.libc.ld`) — per this task's own
-//!     iteration ruling ("if the next stall is another unstubbed ROM
-//!     libc/string call... implement that one too, and repeat"), so it gets
-//!     [`crate::cpu::rom_stubs::RomStubEffect::Strcat`] (mirroring newlib's
-//!     `strcat.c`) in the same task. The caller turned out to be the same
-//!     kind of formatting loop `itoa`'s caller was: value formatted via
-//!     `itoa`, then concatenated onto a growing buffer via `strcat` — almost
-//!     certainly building a backtrace/panic-report line piece by piece.
+//!     exact source cited), and [`crate::cpu::rom_stubs::RomStubEffect::Strcat`]
+//!     does the same for `strcat` (`0x4000_03d8`, [`STRCAT`], also
+//!     `esp32c3.rom.libc.ld` — the very next unstubbed ROM libc call once
+//!     `itoa` was unblocked, so per this task's own iteration ruling it was
+//!     fixed in the same task). Both stubs are correct and needed
+//!     regardless of this narrative correction — newlib's `abort()` calls
+//!     them on real hardware too, and any later boot path (a *successful*
+//!     header check, a different assertion, a hacker app's own `abort()`)
+//!     would hit the exact same two calls.
 //!
-//!     With *both* unblocked, boot runs on and hits a **qualitatively
-//!     different** stall: not another unmapped ROM-address fetch, but a
-//!     real `ILLEGAL_INSTRUCTION` exception (RISC-V cause 2) at
-//!     `0x4038e4fa`, inside the app's own IRAM code — a compiler-emitted
-//!     `c.unimp` (the RVC extension's all-zero 16-bit encoding, reserved to
-//!     always trap), immediately preceded by a store of a "we're aborting"
-//!     flag and the just-built message pointer to two fixed addresses. That
-//!     is ESP-IDF's own `panic_abort()`/`g_panic_abort`/
-//!     `g_panic_abort_details` mechanism (`components/esp_system/panic.c`):
-//!     a deliberate, hardware-standard trap, not a decode gap or an
-//!     unstubbed-ROM-call symptom — exactly the brief's stop condition
-//!     ("anything other than an unstubbed ROM libc/string call"), so Task
-//!     D4 stops here. See [`STRCAT`]'s and [`ITOA`]'s doc for the exact
-//!     addresses and `tests/rom_stub_boot.rs`'s
-//!     `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort` for
-//!     the full post-abort trace (the panic handler completes a real crash
-//!     report for the first time, then tries to reboot via the
-//!     still-unstubbed `software_reset_cpu`, faults again, and loops —
-//!     the same terminal shape Fix round 1 already documented, just reached
-//!     with genuine content instead of a truncated one).
+//!     With both unblocked, the `abort()` call above runs to completion
+//!     (instead of faulting mid-format) and reaches the trap it was always
+//!     going to reach: a real `ILLEGAL_INSTRUCTION` exception (RISC-V cause
+//!     2) at `0x4038e4fa`, inside the app's own IRAM code — a
+//!     compiler-emitted `c.unimp` (the RVC extension's all-zero 16-bit
+//!     encoding, reserved to always trap), immediately preceded by a store
+//!     of `g_panic_abort = true` and `g_panic_abort_details = <the message
+//!     just built>` to two fixed addresses. That's `esp_system_abort` →
+//!     `panic_abort()`'s mechanism (`components/esp_system/panic.c`'s
+//!     `g_panic_abort`/`g_panic_abort_details`) — a deliberate,
+//!     hardware-standard trap, not a decode gap. Per Task D4's own stop
+//!     condition ("anything other than an unstubbed ROM libc/string call"),
+//!     that task stopped there rather than chasing this further. See
+//!     [`STRCAT`]'s and [`ITOA`]'s doc for the exact addresses and
+//!     `tests/rom_stub_boot.rs`'s
+//!     `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`
+//!     for the full post-abort trace: the panic handler now completes a
+//!     real crash report (this abort's message) for the first time, prints
+//!     ESP-IDF's generic pre-restart text, then tries to reboot via the
+//!     still-unstubbed `software_reset_cpu`, faults again, and loops. That
+//!     text is **panic output for `cpu_start`'s abort, not evidence of
+//!     boot progress past it** — the header-check wall has not moved.
+//!     **Unverified hypothesis for the actual next blocker** (flagged as
+//!     such, not confirmed): `cpu_start` reads the image header through
+//!     `SOC_DROM_LOW` (`0x3c00_0000`) via the flash cache/`memcpy`, and
+//!     `crate::boot`'s shortcut-boot mapping may not expose the header
+//!     bytes at that address the way real flash-cache bring-up would — this
+//!     is a plausible next investigation, not a finding.
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -359,28 +410,33 @@
 //! ## Where this gets boot to
 //!
 //! With this table installed (as of Task D4), the real `factory.bin` runs
-//! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up,
-//! analog/PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop
-//! (Task D1), the `memcpy` call (Task D2), the eFuse queries, the UART
-//! flush, the interrupt-controller bring-up (entries 10/11), and now the
-//! `itoa`/`strcat` formatting calls (entry 12) — **all of that runs
-//! fault-free**, as *normal pre-panic boot code*, right up through building
-//! a complete, correctly-formatted panic/backtrace message. Boot then hits
-//! a real, hardware-standard `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own
-//! `panic_abort()` call (entry 12's `0x4038e4fa`, *not* a ROM address) —
-//! not a fault this emulator's stub table is missing something for, but
-//! the firmware genuinely, deliberately triggering its own panic path,
-//! same as real hardware would. The panic handler runs to completion for
-//! the first time (itoa/strcat let it actually build its message), prints
-//! ESP-IDF's generic pre-restart text, then tries to reboot via the
+//! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up, analog/
+//! PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop (Task D1),
+//! the `memcpy` call (Task D2), the eFuse queries, the UART flush, and the
+//! interrupt-controller bring-up (entries 10/11) — **all of that runs
+//! fault-free**. But that is *not* the same as "boot is proceeding
+//! normally": `cpu_start` (ESP-IDF's early startup) rejects this image's
+//! header and calls `ets_printf` (invisible today, see entry 7's caveat)
+//! then `abort()` — see entry 12 for the full, corrected narrative and why
+//! the original "this is normal, pre-panic boot" conclusion was wrong.
+//! With `itoa`/`strcat` real, that pre-existing `abort()` call now runs to
+//! completion instead of faulting mid-format, reaching a real,
+//! hardware-standard `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own
+//! `panic_abort()` (entry 12's `0x4038e4fa`, *not* a ROM address) — the
+//! firmware genuinely, deliberately triggering its own panic path over the
+//! header-check failure, same as real hardware would. The panic handler
+//! runs to completion for the first time (itoa/strcat let it actually
+//! build this abort's message), prints ESP-IDF's generic pre-restart text
+//! (panic output, not boot progress), then tries to reboot via the
 //! still-unstubbed `software_reset_cpu` (`0x4000_0094`) — which faults
 //! (this *is* an unstubbed ROM call, but only reached via the panic path,
 //! so per this module's own scoping it stays unstubbed), re-entering the
 //! panic handler's re-entrancy guard and retrying forever. See
 //! `tests/rom_stub_boot.rs`'s
-//! `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort` and
+//! `boot_currently_aborts_reaching_the_panic_handlers_reboot_message` and
 //! `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
-//! story.
+//! story. **The actual blocker remains `cpu_start`'s app-image-header
+//! check**, unresolved by this task.
 
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,

@@ -41,7 +41,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later stall (see
-    // `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`
+    // `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -51,11 +51,15 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // further still, to step 405,806 (an unstubbed `esprv_intc_int_enable`);
     // Fix round 1 (entry 11) moved it further again, to step 407,471 (an
     // unstubbed `itoa`); Task D4 (entry 12 -- real `itoa`/`strcat`) moved it
-    // further still, to step 407,549 (a real `ILLEGAL_INSTRUCTION` trap at
-    // ESP-IDF's own `panic_abort()`, not an unstubbed-ROM-call fault at all)
-    // -- comfortably clear either way (~57,549-step/~16% margin at the
-    // current fault), without this test needing to also pin the new, later
-    // stall (that's the other test's job).
+    // further still, to step 407,549 -- a real `ILLEGAL_INSTRUCTION` trap,
+    // not an unstubbed-ROM-call fault, at ESP-IDF's own `panic_abort()`
+    // (reached from newlib's `abort()`, called because `cpu_start` rejected
+    // this image's header -- see entry 12's corrected narrative; this is
+    // *not* evidence boot is proceeding normally, only that this budget's
+    // "zero faults" claim needs a fresh margin check against the new fault
+    // step) -- comfortably clear either way (~57,549-step/~16% margin),
+    // without this test needing to also pin the new, later stall (that's
+    // the other test's job).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -178,58 +182,84 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     }
 }
 
-/// Where boot currently *stops*: **not** an unstubbed-ROM-call fault any
-/// more. Milestone 3 Task D4 (`emulator-core/src/rom.rs`'s module doc,
-/// entry 12) implements real HLE for both ROM calls Fix round 1 left this
-/// test pinned on: `itoa` (`0x4000_0448`) and, once that unblocked boot,
-/// the very next unstubbed call, `strcat` (`0x4000_03d8`, also
-/// `esp32c3.rom.libc.ld` — Task D4's own iteration ruling authorized
-/// implementing this in the same task, since it's another ROM libc/string
-/// call). Both calls turned out to belong to the same "format one value,
-/// concatenate it onto a growing buffer" loop, almost certainly assembling
-/// a backtrace/panic-report line.
+/// This test **pins today's abort/panic path, not boot progress past it**.
+/// Milestone 3 Task D4 (`emulator-core/src/rom.rs`'s module doc, entry 12)
+/// implements real HLE for both ROM calls Fix round 1 left this test
+/// pinned on: `itoa` (`0x4000_0448`) and, once that unblocked boot, the
+/// very next unstubbed call, `strcat` (`0x4000_03d8`, also
+/// `esp32c3.rom.libc.ld`). Both calls belong to newlib's own `abort()`
+/// (`components/newlib/abort.c`): `itoa` formats the caller's address and
+/// core ID, and the `strcat`-only loop that follows concatenates the fixed
+/// message `"abort() was called at PC 0x<addr> on core <n>"` — confirmed
+/// by reading the literal string bytes and the caller chain directly out
+/// of `factory.bin` (see Task D4 fix round 1's report).
 ///
-/// With both unblocked, boot no longer stalls on an unmapped ROM-address
-/// fetch at all. It hits a **qualitatively different** kind of stall: a
-/// real `ILLEGAL_INSTRUCTION` exception (RISC-V cause 2, not
-/// `INSTRUCTION_ACCESS_FAULT`) at `0x4038e4fa`, inside the app's own IRAM
-/// code -- a compiler-emitted `c.unimp` (RVC's all-zero 16-bit encoding,
-/// architecturally reserved to always trap), reached immediately after
-/// storing a "we're aborting" flag and a message pointer to two fixed
-/// addresses. That's ESP-IDF's own `panic_abort()` mechanism
-/// (`components/esp_system/panic.c`'s `g_panic_abort`/
-/// `g_panic_abort_details`) -- a deliberate, hardware-standard trap the
-/// firmware itself designed to always fault, not a decode gap or an
-/// unstubbed-ROM-call symptom. Per this task's own stop condition ("stop as
-/// soon as the stall is anything other than an unstubbed ROM libc/string
-/// call"), Task D4 stops here rather than chasing this further.
+/// **Corrected in Task D4 fix round 1** (a review caught this): the
+/// original version of this test's doc claimed `itoa`/`strcat` sat on
+/// "the normal, pre-panic boot path". That was wrong. `abort()`'s own
+/// caller, at `0x42001004`–`0x42001010`, is `ets_printf` called with the
+/// format string `"E (%lu) %s: Invalid app image header\n"` and the tag
+/// `"cpu_start"` — i.e. **ESP-IDF's own early-startup app-image-header
+/// check rejected this image and is logging that fact before aborting.**
+/// The console showed nothing at the time only because `ets_printf` is
+/// stubbed `Return(0)` and never reaches `Console` (see `rom.rs`'s entry 7
+/// caveat) — the `cpu_start` error line was logged and silently dropped,
+/// not skipped. **Boot has been aborting on this check since at least Task
+/// D3 fix round 1**; Task D4 did not move the wall, it only let this
+/// pre-existing `abort()` call finish formatting its message instead of
+/// faulting mid-format on an unstubbed `itoa`/`strcat`.
+///
+/// With both unblocked, that `abort()` call runs to completion and reaches
+/// the trap it was always going to reach: a real `ILLEGAL_INSTRUCTION`
+/// exception (RISC-V cause 2, not `INSTRUCTION_ACCESS_FAULT`) at
+/// `0x4038e4fa`, inside the app's own IRAM code -- a compiler-emitted
+/// `c.unimp` (RVC's all-zero 16-bit encoding, architecturally reserved to
+/// always trap), reached immediately after storing `g_panic_abort = true`
+/// and `g_panic_abort_details = <this abort's message>` to two fixed
+/// addresses. That's `esp_system_abort` -> `panic_abort()`'s mechanism
+/// (`components/esp_system/panic.c`) -- a deliberate, hardware-standard
+/// trap, not a decode gap. Per Task D4's own stop condition ("stop as soon
+/// as the stall is anything other than an unstubbed ROM libc/string
+/// call"), that task stopped here rather than chasing this further --
+/// correctly, since the actual blocker (`cpu_start`'s header check) isn't a
+/// ROM stub gap at all.
 ///
 /// **What happens next** (all of it real, hardware-faithful behavior, not
 /// an emulator gap): the RISC-V trap delivers correctly to the firmware's
 /// own exception handler, which runs `esp_panic_handler` for the first time
-/// with a *complete* message (itoa/strcat actually built it this time,
-/// instead of faulting mid-format the way the old `itoa` stall did). Per
-/// `panic.c`, the abort path leaves `info->reason == NULL`, so the
+/// with a *complete* message (itoa/strcat actually built it this time).
+/// Per `panic.c`, the abort path leaves `info->reason == NULL`, so the
 /// "Guru Meditation Error" header is skipped on this first pass; ESP-IDF's
-/// generic pre-restart text prints unconditionally, then `panic_restart()`
-/// calls into the still-unstubbed ROM `software_reset_cpu` (`0x4000_0094`)
-/// to actually reboot -- which faults (a real `INSTRUCTION_ACCESS_FAULT`
-/// this time), re-entering the panic handler through its *exception* path
-/// (where `info->reason` finally is non-NULL, so "Guru Meditation Error"
-/// prints for the first time), which again reaches the same unstubbed
-/// `software_reset_cpu` call and loops. `software_reset_cpu` remains
-/// unstubbed -- it's only reached via the panic path, per this module's own
-/// scoping, and stubbing it wouldn't address the `panic_abort()` call this
-/// test now pins.
+/// generic pre-restart text prints unconditionally -- **panic output for
+/// `cpu_start`'s abort, not evidence of boot progress past it** -- then
+/// `panic_restart()` calls into the still-unstubbed ROM `software_reset_cpu`
+/// (`0x4000_0094`) to actually reboot -- which faults (a real
+/// `INSTRUCTION_ACCESS_FAULT` this time), re-entering the panic handler
+/// through its *exception* path (where `info->reason` finally is non-NULL,
+/// so "Guru Meditation Error" prints for the first time), which again
+/// reaches the same unstubbed `software_reset_cpu` call and loops.
+/// `software_reset_cpu` remains unstubbed -- it's only reached via the
+/// panic path, per this module's own scoping, and stubbing it wouldn't
+/// address `cpu_start`'s header-check failure, the actual blocker.
+///
+/// This test is **deliberately expected to break** once a later task fixes
+/// (or works around) `cpu_start`'s header check: at that point `abort()`
+/// is never called, this whole panic path disappears, and this test's
+/// assertions (two traps, this exact fault sequence, this console text)
+/// stop holding. That's the correct outcome, not a regression -- whoever
+/// fixes the header check should delete or replace this test, not chase a
+/// new pinned value here.
 ///
 /// **History**: until Task D4, this test pinned an *earlier* stall -- an
 /// unstubbed `itoa` call at `0x4000_0448` (see Fix round 1's report). That
 /// call, and the `strcat` call it led to, are now stubbed for real
 /// (`emulator-core/src/rom.rs`'s module doc, entry 12), so this test's
-/// expected stall point moved forward to this new, qualitatively different
-/// kind of fault.
+/// expected stall point moved forward to this abort/panic sequence. It was
+/// also renamed (from `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`)
+/// in Task D4 fix round 1, since "stalls" implied a stub gap rather than a
+/// genuine firmware-triggered abort.
 #[test]
-fn boot_currently_stalls_retrying_reboot_after_a_real_panic_abort() {
+fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 

@@ -66,10 +66,17 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // panic_abort(), still well within this 500,000-step budget, so the
       // trap count here stays 1 (the second fault -- the still-unstubbed
       // software_reset_cpu the panic handler's own reboot attempt calls --
-      // isn't reached until step 645,410, past this budget). See
-      // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_stalls_retrying_reboot_after_a_real_panic_abort and
-      // docs/firmware-emulator-notes.md for the full story.
+      // isn't reached until step 645,410, past this budget).
+      //
+      // Task D4 fix round 1 (correction, not a code change): itoa/strcat
+      // are called from newlib's abort(), itself called because cpu_start
+      // (ESP-IDF's early startup) rejects this image's header and aborts --
+      // *not* from "normal boot progress" as originally (incorrectly)
+      // documented. This trap is panic_abort() reached via that
+      // pre-existing abort() call, not evidence of progress past the
+      // header check. See emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_aborts_reaching_the_panic_handlers_reboot_message
+      // and docs/firmware-emulator-notes.md for the full corrected story.
       expect(report.traps).toBe(1);
 
       const fb = handle.framebuffer();

@@ -19,14 +19,18 @@ ESP32-C3 device), in two complementary modes:
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   Real-firmware boot currently runs past the mask-ROM wall, through the
-   app image's own runtime, and all the way to a real, hardware-standard
-   `panic_abort()` trap the firmware itself triggers at step ~407,549
-   (not an unstubbed-ROM-call fault), then loops in the firmware's own
-   panic handler and `software_reset_cpu` retry — well before reaching any
-   built-in app (a known, documented gap — see
-   `docs/firmware-emulator-notes.md`'s "Known limitations" section before
-   assuming a built-in app is reachable in this mode).
+   Real-firmware boot currently runs past the mask-ROM wall and into the
+   app image's own runtime, but `cpu_start` (ESP-IDF's early startup)
+   rejects this image's header and calls `abort()`, which — now that ROM
+   `itoa`/`strcat` are HLE-stubbed for real — completes its crash message
+   and reaches a real, hardware-standard `panic_abort()` trap at step
+   ~407,549 (not an unstubbed-ROM-call fault), then loops in the
+   firmware's own panic handler and `software_reset_cpu` retry — well
+   before reaching any built-in app. The current blocker is `cpu_start`'s
+   app-image-header check itself, not a missing ROM stub (a known,
+   documented gap — see `docs/firmware-emulator-notes.md`'s "Known
+   limitations" section before assuming a built-in app is reachable in
+   this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
