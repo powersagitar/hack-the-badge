@@ -20,15 +20,19 @@ ESP32-C3 device), in two complementary modes:
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
    Real-firmware boot currently runs past the mask-ROM wall and into the
-   app image's own runtime, but `cpu_start` (ESP-IDF's early startup)
-   rejects this image's header and calls `abort()`, which — now that ROM
-   `itoa`/`strcat` are HLE-stubbed for real — completes its crash message
-   and reaches a real, hardware-standard `panic_abort()` trap at step
-   ~407,549 (not an unstubbed-ROM-call fault), then loops in the
-   firmware's own panic handler and `software_reset_cpu` retry — well
-   before reaching any built-in app. The current blocker is `cpu_start`'s
-   app-image-header check itself, not a missing ROM stub (a known,
-   documented gap — see `docs/firmware-emulator-notes.md`'s "Known
+   app image's own runtime, and — now that ROM `ets_printf` is HLE-stubbed
+   as a real C-printf formatter (Milestone 3 Task 7), not just a
+   `Return(0)` status stub — every early boot-log line up to and including
+   `cpu_start`'s own is now visible on the emulated console, e.g. `E (0)
+   cpu_start: Invalid app image header`: `cpu_start` (ESP-IDF's early
+   startup) rejects this image's header and calls `abort()`, which — now
+   that ROM `itoa`/`strcat` are also HLE-stubbed for real — completes its
+   crash message and reaches a real, hardware-standard `panic_abort()`
+   trap at step ~407,549 (not an unstubbed-ROM-call fault), then loops in
+   the firmware's own panic handler and `software_reset_cpu` retry — well
+   before reaching any built-in app. The current blocker is still
+   `cpu_start`'s app-image-header check itself, not a missing ROM stub (a
+   known, documented gap — see `docs/firmware-emulator-notes.md`'s "Known
    limitations" section before assuming a built-in app is reachable in
    this mode).
 

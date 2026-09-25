@@ -90,6 +90,39 @@ impl Default for Cpu {
     }
 }
 
+/// Backs [`rom_stubs::PrintfHost`] for [`Cpu::apply_rom_stub`]'s
+/// [`rom_stubs::RomStubEffect::Printf`] arm with a live CPU register
+/// snapshot and a live [`Bus`], resolving [`rom_stubs::VarargCursor`] slots
+/// exactly per the RV32 ILP32 convention `rom_stubs::compute_printf` cites:
+/// slots `1..=7` are `a1..=a7` (`REG_A0 + slot`, since `REG_A0 + 1 ==
+/// REG_A1` and so on through `REG_A0 + 7 == REG_A7`), and slot `8` onward
+/// is the caller's stack at `sp + (slot - 8) * 4`.
+///
+/// Holds `regs` by value (`Registers` is `Copy`) rather than by reference,
+/// so this struct's lifetime is entirely tied to `bus`'s borrow, not also
+/// to `self.regs`'s -- letting [`Cpu::apply_rom_stub`]'s `Printf` arm write
+/// `self.regs`'s `a0` right after this host is dropped, with no borrow
+/// conflict.
+struct CpuPrintfHost<'a, B: Bus> {
+    regs: Registers,
+    bus: &'a mut B,
+    sp: u32,
+}
+
+impl<'a, B: Bus> rom_stubs::PrintfHost for CpuPrintfHost<'a, B> {
+    fn read_byte(&mut self, addr: u32) -> u8 {
+        self.bus.read8(addr)
+    }
+
+    fn slot(&mut self, slot: u32) -> u32 {
+        if slot <= 7 {
+            self.regs.read(rom_stubs::REG_A0 + slot as u8)
+        } else {
+            self.bus.read32(self.sp.wrapping_add((slot - 8) * 4))
+        }
+    }
+}
+
 impl Cpu {
     pub fn new() -> Self {
         Self::default()
@@ -340,6 +373,26 @@ impl Cpu {
                     i += 1;
                 }
                 // strcat returns dst, which is already in a0.
+            }
+            RomStubEffect::Printf { sink_addr } => {
+                let fmt_addr = self.regs.read(rom_stubs::REG_A0);
+                let sp = self.regs.read(rom_stubs::REG_SP);
+                // `Registers` is `Copy`, so the host below can hold its own
+                // snapshot -- no lifetime entanglement with `self.regs`,
+                // which this arm still needs to write `a0` to afterward.
+                let regs = self.regs;
+                let result = {
+                    let mut host = CpuPrintfHost {
+                        regs,
+                        bus: &mut *bus,
+                        sp,
+                    };
+                    rom_stubs::compute_printf(fmt_addr, &mut host)
+                };
+                for byte in &result.bytes {
+                    bus.write8(sink_addr, *byte);
+                }
+                self.regs.write(rom_stubs::REG_A0, result.chars_written);
             }
         }
         self.regs.pc = self.regs.read(rom_stubs::REG_RA);

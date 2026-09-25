@@ -120,6 +120,25 @@
 //! `abort()` calls them on real hardware too. See Task D4 fix round 1's
 //! report for the full corrected trace (register/caller evidence,
 //! confirmed against the actual image bytes at every address cited).
+//!
+//! **Task 7 status**: `ets_printf` (`emulator_core::rom::ETS_PRINTF`) is no
+//! longer `Return(0)` -- it's a real HLE formatter
+//! (`emulator_core::cpu::rom_stubs::RomStubEffect::Printf`, see
+//! `emulator-core/src/rom.rs`'s module doc, entry 7), so every
+//! `ESP_EARLY_LOG*` line the firmware prints before `abort()` now reaches
+//! the console, not just the panic path's raw MMIO writes. The header
+//! check itself is unchanged (that's the next task's job, D5, not this
+//! one's): boot still reaches `cpu_start`'s `E (%lu) %s: Invalid app image
+//! header\n` call, but it's a real, console-visible early-log line now
+//! instead of a silently-dropped one -- see
+//! [`boot_reaches_cpu_starts_own_header_check_error_line`] below, this
+//! file's first genuinely new *early-boot* console-line rung (as opposed
+//! to a panic-report string). The spec's original ladder rungs
+//! (`cpu_start: Pro cpu start user code`, `cpu_start: cpu freq:`) do
+//! **not** appear -- boot-probe evidence (this task's report) confirms
+//! `cpu_start`'s header check runs and fails before either would print --
+//! so per this task's own orchestrator contingency for that case, the new
+//! rung asserts the line boot *does* reach instead.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -391,4 +410,35 @@ fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
          last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
+}
+
+/// Milestone 3 Task 7's ratchet rung -- and this file's **first genuinely
+/// new early-boot console line**, not a panic-report string. Before this
+/// task, `ets_printf` (`emulator_core::rom::ETS_PRINTF`) was a `Return(0)`
+/// status stub that silently dropped every `ESP_EARLY_LOG*` line,
+/// including this exact one; now it's a real HLE formatter
+/// (`emulator_core::cpu::rom_stubs::RomStubEffect::Printf`, see
+/// `emulator-core/src/rom.rs`'s module doc, entry 7), so `cpu_start`'s own
+/// `E (%lu) %s: Invalid app image header\n` call (the one whose `itoa`/
+/// `strcat`-formatted `abort()` message this file's sibling rungs above
+/// are about) now actually reaches the console.
+///
+/// This module's own doc predicted the spec's original ladder rungs
+/// (`cpu_start: Pro cpu start user code`, `cpu_start: cpu freq:`) would
+/// only appear if boot reached them before aborting -- boot-probe evidence
+/// (this task's report) confirms it does not: `cpu_start`'s app-image-
+/// header check runs, fails, and calls `abort()` before either of those
+/// two lines would print, so per the orchestrator's own contingency this
+/// rung asserts the line boot *does* reach instead, and pins it as the
+/// current blocker (unchanged by this task): `cpu_start`'s app-image-
+/// header check itself.
+///
+/// Measured reaching the console at step 407,448 (just before the
+/// itoa/strcat-formatted `abort()` call at step 407,471 that this file's
+/// sibling rung above is about -- the same `cpu_start` code path, in the
+/// order the source emits them). 420,000 keeps this comfortably past that
+/// with margin, well short of the panic path's own budgets below.
+#[test]
+fn boot_reaches_cpu_starts_own_header_check_error_line() {
+    assert_reaches("cpu_start: Invalid app image header", 420_000);
 }

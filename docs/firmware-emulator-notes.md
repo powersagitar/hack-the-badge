@@ -133,6 +133,23 @@ stub can have is one of `RomStubEffect`'s variants
   itself is one of three chip-agnostic shapes (`BusRegisterOp`) — overwrite
   the whole word (`Store`), OR-in/AND-out a mask (`UpdateMask`), or set/clear
   one bit chosen by another argument register (`SetOrClearBit`).
+- `Itoa`/`Strcat` (added in Milestone 3's Task D4) — real byte-for-byte
+  reimplementations of ROM libc's `itoa`/`strcat`, mirroring newlib's own
+  `itoa.c`/`utoa.c`/`strcat.c` source, through the bus — same "the caller
+  uses the output, so a status stub would corrupt it" reasoning as
+  `Memset`/`Memcpy`.
+- `Printf { sink_addr }` (added in Milestone 3's Task 7) — a real C-printf
+  formatter for ROM's `ets_printf` (`%d %i %u %x %X %c %s %p %%`, the `l`/
+  `ll` length modifiers, `-`/`0` flags, field width, `%s` precision — see
+  `emulator-core/src/cpu/rom_stubs.rs`'s `compute_printf` for the exact
+  RV32 ILP32 vararg-slot convention cited from the RISC-V calling-
+  convention spec). Formats `a0`'s C string against `a1..a7`/the stack,
+  then writes each output byte through `bus.write8(sink_addr, ..)` — for
+  the ESP32-C3, `rom.rs` supplies `sink_addr =
+  USB_SERIAL_JTAG_RANGE.start`, the same MMIO byte real FIFO TX output
+  writes through, so console output, its cap, and the WASM passthrough all
+  apply unchanged. Output and format-string-scan length are both capped
+  (1 KiB) so a garbage format-string pointer can't hang the emulator.
 
 This is split across two files on purpose:
 
@@ -494,6 +511,27 @@ predicted these blockers would surface once TIMG unblocks further boot:
    there the way real flash-cache bring-up would — not confirmed, just a
    plausible next investigation), since that — not another ROM stub — is
    what stands between here and a built-in app / the first real pixels.
+
+   **Milestone 3 Task 7** implemented `ets_printf` for real (see the
+   `RomStubEffect` vocabulary's `Printf` bullet above), closing the
+   "console emptiness is not evidence" caveat two paragraphs up: boot-probe
+   confirmed the firmware calls `ets_printf` directly rather than through
+   an IDF-side formatter that calls a ROM putc, so the plan's original
+   "don't implement printf in the stub" clause didn't hold and was
+   overridden by that task's orchestrator ruling. Every early-boot log
+   line up to and including `cpu_start`'s own header-check error now
+   reaches the console for real, e.g. (full text in that task's report,
+   not reproduced here beyond this one line, which is generic ESP-IDF
+   text, not identity data): `E (0) cpu_start: Invalid app image header`.
+   The spec's original ladder rungs (`cpu_start: Pro cpu start user code`,
+   `cpu_start: cpu freq:`) were checked for and do **not** appear —
+   `cpu_start`'s header check runs and fails before either would print —
+   so `emulator-core/tests/boot_progress.rs`'s new
+   `boot_reaches_cpu_starts_own_header_check_error_line` rung asserts the
+   line boot *does* reach instead, per that task's own contingency for
+   this case. **This does not move the header-check wall** — it's the same
+   blocker as before, just now diagnosable by reading the actual firmware
+   log instead of only trap addresses and register dumps.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

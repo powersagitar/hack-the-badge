@@ -99,6 +99,17 @@ pub const REG_A1: u8 = 11;
 pub const REG_A2: u8 = 12;
 /// `x13`/`a3` — the RV32 ABI fourth argument.
 pub const REG_A3: u8 = 13;
+/// `x14`/`a4` — the RV32 ABI fifth argument.
+pub const REG_A4: u8 = 14;
+/// `x15`/`a5` — the RV32 ABI sixth argument.
+pub const REG_A5: u8 = 15;
+/// `x16`/`a6` — the RV32 ABI seventh argument.
+pub const REG_A6: u8 = 16;
+/// `x17`/`a7` — the RV32 ABI eighth (and last register-passed) argument.
+pub const REG_A7: u8 = 17;
+/// `x2`/`sp` — the RV32 ABI stack pointer, where a call's 9th-and-later
+/// arguments spill to (`sp`, `sp+4`, `sp+8`, ...).
+pub const REG_SP: u8 = 2;
 
 /// Upper bound on how many bytes one memory-touching stub
 /// ([`RomStubEffect::Memset`] and friends) will write in a single call.
@@ -203,6 +214,38 @@ pub enum RomStubEffect {
     /// a NUL, not given as an argument), so a corrupt/unterminated string
     /// could otherwise hang this emulator forever.
     Strcat,
+    /// `int ets_printf(const char *fmt, ...)` (ROM's own vararg formatter,
+    /// and the target of `esp_rom_printf`/every early-boot `ESP_EARLY_LOG*`
+    /// line -- `esp32c3.rom.ld: ets_printf = 0x40000040;`,
+    /// `esp32c3.rom.api.ld: PROVIDE(esp_rom_printf = ets_printf);`).
+    ///
+    /// Milestone 3 Task 7's orchestrator ruling: the firmware calls this
+    /// address directly (confirmed by disassembly -- see `crate::rom`'s
+    /// module doc, entry 7), so a `Return(0)` stub silently drops every
+    /// early boot-log line rather than formatting and emitting it. This
+    /// effect gives `ets_printf` a real HLE implementation
+    /// ([`compute_printf`]): it formats `a0`'s C format string against the
+    /// RV32 ILP32 varargs in `a1..a7`/the stack (see [`VarargCursor`]),
+    /// writes each output byte through `bus.write8(sink_addr, ..)` -- the
+    /// same path real FIFO/putc output already takes, so the console
+    /// buffer, its cap, and the WASM passthrough all apply unchanged -- and
+    /// returns the number of characters written in `a0`, matching
+    /// `ets_sys.h`'s documented `int ets_printf(const char *fmt, ...)`
+    /// signature ("@return int : the length printed to the output
+    /// device.").
+    ///
+    /// `sink_addr` is chip-specific (the ESP32-C3's USB-Serial-JTAG EP1
+    /// FIFO data register in this project), so it's supplied by
+    /// `crate::rom`, not hardcoded here -- this effect's mechanism (parse a
+    /// C format string, walk varargs per the RV32 ILP32 calling
+    /// convention, write bytes through the bus) has nothing ESP32-C3-
+    /// specific about it.
+    Printf {
+        /// The MMIO byte address each formatted output byte is written to
+        /// via `bus.write8` -- one byte per write, matching how a real
+        /// putc-style TX register is driven one character at a time.
+        sink_addr: u32,
+    },
 }
 
 /// The address/value computation for [`RomStubEffect::BusRegisterWrite`].
@@ -417,6 +460,380 @@ pub fn compute_itoa(value: i32, base: i32) -> ItoaResult {
     }
 }
 
+// ---------------------------------------------------------------------
+// `ets_printf` HLE formatter (see `RomStubEffect::Printf`).
+// ---------------------------------------------------------------------
+
+/// Upper bound on how many bytes one [`compute_printf`] call will scan out
+/// of the format string (and any `%s` argument string) before giving up,
+/// and on how many bytes of *output* it will produce. Same rationale as
+/// [`MAX_STUB_MEMORY_BYTES`]: this runs inside a WASM module driving a
+/// browser tab, so a garbage/unterminated pointer must not be able to hang
+/// it. 1 KiB comfortably covers any real ESP-IDF early-boot log line (the
+/// longest observed, `cpu_start`'s "Invalid app image header" line plus
+/// its tag/timestamp, is well under 64 bytes) while still catching a
+/// runaway format string loudly (truncated output) rather than silently.
+pub const PRINTF_MAX_OUTPUT_BYTES: usize = 1024;
+/// Companion cap on the format string's own scan length, and on how many
+/// bytes of a `%s` argument are read -- kept equal to
+/// [`PRINTF_MAX_OUTPUT_BYTES`] for the same "no runaway pointer hangs the
+/// host" reasoning, not because the two must match in general.
+pub const PRINTF_MAX_SCAN_BYTES: usize = PRINTF_MAX_OUTPUT_BYTES;
+
+/// Tracks which 32-bit vararg "slot" [`compute_printf`] should read next,
+/// and applies the RV32 ILP32 calling convention's alignment rule for a
+/// 64-bit vararg.
+///
+/// **Source**: the RISC-V calling-convention spec
+/// (`riscv-non-isa/riscv-elf-psabi-doc`, `riscv-cc.adoc`, "Integer Calling
+/// Convention"): "Variadic arguments with 2×XLEN-bit alignment and size at
+/// most 2×XLEN bits are passed in an *aligned* register pair (i.e., the
+/// first register in the pair is even-numbered), or on the stack by value
+/// if none is available. After a variadic argument has been passed on the
+/// stack, all future arguments will also be passed on the stack (i.e. the
+/// last argument register may be left unused due to the aligned register
+/// pair rule)."
+///
+/// Slots are numbered from `1` (`ets_printf`'s fixed `fmt` parameter
+/// itself occupies slot `0`/`a0`, already consumed before any
+/// [`VarargCursor`] exists): slots `1..=7` are `a1..=a7` (`x11..=x17`),
+/// and slot `8` onward is the caller's stack at `sp`, `sp+4`, `sp+8`, ...
+/// A single monotonically increasing index can address both zones with
+/// one alignment rule because the psABI's "even-numbered register" and
+/// "8-byte-aligned stack slot" requirements are the same requirement
+/// viewed in 4-byte units: slot `0` (`a0`) sits at relative byte offset
+/// `0`, so every slot's relative byte offset is `slot * 4`, and "starts at
+/// an even-numbered register" / "is 8-byte-aligned on the stack" both
+/// reduce to "`slot` is even" under that numbering -- including right at
+/// the register/stack boundary (slot `8`, the stack's first word, is
+/// even, matching the ABI's own requirement that `sp` itself is 16-byte
+/// -- hence 8-byte -- aligned).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VarargCursor {
+    next_slot: u32,
+}
+
+impl VarargCursor {
+    pub fn new() -> Self {
+        Self { next_slot: 1 }
+    }
+
+    /// Consumes one 32-bit slot and returns its index.
+    fn take_u32_slot(&mut self) -> u32 {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        slot
+    }
+
+    /// Consumes an aligned pair of slots -- skipping one slot of padding
+    /// first if the next slot is odd, per this type's doc -- and returns
+    /// `(low_slot, high_slot)`.
+    fn take_u64_slots(&mut self) -> (u32, u32) {
+        if !self.next_slot.is_multiple_of(2) {
+            self.next_slot += 1; // padding: this slot is left unused.
+        }
+        let low = self.next_slot;
+        let high = self.next_slot + 1;
+        self.next_slot += 2;
+        (low, high)
+    }
+}
+
+/// What [`compute_printf`] needs from its caller: a way to read a byte of
+/// memory (backing both the format-string scan and any `%s` argument
+/// string) and a way to resolve a [`VarargCursor`] slot index to its
+/// 32-bit value.
+///
+/// Deliberately abstract over *both* concerns in one trait rather than two
+/// separate closures: the real HLE stub (`crate::cpu::Cpu::apply_rom_stub`)
+/// backs both with the same live `Bus`, and a single mutable borrow of
+/// that bus is all Rust's borrow checker will allow across one
+/// [`compute_printf`] call -- two independent closures each independently
+/// capturing the bus would be two live mutable borrows of the same value.
+/// Unit tests below back this with a plain in-memory fake instead.
+pub trait PrintfHost {
+    /// Reads the byte at `addr`.
+    fn read_byte(&mut self, addr: u32) -> u8;
+    /// Resolves vararg slot `slot` (`1..=7` are `a1..=a7`; `8+` is the
+    /// caller's stack, per [`VarargCursor`]'s doc) to its 32-bit value.
+    fn slot(&mut self, slot: u32) -> u32;
+}
+
+/// [`compute_printf`]'s result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintfOutput {
+    /// The formatted output bytes, already capped at
+    /// [`PRINTF_MAX_OUTPUT_BYTES`].
+    pub bytes: Vec<u8>,
+    /// `a0`'s return value: the number of bytes actually emitted (i.e.
+    /// `bytes.len()`) -- matching `ets_sys.h`'s documented
+    /// `ets_printf`/`ets_vprintf` return, "the length printed to the
+    /// output device", under this cap.
+    pub chars_written: u32,
+}
+
+/// Appends `byte` to `out` unless [`PRINTF_MAX_OUTPUT_BYTES`] has already
+/// been reached. Returns whether the byte was written -- callers use this
+/// to stop early instead of doing pointless further work once the cap is
+/// hit.
+fn push_capped(out: &mut Vec<u8>, byte: u8) -> bool {
+    if out.len() >= PRINTF_MAX_OUTPUT_BYTES {
+        return false;
+    }
+    out.push(byte);
+    true
+}
+
+/// Appends `text`, padded to at least `width` bytes with `pad_byte`
+/// (space, or `'0'` for a zero-padded numeric conversion -- see
+/// [`compute_printf`]'s flag handling), on the left unless `left_align`.
+/// Stops early (silently) once [`PRINTF_MAX_OUTPUT_BYTES`] is hit, same as
+/// [`push_capped`].
+fn push_padded(out: &mut Vec<u8>, text: &[u8], width: usize, left_align: bool, pad_byte: u8) {
+    let pad_len = width.saturating_sub(text.len());
+    if !left_align {
+        for _ in 0..pad_len {
+            if !push_capped(out, pad_byte) {
+                return;
+            }
+        }
+    }
+    for &b in text {
+        if !push_capped(out, b) {
+            return;
+        }
+    }
+    if left_align {
+        for _ in 0..pad_len {
+            if !push_capped(out, pad_byte) {
+                return;
+            }
+        }
+    }
+}
+
+/// Formats `fmt_addr`'s C format string (read through `host`) against the
+/// RV32 ILP32 varargs `host` resolves (`a1..a7`, then the stack -- see
+/// [`VarargCursor`]), mirroring the ESP32-C3 ROM's own `ets_printf`
+/// (`components/esp_rom/esp32c3/include/esp32c3/rom/ets_sys.h`:
+/// `int ets_printf(const char *fmt, ...)`, "Printf the strings to uart or
+/// other devices, similar with printf, simple than printf.").
+///
+/// **Supported conversions** (Milestone 3 Task 7's orchestrator ruling):
+/// `%d %i %u %x %X %c %s %p %%`; the `l` modifier (a no-op on RV32
+/// ILP32, where `long` is already 32 bits) and `ll` (consumes an aligned
+/// 64-bit pair via [`VarargCursor::take_u64_slots`]); flags `-`
+/// (left-align) and `0` (zero-pad); a decimal field width; and a decimal
+/// precision on `%s` (truncates the string to at most that many bytes --
+/// cheap to support since the string is already being scanned byte by
+/// byte).
+///
+/// **Unsupported specifiers** (notably `%f`/`%e`/`%g` -- ROM's own
+/// `ets_sys.h` documents `ets_printf` itself as unable to print
+/// floating-point, "Can not print float point data format, or longlong
+/// data format", though this stub does support `ll` per the orchestrator
+/// ruling above) are emitted **verbatim** as `%` followed by the
+/// conversion character (e.g. `%f` prints the two characters `%f`) and
+/// consume **no** vararg -- printing a wrong/misaligned value from the
+/// wrong slot would be worse than printing the literal specifier.
+///
+/// A NULL (`0`) `%s` pointer prints `(null)`, matching glibc/newlib's own
+/// common convention for this ROM's non-standard printf (not documented in
+/// `ets_sys.h`, which is silent on this case, but universal defensive
+/// practice for a `%s` implementation and clearly preferable to dereferencing
+/// a null pointer).
+///
+/// Every byte read (format string, `%s` argument) and every byte written is
+/// capped at [`PRINTF_MAX_SCAN_BYTES`]/[`PRINTF_MAX_OUTPUT_BYTES`] so a
+/// garbage/unterminated pointer can't hang the caller.
+pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput {
+    let mut out = Vec::new();
+    let mut cursor = VarargCursor::new();
+    let mut i: u32 = 0;
+
+    loop {
+        if i as usize >= PRINTF_MAX_SCAN_BYTES || out.len() >= PRINTF_MAX_OUTPUT_BYTES {
+            break;
+        }
+        let c = host.read_byte(fmt_addr.wrapping_add(i));
+        i += 1;
+        if c == 0 {
+            break;
+        }
+        if c != b'%' {
+            if !push_capped(&mut out, c) {
+                break;
+            }
+            continue;
+        }
+
+        // Flags: '-' (left-align) and '0' (zero-pad), in any order/repeat,
+        // per this function's doc.
+        let mut left_align = false;
+        let mut zero_pad = false;
+        loop {
+            match host.read_byte(fmt_addr.wrapping_add(i)) {
+                b'-' => {
+                    left_align = true;
+                    i += 1;
+                }
+                b'0' => {
+                    zero_pad = true;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Decimal field width.
+        let mut width: usize = 0;
+        while (i as usize) < PRINTF_MAX_SCAN_BYTES {
+            let d = host.read_byte(fmt_addr.wrapping_add(i));
+            if d.is_ascii_digit() {
+                width = width.saturating_mul(10).saturating_add((d - b'0') as usize);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Decimal precision, `%s`-only per this function's doc.
+        let mut precision: Option<usize> = None;
+        if host.read_byte(fmt_addr.wrapping_add(i)) == b'.' {
+            i += 1;
+            let mut p: usize = 0;
+            while (i as usize) < PRINTF_MAX_SCAN_BYTES {
+                let d = host.read_byte(fmt_addr.wrapping_add(i));
+                if d.is_ascii_digit() {
+                    p = p.saturating_mul(10).saturating_add((d - b'0') as usize);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            precision = Some(p);
+        }
+
+        // Length modifier: 'l' (no-op on ILP32) or 'll' (a 64-bit vararg).
+        let mut is_64 = false;
+        if host.read_byte(fmt_addr.wrapping_add(i)) == b'l' {
+            i += 1;
+            if host.read_byte(fmt_addr.wrapping_add(i)) == b'l' {
+                i += 1;
+                is_64 = true;
+            }
+        }
+
+        let conv = host.read_byte(fmt_addr.wrapping_add(i));
+        i += 1;
+
+        let zero_pad_byte = if zero_pad && !left_align { b'0' } else { b' ' };
+
+        match conv {
+            b'%' => {
+                if !push_capped(&mut out, b'%') {
+                    break;
+                }
+            }
+            b'c' => {
+                let slot = cursor.take_u32_slot();
+                let v = host.slot(slot);
+                if !push_capped(&mut out, v as u8) {
+                    break;
+                }
+            }
+            b'd' | b'i' => {
+                let value: i64 = if is_64 {
+                    let (lo, hi) = cursor.take_u64_slots();
+                    let raw = u64::from(host.slot(lo)) | (u64::from(host.slot(hi)) << 32);
+                    raw as i64
+                } else {
+                    let slot = cursor.take_u32_slot();
+                    host.slot(slot) as i32 as i64
+                };
+                let text = value.to_string();
+                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+            }
+            b'u' => {
+                let value: u64 = if is_64 {
+                    let (lo, hi) = cursor.take_u64_slots();
+                    u64::from(host.slot(lo)) | (u64::from(host.slot(hi)) << 32)
+                } else {
+                    let slot = cursor.take_u32_slot();
+                    u64::from(host.slot(slot))
+                };
+                let text = value.to_string();
+                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+            }
+            b'x' | b'X' => {
+                let value: u64 = if is_64 {
+                    let (lo, hi) = cursor.take_u64_slots();
+                    u64::from(host.slot(lo)) | (u64::from(host.slot(hi)) << 32)
+                } else {
+                    let slot = cursor.take_u32_slot();
+                    u64::from(host.slot(slot))
+                };
+                let text = if conv == b'X' {
+                    format!("{value:X}")
+                } else {
+                    format!("{value:x}")
+                };
+                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+            }
+            b'p' => {
+                let slot = cursor.take_u32_slot();
+                let ptr = host.slot(slot);
+                let text = format!("0x{ptr:x}");
+                push_padded(&mut out, text.as_bytes(), width, left_align, b' ');
+            }
+            b's' => {
+                let slot = cursor.take_u32_slot();
+                let ptr = host.slot(slot);
+                if ptr == 0 {
+                    push_padded(&mut out, b"(null)", width, left_align, b' ');
+                } else {
+                    let mut s = Vec::new();
+                    let mut j: u32 = 0;
+                    loop {
+                        if (j as usize) >= PRINTF_MAX_SCAN_BYTES {
+                            break;
+                        }
+                        if let Some(p) = precision {
+                            if s.len() >= p {
+                                break;
+                            }
+                        }
+                        let b = host.read_byte(ptr.wrapping_add(j));
+                        if b == 0 {
+                            break;
+                        }
+                        s.push(b);
+                        j += 1;
+                    }
+                    push_padded(&mut out, &s, width, left_align, b' ');
+                }
+            }
+            _ => {
+                // Unsupported specifier (e.g. `%f`): emit the literal `%`
+                // and conversion character, consuming no vararg -- see
+                // this function's doc.
+                if !push_capped(&mut out, b'%') {
+                    break;
+                }
+                if !push_capped(&mut out, conv) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let chars_written = out.len() as u32;
+    PrintfOutput {
+        bytes: out,
+        chars_written,
+    }
+}
+
 /// One high-level-emulated ROM function: a name (for diagnostics) and an
 /// effect.
 ///
@@ -480,6 +897,15 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strcat,
+        }
+    }
+
+    /// A real high-level-emulated `ets_printf`, writing formatted output
+    /// bytes to `sink_addr` — see [`RomStubEffect::Printf`].
+    pub const fn printf(name: &'static str, sink_addr: u32) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Printf { sink_addr },
         }
     }
 
@@ -727,5 +1153,196 @@ mod tests {
             .insert(0x4000_0050, RomStub::returning("b", 0));
         let addrs: Vec<u32> = table.entries_sorted().iter().map(|(a, _)| *a).collect();
         assert_eq!(addrs, vec![0x4000_0018, 0x4000_0050, 0x4000_0528]);
+    }
+
+    #[test]
+    fn printf_constructor_maps_to_the_expected_effect() {
+        assert_eq!(
+            RomStub::printf("ets_printf", 0x6004_3000).effect,
+            RomStubEffect::Printf {
+                sink_addr: 0x6004_3000
+            }
+        );
+    }
+
+    // ---- `compute_printf` unit tests ----
+    //
+    // `TestHost` is a `PrintfHost` fake: memory is a plain byte map (built
+    // by `write_cstr`), and vararg slots come from a flat `Vec<u32>`
+    // indexed `slot - 1` (slot 1 is index 0). It deliberately does *not*
+    // distinguish "register" from "stack" slots -- `VarargCursor`'s whole
+    // point is that both zones share one alignment rule, so one flat
+    // backing array exercises "slot <= 7" and "slot > 7" identically. The
+    // real CPU-backed implementation (`crate::cpu::Cpu::apply_rom_stub`)
+    // is the one that actually splits slots 1..=7 (registers) from 8+
+    // (stack) -- see `crate::rom`'s full-execution test for that half.
+
+    struct TestHost {
+        mem: HashMap<u32, u8>,
+        slots: Vec<u32>,
+    }
+
+    impl TestHost {
+        fn new(slots: Vec<u32>) -> Self {
+            Self {
+                mem: HashMap::new(),
+                slots,
+            }
+        }
+
+        fn write_cstr(&mut self, addr: u32, s: &[u8]) {
+            for (i, b) in s.iter().enumerate() {
+                self.mem.insert(addr + i as u32, *b);
+            }
+            self.mem.insert(addr + s.len() as u32, 0);
+        }
+    }
+
+    impl PrintfHost for TestHost {
+        fn read_byte(&mut self, addr: u32) -> u8 {
+            self.mem.get(&addr).copied().unwrap_or(0)
+        }
+        fn slot(&mut self, slot: u32) -> u32 {
+            self.slots.get((slot - 1) as usize).copied().unwrap_or(0)
+        }
+    }
+
+    const FMT_ADDR: u32 = 0x1000;
+
+    /// Runs `compute_printf` on `fmt` against `slots`, with no `%s`
+    /// arguments (see [`run_printf_with_strings`] for those).
+    fn run_printf(fmt: &[u8], slots: Vec<u32>) -> (String, u32) {
+        let mut host = TestHost::new(slots);
+        host.write_cstr(FMT_ADDR, fmt);
+        let result = compute_printf(FMT_ADDR, &mut host);
+        (
+            String::from_utf8(result.bytes).expect("ascii output"),
+            result.chars_written,
+        )
+    }
+
+    #[test]
+    fn printf_supports_each_documented_conversion() {
+        assert_eq!(run_printf(b"%d", vec![42]).0, "42");
+        assert_eq!(run_printf(b"%i", vec![(-7i32) as u32]).0, "-7");
+        assert_eq!(run_printf(b"%u", vec![u32::MAX]).0, "4294967295");
+        assert_eq!(run_printf(b"%x", vec![0xdead_beef]).0, "deadbeef");
+        assert_eq!(run_printf(b"%X", vec![0xdead_beef]).0, "DEADBEEF");
+        assert_eq!(run_printf(b"%c", vec![b'Q' as u32]).0, "Q");
+        assert_eq!(run_printf(b"100%%", vec![]).0, "100%");
+        assert_eq!(run_printf(b"%p", vec![0x1234]).0, "0x1234");
+    }
+
+    #[test]
+    fn printf_return_value_is_the_number_of_bytes_written() {
+        let (text, chars_written) = run_printf(b"x=%d!", vec![42]);
+        assert_eq!(text, "x=42!");
+        assert_eq!(chars_written, text.len() as u32);
+    }
+
+    #[test]
+    fn printf_percent_s_reads_a_nul_terminated_string_through_the_host() {
+        let mut host = TestHost::new(vec![0x2000]);
+        host.write_cstr(FMT_ADDR, b"%s");
+        host.write_cstr(0x2000, b"hi");
+        let result = compute_printf(FMT_ADDR, &mut host);
+        assert_eq!(String::from_utf8(result.bytes).unwrap(), "hi");
+    }
+
+    #[test]
+    fn printf_percent_s_precision_truncates() {
+        let mut host = TestHost::new(vec![0x2000]);
+        host.write_cstr(FMT_ADDR, b"%.2s");
+        host.write_cstr(0x2000, b"hello");
+        let result = compute_printf(FMT_ADDR, &mut host);
+        assert_eq!(String::from_utf8(result.bytes).unwrap(), "he");
+    }
+
+    #[test]
+    fn printf_null_percent_s_prints_null_literal() {
+        // No documented ets_sys.h behavior for this case; universal
+        // defensive convention for a %s implementation, and clearly
+        // better than dereferencing a null pointer -- see this function's
+        // doc.
+        assert_eq!(run_printf(b"%s", vec![0]).0, "(null)");
+    }
+
+    #[test]
+    fn printf_field_width_and_flags() {
+        assert_eq!(run_printf(b"[%5d]", vec![42]).0, "[   42]");
+        assert_eq!(run_printf(b"[%-5d]", vec![42]).0, "[42   ]");
+        assert_eq!(run_printf(b"[%05d]", vec![42]).0, "[00042]");
+        // `0` is ignored once `-` is also given (left-align wins), same as
+        // standard C printf.
+        assert_eq!(run_printf(b"[%-05d]", vec![42]).0, "[42   ]");
+    }
+
+    #[test]
+    fn printf_ll_reads_an_aligned_64_bit_pair_and_skips_a_padding_slot() {
+        // The first vararg is a 64-bit one: per VarargCursor's doc, slot 1
+        // (a1) is odd and gets skipped as padding, so the pair comes from
+        // slots 2:3 (a2:a3), not 1:2. Seed slot 1 with a value that would
+        // produce a wildly different (huge) result if the cursor
+        // incorrectly failed to skip it and used slots 1:2 as the
+        // low/high pair instead -- so this test actually discriminates a
+        // broken alignment rule from a correct one.
+        let (text, _) = run_printf(b"%llu", vec![0x00ba_dbad, 1, 0]);
+        assert_eq!(text, "1", "expected the aligned pair (slots 2:3 = 1,0), not slots 1:2");
+    }
+
+    #[test]
+    fn printf_ll_high_word_is_significant() {
+        // slot 1 (padding, skipped), slot 2 = low = 0x11112222, slot 3 =
+        // high = 0x33334444 -> the full 64-bit value, not just the low
+        // word a plain %x/%u (32-bit) read would have produced.
+        let (text, _) = run_printf(b"%llx", vec![0, 0x1111_2222, 0x3333_4444]);
+        assert_eq!(text, "3333444411112222");
+    }
+
+    #[test]
+    fn printf_llu_after_a_32_bit_vararg_still_aligns() {
+        // slot 1 (a1, odd) holds an ordinary %u; the %llu that follows
+        // must then skip slot 2 (a2 -- even, but the *next* slot after
+        // slot 1 is already even, so no padding is needed here) -- this
+        // exercises the "next slot already even" branch, complementing
+        // the padding-needed case above.
+        let (text, _) = run_printf(b"%u %llu", vec![7, 9, 0]);
+        assert_eq!(text, "7 9");
+    }
+
+    #[test]
+    fn printf_more_than_eight_varargs_keeps_resolving_sequentially() {
+        // Slots 1..=7 would be a1..=a7 in the real CPU-backed host; slots
+        // 8+ would be the stack. `compute_printf`/`VarargCursor` don't
+        // themselves know which is which (that split lives in the real
+        // host -- see crate::rom's full-execution test) -- this test
+        // proves the *cursor* still resolves nine sequential 32-bit
+        // varargs, i.e. slots 1..=9, in strict order regardless.
+        let (text, _) = run_printf(
+            b"%d %d %d %d %d %d %d %d %d",
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90],
+        );
+        assert_eq!(text, "10 20 30 40 50 60 70 80 90");
+    }
+
+    #[test]
+    fn printf_unsupported_specifier_is_emitted_verbatim_and_consumes_no_arg() {
+        // %f is unsupported (see this function's doc, citing ets_sys.h's
+        // own "cannot print floating point" caveat); it must print the
+        // literal two characters "%f" and NOT consume a vararg, so the
+        // %d that follows must still read slot 1, not slot 2.
+        let (text, _) = run_printf(b"%f%d", vec![111, 222]);
+        assert_eq!(text, "%f111");
+    }
+
+    #[test]
+    fn printf_stops_at_the_output_cap_without_hanging() {
+        // A firmware format string that's just a huge repeated literal (no
+        // conversions, so no vararg host calls needed) must still be
+        // capped, not grown without bound.
+        let fmt = vec![b'A'; PRINTF_MAX_OUTPUT_BYTES * 4];
+        let (text, chars_written) = run_printf(&fmt, vec![]);
+        assert_eq!(text.len(), PRINTF_MAX_OUTPUT_BYTES);
+        assert_eq!(chars_written as usize, PRINTF_MAX_OUTPUT_BYTES);
     }
 }

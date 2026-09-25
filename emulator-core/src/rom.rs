@@ -125,27 +125,45 @@
 //!    no-op.
 //!
 //! 7. **`ets_printf` (`0x4000_0040`)** — every line of ESP-IDF's early boot
-//!    log, via the `esp_rom_printf` alias. Stubbed as `Return(0)`: there's no
-//!    UART model for the output to go to, and the return value (characters
-//!    written) is discarded by ESP-IDF's logging macros. Note that the format
-//!    string is still readable from `a0` at the moment of the call, which is
-//!    how `tests/rom_stub_boot.rs`'s trace recovers boot-log text without any
-//!    of this code needing an output sink.
+//!    log, via the `esp_rom_printf` alias (`esp32c3.rom.api.ld`:
+//!    `PROVIDE(esp_rom_printf = ets_printf)`). **Milestone 3 Task 7**: this
+//!    used to be `Return(0)` (see "History" below) — a status stub that
+//!    dropped every line, including a real `E (...) cpu_start: Invalid app
+//!    image header` error (entry 12). Task 7's boot-probe run confirmed
+//!    the firmware calls this ROM formatting entry point *directly*
+//!    (`cpu_start` at `0x42001004`–`0x42001010`, and other early sites), so
+//!    `esp_rom_printf` does not format IDF-side and call a ROM putc the way
+//!    some other chips' ROMs do — the plan's original "don't implement
+//!    printf in the stub" clause assumed otherwise and was overridden by
+//!    that task's orchestrator ruling. `ets_printf` is now
+//!    [`RomStubEffect::Printf`](crate::cpu::rom_stubs::RomStubEffect::Printf),
+//!    a real HLE formatter
+//!    ([`crate::cpu::rom_stubs::compute_printf`] — see that function's doc
+//!    for the exact conversions supported, the RV32 ILP32 vararg-slot
+//!    convention cited from the RISC-V calling-convention spec, and the
+//!    output/scan caps): it formats `a0`'s C string against the varargs in
+//!    `a1..a7`/the stack and writes each output byte through
+//!    `bus.write8(USB_SERIAL_JTAG_RANGE.start, ..)` — [`USB_SERIAL_JTAG_RANGE`]'s
+//!    first byte is `USB_SERIAL_JTAG_EP1_REG`'s byte-0 lane
+//!    (`crate::peripherals::usb_serial_jtag`), the exact same path real
+//!    FIFO TX output already takes, so every early boot-log line now
+//!    reaches [`crate::peripherals::console::Console`] and therefore
+//!    [`crate::runtime::FirmwareRuntime::console_output`] — see this
+//!    module's tests for the full-execution proof (a real `ets_printf`
+//!    call through a real `FirmwareBus`, asserting the console text) and
+//!    `tests/boot_progress.rs`/`tests/rom_stub_boot.rs` for what boot's
+//!    console now actually shows.
 //!
-//!    **Load-bearing caveat (Task D4 fix round 1, finding I2)**: because
-//!    this stub is `Return(0)` and never touches [`crate::peripherals::console::Console`],
-//!    *every* `ets_printf`/`ESP_EARLY_LOG*` call this firmware makes is
-//!    currently invisible to [`crate::runtime::FirmwareRuntime::console_output`]
-//!    — including, as it turns out, an actual `E (...) cpu_start: Invalid
-//!    app image header` error line (see entry 12 below). **Console
-//!    emptiness at any point during boot is therefore not evidence that
-//!    nothing was logged** — it only proves nothing was logged *through a
-//!    path this emulator doesn't route through `ets_printf`* (there is
-//!    none yet). Implementing `ets_printf` for real (writing through
-//!    `Console` the way a real UART/USB-Serial-JTAG TX would) is left to a
-//!    later task (plan Task 7) — deliberately not attempted here per that
-//!    task's own orchestrator ruling, to keep this round's diff to the
-//!    stubs it actually needed.
+//!    **History (superseded by the above)**: until Task 7, this was
+//!    `Return(0)` — no UART/USB-Serial-JTAG model existed for the output to
+//!    go to yet, and the return value (characters written) is discarded by
+//!    ESP-IDF's logging macros regardless, so a status stub looked
+//!    sufficient at the time. Task D4 fix round 1 (finding I2) flagged the
+//!    resulting load-bearing caveat: because that stub never touched
+//!    `Console`, *every* `ets_printf`/`ESP_EARLY_LOG*` call was invisible to
+//!    `console_output`, so console emptiness at any point during boot was
+//!    not evidence that nothing had been logged. That caveat no longer
+//!    applies now that `ets_printf` is a real formatter.
 //!
 //! 8. **libgcc's 64-bit integer helpers** ([`LIBGCC_INT64_FAMILY`]) — 32-bit
 //!    RISC-V has no 64-bit divide instruction, so `uint64_t` arithmetic
@@ -390,6 +408,26 @@
 //!     bytes at that address the way real flash-cache bring-up would — this
 //!     is a plausible next investigation, not a finding.
 //!
+//! 13. **Milestone 3 Task 7: `ets_printf` becomes a real formatter** — see
+//!     entry 7 above for the full account. In one line: boot-probe
+//!     confirmed the firmware calls `ets_printf` directly (not through an
+//!     IDF-side formatter that calls a ROM putc), so `ets_printf` is now
+//!     [`RomStubEffect::Printf`](crate::cpu::rom_stubs::RomStubEffect::Printf)
+//!     ([`crate::cpu::rom_stubs::compute_printf`]), writing formatted bytes
+//!     through the bus to [`USB_SERIAL_JTAG_RANGE`]'s FIFO register — the
+//!     same path real TX output takes. This doesn't move the header-check
+//!     wall (still entry 12's blocker, unresolved — that's Task D5's job,
+//!     explicitly out of scope here), but every early-boot log line up to
+//!     and including `cpu_start`'s own `E (%lu) %s: Invalid app image
+//!     header\n` call now reaches the console instead of being silently
+//!     dropped. Confirmed by this task's boot-probe re-run (report has the
+//!     full console text): the spec's original ladder rungs (`cpu_start:
+//!     Pro cpu start user code`, `cpu_start: cpu freq:`) do **not** appear
+//!     — `cpu_start`'s header check runs and fails before either would
+//!     print — so `tests/boot_progress.rs`'s new rung asserts the line
+//!     boot *does* reach instead
+//!     (`boot_reaches_cpu_starts_own_header_check_error_line`).
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -409,25 +447,26 @@
 //!
 //! ## Where this gets boot to
 //!
-//! With this table installed (as of Task D4), the real `factory.bin` runs
+//! With this table installed (as of Task 7), the real `factory.bin` runs
 //! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up, analog/
 //! PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop (Task D1),
 //! the `memcpy` call (Task D2), the eFuse queries, the UART flush, and the
 //! interrupt-controller bring-up (entries 10/11) — **all of that runs
 //! fault-free**. But that is *not* the same as "boot is proceeding
 //! normally": `cpu_start` (ESP-IDF's early startup) rejects this image's
-//! header and calls `ets_printf` (invisible today, see entry 7's caveat)
-//! then `abort()` — see entry 12 for the full, corrected narrative and why
-//! the original "this is normal, pre-panic boot" conclusion was wrong.
-//! With `itoa`/`strcat` real, that pre-existing `abort()` call now runs to
-//! completion instead of faulting mid-format, reaching a real,
-//! hardware-standard `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own
-//! `panic_abort()` (entry 12's `0x4038e4fa`, *not* a ROM address) — the
-//! firmware genuinely, deliberately triggering its own panic path over the
-//! header-check failure, same as real hardware would. The panic handler
-//! runs to completion for the first time (itoa/strcat let it actually
-//! build this abort's message), prints ESP-IDF's generic pre-restart text
-//! (panic output, not boot progress), then tries to reboot via the
+//! header and calls `ets_printf` — **now console-visible** (entry 13; no
+//! longer entry 7's old invisibility caveat) — then `abort()` — see entry
+//! 12 for the full, corrected narrative and why the original "this is
+//! normal, pre-panic boot" conclusion was wrong. With `itoa`/`strcat`
+//! real, that pre-existing `abort()` call runs to completion instead of
+//! faulting mid-format, reaching a real, hardware-standard
+//! `ILLEGAL_INSTRUCTION` trap at ESP-IDF's own `panic_abort()` (entry 12's
+//! `0x4038e4fa`, *not* a ROM address) — the firmware genuinely,
+//! deliberately triggering its own panic path over the header-check
+//! failure, same as real hardware would. The panic handler runs to
+//! completion for the first time (itoa/strcat let it actually build this
+//! abort's message), prints ESP-IDF's generic pre-restart text (panic
+//! output, not boot progress), then tries to reboot via the
 //! still-unstubbed `software_reset_cpu` (`0x4000_0094`) — which faults
 //! (this *is* an unstubbed ROM call, but only reached via the panic path,
 //! so per this module's own scoping it stays unstubbed), re-entering the
@@ -436,12 +475,14 @@
 //! `boot_currently_aborts_reaching_the_panic_handlers_reboot_message` and
 //! `docs/firmware-emulator-notes.md`'s "Known limitations" for the full
 //! story. **The actual blocker remains `cpu_start`'s app-image-header
-//! check**, unresolved by this task.
+//! check**, unresolved by this task — Task 7 only made the boot log
+//! leading up to it, and the abort/panic path following it, actually
+//! readable.
 
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,
 };
-use crate::mem::soc::INTERRUPT_CORE0_RANGE;
+use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
 use crate::peripherals::intc::{CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_TYPE_REG};
 
 /// `rtc_get_reset_reason`'s return value: `POWERON_RESET` from ESP-IDF's
@@ -572,7 +613,10 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         RTC_GET_RESET_REASON,
         RomStub::returning("rtc_get_reset_reason", POWERON_RESET),
     ),
-    (ETS_PRINTF, RomStub::returning("ets_printf", 0)),
+    (
+        ETS_PRINTF,
+        RomStub::printf("ets_printf", USB_SERIAL_JTAG_RANGE.start),
+    ),
     (ETS_DELAY_US, RomStub::void("ets_delay_us")),
     (MEMSET, RomStub::memset("memset")),
     (MEMCPY, RomStub::memcpy("memcpy")),
@@ -974,7 +1018,9 @@ mod tests {
     // bus, at `InterruptController`'s real offsets, not re-derived) and that
     // control returns to `ra`.
 
-    use crate::cpu::rom_stubs::{REG_A0, REG_A1, REG_A2, REG_RA};
+    use crate::cpu::rom_stubs::{
+        REG_A0, REG_A1, REG_A2, REG_A3, REG_A4, REG_A5, REG_A6, REG_A7, REG_RA, REG_SP,
+    };
     use crate::cpu::Cpu;
     use crate::mem::bus::FirmwareBus;
     use crate::mem::Bus;
@@ -1212,5 +1258,98 @@ mod tests {
              immediately without touching a0 is correct HLE, same reasoning \
              as ets_delay_us"
         );
+    }
+
+    // ---- Milestone 3 Task 7: `ets_printf` full-execution tests ----
+    //
+    // These exercise the real stub end to end through a real `FirmwareBus`
+    // (so a real `UsbSerialJtag`/`Console` backs the output), unlike
+    // `cpu::rom_stubs::tests`' `compute_printf` unit tests, which use a
+    // plain in-memory fake and never touch `Cpu::apply_rom_stub`'s
+    // register/stack-splitting `CpuPrintfHost` adapter at all.
+
+    #[test]
+    fn ets_printf_stub_writes_the_observed_boot_log_line_through_a_real_bus() {
+        // The exact call shape `cpu_start` makes right before `abort()`
+        // (see this module's doc, entry 12, and this task's boot-probe
+        // report): `ets_printf("E (%lu) %s: Invalid app image header\n",
+        // <timestamp>, "cpu_start")`.
+        use crate::mem::soc::DRAM_RANGE;
+        let fmt_addr = 0x3fcd_0000u32;
+        let tag_addr = 0x3fcd_0100u32;
+        assert!(DRAM_RANGE.contains(&fmt_addr) && DRAM_RANGE.contains(&tag_addr));
+
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.add_scratch_ram(fmt_addr, 64);
+        bus.add_scratch_ram(tag_addr, 16);
+        for (i, b) in b"E (%lu) %s: Invalid app image header\n\0".iter().enumerate() {
+            bus.write8(fmt_addr + i as u32, *b);
+        }
+        for (i, b) in b"cpu_start\0".iter().enumerate() {
+            bus.write8(tag_addr + i as u32, *b);
+        }
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, fmt_addr);
+        cpu.regs.write(REG_A1, 0); // timestamp
+        cpu.regs.write(REG_A2, tag_addr);
+        cpu.regs.pc = ETS_PRINTF;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken, "a stub call must never trap");
+        assert_eq!(info.rom_stub, Some(ETS_PRINTF));
+        assert_eq!(cpu.regs.pc, 0x4000_1000, "pc must return to ra");
+
+        let expected = "E (0) cpu_start: Invalid app image header\n";
+        assert_eq!(bus.console.text(), expected);
+        assert_eq!(
+            cpu.regs.read(REG_A0),
+            expected.len() as u32,
+            "a0 must be the number of characters written, per ets_sys.h"
+        );
+    }
+
+    #[test]
+    fn ets_printf_stub_reads_stack_spilled_varargs_through_a_real_bus() {
+        // Nine `%d` conversions: the first seven come from a1..a7, the
+        // last two spill to the stack at sp+0/sp+4 -- this is the one
+        // thing the pure `compute_printf` unit tests (cpu::rom_stubs::
+        // tests, backed by a flat fake with no register/stack distinction)
+        // cannot exercise, since that split is `CpuPrintfHost`'s job, not
+        // `compute_printf`'s.
+        use crate::mem::soc::DRAM_RANGE;
+        let fmt_addr = 0x3fcd_0200u32;
+        let sp = 0x3fcd_0300u32;
+        assert!(DRAM_RANGE.contains(&fmt_addr) && DRAM_RANGE.contains(&sp));
+
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.add_scratch_ram(fmt_addr, 64);
+        bus.add_scratch_ram(sp, 16);
+        for (i, b) in b"%d %d %d %d %d %d %d %d %d\0".iter().enumerate() {
+            bus.write8(fmt_addr + i as u32, *b);
+        }
+        bus.write32(sp, 80); // 8th vararg -- stack word 0
+        bus.write32(sp + 4, 90); // 9th vararg -- stack word 1
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, fmt_addr);
+        cpu.regs.write(REG_A1, 10);
+        cpu.regs.write(REG_A2, 20);
+        cpu.regs.write(REG_A3, 30);
+        cpu.regs.write(REG_A4, 40);
+        cpu.regs.write(REG_A5, 50);
+        cpu.regs.write(REG_A6, 60);
+        cpu.regs.write(REG_A7, 70);
+        cpu.regs.write(REG_SP, sp);
+        cpu.regs.pc = ETS_PRINTF;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(ETS_PRINTF));
+        assert_eq!(bus.console.text(), "10 20 30 40 50 60 70 80 90");
     }
 }

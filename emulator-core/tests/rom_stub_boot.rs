@@ -258,6 +258,17 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// also renamed (from `boot_currently_stalls_retrying_reboot_after_a_real_panic_abort`)
 /// in Task D4 fix round 1, since "stalls" implied a stub gap rather than a
 /// genuine firmware-triggered abort.
+///
+/// **Task 7 update**: `ets_printf` (`emulator_core::rom::ETS_PRINTF`) is no
+/// longer a `Return(0)` stub -- it's a real HLE formatter (`rom.rs`'s
+/// module doc, entry 7) -- so the `cpu_start`-rejects-this-header error
+/// line this whole abort sequence starts from is now itself visible in the
+/// console too (asserted below and by `tests/boot_progress.rs`'s
+/// `boot_reaches_cpu_starts_own_header_check_error_line`, the dedicated
+/// ratchet rung for that specific line -- not duplicated as a budget rung
+/// here, just reinforced as one more assertion on this already-pinned
+/// trace). **The actual blocker is unchanged**: `cpu_start`'s
+/// app-image-header check itself, still unresolved.
 #[test]
 fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
     let image = read_factory_bin();
@@ -299,6 +310,18 @@ fn boot_currently_aborts_reaching_the_panic_handlers_reboot_message() {
         rt.console_output().contains("Guru Meditation Error"),
         "expected the firmware's panic handler to have printed its crash \
          report; got:\n{}",
+        rt.console_output()
+    );
+    // Task 7: `ets_printf` now really formats/emits its output (see
+    // `rom.rs`'s module doc, entry 7), so the early-boot error line that
+    // triggers this whole abort/panic sequence -- previously silently
+    // dropped -- is itself visible too. Reinforces this file's pin; the
+    // dedicated ratchet rung is `tests/boot_progress.rs`'s
+    // `boot_reaches_cpu_starts_own_header_check_error_line`.
+    assert!(
+        rt.console_output().contains("cpu_start: Invalid app image header"),
+        "expected cpu_start's own header-check error line to reach the \
+         console now that ets_printf is a real formatter; got:\n{}",
         rt.console_output()
     );
 
