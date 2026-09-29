@@ -108,7 +108,19 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // trap within this 500,000-step budget. The software_reset_cpu
       // reboot-retry fault follows at step 647,238, past this budget. See
       // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message.
+      // boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message
+      // (renamed in Task D7, below).
+      //
+      // Milestone 3 Task D7: the ROM layout table (ets_rom_layout_p and the
+      // ets_rom_layout_t it points at) is now backed as read-only ROM data
+      // (emulator-core/src/rom.rs's module doc, entry 15), so the overlap
+      // check passes and that abort() is gone. Boot prints heap_init's first
+      // line, then faults on the unstubbed libgcc __clzsi2 (0x4000_079c) on
+      // the 409,759th step. That is still the only trap within this
+      // 500,000-step budget; the software_reset_cpu reboot-retry fault
+      // follows on the 650,332nd step, past it. See
+      // emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message.
       expect(report.traps).toBe(1);
 
       const fb = handle.framebuffer();

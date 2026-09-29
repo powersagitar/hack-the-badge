@@ -25,6 +25,15 @@
 //!    and fetches return the blob's bytes; writes are dropped silently, like
 //!    XIP flash. Only each blob's own bytes are mapped: every other ROM
 //!    address stays unmapped, so its fetch still traps.
+//!
+//!    **ROM data** ([`RomDataBlob`]s installed via
+//!    [`FirmwareBus::map_rom_data`], checked right after ROM code): the same
+//!    kind of small, fixed, read-only blob, but for mask-ROM *data* tables
+//!    and pointers the firmware reads (Milestone 3 Task D7: the ROM layout
+//!    table behind `ets_rom_layout_p`). Reads return the blob's bytes and
+//!    writes are dropped, but a ROM data blob is **never fetchable**:
+//!    [`Bus::fetch16`] on it returns `None`, exactly as for unmapped space.
+//!    ROM code and data blobs may not overlap each other.
 //! 4. **SYSTIMER** ([`crate::mem::soc::SYSTIMER_RANGE`]): routed to
 //!    [`FirmwareBus::systimer`], a concrete named field per this plan's
 //!    pre-flight "no trait-object peripheral dispatch" ruling — see
@@ -184,14 +193,54 @@ pub struct RomCodeBlob {
 
 impl RomCodeBlob {
     fn contains(&self, addr: u32) -> bool {
-        let start = self.base as u64;
-        let end = start + 4 * self.words.len() as u64;
-        (addr as u64) >= start && (addr as u64) < end
+        rom_words_contain(self.base, self.words, addr)
     }
 
     fn byte_at(&self, addr: u32) -> u8 {
-        let offset = (addr - self.base) as usize;
-        self.words[offset / 4].to_le_bytes()[offset % 4]
+        rom_word_byte(self.base, self.words, addr)
+    }
+}
+
+/// `true` if `addr` is one of the `4 * words.len()` bytes a ROM blob based
+/// at `base` covers. Shared by [`RomCodeBlob`] and [`RomDataBlob`].
+fn rom_words_contain(base: u32, words: &[u32], addr: u32) -> bool {
+    let start = base as u64;
+    let end = start + 4 * words.len() as u64;
+    (addr as u64) >= start && (addr as u64) < end
+}
+
+/// The little-endian byte at `addr` of a ROM blob based at `base`
+/// (`addr` must be inside it).
+fn rom_word_byte(base: u32, words: &[u32], addr: u32) -> u8 {
+    let offset = (addr - base) as usize;
+    words[offset / 4].to_le_bytes()[offset % 4]
+}
+
+/// A small, fixed, read-only **data** blob mapped at a fixed address:
+/// `[base, base + 4 * words.len())` reads `words` as little-endian 32-bit
+/// words. Writes are dropped (real mask ROM is read-only). Unlike
+/// [`RomCodeBlob`], it is **never executable**: an instruction fetch from it
+/// traps exactly as it would from unmapped space, because on real silicon
+/// these bytes are ROM *data* (tables and pointers the firmware reads), not
+/// code, and a jump into them is a bug worth surfacing.
+///
+/// The generic, chip-agnostic half of "ROM data tables" (Milestone 3 Task
+/// D7): which addresses and which words is chip-specific data that lives in
+/// `crate::rom` (see its module doc), like [`RomCodeBlob`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RomDataBlob {
+    /// Address of `words[0]`. Must be 4-byte aligned.
+    pub base: u32,
+    pub words: &'static [u32],
+}
+
+impl RomDataBlob {
+    fn contains(&self, addr: u32) -> bool {
+        rom_words_contain(self.base, self.words, addr)
+    }
+
+    fn byte_at(&self, addr: u32) -> u8 {
+        rom_word_byte(self.base, self.words, addr)
     }
 }
 
@@ -210,6 +259,11 @@ pub struct FirmwareBus {
     /// (`crate::boot::boot_from_factory_image_with_rom_stubs` installs
     /// `crate::rom`'s ESP32-C3 set).
     rom_code: Vec<RomCodeBlob>,
+    /// Read-only, non-executable ROM data blobs ([`RomDataBlob`]),
+    /// installed by [`FirmwareBus::map_rom_data`]. Empty unless a caller
+    /// installs some (`crate::boot::boot_from_factory_image_with_rom_stubs`
+    /// installs `crate::rom`'s ESP32-C3 set).
+    rom_data: Vec<RomDataBlob>,
     /// The SYSTIMER peripheral (`crate::peripherals::systimer`), a concrete
     /// named field per this plan's pre-flight design ruling — see the
     /// module doc.
@@ -437,6 +491,7 @@ impl FirmwareBus {
             xip_regions,
             ram_regions,
             rom_code: Vec::new(),
+            rom_data: Vec::new(),
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             gpio: Gpio::new(),
@@ -488,22 +543,45 @@ impl FirmwareBus {
     /// browser-supplied image, so failing loudly beats a silently shadowed
     /// blob.
     pub fn map_rom_code(&mut self, blob: RomCodeBlob) {
+        self.assert_rom_blob_fits("code", blob.base, blob.words);
+        self.rom_code.push(blob);
+    }
+
+    /// Maps a read-only, **non-executable** [`RomDataBlob`] onto the bus
+    /// (see that type's doc). Only the blob's own `4 * words.len()` bytes
+    /// become readable; none of them ever becomes fetchable, and every other
+    /// address in the surrounding ROM aperture stays catch-all.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`FirmwareBus::map_rom_code`]: a misaligned `blob.base`, or
+    /// an overlap with any ROM code *or* data blob already mapped.
+    pub fn map_rom_data(&mut self, blob: RomDataBlob) {
+        self.assert_rom_blob_fits("data", blob.base, blob.words);
+        self.rom_data.push(blob);
+    }
+
+    /// The shared precondition of [`FirmwareBus::map_rom_code`] and
+    /// [`FirmwareBus::map_rom_data`]: `base` is word-aligned, and the blob
+    /// overlaps no ROM blob of either kind already mapped.
+    fn assert_rom_blob_fits(&self, kind: &str, base: u32, words: &[u32]) {
         assert!(
-            blob.base.is_multiple_of(4),
-            "ROM code blob base {:#x} is not word-aligned",
-            blob.base
+            base.is_multiple_of(4),
+            "ROM {kind} blob base {base:#x} is not word-aligned"
         );
-        let end = blob.base as u64 + 4 * blob.words.len() as u64;
-        for other in &self.rom_code {
-            let other_end = other.base as u64 + 4 * other.words.len() as u64;
+        let end = base as u64 + 4 * words.len() as u64;
+        let mapped = self
+            .rom_code
+            .iter()
+            .map(|b| (b.base, b.words.len()))
+            .chain(self.rom_data.iter().map(|b| (b.base, b.words.len())));
+        for (other_base, other_len) in mapped {
+            let other_end = other_base as u64 + 4 * other_len as u64;
             assert!(
-                end <= other.base as u64 || other_end <= blob.base as u64,
-                "ROM code blob at {:#x} overlaps the one at {:#x}",
-                blob.base,
-                other.base
+                end <= other_base as u64 || other_end <= base as u64,
+                "ROM {kind} blob at {base:#x} overlaps the one at {other_base:#x}"
             );
         }
-        self.rom_code.push(blob);
     }
 
     /// The most recent catch-all accesses (oldest first), capped at
@@ -541,6 +619,9 @@ impl FirmwareBus {
             return region.data[offset];
         }
         if let Some(blob) = self.rom_code.iter().find(|b| b.contains(addr)) {
+            return blob.byte_at(addr);
+        }
+        if let Some(blob) = self.rom_data.iter().find(|b| b.contains(addr)) {
             return blob.byte_at(addr);
         }
         if SYSTIMER_RANGE.contains(&addr) {
@@ -603,7 +684,9 @@ impl FirmwareBus {
             region.data[offset] = val;
             return;
         }
-        if self.rom_code.iter().any(|b| b.contains(addr)) {
+        if self.rom_code.iter().any(|b| b.contains(addr))
+            || self.rom_data.iter().any(|b| b.contains(addr))
+        {
             // Mask ROM is read-only on real hardware; drop silently, same as
             // the XIP tier above.
             return;
@@ -681,7 +764,9 @@ impl FirmwareBus {
     }
 
     /// `true` if `addr` falls inside an XIP, RAM-copied or ROM-code region — i.e. is
-    /// "genuinely executable" per [`Bus::fetch16`]'s contract. Reuses the
+    /// "genuinely executable" per [`Bus::fetch16`]'s contract. ROM *data*
+    /// blobs ([`RomDataBlob`]) are deliberately not checked here, so they are
+    /// never fetchable. Reuses the
     /// same region-membership checks [`FirmwareBus::read_byte`]/
     /// [`FirmwareBus::write_byte`] use, rather than duplicating them.
     fn is_mapped(&self, addr: u32) -> bool {
@@ -1083,6 +1168,109 @@ mod tests {
         });
         bus.map_rom_code(RomCodeBlob {
             base: 0x4000_1004,
+            words: &TWO_WORDS,
+        });
+    }
+
+    // ---- Task D7: read-only, non-executable ROM data blobs ----
+
+    #[test]
+    fn rom_data_blob_is_readable_and_read_only() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0000,
+            words: &TWO_WORDS,
+        });
+
+        assert_eq!(bus.read32(0x3ff1_0000), 0x0000_0013);
+        assert_eq!(bus.read32(0x3ff1_0004), 0x0000_8067);
+        assert_eq!(bus.read8(0x3ff1_0005), 0x80);
+
+        bus.write32(0x3ff1_0000, 0xdead_beef);
+        assert_eq!(
+            bus.read32(0x3ff1_0000),
+            0x0000_0013,
+            "ROM data must be read-only"
+        );
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "blob accesses are mapped, not catch-all traffic"
+        );
+    }
+
+    #[test]
+    fn rom_data_blob_is_never_fetchable() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0000,
+            words: &TWO_WORDS,
+        });
+        // Its words *are* valid instructions (nop; ret), so a fetch that
+        // wrongly succeeded would execute them -- it must not.
+        for addr in (0x3ff1_0000..0x3ff1_0008).step_by(2) {
+            assert_eq!(bus.fetch16(addr), None, "{addr:#x} must not be fetchable");
+        }
+
+        let mut cpu = crate::cpu::Cpu::new();
+        cpu.csr.mtvec = 0x9000;
+        cpu.regs.pc = 0x3ff1_0000;
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken, "jumping into ROM data must trap");
+        assert_eq!(
+            cpu.csr.mcause,
+            crate::cpu::exception_code::INSTRUCTION_ACCESS_FAULT
+        );
+        assert_eq!(cpu.csr.mtval, 0x3ff1_0000);
+    }
+
+    #[test]
+    fn rom_data_blob_maps_only_its_own_bytes() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0000,
+            words: &TWO_WORDS,
+        });
+
+        assert_eq!(bus.read32(0x3ff0_fffc), 0);
+        assert_eq!(bus.read32(0x3ff1_0008), 0);
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == 0x3ff0_fffc));
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == 0x3ff1_0008));
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn overlapping_rom_data_blobs_are_rejected() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0000,
+            words: &TWO_WORDS,
+        });
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0004,
+            words: &TWO_WORDS,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "overlaps")]
+    fn a_rom_data_blob_overlapping_a_rom_code_blob_is_rejected() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_code(RomCodeBlob {
+            base: 0x4000_1000,
+            words: &TWO_WORDS,
+        });
+        bus.map_rom_data(RomDataBlob {
+            base: 0x4000_1004,
+            words: &TWO_WORDS,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "not word-aligned")]
+    fn a_misaligned_rom_data_blob_is_rejected() {
+        let mut bus = bus_with(vec![]);
+        bus.map_rom_data(RomDataBlob {
+            base: 0x3ff1_0002,
             words: &TWO_WORDS,
         });
     }

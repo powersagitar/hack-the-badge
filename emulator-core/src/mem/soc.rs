@@ -28,6 +28,14 @@ pub const DROM_RANGE: Range<u32> = 0x3C00_0000..0x3E00_0000;
 /// mechanism as [`DROM_RANGE`], but for code fetches.
 pub const IROM_RANGE: Range<u32> = 0x4200_0000..0x4400_0000;
 
+/// The mask ROM's read-only *data* aperture (DROM mask):
+/// `SOC_DROM_MASK_LOW..SOC_DROM_MASK_HIGH` in ESP-IDF v5.5.3's
+/// `components/soc/esp32c3/include/soc/soc.h`. Nothing backs it wholesale:
+/// only the specific ROM data words `crate::rom` installs as
+/// `crate::mem::bus::RomDataBlob`s are mapped, and every other address in
+/// it stays catch-all (reads `0`, logged).
+pub const DROM_MASK_RANGE: Range<u32> = 0x3FF0_0000..0x3FF2_0000;
+
 /// Internal SRAM mapped as data (DRAM): where `.data`/`.rodata`/`.bss`, the
 /// heap, and the stack actually live at runtime. The app image only carries
 /// initialized bytes for the segments that need them (`.data`/`.rodata`);

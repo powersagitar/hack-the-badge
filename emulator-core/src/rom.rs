@@ -4,7 +4,9 @@
 //! The *mechanism* lives in `crate::cpu::rom_stubs` (chip-agnostic, per
 //! `crate::cpu`'s own "knows nothing about the ESP32-C3" rule). This module
 //! holds the chip-specific half: which fixed ROM addresses we intercept, and
-//! what each one pretends to have done.
+//! what each one pretends to have done. It also holds the few guest-executed
+//! ROM code blobs (entry 14) and ROM data tables (entry 15) that a stub
+//! cannot replace.
 //!
 //! ## Where the addresses come from
 //!
@@ -490,6 +492,75 @@
 //!     409,071). That is a missing ROM *data table*, outside Task D6's
 //!     "atomic ROM libc call" continuation rule, so the task stopped there.
 //!
+//! 15. **Milestone 3 Task D7: ROM *data*, the layout table
+//!     (`ets_rom_layout_p`)** — entry 14's stall. This is the first ROM
+//!     *data* this emulator backs; everything above is ROM code.
+//!
+//!     **Which code reads it, and which fields** (disassembled from
+//!     `factory.bin`'s IROM segment): `s_prepare_reserved_regions()` at
+//!     `0x4200_29c4` does `lui a5, 0x3ff20; lw a5, -4(a5)` (loads
+//!     `ets_rom_layout_p` at `0x3ff1_fffc`), then `lw a5, 4(a5)` (loads the
+//!     struct's second field, byte offset 4) and stores it as
+//!     `reserved[0].start`. `reserved[0].end` is the immediate `0x3fce0000`
+//!     (`SOC_DIRAM_DRAM_HIGH`, `components/soc/esp32c3/include/soc/soc.h`).
+//!     This matches ESP-IDF v5.5.3's
+//!     `components/heap/port/memory_layout_utils.c`
+//!     (`reserved[0].start = (intptr_t)layout->dram0_rtos_reserved_start;`,
+//!     under `ESP_ROM_HAS_LAYOUT_TABLE`, which
+//!     `components/esp_rom/esp32c3/esp_rom_caps.h` sets). Per
+//!     `components/esp_rom/esp32c3/include/esp32c3/rom/rom_layout.h`,
+//!     offset 4 of `ets_rom_layout_t` is `dram0_rtos_reserved_start` (the
+//!     second of 40 `void *` fields, with `SUPPORT_BTDM` = `SUPPORT_WIFI` =
+//!     1 and `SUPPORT_USB_DWCOTG` = 0). That instruction pair is the only
+//!     `lui` of `0x3ff20` in the image's IROM and IRAM segments. A 12-bit
+//!     load offset from a `lui 0x3ff1f` base can reach at most `0x3ff1_f7ff`.
+//!     No `auipc` in either segment targets the DROM mask, and no aligned
+//!     word anywhere in the image equals `0x3ff1fffc` or `0x3ff1be3c`. So
+//!     nothing else in this firmware reads `ets_rom_layout_p`, and so no
+//!     other field of the table is ever read.
+//!
+//!     **Where the values come from**: the mask ROM, not IDF source. They
+//!     were read from Espressif's published ROM ELF, `esp32c3_rev3_rom.elf`,
+//!     in `espressif/esp-rom-elfs` release `20241011`
+//!     (`esp-rom-elfs-20241011.tar.gz`, SHA-256
+//!     `921f000164a421c7628fbfee55b173384aafaa51883adc65cd27bf9b0af9e9a9`,
+//!     the version ESP-IDF v5.5.3's `tools/tools.json` pins; the ELF itself
+//!     has SHA-256
+//!     `19ac22e08707df926fb0cf4c54795d4067b983fae8635f396ded173a6d78fc3c`).
+//!     The rev3 ELF is the right one for this badge: its chip is rev v0.4
+//!     (ECO3 silicon), and the firmware's minimum is v0.3. In that ELF:
+//!     - `ets_rom_layout_p` (`0x3ff1fffc`, in `.rodata.interface`) holds
+//!       `0x3ff1be3c`, the address of the 160-byte local object
+//!       `ets_rom_layout` (in `.rodata`): [`ETS_ROM_LAYOUT`].
+//!     - Its field at offset 4 is `0x3fcdf060`, equal to the ELF's own
+//!       `_dram0_rtos_reserved_start` symbol: [`DRAM0_RTOS_RESERVED_START`].
+//!       (The rev0 ELF differs: it has `0x3ff1be30` and `0x3fcdf260`.)
+//!
+//!     Only that one consumed field carries its real value. The other 39
+//!     fields are `0` in [`ETS_ROM_LAYOUT_TABLE`], because the evidence above
+//!     shows this firmware never reads them. The table is mapped at its
+//!     real address and full size. Neither blob clashes with anything: both
+//!     lie in the DROM mask (`SOC_DROM_MASK_LOW..SOC_DROM_MASK_HIGH`,
+//!     [`crate::mem::soc::DROM_MASK_RANGE`]), which nothing else on the bus
+//!     maps.
+//!
+//!     **Mechanism**: [`RomDataBlob`]/[`FirmwareBus::map_rom_data`], the
+//!     data twin of entry 14's [`RomCodeBlob`]. It is a read-only region in
+//!     `FirmwareBus`'s ordered region list, and it is **never fetchable**:
+//!     a jump into ROM data still traps, like unmapped space. The ESP32-C3
+//!     data is [`ESP32C3_ROM_DATA`], installed by
+//!     [`install_esp32c3_rom_data`] from
+//!     `crate::boot::boot_from_factory_image_with_rom_stubs`.
+//!
+//!     With it, the overlap check passes: entry 0 becomes `0x3fcdf060 -
+//!     0x3fce0000` and sorts last. Boot prints `I (0) heap_init:
+//!     Initializing. RAM available for dynamic allocation:`. It then faults
+//!     on the 409,759th step, on the unstubbed libgcc `__clzsi2`
+//!     (`0x4000_079c`, `esp32c3.rom.libgcc.ld`), called from `0x4212_9480`
+//!     as `32 - __clzsi2(size)` while registering a heap region. That is a
+//!     libgcc bit-count helper, not ROM data or a ROM libc/string call, so
+//!     Task D7 stopped there.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -509,16 +580,18 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D6** (this table, 80 stubs, plus one guest-executed
-//! routine, `qsort`, from [`ESP32C3_ROM_CODE`]): boot passes `cpu_start`'s
-//! header check (Task D5), prints the full `cpu_start`/`app_init`/
-//! `efuse_init` log up to `efuse_init: Chip rev: v0.0`, runs ROM `qsort`
-//! (entry 14), and then aborts in `s_prepare_reserved_regions()` because
-//! the ROM layout table (`ets_rom_layout_p`) is not backed. The panic
-//! handler prints the abort report, faults on the still-unstubbed
-//! `software_reset_cpu` and loops. **The actual blocker is now the unbacked
-//! ROM layout table.** See `tests/rom_stub_boot.rs`'s
-//! `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`.
+//! **As of Task D7** (this table, 80 stubs, one guest-executed routine,
+//! `qsort`, from [`ESP32C3_ROM_CODE`], and the ROM layout table from
+//! [`ESP32C3_ROM_DATA`]): boot passes `cpu_start`'s header check (Task
+//! D5), prints the full `cpu_start`/`app_init`/`efuse_init` log up to
+//! `efuse_init: Chip rev: v0.0`, runs ROM `qsort` (entry 14), passes the
+//! reserved-region check (entry 15), and prints `heap_init: Initializing.
+//! RAM available for dynamic allocation:`. It then faults on the unstubbed
+//! libgcc `__clzsi2` (`0x4000_079c`). The panic handler prints a "Guru
+//! Meditation Error" report, faults on the still-unstubbed
+//! `software_reset_cpu` and loops. **The actual blocker is now the
+//! unstubbed `__clzsi2`.** See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`.
 //! The rest of this section is the Task 7 snapshot, kept as history.
 //!
 //! With this table installed (as of Task 7), the real `factory.bin` runs
@@ -560,7 +633,7 @@ use crate::cpu::encode::{
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,
 };
-use crate::mem::bus::{FirmwareBus, RomCodeBlob};
+use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
 use crate::peripherals::intc::{CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_TYPE_REG};
 
@@ -842,6 +915,70 @@ pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
 pub fn install_esp32c3_rom_code(bus: &mut FirmwareBus) {
     for blob in ESP32C3_ROM_CODE {
         bus.map_rom_code(*blob);
+    }
+}
+
+/// `ets_rom_layout_p`: the ROM *data* word holding a pointer to the ROM's
+/// `ets_rom_layout_t` table (`esp32c3.rom.ld`: `ets_rom_layout_p =
+/// 0x3ff1fffc;`). See the module doc's entry 15.
+pub const ETS_ROM_LAYOUT_P: u32 = 0x3ff1_fffc;
+
+/// Where the ROM's `ets_rom_layout_t` table itself lives: the value of the
+/// `ets_rom_layout_p` word (and the local symbol `ets_rom_layout`, 160
+/// bytes) in `esp32c3_rev3_rom.elf` from `espressif/esp-rom-elfs` release
+/// `20241011` (module doc, entry 15).
+pub const ETS_ROM_LAYOUT: u32 = 0x3ff1_be3c;
+
+/// `sizeof(ets_rom_layout_t)` in words: 40 `void *` fields per
+/// `components/esp_rom/esp32c3/include/esp32c3/rom/rom_layout.h`
+/// (`SUPPORT_BTDM` = `SUPPORT_WIFI` = 1, `SUPPORT_USB_DWCOTG` = 0), matching
+/// the ELF's 160-byte `ets_rom_layout` symbol.
+const ETS_ROM_LAYOUT_WORDS: usize = 40;
+
+/// Word index of `dram0_rtos_reserved_start` in `ets_rom_layout_t` (the
+/// second field, byte offset 4). The only field this firmware reads.
+pub const DRAM0_RTOS_RESERVED_START_FIELD: usize = 1;
+
+/// `ets_rom_layout_t::dram0_rtos_reserved_start` in `esp32c3_rev3_rom.elf`
+/// (equal to that ELF's `_dram0_rtos_reserved_start` linker symbol): the
+/// start of the DRAM the ROM keeps for its own `.data`/`.bss`, which
+/// ESP-IDF reserves up to `SOC_DIRAM_DRAM_HIGH` (`0x3fce0000`).
+pub const DRAM0_RTOS_RESERVED_START: u32 = 0x3fcd_f060;
+
+/// The `ets_rom_layout_p` word: a pointer to [`ETS_ROM_LAYOUT_TABLE`].
+pub const ETS_ROM_LAYOUT_P_WORD: [u32; 1] = [ETS_ROM_LAYOUT];
+
+/// The `ets_rom_layout_t` table, full size. Only the field this firmware
+/// consumes ([`DRAM0_RTOS_RESERVED_START_FIELD`]) carries its real value;
+/// every other field is `0`, because nothing reads it (module doc, entry
+/// 15, has the evidence). A future consumer of another field must back it
+/// from the same ELF, not rely on the `0`.
+pub const ETS_ROM_LAYOUT_TABLE: [u32; ETS_ROM_LAYOUT_WORDS] = {
+    let mut table = [0; ETS_ROM_LAYOUT_WORDS];
+    table[DRAM0_RTOS_RESERVED_START_FIELD] = DRAM0_RTOS_RESERVED_START;
+    table
+};
+
+/// Every ROM data blob this module maps (module doc, entry 15), installed
+/// by [`install_esp32c3_rom_data`].
+pub const ESP32C3_ROM_DATA: &[RomDataBlob] = &[
+    RomDataBlob {
+        base: ETS_ROM_LAYOUT_P,
+        words: &ETS_ROM_LAYOUT_P_WORD,
+    },
+    RomDataBlob {
+        base: ETS_ROM_LAYOUT,
+        words: &ETS_ROM_LAYOUT_TABLE,
+    },
+];
+
+/// Maps every [`ESP32C3_ROM_DATA`] blob onto `bus` as read-only,
+/// non-executable memory ([`FirmwareBus::map_rom_data`]). The ROM-data
+/// counterpart of [`install_esp32c3_rom_code`];
+/// `crate::boot::boot_from_factory_image_with_rom_stubs` installs both.
+pub fn install_esp32c3_rom_data(bus: &mut FirmwareBus) {
+    for blob in ESP32C3_ROM_DATA {
+        bus.map_rom_data(*blob);
     }
 }
 
@@ -2006,5 +2143,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Milestone 3 Task D7: ROM layout data (`ets_rom_layout_p`) ----
+
+    /// An empty-flash bus with only `crate::rom`'s ROM data installed, the
+    /// way `crate::boot` installs it.
+    fn bus_with_rom_data() -> FirmwareBus {
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        install_esp32c3_rom_data(&mut bus);
+        bus
+    }
+
+    #[test]
+    fn ets_rom_layout_p_points_at_the_rom_layout_table() {
+        let mut bus = bus_with_rom_data();
+        assert_eq!(bus.read32(0x3ff1_fffc), 0x3ff1_be3c);
+    }
+
+    #[test]
+    fn the_rom_layout_tables_dram0_rtos_reserved_start_is_the_rev3_rom_value() {
+        let mut bus = bus_with_rom_data();
+        // Exactly the firmware's own access sequence (0x420029d6..de):
+        // `lw a5, -4(0x3ff20000)`, then `lw a5, 4(a5)`.
+        let layout = bus.read32(0x3ff2_0000 - 4);
+        assert_eq!(bus.read32(layout + 4), 0x3fcd_f060);
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "both loads hit mapped ROM data, not the catch-all"
+        );
+    }
+
+    #[test]
+    fn unconsumed_rom_layout_fields_read_zero() {
+        let mut bus = bus_with_rom_data();
+        for field in (0..40u32).filter(|&i| i != 1) {
+            assert_eq!(bus.read32(0x3ff1_be3c + 4 * field), 0, "field {field}");
+        }
+    }
+
+    #[test]
+    fn rom_layout_data_is_not_executable() {
+        for addr in [0x3ff1_fffcu32, 0x3ff1_be3c, 0x3ff1_be40] {
+            let mut bus = bus_with_rom_data();
+            let mut cpu = Cpu::new();
+            cpu.set_rom_stubs(esp32c3_rom_stubs());
+            cpu.csr.mtvec = 0x4038_0000;
+            cpu.regs.pc = addr;
+            let info = cpu.step(&mut bus);
+            assert!(info.trap_taken, "{addr:#x} must trap");
+            assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+            assert_eq!(cpu.csr.mtval, addr);
+        }
+    }
+
+    #[test]
+    fn neighbouring_drom_mask_addresses_still_read_zero() {
+        let mut bus = bus_with_rom_data();
+        // Just below the pointer word, just past the table, and just below
+        // the table: all still unmapped catch-all space.
+        for addr in [0x3ff1_fff8u32, 0x3ff1_bedc, 0x3ff1_be38] {
+            assert_eq!(bus.read32(addr), 0, "{addr:#x}");
+            assert!(
+                bus.unmapped_log().iter().any(|a| a.addr == addr),
+                "{addr:#x} is logged as unmapped"
+            );
+        }
+    }
+
+    #[test]
+    fn rom_data_lies_inside_the_drom_mask_and_clear_of_rom_code() {
+        use crate::mem::soc::DROM_MASK_RANGE;
+        assert!(!ESP32C3_ROM_DATA.is_empty());
+        for blob in ESP32C3_ROM_DATA {
+            let end = blob.base as u64 + 4 * blob.words.len() as u64;
+            assert!(
+                DROM_MASK_RANGE.contains(&blob.base) && end <= DROM_MASK_RANGE.end as u64,
+                "blob at {:#x} is outside the DROM mask",
+                blob.base
+            );
+        }
+        // Installing ROM code and ROM data together must not trip
+        // `FirmwareBus`'s overlap assertion.
+        let mut bus = bus_with_rom_data();
+        install_esp32c3_rom_code(&mut bus);
     }
 }

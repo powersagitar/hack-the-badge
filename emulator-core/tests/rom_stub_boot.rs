@@ -41,7 +41,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later stall (see this file's renamed
-    // `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`
+    // `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -76,6 +76,12 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // ILLEGAL_INSTRUCTION at step 409,071, from an `abort()` over the
     // unbacked ROM layout table (see the pinned-stall test below). 350,000
     // stays clear by ~59,071 steps (~17%).
+    //
+    // Task D7 status: the ROM layout table is now backed (`emulator_core::
+    // rom`'s module doc, entry 15), so that `abort()` is gone; boot's first
+    // trap is now the unstubbed libgcc `__clzsi2` fault at step 409,759
+    // (see the pinned-stall test below). 350,000 stays clear by ~59,759
+    // steps (~17%).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -199,85 +205,79 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// This test **pins today's panic path, not boot progress past it**.
-/// **Renamed and re-pointed in Task D6** (from
+/// **Renamed and re-pointed in Task D7** (from
+/// `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`,
+/// itself renamed in Task D6 from
 /// `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`,
-/// itself renamed in Task D5 from
+/// renamed in Task D5 from
 /// `boot_currently_aborts_reaching_the_panic_handlers_reboot_message`).
 ///
-/// **What changed in Task D6**: ROM libc `qsort` (`0x4000_0434`) is now
-/// real guest-executed code (`emulator_core::rom::QSORT_BODY`, see
-/// `emulator-core/src/rom.rs`'s module doc, entry 14), so the
-/// `INSTRUCTION_ACCESS_FAULT` Task D5 pinned at step 408,481 is gone: the
-/// call runs and returns (step 408,906). Task D6 Step 1 also **refuted**
-/// D5's unconfirmed guess about the caller: it is not `do_system_init_fn()`
-/// but ESP-IDF v5.5.3's `s_prepare_reserved_regions()`
-/// (`components/heap/port/memory_layout_utils.c`), sorting its 5
-/// `soc_reserved_region_t {start, end}` entries (hence `size` 8) with
-/// `s_compare_reserved_regions` (`0x420029bc`).
+/// **What changed in Task D7**: the ROM *data* pointer `ets_rom_layout_p`
+/// (`0x3ff1_fffc`) and the `ets_rom_layout_t` table it points at are now
+/// backed (`emulator_core::rom::ESP32C3_ROM_DATA`, see
+/// `emulator-core/src/rom.rs`'s module doc, entry 15), so
+/// `s_prepare_reserved_regions()`'s entry 0 is the real
+/// `{0x3fcdf060, 0x3fce0000}` instead of `{0, 0x3fce0000}`. The overlap
+/// check passes: the `E (0) memory_layout: ...` line and its `abort()`
+/// (Task D6's pinned stall) are gone. ROM `qsort` now returns at step
+/// 409,036 (later than D6's 408,906 because the input differs: entry 0 now
+/// sorts last, not first).
 ///
-/// **The new stall** is that function's own validity check, right after the
-/// sort: entry 0 of the array is the ROM layout table's reserved DRAM range,
-/// `{ets_rom_layout_p->dram0_rtos_reserved_start, SOC_DIRAM_DRAM_HIGH}`
-/// (`ESP_ROM_HAS_LAYOUT_TABLE` is set for the ESP32-C3). `ets_rom_layout_p`
-/// is a **ROM data** pointer (`esp32c3.rom.ld`: `ets_rom_layout_p =
-/// 0x3ff1fffc;`) that this emulator does not back, so it reads `0` from the
-/// bus catch-all, and so does the `NULL`-relative field load after it. The
-/// region becomes `0x00000000 - 0x3fce0000`, which overlaps the next one
-/// after sorting, so the firmware logs
-/// `E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range 0x00000000 -
-/// 0x3fce0000 overlaps with 0x3fc80000 - 0x3fc99c00` (step 408,970) and calls
-/// `abort()`. That line is also end-to-end evidence that `qsort` really
-/// sorted: in the unsorted input, `0x3fc80000` was the 4th element, not the
-/// 2nd. `abort()` reaches the `ILLEGAL_INSTRUCTION` trap in `panic_abort()`
-/// at `0x4038e4fa` (step 409,071), which is the same mechanism Task D4
-/// pinned. The panic handler prints `abort() was called at PC 0x42002acf on
-/// core 0` plus a register dump, then "Rebooting..." (step ~646,656). It
-/// then faults on the still-unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`, step 647,238), re-enters the panic handler, prints "Guru
-/// Meditation Error" (step ~648,960) and loops (next fault at step 887,681).
+/// **The new stall**: boot prints ESP-IDF's normal
+/// `I (0) heap_init: Initializing. RAM available for dynamic allocation:`
+/// and then, on the 409,759th step, fetches from `0x4000_079c`, which is
+/// libgcc `__clzsi2` (`esp32c3.rom.libgcc.ld`). It is not stubbed, so this
+/// is an `INSTRUCTION_ACCESS_FAULT`. The caller (`0x4212_9480`) computes
+/// `32 - __clzsi2(size)` (a TLSF "find last set" for the heap being
+/// registered; `a0 = 0x2e6c` here). Because this is a hardware exception,
+/// not an `abort()`, the panic handler prints "Guru Meditation Error"
+/// straight away (step ~411,500), then "Rebooting..." (step ~649,700), then
+/// faults on the still-unstubbed ROM `software_reset_cpu` (`0x4000_0094`)
+/// on the 650,332nd step, and loops (next fault on step 890,793).
 /// `software_reset_cpu` stays unstubbed: it is reached only on the panic
-/// path, and stubbing it would not fix the actual blocker, the unbacked ROM
-/// layout table.
+/// path. `__clzsi2` was left for a later task: it is a libgcc bit-count
+/// helper, outside Task D7's "ROM data, or an atomic ROM libc/string call"
+/// continuation rule.
 ///
-/// This test is **deliberately expected to break** once a later task gives
-/// `ets_rom_layout_p` a real value (or otherwise gets boot past this
-/// check). At that point this fault sequence disappears, and whoever makes
-/// that fix should delete or replace this test rather than chase a new
-/// pinned value here.
+/// This test is **deliberately expected to break** once a later task backs
+/// `__clzsi2`. At that point this fault sequence disappears, and whoever
+/// makes that fix should delete or replace this test rather than chase a
+/// new pinned value here.
 #[test]
-fn boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message(
+fn boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message(
 ) {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through the old qsort fault (step 408,481) and past qsort's
-    // return (step 408,906) with zero traps. The first trap comes at step
-    // 409,071.
-    let summary = rt.run(409_000);
+    // Phase 1: through ROM qsort, the reserved-region check (Task D6's old
+    // abort) and heap_init's first line, with zero traps.
+    let summary = rt.run(409_758);
     assert_eq!(
         summary.traps, 0,
-        "ROM qsort must run and return without any trap (pre-Task-D6 it \
-         faulted at step 408,481); got {summary:?}"
+        "boot must run through the reserved-region check without any trap \
+         (pre-Task-D7 it aborted there; first trap at step 409,071); got {summary:?}"
     );
 
-    // Phase 2: the abort()'s panic_abort() trap -- ILLEGAL_INSTRUCTION at
-    // 0x4038e4fa, not an instruction-access fault.
-    let summary = rt.run(100);
+    // Phase 2: the very next step fetches the unstubbed ROM `__clzsi2`.
+    let summary = rt.run(1);
     assert_eq!(
         summary.traps, 1,
-        "expected panic_abort()'s trap; got {summary:?}"
+        "expected the __clzsi2 fault; got {summary:?}"
     );
-    assert_eq!(summary.last_instruction_fault, None);
+    assert_eq!(
+        summary.last_instruction_fault,
+        Some(0x4000_079c),
+        "expected an INSTRUCTION_ACCESS_FAULT on __clzsi2 (esp32c3.rom.libgcc.ld)"
+    );
     assert_eq!(
         rt.cpu().csr.mcause,
-        emulator_core::cpu::exception_code::ILLEGAL_INSTRUCTION
+        exception_code::INSTRUCTION_ACCESS_FAULT
     );
-    assert_eq!(rt.cpu().csr.mepc, 0x4038_e4fa);
 
     // Phase 3, up to 660,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (step 647,238). 12,762 steps of
-    // margin, and the next fault is not until step 887,681.
-    let summary = rt.run(660_000 - 409_100);
+    // faults on unstubbed software_reset_cpu (the 650,332nd step). 9,668
+    // steps of margin, and the next fault is not until step 890,793.
+    let summary = rt.run(660_000 - 409_759);
     assert_eq!(
         summary.traps, 1,
         "expected exactly one more trap: the software_reset_cpu \
@@ -291,29 +291,28 @@ fn boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_
     );
 
     let console = rt.console_output();
-    // The root cause, in the firmware's own words. Generic ESP-IDF text
-    // plus SoC memory-map addresses, never identity data (see this file's
+    // Generic ESP-IDF text only, never identity data (see this file's
     // module doc and `docs/firmware-emulator-notes.md`'s data-handling
     // note).
     assert!(
-        console.contains(
-            "E (0) memory_layout: SOC_RESERVE_MEMORY_REGION region range \
-             0x00000000 - 0x3fce0000 overlaps with 0x3fc80000 - 0x3fc99c00"
-        ),
-        "expected s_prepare_reserved_regions()'s overlap error, which is \
-         also proof that qsort sorted the regions; got:\n{console}"
+        console.contains("I (0) heap_init: Initializing. RAM available for dynamic allocation:"),
+        "expected heap_init's first line; got:\n{console}"
     );
     assert!(
-        console.contains("abort() was called at PC 0x42002acf on core 0"),
-        "expected the abort() from s_prepare_reserved_regions(); got:\n{console}"
+        !console.contains("memory_layout"),
+        "the reserved-region overlap error (Task D6's stall) must be gone; got:\n{console}"
+    );
+    assert!(
+        !console.contains("abort() was called"),
+        "nothing on this path calls abort() any more; got:\n{console}"
+    );
+    assert!(
+        console.contains("Guru Meditation Error"),
+        "expected the panic handler's crash report for the __clzsi2 fault; got:\n{console}"
     );
     assert!(
         console.contains("Rebooting..."),
         "expected the panic handler's generic pre-restart text; got:\n{console}"
-    );
-    assert!(
-        console.contains("Guru Meditation Error"),
-        "expected the re-entered panic handler's crash report; got:\n{console}"
     );
 
     // Task D5's fix still holds: cpu_start's header check passes.

@@ -193,6 +193,35 @@ emulated ROM address space, and the CPU runs it like any other code:
   (`qsort` isn't stable either way). The one observed caller has no equal
   elements, so this doesn't affect it.
 
+**ROM data (Milestone 3 Task D7).** Some of what firmware takes from the
+mask ROM is *data*, not code: tables and pointers at fixed DROM-mask
+addresses (`SOC_DROM_MASK_LOW..SOC_DROM_MASK_HIGH` = `0x3ff0_0000..
+0x3ff2_0000`, `components/soc/esp32c3/include/soc/soc.h`). These are
+backed the same split way:
+
+- `emulator-core/src/mem/bus.rs`'s `RomDataBlob`/`FirmwareBus::map_rom_data`
+  is a generic read-only region, checked right after ROM code. Unlike ROM
+  code it is **never fetchable**: a jump into ROM data traps like unmapped
+  space. Only each blob's own bytes are mapped; the rest of the DROM mask
+  still reads `0` and is logged. ROM code and data blobs can't overlap.
+- `rom.rs`'s `ESP32C3_ROM_DATA` holds the ESP32-C3 values:
+  `ets_rom_layout_p` (`0x3ff1_fffc`, `esp32c3.rom.ld`) holds `0x3ff1_be3c`,
+  and the 40-word `ets_rom_layout_t` there
+  (`components/esp_rom/esp32c3/include/esp32c3/rom/rom_layout.h`) has
+  `dram0_rtos_reserved_start = 0x3fcd_f060`.
+- The **values** come from the mask ROM, so IDF source can't supply them.
+  They were read from Espressif's published ROM ELF: `esp32c3_rev3_rom.elf`
+  in `espressif/esp-rom-elfs` release `20241011` (the release ESP-IDF
+  v5.5.3's `tools/tools.json` pins; tarball SHA-256 `921f0001…e9a9`, ELF
+  SHA-256 `19ac22e0…fc3c`, full hashes in `rom.rs`'s entry 15). Rev3 matches
+  the badge's v0.4 (ECO3) chip; the rev0 ELF has different addresses.
+  The ELF is not committed.
+- Only fields the firmware actually reads get real values. Disassembly of
+  `factory.bin` shows exactly one reader of `ets_rom_layout_p`, and it
+  reads only `dram0_rtos_reserved_start` (offset 4). The other 39 fields
+  are `0`. A later consumer of another field must back it from the same
+  ELF, not rely on the `0`.
+
 This is split across two files on purpose:
 
 - `emulator-core/src/cpu/rom_stubs.rs` — the **generic mechanism** (a stub
@@ -691,15 +720,42 @@ predicted these blockers would surface once TIMG unblocks further boot:
    409,071). The panic handler prints `abort() was called at PC 0x42002acf
    on core 0` and "Rebooting...", faults on the unstubbed
    `software_reset_cpu` (step 647,238), prints "Guru Meditation Error" and
-   loops. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`.
+   loops. Pinned at the time in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`
+   (historical name: since Task D7 that test is
+   `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`).
 
-   **Next candidate**: give the ROM layout table real contents. That means
-   backing `ets_rom_layout_p` (`0x3ff1_fffc`) with a pointer to an
-   `ets_rom_layout_t` (`components/esp_rom/esp32c3/include/esp32c3/rom/rom_layout.h`)
-   whose fields hold values that can be cited, not guessed. Other fields of
-   the same struct may be read later too. This is ROM *data*, not a ROM
-   call, so it was outside Task D6's scope.
+   **Task D7 (ROM layout data) and the current stall.** The ROM layout
+   table is now backed (see "ROM data" above). The only reader,
+   `s_prepare_reserved_regions()` at `0x4200_29d6`, loads
+   `ets_rom_layout_p` and then the field at offset 4, now `0x3fcdf060`. So
+   entry 0 is `0x3fcdf060 - 0x3fce0000`. It sorts last, nothing overlaps,
+   and the `memory_layout` error and its `abort()` are gone. `qsort` now
+   returns at step 409,036 (its input changed). Boot prints ESP-IDF's
+   normal `I (0) heap_init: Initializing. RAM available for dynamic
+   allocation:`.
+
+   **The current stall**: on the 409,759th step, boot fetches from
+   `0x4000_079c`, which is the unstubbed libgcc `__clzsi2`
+   (`esp32c3.rom.libgcc.ld`). The caller (`0x4212_9480`) computes
+   `32 - __clzsi2(size)` (`a0 = 0x2e6c`), a TLSF "find last set" while
+   registering a heap region. The `INSTRUCTION_ACCESS_FAULT` is a hardware
+   exception, so the panic handler prints "Guru Meditation Error" right
+   away (step ~411,500), then "Rebooting..." (step ~649,700), faults on the
+   unstubbed `software_reset_cpu` (650,332nd step) and loops. Pinned in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`.
+
+   **Next candidate**: back `__clzsi2`, and re-probe. It needs a new
+   `RomStubEffect` (the existing `Int64Op` family is 64-bit binary
+   operations; this is a 32-bit unary bit count). Its semantics are
+   defined by GCC's internals manual ("Integer library routines":
+   "These functions return the number of leading 0-bits in a, starting at
+   the most significant bit position. If a is zero, the result is
+   undefined."). The rest of the bit-count family in
+   `esp32c3.rom.libgcc.ld` (`__clzdi2`, `__ctzsi2`, …) is left to fault
+   until observed, per `rom.rs`'s scoping. Task D7 stopped here because
+   this is a libgcc helper, not ROM data or a ROM libc/string call.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -742,12 +798,12 @@ predicted these blockers would surface once TIMG unblocks further boot:
    aligned start (`drom_addr_aligned`) — the source comment says this is
    "for app to find the boot partition." `crate::mem::bus::FirmwareBus`
    doesn't add this extra mapping at all today; nothing in the observed
-   boot trace through Task D6's stall (the unbacked ROM layout table, item
-   1) has touched that fixed high address, so it's not yet a confirmed
+   boot trace through Task D7's stall (the unstubbed `__clzsi2`, item 1)
+   has touched that fixed high address, so it's not yet a confirmed
    blocker — but it's a plausible **candidate cause of a later
    partition-table/`esp_partition_find`-style stall**, worth checking first
-   if boot gets past the reserved-region check and stalls again on an
-   unmapped read inside the DROM aperture near its top end.
+   if boot gets past heap init and stalls again on an unmapped read inside
+   the DROM aperture near its top end.
 
 None of the above are correctness bugs *today* — they're dormant because
 boot doesn't reach the code paths that would exercise them. They're

@@ -29,16 +29,18 @@ ESP32-C3 device), in two complementary modes:
    `app_init`/`efuse_init` build-metadata block, all visible on the emulated
    console since ROM `ets_printf` is HLE-stubbed as a real C-printf
    formatter (Milestone 3 Task 7). ROM libc `qsort` then runs as real
-   guest-executed code (Milestone 3 Task D6). Its caller, ESP-IDF's
-   `s_prepare_reserved_regions()`, then fails its own overlap check,
-   because the ROM layout table pointer `ets_rom_layout_p` (ROM *data* at
-   `0x3ff1_fffc`) isn't backed and reads 0. The firmware logs `E (0)
-   memory_layout: SOC_RESERVE_MEMORY_REGION ... overlaps ...` (step
-   ~408,970) and calls `abort()`, so the panic handler runs and loops in
-   `software_reset_cpu` retry — well before reaching any built-in app. The
-   current blocker is this unbacked ROM layout table (a known, documented
-   gap — see `docs/firmware-emulator-notes.md`'s "Known limitations"
-   section before assuming a built-in app is reachable in this mode).
+   guest-executed code (Milestone 3 Task D6). The ROM layout table behind
+   `ets_rom_layout_p` (ROM *data* at `0x3ff1_fffc`) is backed with values
+   read from Espressif's published ESP32-C3 ROM ELF (Milestone 3 Task D7),
+   so its caller `s_prepare_reserved_regions()` passes its overlap check and
+   boot prints `heap_init: Initializing. RAM available for dynamic
+   allocation:`. It then faults on the unstubbed libgcc ROM helper
+   `__clzsi2` (`0x4000_079c`, step ~409,759), so the panic handler runs and
+   loops in `software_reset_cpu` retry — well before reaching any built-in
+   app. The current blocker is this unstubbed `__clzsi2` (a known,
+   documented gap — see `docs/firmware-emulator-notes.md`'s "Known
+   limitations" section before assuming a built-in app is reachable in
+   this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -152,7 +154,7 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       generic over. mem/bus.rs's FirmwareBus is the real
                       ESP32-C3 memory map: an ordered sequence of named
                       regions (XIP flash, RAM-copied segments, ROM code
-                      blobs, then one concrete named field per
+                      and data blobs, then one concrete named field per
                       peripheral, then a
                       never-panics catch-all) checked in order on every
                       access — no trait-object dispatch table (a deliberate
@@ -165,7 +167,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       A `RomCodeBlob` region (Milestone 3 Task D6,
                       `FirmwareBus::map_rom_code`) maps small read-only,
                       executable code blobs at fixed ROM addresses; only
-                      the blob's own bytes become fetchable. Each
+                      the blob's own bytes become fetchable. A
+                      `RomDataBlob` region (Task D7,
+                      `FirmwareBus::map_rom_data`) maps read-only ROM
+                      *data* the same way, but is never fetchable. Each
                       XIP (DROM/IROM) segment is widened to its containing
                       64 KiB flash-cache MMU page (Milestone 3 Task D5,
                       `xip_page_window`), not just its own declared
@@ -193,8 +198,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       above. Also the guest-executed ROM code blobs
                       (`ESP32C3_ROM_CODE`: qsort's one-`jal` jump-table
                       slot plus its insertion-sort body in a ROM range no
-                      linker-script symbol points into), installed on the
-                      bus by boot.rs alongside the stub table. Addresses
+                      linker-script symbol points into) and the ROM data
+                      tables (`ESP32C3_ROM_DATA`: the `ets_rom_layout_p`
+                      layout table, values from Espressif's ROM ELF),
+                      both installed on the bus by boot.rs alongside the
+                      stub table. Addresses
                       sourced from ESP-IDF's own linker scripts, not
                       guessed — see docs/firmware-emulator-notes.md.
   src/boot.rs         "Shortcut boot": loads factory.bin directly into a
