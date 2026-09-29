@@ -591,7 +591,8 @@
 //!       (`*a0`, `*a1`), not the pointers, into the ROM statics
 //!       `common_recursive_mutex` (`0x3fcd_f660`) and `common_mutex`
 //!       (`0x3fcd_f65c`) (`llvm-nm` names). Modeled faithfully as
-//!       [`RomStubEffect::LoadStoreWords`] with [`NEWLIB_COMMON_MUTEX_COPIES`]:
+//!       [`RomStubEffect::StoreWords`] (then named `LoadStoreWords`) with
+//!       [`NEWLIB_COMMON_MUTEX_COPIES`]:
 //!       the stores go through the bus into the DRAM aperture (which
 //!       `crate::boot` backs with scratch RAM, including the ROM-reserved
 //!       `0x3fcd_f060..` window), leaving `a0` alone (a `void` function).
@@ -627,7 +628,110 @@
 //!     `0x40058870`) whose semantics their effects' doc comments state. The
 //!     next stall is on the 493,861st step: ROM
 //!     `ets_apb_backup_init_lock_func` (`0x4000_0060`, `esp32c3.rom.ld`),
-//!     neither libc nor flash, so Task 8 stopped there.
+//!     neither libc nor flash, so Task 8 stopped there. (Task D10 backed it:
+//!     entry 19.)
+//!
+//! 19. **`ets_apb_backup_init_lock_func`** ([`ETS_APB_BACKUP_INIT_LOCK_FUNC`],
+//!     `0x4000_0060`, `esp32c3.rom.ld`) — Milestone 3 Task D10. Called once,
+//!     from `esp_apb_backup_dma_lock_init()`
+//!     (`components/esp_system/port/soc/esp32c3/apb_backup_dma.c`, run by
+//!     `ESP_SYSTEM_INIT_FN(init_apb_dma, SECONDARY, BIT(0), 203)` in
+//!     `components/esp_system/startup_funcs.c`) with the IRAM functions
+//!     `apb_backup_dma_lock`/`_unlock` (observed on step 493,812 with
+//!     `a0 = 0x4038_0512`, `a1 = 0x4038_04f8`, caller RA `0x4200_155c`;
+//!     493,861 before entry 20's seeding shortened flash init by 49
+//!     steps). The ROM ELF body (`0x40045fe8`: `sw a0,0x654(0x3fcdf000); sw
+//!     a1,0x658(0x3fcdf000); ret`) stores the two pointers *themselves* into the ROM statics
+//!     `_rom_apb_backup_lock`/`_rom_apb_backup_unlock` (`0x3fcd_f654`/
+//!     `0x3fcd_f658`), the lock hooks the ROM's APB backup-DMA code uses. It
+//!     is modeled faithfully, not as a `void` no-op (the D3 precedent), as
+//!     [`RomStubEffect::StoreWords`] with [`WordSource::Register`]
+//!     ([`APB_BACKUP_LOCK_FUNC_STORES`]); D9's pointee copy is the same
+//!     effect with [`WordSource::Pointee`].
+//!
+//! 20. **ROM writable `.data`: the SPI-flash legacy data** — Milestone 3
+//!     Task D10. `rom_spiflash_legacy_data` ([`ROM_SPIFLASH_LEGACY_DATA`],
+//!     `0x3fcd_fff0`, `esp32c3.rom.ld`) is a ROM `.data` pointer, and ESP-IDF
+//!     reads its flash chip's `device_id`/`chip_size` through it
+//!     (`g_rom_flashchip` is `rom_spiflash_legacy_data->chip`,
+//!     `components/esp_rom/include/esp_rom_spiflash.h`). On real hardware
+//!     the mask ROM's reset code copies its `.data` initializer (the pointer
+//!     to [`ROM_DEFAULT_SPIFLASH_LEGACY_DATA`], `0x3fcd_f5c0`, and that
+//!     struct's defaults) into DRAM, and the 2nd-stage bootloader then calls
+//!     `esp_rom_spiflash_config_param()` with the real chip size. The
+//!     shortcut boot skips both, so before this task the pointer read 0:
+//!     `esp_flash` saw `chip_size` 0 and printed `Detected size(4096k)
+//!     larger than the size in the binary image header(0k)` (a line the
+//!     real badge's log does not have), and the firmware's own
+//!     `bootloader_flash_update_id()` stored the device ID at address 0.
+//!     [`esp32c3_rom_ram_initializers`] now supplies those writes and
+//!     `crate::boot::apply_ram_initializers` applies them before the first
+//!     instruction; its doc cites every value. Values: from the ROM ELF
+//!     (esp-rom-elfs 20241011 `esp32c3_rev3_rom.elf`, the SHA-256 recorded in
+//!     entry 15), `llvm-nm` symbols `rom_spiflash_legacy_data`
+//!     (`0x3fcdfff0`, section `.data.interface.spiflash_legacy`, initializer
+//!     `c0 f5 cd 3f`) and `rom_default_spiflash_legacy_data` (`0x3fcdf5c0`,
+//!     28 bytes, section `.data_spi_flash`); field layout
+//!     `esp_rom_spiflash_legacy_data_t` / `esp_rom_spiflash_chip_t`
+//!     (`esp_rom_spiflash.h`); the bootloader's overwrite from
+//!     `bootloader_flash_config_esp32c3.c` `update_flash_config()` and the
+//!     ROM body of `esp_rom_spiflash_config_param` (`0x4004e22e`, six `sw`
+//!     through the pointer); `chip_size` from factory.bin's own header
+//!     (byte 3 `0x2f`: `ESP_IMAGE_FLASH_SIZE_4MB`, `esp_app_format.h`),
+//!     `device_id` `0x464016` from `bootloader_read_flash_id()`'s byte swap
+//!     of the badge's JEDEC ID. With this, the warning is gone and no
+//!     unmapped access below `0x100` happens during boot (before, the NULL
+//!     pointer caused reads at `0x3`/`0x7`/`0x19` and the store at `0x0`).
+//!
+//!     **Nothing else is seeded, on purpose.** The ROM ELF has many more
+//!     writable `.data`/`.bss` sections (BT/Wi-Fi/PHY state,
+//!     `ets_ops_table_ptr`, `rom_spiflash_legacy_funcs`, cache state, the
+//!     newlib/APB statics above, ...). Boot has not been observed to read
+//!     any of them before writing it. Evidence: a temporary (uncommitted)
+//!     bus trace of every read of the ROM-reserved DRAM `0x3fcd_f060..0x3fce_0000` not preceded by a
+//!     write, run to the Task D10 stall, found only this struct's pointer
+//!     (without the seeding) and `g_coa_funcs_p`/`coexist_funcs`
+//!     (`0x3fcd_f838..0x3fcd_f840`, section `.bss.interface.rom_coexist`,
+//!     all-zero in the ELF), which the coexistence library reads (and, for
+//!     `coexist_funcs`, fills after finding it NULL). The whole DRAM aperture
+//!     is backed with zeroed RAM (`crate::boot`), so that `.bss` is already
+//!     correct. Bulk-copying the ELF's `.data` would add bytes with no
+//!     observed consumer; each one is added when a probe shows a read, as
+//!     here.
+//!
+//! 21. **After the APB call: coexistence version, interrupt threshold** —
+//!     Milestone 3 Task D10. With entries 19 and 20, boot reaches two more
+//!     atomic ROM calls:
+//!     - `esp_coex_rom_version_get` ([`ESP_COEX_ROM_VERSION_GET`],
+//!       `0x4000_18ac`, step 498,924), from the closed coexistence library
+//!       during `ESP_SYSTEM_INIT_FN(init_coexist, ..., 204)`
+//!       (`startup_funcs.c`: `esp_coex_adapter_register()` then
+//!       `coex_pre_init()`); the caller passes the result to
+//!       `coexist_printf("coexist rom version %s\n", ...)`
+//!       (`components/esp_coex/src/lib_printf.c`). The ROM body (`lui
+//!       a5,0x3fcdf; lw a0,0xd0(a5); ret`) returns the ROM `.data` word
+//!       `coexist_rom_version` (`0x3fcd_f0d0`), whose ELF initializer
+//!       `0x3ff1_b74c` points at the string `"9387209"` in ROM `.rodata`.
+//!       None of the 21 `components/esp_rom/esp32c3/ld/*.ld` scripts exports
+//!       that word, so firmware cannot name it; the stub returns its
+//!       initializer, [`COEXIST_ROM_VERSION_STR`]. The string is backed as
+//!       ROM data ([`COEXIST_ROM_VERSION_WORDS`], the D7 mechanism) because
+//!       the caller formats it. (The line itself does
+//!       not reach the console, in the emulator or in the real badge's log.)
+//!     - `esprv_intc_int_set_threshold` ([`ESPRV_INTC_INT_SET_THRESHOLD`],
+//!       `0x4000_05e4`, step 528,694), aliased as `esprv_int_set_threshold` by
+//!       `components/riscv/ld/rom.api.ld` and called by FreeRTOS's
+//!       `xPortStartScheduler()` (`components/freertos/FreeRTOS-Kernel/
+//!       portable/riscv/port.c`) with `RVHAL_INTR_ENABLE_THRESH` = 1. The ROM
+//!       body is `sw a0,0x194(0x600c2000)`, a store to `CPU_INT_THRESH_REG`,
+//!       so it is a [`RomStubEffect::BusRegisterWrite`] like its entry-11
+//!       siblings. (`crate::peripherals::intc` stores the threshold but does
+//!       not yet consult it; see its module doc.)
+//!
+//!     The next stall is not a ROM call: `vPortYield()` requests the first
+//!     context switch through the unmodeled SYSTEM cross-core software
+//!     interrupt, so the scheduler never starts (see "Where this gets boot
+//!     to").
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -648,7 +752,23 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task 8**: 89 stubs (D9's 87 plus `memchr` and `memmove`, entry
+//! **As of Task D10**: 92 stubs (Task 8's 89 plus
+//! `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get` and
+//! `esprv_intc_int_set_threshold`, entries 19 and 21), three ROM data blobs
+//! (entries 15 and 21) and the seeded SPI-flash legacy data (entry 20). The
+//! `(0k)` flash-size warning is gone, and boot runs with **zero traps**
+//! through FreeRTOS's scheduler start. There it stalls on a peripheral, not
+//! a ROM call: `vPortYield()` requests the first context switch by writing
+//! `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (`0x600c_0028`, `soc/system_reg.h`) on
+//! the 528,777th step; the SYSTEM peripheral is unmodeled, so no software
+//! interrupt fires, `vTaskStartScheduler()` returns, and from step 528,805
+//! the CPU spins on a `j .` at `0x4200_0cd2`. No task runs, so the real
+//! badge's next line (`main_task: Started on CPU0`) never prints. See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled`.
+//! The Task 8 paragraph below is kept as history.
+//!
+//! **As of Task 8** (history): 89 stubs (D9's 87 plus `memchr` and `memmove`, entry
 //! 18). The SPI1 flash controller is modeled (`crate::peripherals::flash`),
 //! so flash-chip detection succeeds (`I (0) spi_flash: detected chip:
 //! generic`, step ~446,991). Boot runs fault-free to step 493,860, then
@@ -726,17 +846,21 @@
 //! leading up to it, and the abort/panic path following it, actually
 //! readable.
 
+use crate::boot::RamInitializer;
 use crate::cpu::encode::{
     add, addi, beq, bge, bgeu, bne, jal, jalr, lbu, lw, mul, sb, sub, sw, A0, A1, A2, A3, RA, S0,
     S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, WordLoadStore,
-    REG_A0, REG_A1, REG_A2,
+    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, WordSource,
+    WordStore, REG_A0, REG_A1, REG_A2,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
+use crate::mem::image::ImageHeader;
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
-use crate::peripherals::intc::{CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_TYPE_REG};
+use crate::peripherals::intc::{
+    CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_THRESH_REG, CPU_INT_TYPE_REG,
+};
 
 /// `rtc_get_reset_reason`'s return value: `POWERON_RESET` from ESP-IDF's
 /// `RESET_REASON` enum (`esp32c3/rom/rtc.h`). See the module doc for why a
@@ -822,6 +946,14 @@ pub const ESPRV_INTC_INT_ENABLE: u32 = 0x4000_05e8;
 /// see the module doc's entry 11).
 pub const ESPRV_INTC_INT_SET_TYPE: u32 = 0x4000_05f0;
 
+/// `esprv_intc_int_set_threshold`'s fixed ROM address (`esp32c3.rom.ld`:
+/// `esprv_intc_int_set_threshold = 0x400005e4;`). The ROM ELF shows a `j
+/// 0x400529a2` trampoline to `lui a5,0x600c2; sw a0,0x194(a5); ret`: a plain
+/// store of `a0` to `CPU_INT_THRESH_REG` (`INTERRUPT_CORE0` base
+/// `0x600c_2000` + `0x194`, `soc/interrupt_core0_reg.h`). Module doc, entry
+/// 21.
+pub const ESPRV_INTC_INT_SET_THRESHOLD: u32 = 0x4000_05e4;
+
 /// `esprv_intc_int_set_priority`'s fixed ROM address (`esp32c3.rom.ld`).
 /// Writes a `CPU_INT_PRI_<n>_REG` entry
 /// (`crate::peripherals::intc::InterruptController`) — a **real** register
@@ -855,7 +987,7 @@ pub const STRCAT: u32 = 0x4000_03d8;
 
 /// `esp_rom_newlib_init_common_mutexes`'s fixed address
 /// (`esp32c3.rom.libc.ld`: `esp_rom_newlib_init_common_mutexes = 0x40000350;`).
-/// A real HLE effect ([`crate::cpu::rom_stubs::RomStubEffect::LoadStoreWords`]),
+/// A real HLE effect ([`crate::cpu::rom_stubs::RomStubEffect::StoreWords`]),
 /// see the module doc's entry 17 and [`NEWLIB_COMMON_MUTEX_COPIES`].
 pub const ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES: u32 = 0x4000_0350;
 
@@ -872,14 +1004,49 @@ pub const ROM_COMMON_RECURSIVE_MUTEX: u32 = 0x3fcd_f660;
 /// reached from the `0x40000350` `j` trampoline `__call_...`): `lw a4,0(a0);
 /// sw a4,0x660(0x3fcdf000); lw a4,0(a1); sw a4,0x65c(0x3fcdf000); ret` --
 /// i.e. `*a0 -> 0x3fcdf660`, `*a1 -> 0x3fcdf65c`, in that order.
-const NEWLIB_COMMON_MUTEX_COPIES: &[WordLoadStore] = &[
-    WordLoadStore {
-        ptr_reg: REG_A0,
+const NEWLIB_COMMON_MUTEX_COPIES: &[WordStore] = &[
+    WordStore {
+        src: WordSource::Pointee(REG_A0),
         dst: ROM_COMMON_RECURSIVE_MUTEX,
     },
-    WordLoadStore {
-        ptr_reg: REG_A1,
+    WordStore {
+        src: WordSource::Pointee(REG_A1),
         dst: ROM_COMMON_MUTEX,
+    },
+];
+
+/// `ets_apb_backup_init_lock_func`'s fixed address (`esp32c3.rom.ld`:
+/// `ets_apb_backup_init_lock_func = 0x40000060;`). A real HLE effect
+/// ([`crate::cpu::rom_stubs::RomStubEffect::StoreWords`] with
+/// [`WordSource::Register`]); see the module doc's entry 19 and
+/// [`APB_BACKUP_LOCK_FUNC_STORES`].
+pub const ETS_APB_BACKUP_INIT_LOCK_FUNC: u32 = 0x4000_0060;
+
+/// The two ROM-internal statics `ets_apb_backup_init_lock_func` stores into,
+/// from the ROM ELF's symbol table (`llvm-nm`, both local `.bss` symbols of
+/// the `ets_apb_backup` group, `_bss_start_ets_apb_backup` = `0x3fcd_f654`):
+/// `_rom_apb_backup_lock` (`0x3fcd_f654`) and `_rom_apb_backup_unlock`
+/// (`0x3fcd_f658`).
+pub const ROM_APB_BACKUP_LOCK: u32 = 0x3fcd_f654;
+/// See [`ROM_APB_BACKUP_LOCK`].
+pub const ROM_APB_BACKUP_UNLOCK: u32 = 0x3fcd_f658;
+
+/// The ROM's own disassembly (`40045fe8 <ets_apb_backup_init_lock_func>`,
+/// reached from the `0x40000060` `j` trampoline
+/// `__call_ets_apb_backup_init_lock_func`): `lui a5,0x3fcdf; sw
+/// a0,0x654(a5); lui a5,0x3fcdf; sw a1,0x658(a5); ret` -- i.e. the register
+/// *values* `a0 -> 0x3fcdf654`, `a1 -> 0x3fcdf658`, in that order. No load:
+/// the arguments are the lock/unlock function pointers themselves
+/// (`void ets_apb_backup_init_lock_func(void(*)(void), void(*)(void))`,
+/// `esp32c3/rom/apb_backup_dma.h`).
+const APB_BACKUP_LOCK_FUNC_STORES: &[WordStore] = &[
+    WordStore {
+        src: WordSource::Register(REG_A0),
+        dst: ROM_APB_BACKUP_LOCK,
+    },
+    WordStore {
+        src: WordSource::Register(REG_A1),
+        dst: ROM_APB_BACKUP_UNLOCK,
     },
 ];
 
@@ -1125,7 +1292,25 @@ pub const ETS_ROM_LAYOUT_TABLE: [u32; ETS_ROM_LAYOUT_WORDS] = {
     table
 };
 
-/// Every ROM data blob this module maps (module doc, entry 15), installed
+/// `esp_coex_rom_version_get`'s fixed address (`esp32c3.rom.ld`:
+/// `esp_coex_rom_version_get = 0x400018ac;`). The ROM ELF shows a `j
+/// 0x40045c1a` trampoline to `lui a5,0x3fcdf; lw a0,0xd0(a5); ret`: it
+/// returns the ROM `.data` word `coexist_rom_version` (`0x3fcd_f0d0`,
+/// section `.data_coexist_rom`), whose initializer is
+/// [`COEXIST_ROM_VERSION_STR`]. Module doc, entry 21.
+pub const ESP_COEX_ROM_VERSION_GET: u32 = 0x4000_18ac;
+
+/// Where the ROM's coexistence-library version string lives: the ELF
+/// `.data` initializer of `coexist_rom_version` (`4c b7 f1 3f`), inside the
+/// ROM ELF's `.rodata` (`0x3ff19c00..0x3ff1eac8`). Module doc, entry 21.
+pub const COEXIST_ROM_VERSION_STR: u32 = 0x3ff1_b74c;
+
+/// The NUL-terminated string at [`COEXIST_ROM_VERSION_STR`] in the rev3
+/// ROM ELF: `"9387209\0"` (`39 33 38 37 32 30 39 00`), as little-endian
+/// words.
+pub const COEXIST_ROM_VERSION_WORDS: [u32; 2] = [0x3738_3339, 0x0039_3032];
+
+/// Every ROM data blob this module maps (module doc, entries 15 and 21), installed
 /// by [`install_esp32c3_rom_data`].
 pub const ESP32C3_ROM_DATA: &[RomDataBlob] = &[
     RomDataBlob {
@@ -1135,6 +1320,10 @@ pub const ESP32C3_ROM_DATA: &[RomDataBlob] = &[
     RomDataBlob {
         base: ETS_ROM_LAYOUT,
         words: &ETS_ROM_LAYOUT_TABLE,
+    },
+    RomDataBlob {
+        base: COEXIST_ROM_VERSION_STR,
+        words: &COEXIST_ROM_VERSION_WORDS,
     },
 ];
 
@@ -1146,6 +1335,107 @@ pub fn install_esp32c3_rom_data(bus: &mut FirmwareBus) {
     for blob in ESP32C3_ROM_DATA {
         bus.map_rom_data(*blob);
     }
+}
+
+/// `rom_spiflash_legacy_data`: the ROM's writable `.data` *pointer* to its
+/// SPI-flash legacy data (`esp32c3.rom.ld`: `PROVIDE( rom_spiflash_legacy_data
+/// = 0x3fcdfff0 );`; ESP-IDF's `g_rom_flashchip` is
+/// `rom_spiflash_legacy_data->chip`, `components/esp_rom/include/esp_rom_spiflash.h`).
+/// Module doc, entry 20.
+pub const ROM_SPIFLASH_LEGACY_DATA: u32 = 0x3fcd_fff0;
+
+/// `rom_default_spiflash_legacy_data`: the ROM's own
+/// `esp_rom_spiflash_legacy_data_t` (28 bytes) that
+/// [`ROM_SPIFLASH_LEGACY_DATA`] initially points at (`llvm-nm` on the ROM
+/// ELF: `3fcdf5c0 0000001c ? rom_default_spiflash_legacy_data`, in section
+/// `.data_spi_flash`). Module doc, entry 20.
+pub const ROM_DEFAULT_SPIFLASH_LEGACY_DATA: u32 = 0x3fcd_f5c0;
+
+/// The ROM ELF's `.data` initializer of [`ROM_DEFAULT_SPIFLASH_LEGACY_DATA`]:
+/// section `.data_spi_flash` (`0x3fcdf5bc`, 0x20 bytes) bytes 4..32
+/// (`llvm-objdump -s`), as `esp_rom_spiflash_legacy_data_t` fields
+/// (`esp_rom_spiflash.h`): `chip = { device_id 0x1540ef, chip_size
+/// 0x200000, block_size 0x10000, sector_size 0x1000, page_size 0x100,
+/// status_mask 0xffff }`, then `dummy_len_plus[3] = {0,0,0}`, `sig_matrix =
+/// 0`.
+pub const ROM_DEFAULT_SPIFLASH_LEGACY_DATA_INIT: [u8; 28] = [
+    0xef, 0x40, 0x15, 0x00, // chip.device_id   = 0x001540ef
+    0x00, 0x00, 0x20, 0x00, // chip.chip_size   = 0x00200000
+    0x00, 0x00, 0x01, 0x00, // chip.block_size  = 0x00010000
+    0x00, 0x10, 0x00, 0x00, // chip.sector_size = 0x00001000
+    0x00, 0x01, 0x00, 0x00, // chip.page_size   = 0x00000100
+    0xff, 0xff, 0x00, 0x00, // chip.status_mask = 0x0000ffff
+    0x00, 0x00, 0x00, 0x00, // dummy_len_plus[3], sig_matrix
+];
+
+/// The flash size the 2nd-stage bootloader assumes when the image header's
+/// size nibble is not a known `esp_image_flash_size_t`
+/// (`bootloader_flash_config_esp32c3.c` `update_flash_config`: `default:
+/// size = 2;`, in MB).
+pub const BOOTLOADER_DEFAULT_FLASH_SIZE: u32 = 2 * 0x10_0000;
+
+/// The `device_id` the 2nd-stage bootloader stores in `g_rom_flashchip`:
+/// `bootloader_read_flash_id()` (`bootloader_support/bootloader_flash/src/bootloader_flash.c`)
+/// reads RDID's 3 bytes into the low 24 bits of `W0` and byte-swaps them as
+/// `((id & 0xff) << 16) | ((id >> 16) & 0xff) | (id & 0xff00)`, i.e.
+/// manufacturer, memory type, capacity from most to least significant. For
+/// the badge's [`crate::peripherals::flash::JEDEC_ID`] `0x46 0x40 0x16` that
+/// is `0x464016`.
+pub const BOOTLOADER_FLASH_DEVICE_ID: u32 = {
+    let id = crate::peripherals::flash::JEDEC_ID;
+    ((id[0] as u32) << 16) | ((id[1] as u32) << 8) | id[2] as u32
+};
+
+/// The ROM writable-`.data` state the shortcut boot must seed, standing in
+/// for the two steps it skips (module doc, entry 20), in application order:
+///
+/// 1. The mask ROM's reset-time `.data` copy, for the only ROM `.data` boot
+///    is observed to consume: [`ROM_SPIFLASH_LEGACY_DATA`] (its ELF
+///    initializer, section `.data.interface.spiflash_legacy`, is `c0 f5 cd
+///    3f` = [`ROM_DEFAULT_SPIFLASH_LEGACY_DATA`]) and the struct it points
+///    at ([`ROM_DEFAULT_SPIFLASH_LEGACY_DATA_INIT`]).
+/// 2. The 2nd-stage bootloader's `update_flash_config()`
+///    (`components/bootloader_support/bootloader_flash/src/bootloader_flash_config_esp32c3.c`,
+///    from `bootloader_init_spi_flash()`), which calls
+///    `esp_rom_spiflash_config_param(g_rom_flashchip.device_id, size *
+///    0x100000, 0x10000, 0x1000, 0x100, 0xffff)`. The ROM body
+///    (`4004e22e`) stores its six arguments over the six `chip` words
+///    through the pointer. `device_id` was set just before by
+///    `bootloader_flash_update_id()` ([`BOOTLOADER_FLASH_DEVICE_ID`]).
+///    `size` is decoded from `header`'s flash-size nibble
+///    ([`ImageHeader::flash_size_bytes`]), falling back to
+///    [`BOOTLOADER_DEFAULT_FLASH_SIZE`] as the bootloader does. (The real
+///    bootloader reads its *own* image header; esptool writes the same
+///    flash size into both, and on this badge both say 4 MB.)
+pub fn esp32c3_rom_ram_initializers(header: &ImageHeader) -> Vec<RamInitializer> {
+    let chip_size = header
+        .flash_size_bytes()
+        .unwrap_or(BOOTLOADER_DEFAULT_FLASH_SIZE);
+    // esp_rom_spiflash_config_param's six arguments, in `chip` field order.
+    let config_param = [
+        BOOTLOADER_FLASH_DEVICE_ID,
+        chip_size,
+        0x10000, // block_size
+        0x1000,  // sector_size
+        0x100,   // page_size
+        0xffff,  // status_mask
+    ];
+    vec![
+        // 1. Mask-ROM .data init.
+        RamInitializer {
+            addr: ROM_SPIFLASH_LEGACY_DATA,
+            bytes: ROM_DEFAULT_SPIFLASH_LEGACY_DATA.to_le_bytes().to_vec(),
+        },
+        RamInitializer {
+            addr: ROM_DEFAULT_SPIFLASH_LEGACY_DATA,
+            bytes: ROM_DEFAULT_SPIFLASH_LEGACY_DATA_INIT.to_vec(),
+        },
+        // 2. The bootloader's esp_rom_spiflash_config_param() effect.
+        RamInitializer {
+            addr: ROM_DEFAULT_SPIFLASH_LEGACY_DATA,
+            bytes: config_param.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        },
+    ]
 }
 
 /// The CPU frequency (MHz) [`ETS_GET_CPU_FREQUENCY`]'s stub reports. 160 MHz
@@ -1247,6 +1537,17 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         ),
     ),
     (
+        ESPRV_INTC_INT_SET_THRESHOLD,
+        RomStub::bus_register_write(
+            "esprv_intc_int_set_threshold",
+            BusRegisterWrite {
+                base: INTERRUPT_CORE0_RANGE.start + CPU_INT_THRESH_REG,
+                index_reg: None,
+                op: BusRegisterOp::Store { value_reg: REG_A0 }, // priority_threshold
+            },
+        ),
+    ),
+    (
         ETS_GET_CPU_FREQUENCY,
         RomStub::returning("ets_get_cpu_frequency", CPU_FREQ_MHZ),
     ),
@@ -1261,10 +1562,20 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (DIV, RomStub::div_t("div")),
     (
         ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES,
-        RomStub::load_store_words(
+        RomStub::store_words(
             "esp_rom_newlib_init_common_mutexes",
             NEWLIB_COMMON_MUTEX_COPIES,
         ),
+    ),
+    (
+        ETS_APB_BACKUP_INIT_LOCK_FUNC,
+        RomStub::store_words("ets_apb_backup_init_lock_func", APB_BACKUP_LOCK_FUNC_STORES),
+    ),
+    (
+        ESP_COEX_ROM_VERSION_GET,
+        // Returns the ROM .data word coexist_rom_version at its ELF
+        // initializer value (module doc, entry 21).
+        RomStub::returning("esp_coex_rom_version_get", COEXIST_ROM_VERSION_STR),
     ),
 ];
 
@@ -1735,6 +2046,26 @@ mod tests {
     }
 
     #[test]
+    fn esprv_intc_int_set_threshold_writes_cpu_int_thresh_reg() {
+        // xPortStartScheduler's esprv_int_set_threshold(RVHAL_INTR_ENABLE_THRESH = 1).
+        let stub = esp32c3_rom_stubs()
+            .lookup(ESPRV_INTC_INT_SET_THRESHOLD)
+            .expect("registered");
+        assert_eq!(stub.name, "esprv_intc_int_set_threshold");
+        let (cpu, mut bus) = run_stub_call(ESPRV_INTC_INT_SET_THRESHOLD, &[(REG_A0, 1)]);
+        assert_eq!(
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_THRESH_REG),
+            1
+        );
+        assert_eq!(cpu.regs.read(REG_A0), 1, "void: a0 untouched");
+        // A neighbouring register (the last priority register) is untouched.
+        assert_eq!(
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG + 31 * 4),
+            0
+        );
+    }
+
+    #[test]
     fn esprv_intc_int_set_priority_writes_the_indexed_priority_register() {
         let (_cpu, mut bus) =
             run_stub_call(ESPRV_INTC_INT_SET_PRIORITY, &[(REG_A0, 25), (REG_A1, 4)]);
@@ -1881,6 +2212,129 @@ mod tests {
         assert_eq!(cpu.regs.read(REG_A0), 0x3fc9_0100, "void: a0 untouched");
         assert_eq!(bus.read32(0x3fcd_f660), 0xdead_beef);
         assert_eq!(bus.read32(0x3fcd_f65c), 0x1234_5678);
+    }
+
+    fn header_with_speed_size(spi_speed_size: u8) -> ImageHeader {
+        let mut bytes = vec![0u8; crate::mem::image::IMAGE_HEADER_LEN];
+        bytes[0] = crate::mem::image::IMAGE_MAGIC;
+        bytes[3] = spi_speed_size;
+        crate::mem::image::parse_image(&bytes)
+            .expect("zero-segment header parses")
+            .header
+    }
+
+    /// Applies `inits` to a flat little-endian word map (address -> word),
+    /// in order, so the test checks the *net* effect, not the list shape.
+    fn net_words(inits: &[RamInitializer]) -> std::collections::BTreeMap<u32, u32> {
+        let mut bytes = std::collections::BTreeMap::new();
+        for init in inits {
+            for (i, b) in init.bytes.iter().enumerate() {
+                bytes.insert(init.addr + i as u32, *b);
+            }
+        }
+        let mut words = std::collections::BTreeMap::new();
+        for (&addr, _) in bytes.iter().filter(|(a, _)| *a % 4 == 0) {
+            let w = (0..4)
+                .map(|i| u32::from(bytes[&(addr + i)]) << (8 * i))
+                .sum();
+            words.insert(addr, w);
+        }
+        words
+    }
+
+    #[test]
+    fn rom_ram_initializers_seed_the_spiflash_legacy_data_as_rom_then_bootloader_leave_it() {
+        // factory.bin's header byte 3 is 0x2f (ESP_IMAGE_FLASH_SIZE_4MB).
+        let words = net_words(&esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f)));
+        let expected: std::collections::BTreeMap<u32, u32> = [
+            // rom_spiflash_legacy_data -> rom_default_spiflash_legacy_data
+            (0x3fcd_fff0, 0x3fcd_f5c0),
+            // chip, as esp_rom_spiflash_config_param(0x464016, 4 MiB, ...) left it
+            (0x3fcd_f5c0, 0x0046_4016), // device_id (bootloader RDID)
+            (0x3fcd_f5c4, 0x0040_0000), // chip_size (header: 4 MB)
+            (0x3fcd_f5c8, 0x0001_0000), // block_size
+            (0x3fcd_f5cc, 0x0000_1000), // sector_size
+            (0x3fcd_f5d0, 0x0000_0100), // page_size
+            (0x3fcd_f5d4, 0x0000_ffff), // status_mask
+            (0x3fcd_f5d8, 0),           // dummy_len_plus[3], sig_matrix (ROM .data)
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(words, expected);
+    }
+
+    #[test]
+    fn rom_ram_initializers_take_chip_size_from_the_header_with_the_bootloaders_fallback() {
+        let size_of = |b: u8| {
+            net_words(&esp32c3_rom_ram_initializers(&header_with_speed_size(b)))
+                [&(ROM_DEFAULT_SPIFLASH_LEGACY_DATA + 4)]
+        };
+        assert_eq!(size_of(0x1f), 0x0020_0000); // 2 MB
+        assert_eq!(size_of(0x3f), 0x0080_0000); // 8 MB
+                                                // Not an esp_image_flash_size_t: update_flash_config's `default:
+                                                // size = 2;`.
+        assert_eq!(size_of(0x8f), BOOTLOADER_DEFAULT_FLASH_SIZE);
+    }
+
+    #[test]
+    fn rom_ram_initializers_seed_only_the_rom_data_boot_consumes() {
+        // Guard against bulk-copying ROM .data: every byte seeded lies in
+        // either the legacy-data pointer word or the 28-byte struct.
+        for init in esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f)) {
+            let end = init.addr + init.bytes.len() as u32;
+            let in_ptr =
+                init.addr >= ROM_SPIFLASH_LEGACY_DATA && end <= ROM_SPIFLASH_LEGACY_DATA + 4;
+            let in_struct = init.addr >= ROM_DEFAULT_SPIFLASH_LEGACY_DATA
+                && end <= ROM_DEFAULT_SPIFLASH_LEGACY_DATA + 28;
+            assert!(
+                in_ptr || in_struct,
+                "unexpected seed at 0x{:08x}",
+                init.addr
+            );
+        }
+    }
+
+    #[test]
+    fn bootloader_device_id_is_the_byte_swapped_jedec_id() {
+        // bootloader_read_flash_id() on W0 = 0x00164046 (Task 8's RDID).
+        let w0: u32 = 0x0016_4046;
+        let id = ((w0 & 0xff) << 16) | ((w0 >> 16) & 0xff) | (w0 & 0xff00);
+        assert_eq!(BOOTLOADER_FLASH_DEVICE_ID, id);
+        assert_eq!(BOOTLOADER_FLASH_DEVICE_ID, 0x0046_4016);
+    }
+
+    #[test]
+    fn apb_backup_init_lock_func_stores_the_register_values_into_rom_statics() {
+        // ets_apb_backup_init_lock_func(a0 = lock_fn, a1 = unlock_fn) must
+        // store the pointers *themselves* (not the words they point at) at
+        // 0x3fcdf654 / 0x3fcdf658, and leave a0 alone (void function).
+        let table = esp32c3_rom_stubs();
+        let stub = table
+            .lookup(ETS_APB_BACKUP_INIT_LOCK_FUNC)
+            .expect("registered");
+        assert_eq!(stub.name, "ets_apb_backup_init_lock_func");
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(0x3fcd_f650, 0x20);
+        // Function pointers in IRAM, as the real caller passes (a0 =
+        // 0x40380512, a1 = 0x403804f8 at the observed call). Back IRAM with
+        // a distinct word at each so a pointee-load would be caught.
+        bus.add_scratch_ram(0x4038_04f8, 0x20);
+        bus.write32(0x4038_04f8, 0x1111_1111);
+        bus.write32(0x4038_0510, 0x2222_2222);
+        cpu.regs.write(REG_RA, 0x4200_155c);
+        cpu.regs.write(REG_A0, 0x4038_0512);
+        cpu.regs.write(REG_A1, 0x4038_04f8);
+        cpu.regs.pc = ETS_APB_BACKUP_INIT_LOCK_FUNC;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(ETS_APB_BACKUP_INIT_LOCK_FUNC));
+        assert_eq!(cpu.regs.pc, 0x4200_155c);
+        assert_eq!(cpu.regs.read(REG_A0), 0x4038_0512, "void: a0 untouched");
+        assert_eq!(bus.read32(ROM_APB_BACKUP_LOCK), 0x4038_0512);
+        assert_eq!(bus.read32(ROM_APB_BACKUP_UNLOCK), 0x4038_04f8);
     }
 
     #[test]
@@ -2604,6 +3058,31 @@ mod tests {
             bus.unmapped_log().is_empty(),
             "both loads hit mapped ROM data, not the catch-all"
         );
+    }
+
+    #[test]
+    fn coexist_rom_version_string_is_backed_with_the_rev3_rom_bytes() {
+        let mut bus = bus_with_rom_data();
+        let s: Vec<u8> = (0..8).map(|i| bus.read8(0x3ff1_b74c + i)).collect();
+        assert_eq!(&s, b"9387209\0");
+        assert!(bus.unmapped_log().is_empty());
+    }
+
+    #[test]
+    fn esp_coex_rom_version_get_returns_the_rom_version_string_pointer() {
+        let stub = esp32c3_rom_stubs()
+            .lookup(ESP_COEX_ROM_VERSION_GET)
+            .expect("registered");
+        assert_eq!(stub.name, "esp_coex_rom_version_get");
+        let mut bus = bus_with_rom_data();
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        cpu.regs.write(REG_RA, 0x4210_5722);
+        cpu.regs.pc = ESP_COEX_ROM_VERSION_GET;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(cpu.regs.pc, 0x4210_5722);
+        assert_eq!(cpu.regs.read(REG_A0), 0x3ff1_b74c);
     }
 
     #[test]

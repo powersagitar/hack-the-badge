@@ -41,7 +41,10 @@ pub struct ImageHeader {
     pub magic: u8,
     pub segment_count: u8,
     pub spi_mode: u8,
-    /// Packed nibbles (spi speed / flash size); unused by this task.
+    /// Packed nibbles, per `esp_app_format.h`'s bitfields `uint8_t
+    /// spi_speed: 4; uint8_t spi_size: 4;` (the first-declared field takes
+    /// the low nibble): low nibble = `esp_image_spi_freq_t`, high nibble =
+    /// `esp_image_flash_size_t`. See [`ImageHeader::flash_size_bytes`].
     pub spi_speed_size: u8,
     pub entry_addr: u32,
     pub wp_pin: u8,
@@ -57,6 +60,24 @@ pub struct ImageHeader {
     /// to locate it can use this flag plus the offset returned alongside the
     /// last parsed segment.
     pub hash_appended: u8,
+}
+
+impl ImageHeader {
+    /// The flash chip size this image header declares, in bytes, decoded
+    /// from the high nibble of [`ImageHeader::spi_speed_size`] per ESP-IDF
+    /// v5.5.3 `components/bootloader_support/include/esp_app_format.h`'s
+    /// `esp_image_flash_size_t` (`ESP_IMAGE_FLASH_SIZE_1MB = 0`, `_2MB`,
+    /// `_4MB`, `_8MB`, `_16MB`, `_32MB`, `_64MB`, `_128MB = 7`, i.e. 1 MiB
+    /// shifted left by the value). `None` for any other value (`8` is
+    /// `ESP_IMAGE_FLASH_SIZE_MAX`, not a size): what a consumer does then is
+    /// its own policy (the 2nd-stage bootloader's `update_flash_config`
+    /// falls back to 2 MB, see `crate::rom`).
+    pub fn flash_size_bytes(&self) -> Option<u32> {
+        match self.spi_speed_size >> 4 {
+            n @ 0..=7 => Some((1u32 << 20) << n),
+            _ => None,
+        }
+    }
 }
 
 /// One segment's location within the image file plus its ESP32-C3 load
@@ -225,6 +246,45 @@ mod tests {
         assert_eq!(parsed.header.hash_appended, 1);
         assert_eq!(parsed.segments.len(), 6);
         assert!(parsed.segments.iter().all(|s| s.len == 0));
+    }
+
+    fn header_with_speed_size(spi_speed_size: u8) -> ImageHeader {
+        let mut bytes = vec![0u8; IMAGE_HEADER_LEN];
+        bytes[0] = IMAGE_MAGIC;
+        bytes[3] = spi_speed_size;
+        parse_image(&bytes)
+            .expect("zero-segment header parses")
+            .header
+    }
+
+    #[test]
+    fn flash_size_bytes_decodes_the_high_nibble_per_esp_app_format() {
+        // factory.bin's own byte 3 is 0x2f: speed nibble 0xf, size nibble 2
+        // = ESP_IMAGE_FLASH_SIZE_4MB.
+        assert_eq!(
+            header_with_speed_size(0x2f).flash_size_bytes(),
+            Some(4 << 20)
+        );
+        assert_eq!(
+            header_with_speed_size(0x0f).flash_size_bytes(),
+            Some(1 << 20)
+        );
+        assert_eq!(
+            header_with_speed_size(0x10).flash_size_bytes(),
+            Some(2 << 20)
+        );
+        assert_eq!(
+            header_with_speed_size(0x7f).flash_size_bytes(),
+            Some(128 << 20)
+        );
+        // The speed nibble never leaks into the size.
+        assert_eq!(
+            header_with_speed_size(0x20).flash_size_bytes(),
+            Some(4 << 20)
+        );
+        // ESP_IMAGE_FLASH_SIZE_MAX (8) and above are not sizes.
+        assert_eq!(header_with_speed_size(0x8f).flash_size_bytes(), None);
+        assert_eq!(header_with_speed_size(0xff).flash_size_bytes(), None);
     }
 
     #[test]

@@ -303,10 +303,14 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, result as u32);
                 self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
             }
-            RomStubEffect::LoadStoreWords(copies) => {
-                for copy in copies {
-                    let word = bus.read32(self.regs.read(copy.ptr_reg));
-                    bus.write32(copy.dst, word);
+            RomStubEffect::StoreWords(stores) => {
+                use rom_stubs::WordSource;
+                for store in stores {
+                    let word = match store.src {
+                        WordSource::Pointee(reg) => bus.read32(self.regs.read(reg)),
+                        WordSource::Register(reg) => self.regs.read(reg),
+                    };
+                    bus.write32(store.dst, word);
                 }
             }
             RomStubEffect::Int32Unary(op) => {

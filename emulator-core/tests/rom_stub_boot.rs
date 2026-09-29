@@ -245,7 +245,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 ///
 /// **What changed in Task D9**: `esp_rom_newlib_init_common_mutexes`
 /// (`0x4000_0350`) now really copies `*a0`/`*a1` to the ROM statics
-/// `0x3fcd_f660`/`0x3fcd_f65c` (`RomStubEffect::LoadStoreWords`), and the
+/// `0x3fcd_f660`/`0x3fcd_f65c` (`RomStubEffect::LoadStoreWords`, since Task D10 `StoreWords`), and the
 /// atomic ROM libc calls `esp_newlib_init`'s successors make -- `strlen`
 /// (`0x4000_0374`), `memcmp` (`0x4000_0360`), `strncmp` (`0x4000_0370`),
 /// `div` (`0x4000_0428`) -- are real HLE stubs. Boot runs on with zero traps
@@ -262,101 +262,164 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// right after, `memchr` (`0x4000_03c8`, first reached on step 490,128) and
 /// `memmove` (`0x4000_035c`, step 490,143), are real HLE stubs.
 ///
-/// **The new stall**: on the 493,861st step boot fetches from `0x4000_0060`,
-/// the unstubbed ROM `ets_apb_backup_init_lock_func` (`esp32c3.rom.ld`;
-/// caller RA `0x4200_155c`). It is not a flash or libc routine. The
-/// `INSTRUCTION_ACCESS_FAULT` prints "Guru Meditation Error" right away
-/// (step ~494,744), then "Rebooting..." (~733,938), and the panic handler's
-/// reboot attempt faults on the unstubbed `software_reset_cpu` on step
-/// 734,553 (next fault 975,150). `software_reset_cpu` stays unstubbed: it
-/// is reached only on the panic path.
+/// **Task 8's stall** (history): on the 493,861st step boot fetched from
+/// `0x4000_0060`, the then-unstubbed ROM `ets_apb_backup_init_lock_func`
+/// (caller RA `0x4200_155c`), and the panic handler printed "Guru
+/// Meditation Error" and "Rebooting..." and looped on `software_reset_cpu`.
 ///
-/// This test is **deliberately expected to break** once
-/// `ets_apb_backup_init_lock_func` is handled; whoever makes that fix should
-/// delete or replace it rather than chase a new pinned value here.
+/// **What changed in Task D10**: `ets_apb_backup_init_lock_func` stores its
+/// two function-pointer arguments into the ROM statics `0x3fcd_f654`/
+/// `0x3fcd_f658` (`RomStubEffect::StoreWords` with `WordSource::Register`);
+/// the shortcut boot seeds the ROM's SPI-flash legacy data
+/// (`rom_spiflash_legacy_data` -> `0x3fcd_f5c0`, with `chip_size` 4 MiB from
+/// factory.bin's header), so the `Detected size(4096k) larger than the size
+/// in the binary image header(0k)` warning is gone; the next two ROM calls,
+/// `esp_coex_rom_version_get` (`0x4000_18ac`, returns the ROM version string
+/// `0x3ff1_b74c`, now backed as ROM data) and `esprv_intc_int_set_threshold`
+/// (`0x4000_05e4`, stores `a0` to `CPU_INT_THRESH_REG`), are stubbed too.
+///
+/// **The new stall** is not a fault at all: zero traps. FreeRTOS's
+/// `xPortStartScheduler()` (IDF `components/freertos/FreeRTOS-Kernel/
+/// portable/riscv/port.c`) sets the interrupt threshold, enables interrupts
+/// and calls `vPortYield()`, which requests the first context switch by
+/// writing `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (`0x600c_0028`,
+/// `soc/system_reg.h`; `crosscore_int_ll_trigger_interrupt`) on the
+/// 528,777th step. The SYSTEM peripheral is unmodeled (the write lands in
+/// the unmapped catch-all), so no software interrupt fires, the yield
+/// returns, `xPortStartScheduler()` returns, `vTaskStartScheduler()` returns
+/// to `esp_startup_start_app()`'s caller, and from step 528,805 on the CPU
+/// spins forever on a `j .` at `0x4200_0cd2`. No task (and so no
+/// `main_task:` line, no `app_main`) ever runs.
+///
+/// This test is **deliberately expected to break** once that software
+/// interrupt is modeled; whoever makes that fix should delete or replace it
+/// rather than chase a new pinned value here.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_ets_apb_backup_init_lock_func_call_and_reaches_the_panic_handlers_reboot_message(
+fn boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled(
 ) {
+    const FROM_CPU_0_REG: u32 = 0x600c_0028;
+    const SPIN_PC: u32 = 0x4200_0cd2;
+
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through flash-chip detection and the memchr/memmove calls
-    // with zero traps.
-    let summary = rt.run(493_860);
+    // Phase 1: through the old ets_apb_backup_init_lock_func fault site
+    // (493,861) and the coex/threshold ROM calls with zero traps, up to the
+    // step before the yield request.
+    let summary = rt.run(528_776);
     assert_eq!(
         summary.traps, 0,
-        "boot must run through flash-chip detection and ROM memchr/memmove \
-         without any trap (pre-Task-8 it aborted after `memspi: no \
-         response` at step 442,141); got {summary:?}"
+        "expected a fault-free run; got {summary:?}"
     );
-    assert!(
-        rt.console_output()
-            .contains("I (0) spi_flash: detected chip: generic"),
-        "expected flash-chip detection to succeed; got:\n{}",
-        rt.console_output()
-    );
-    assert!(
-        !rt.console_output().contains("memspi"),
-        "the `memspi: no response` error must be gone; got:\n{}",
-        rt.console_output()
-    );
-
-    // Phase 2: the very next step is the ets_apb_backup_init_lock_func
-    // fetch fault.
-    let summary = rt.run(1);
-    assert_eq!(
-        summary.traps, 1,
-        "expected the fetch fault; got {summary:?}"
-    );
-    assert_eq!(
-        rt.cpu().csr.mcause,
-        exception_code::INSTRUCTION_ACCESS_FAULT
-    );
-    assert_eq!(summary.last_instruction_fault, Some(0x4000_0060));
-
-    // Phase 3, up to 745,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (the 734,553rd step). 10,447
-    // steps of margin, and the next fault is not until step 975,150.
-    let summary = rt.run(745_000 - 493_861);
-    assert_eq!(
-        summary.traps, 1,
-        "expected exactly one more trap: the software_reset_cpu \
-         instruction-access fault; got {summary:?}"
-    );
-    assert_eq!(
-        summary.last_instruction_fault,
-        Some(0x4000_0094),
-        "expected the INSTRUCTION_ACCESS_FAULT to be software_reset_cpu -- \
-         the panic handler's own (unstubbed) reboot attempt"
-    );
-
     let console = rt.console_output();
-    // Generic ESP-IDF text only, never identity data (see this file's
-    // module doc and `docs/firmware-emulator-notes.md`'s data-handling
-    // note).
     assert!(
-        console.contains("I (0) heap_init: Initializing. RAM available for dynamic allocation:"),
-        "expected heap_init's first line; got:\n{console}"
+        console
+            .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
+        "expected the last sleep_gpio line; got:\n{console}"
     );
     assert!(
-        !console.contains("memory_layout"),
-        "the reserved-region overlap error (Task D6's stall) must be gone; got:\n{console}"
+        !console.contains("Detected size"),
+        "the (0k) image-header flash-size warning must be gone; got:\n{console}"
     );
     assert!(
-        console.contains("Guru Meditation Error"),
-        "expected the panic handler's crash report; got:\n{console}"
-    );
-    assert!(
-        console.contains("Rebooting..."),
-        "expected the panic handler's generic pre-restart text; got:\n{console}"
+        !rt.bus()
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr & !3 == FROM_CPU_0_REG),
+        "no yield request yet"
     );
 
-    // Task D5's fix still holds: cpu_start's header check passes.
-    assert!(
-        !console.contains("Invalid app image header"),
-        "cpu_start's header check should pass for real; got:\n{console}"
+    // Phase 2: the next step is vPortYield's write of the cross-core
+    // software-interrupt register -- four byte writes into the catch-all.
+    rt.run(1);
+    let tail: Vec<(u32, bool)> = rt
+        .bus()
+        .unmapped_log()
+        .iter()
+        .rev()
+        .take(4)
+        .map(|a| (a.addr, a.is_write))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            (FROM_CPU_0_REG + 3, true),
+            (FROM_CPU_0_REG + 2, true),
+            (FROM_CPU_0_REG + 1, true),
+            (FROM_CPU_0_REG, true),
+        ],
+        "expected SYSTEM_CPU_INTR_FROM_CPU_0_REG to be written (unmodeled)"
     );
 
-    // And nothing has been drawn, because the display driver is never reached.
+    // Phase 3: nothing answers it; 27 steps later the CPU is on the `j .`.
+    let summary = rt.run(528_804 - 528_777);
+    assert_eq!(summary.traps, 0);
+    assert_eq!(rt.pc(), SPIN_PC);
+
+    // Phase 4: and it stays there, with no trap, no panic and no new output.
+    let console_before = rt.console_output();
+    let summary = rt.run(1_000_000);
+    assert_eq!(summary.traps, 0, "a spin, not a fault; got {summary:?}");
+    assert_eq!(rt.pc(), SPIN_PC);
+    let console = rt.console_output();
+    assert_eq!(console, console_before, "nothing more is printed");
+    // Generic ESP-IDF text only, never identity data.
+    assert!(
+        !console.contains("Guru Meditation Error"),
+        "no panic; got:\n{console}"
+    );
+    assert!(
+        !console.contains("Rebooting..."),
+        "no panic; got:\n{console}"
+    );
+    assert!(!console.contains("main_task"), "no task ever runs");
+    assert!(!console.contains("Invalid app image header"));
+
+    // Nothing has been drawn, because the display driver is never reached.
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
+}
+
+/// Task D10, item B: the shortcut boot seeds the ROM's SPI-flash legacy data
+/// before the first instruction, and the firmware's own writes then land in
+/// it, not at address 0 (before Task D10 the NULL `rom_spiflash_legacy_data`
+/// pointer sent `bootloader_flash_update_id()`'s `device_id` store to
+/// `0x0..0x3` and the flash-size reads to `0x4..0x7`, all unmapped).
+#[test]
+fn rom_spiflash_legacy_data_is_seeded_and_no_null_legacy_data_access_remains() {
+    use emulator_core::mem::Bus;
+    let image = read_factory_bin();
+    let (mut cpu, mut bus) =
+        boot_from_factory_image_with_rom_stubs(&image).expect("real factory.bin should boot");
+
+    // Before the first instruction: the mask ROM's .data init plus the
+    // bootloader's esp_rom_spiflash_config_param(), with chip_size from
+    // factory.bin's own header (byte 3 = 0x2f: 4 MB).
+    assert_eq!(bus.read32(0x3fcd_fff0), 0x3fcd_f5c0);
+    let chip = |bus: &mut emulator_core::mem::bus::FirmwareBus| -> Vec<u32> {
+        (0..7).map(|i| bus.read32(0x3fcd_f5c0 + 4 * i)).collect()
+    };
+    let seeded = [0x0046_4016, 0x0040_0000, 0x1_0000, 0x1000, 0x100, 0xffff, 0];
+    assert_eq!(chip(&mut bus), seeded);
+
+    // Run through flash-chip detection and the sleep_gpio lines (step
+    // ~484,400), checking every step that no access touched the first page
+    // of the address space.
+    for step in 1..=500_000u32 {
+        step_with_interrupts(&mut cpu, &mut bus);
+        if let Some(last) = bus.unmapped_log().back() {
+            assert!(
+                last.addr >= 0x100,
+                "step {step}: unmapped access at {:#x} (write={})",
+                last.addr,
+                last.is_write
+            );
+        }
+    }
+    // The app's own bootloader_flash_update_id() (cpu_start.c) re-read the
+    // JEDEC ID into the struct: same value, now through a valid pointer.
+    assert_eq!(chip(&mut bus), seeded);
+    assert!(bus
+        .console
+        .text()
+        .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"));
 }

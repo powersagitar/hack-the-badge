@@ -57,7 +57,7 @@
 //!    register-only computation for [`RomStubEffect::Int64`], or a real
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`] and
-//!    [`RomStubEffect::LoadStoreWords`] (plus the read-only libc effects
+//!    [`RomStubEffect::StoreWords`] (plus the read-only libc effects
 //!    `Strlen`/`Memcmp`/`Strncmp`/`DivT`).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
@@ -307,25 +307,39 @@ pub enum RomStubEffect {
         /// putc-style TX register is driven one character at a time.
         sink_addr: u32,
     },
-    /// A `void` ROM function whose whole effect is "load the word an
-    /// argument register points at, store it to a fixed address", once per
-    /// [`WordLoadStore`] entry, in order, through the bus (Milestone 3 Task
-    /// D9: `esp_rom_newlib_init_common_mutexes(a0, a1)`, which copies `*a0`
-    /// and `*a1` into two ROM-internal statics). Like
+    /// A `void` ROM function whose whole effect is storing words to fixed
+    /// addresses, once per [`WordStore`] entry, in order, through the bus.
+    /// Each word comes from an argument register, either the word it points
+    /// at ([`WordSource::Pointee`], Milestone 3 Task D9:
+    /// `esp_rom_newlib_init_common_mutexes(a0, a1)` copies `*a0` and `*a1`
+    /// into two ROM-internal statics) or the register's own value
+    /// ([`WordSource::Register`], Task D10: `ets_apb_backup_init_lock_func(a0,
+    /// a1)` stores the two function pointers themselves). Like
     /// [`RomStubEffect::BusRegisterWrite`] it never touches `a0`: the real
     /// functions are `void`, and the state the ROM keeps (which later ROM
     /// code consumes) lands in ordinary emulated memory instead of being
     /// dropped. Chip-agnostic: `crate::rom` supplies the fixed addresses.
-    LoadStoreWords(&'static [WordLoadStore]),
+    /// (Named `LoadStoreWords` before Task D10 added the register-value
+    /// source.)
+    StoreWords(&'static [WordStore]),
 }
 
-/// One `*dst = *a[ptr_reg]` word copy for [`RomStubEffect::LoadStoreWords`].
+/// One `*dst = <word>` store for [`RomStubEffect::StoreWords`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WordLoadStore {
-    /// The argument register holding a pointer to the word to read.
-    pub ptr_reg: u8,
-    /// The fixed guest address the loaded word is stored to.
+pub struct WordStore {
+    /// Where the stored word comes from.
+    pub src: WordSource,
+    /// The fixed guest address the word is stored to.
     pub dst: u32,
+}
+
+/// The source of one [`WordStore`]'s word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordSource {
+    /// The word the register points at (`*a[reg]`; a `lw` from it).
+    Pointee(u8),
+    /// The register's own value (`a[reg]`).
+    Register(u8),
 }
 
 /// The address/value computation for [`RomStubEffect::BusRegisterWrite`].
@@ -995,12 +1009,12 @@ impl RomStub {
         }
     }
 
-    /// A `void` ROM function that copies the words its pointer arguments
-    /// point at to fixed addresses -- see [`RomStubEffect::LoadStoreWords`].
-    pub const fn load_store_words(name: &'static str, copies: &'static [WordLoadStore]) -> Self {
+    /// A `void` ROM function that stores words taken from its argument
+    /// registers to fixed addresses -- see [`RomStubEffect::StoreWords`].
+    pub const fn store_words(name: &'static str, stores: &'static [WordStore]) -> Self {
         Self {
             name,
-            effect: RomStubEffect::LoadStoreWords(copies),
+            effect: RomStubEffect::StoreWords(stores),
         }
     }
 

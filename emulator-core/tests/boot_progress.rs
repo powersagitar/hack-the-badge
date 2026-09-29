@@ -16,7 +16,7 @@
 //! not-yet-fixed stall this task explicitly leaves for the next one; see
 //! `emulator-core/tests/rom_stub_boot.rs`'s
 //! `boot_currently_stalls_retrying_reboot_via_an_unidentified_unstubbed_rom_call`
-//! and `docs/firmware-emulator-notes.md`). [`first_console_output_is_the_firmware_s_own_panic_report`]
+//! and `docs/firmware-emulator-notes.md`). `first_console_output_is_the_firmware_s_own_panic_report`
 //! is this file's first real console-line rung, using
 //! [`boot_until_console_contains`] below exactly as Task 3 anticipated.
 //!
@@ -91,7 +91,7 @@
 //! makes then faults for real, re-entering the panic handler through its
 //! *exception* path (where `info->reason` is finally non-`NULL`), which is
 //! when "Guru Meditation Error" prints for the first time — so
-//! [`first_console_output_is_the_firmware_s_own_panic_report`]'s budget
+//! `first_console_output_is_the_firmware_s_own_panic_report`'s budget
 //! moves out to 750,000 (from 500,000) to stay past that later point.
 //! [`boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site`] is this
 //! file's no-fault-before-step-N rung for this task: it asserts zero traps
@@ -172,7 +172,7 @@
 //! panic handler takes its *exception* path immediately -- `info->reason`
 //! is non-`NULL` from the very first pass, so "Guru Meditation Error"
 //! prints right away (step 410,197) instead of only after a failed reboot
-//! retry. [`first_console_output_is_the_firmware_s_own_panic_report`]'s doc
+//! retry. `first_console_output_is_the_firmware_s_own_panic_report`'s doc
 //! is corrected below to describe this new cause (the assertion/budget
 //! still held even before this correction, since both the old and new
 //! causes print the same generic string). The still-unstubbed ROM
@@ -211,7 +211,7 @@
 //! narratives; one is renamed.
 //!
 //! **Task D9 status**: `esp_rom_newlib_init_common_mutexes` is a real stub
-//! (`RomStubEffect::LoadStoreWords`) and ROM libc `strlen`/`memcmp`/
+//! (`RomStubEffect::LoadStoreWords`, since Task D10 `StoreWords`) and ROM libc `strlen`/`memcmp`/
 //! `strncmp`/`div` are real, so boot runs fault-free to step 442,140. No new
 //! good console line appears: the next line is `E (0) memspi: no response`
 //! (step 441,439), an *error* from the unmodeled SPI1 flash controller, not
@@ -251,8 +251,27 @@
 //!
 //! Task 8 status: the SPI1 flash controller answers JEDEC RDID, so flash-chip
 //! detection succeeds. [`boot_reaches_spi_flash_detected_chip_generic`] is
-//! the new rung; the panic rung is re-pointed at the next fault (ROM
-//! `memchr`) and renamed.
+//! the new rung. With ROM `memchr`/`memmove` also stubbed
+//! ([`boot_no_longer_faults_at_the_pre_task_8_memchr_call_site`]), the panic
+//! rung was re-pointed at the next fault, the unstubbed ROM
+//! `ets_apb_backup_init_lock_func` (step 493,861), and renamed.
+//!
+//! **Task D10 status**: `ets_apb_backup_init_lock_func`,
+//! `esp_coex_rom_version_get` and `esprv_intc_int_set_threshold` are real
+//! stubs, and the ROM's SPI-flash legacy data is seeded at boot. Boot now
+//! runs with **zero traps**: FreeRTOS starts its scheduler, and the first
+//! context switch is requested through the unmodeled SYSTEM cross-core
+//! software interrupt (step 528,777), so `vTaskStartScheduler()` returns and
+//! the CPU spins on a `j .` (see `tests/rom_stub_boot.rs`'s pinned stall).
+//! No new good console line appears (the real badge's next line,
+//! `main_task: Started on CPU0`, is printed by the first task), and the
+//! `(0k)` flash-size warning is gone. So the rungs are:
+//! [`boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site`]
+//! (no trap through step 528,776),
+//! [`boot_no_longer_warns_that_the_image_header_says_0k_of_flash`], and
+//! [`boot_no_longer_reaches_the_panic_handler`], which replaces the two
+//! panic-text rungs (Guru Meditation / Rebooting...), since there is no
+//! panic left to reach.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -336,143 +355,37 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
     );
 }
 
-/// A console-line ratchet — **still panic output, not boot progress, but
-/// for a different reason than before.** "Guru Meditation Error" is
-/// ESP-IDF's own generic panic-header string (`components/esp_system/
-/// panic.c`), present in every ESP-IDF crash report — not badge-specific or
-/// identity data.
+/// Replaces the two panic-text rungs this file carried from Task D1 to
+/// Task 8, retired in Task D10: `first_console_output_is_the_firmware_s_own_panic_report`
+/// ("Guru Meditation Error" within 750,000 steps) and
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_ets_apb_backup_init_lock_func_fault`
+/// ("Rebooting..." within 800,000 steps). Both were panic-path lines, never
+/// boot progress; each task re-pointed them at whatever fault came next
+/// (their full histories are in git). As of Task D10 no fault comes next:
+/// boot runs with **zero traps** into the scheduler-start spin (see the
+/// module doc's "Task D10 status" and `tests/rom_stub_boot.rs`'s pinned
+/// stall), so the panic handler never runs. This rung pins that: over
+/// 1,500,000 steps (the old "Rebooting..." budget, nearly doubled) there is
+/// no trap and neither panic string appears.
 ///
-/// **Corrected in Task D5** (this test's assertion/budget didn't need to
-/// change, but its cause did, so its doc would otherwise now be wrong):
-/// this line used to be reached via `cpu_start`'s header-check `abort()`
-/// (see the pre-Task-D5 history below). Task D5's fix
-/// (`crate::mem::bus::FirmwareBus::from_segments`'s page-granular XIP
-/// mapping) makes that header check pass, so `abort()` is never called any
-/// more. Boot instead runs into a **new, unrelated** stall -- an unstubbed
-/// ROM `qsort` call (`0x4000_0434`; see this file's module doc's "Task D5
-/// status") -- whose `INSTRUCTION_ACCESS_FAULT` is a genuine hardware
-/// exception, not an `abort()`, so ESP-IDF's panic handler takes its
-/// *exception* path immediately (`info->reason` non-`NULL` from the first
-/// pass), printing "Guru Meditation Error" right away (measured at step
-/// 410,197) instead of only after a failed reboot retry.
-///
-/// **Task D6 update**: `qsort` is now real guest code, so that exception is
-/// gone. The cause is an `abort()` again, this time from
-/// `s_prepare_reserved_regions()`'s overlap check (see the module doc's
-/// "Task D6 status"). An `abort()` enters the panic handler with
-/// `info->reason == NULL`, so "Guru Meditation Error" once again prints only
-/// after the failed `software_reset_cpu` reboot retry, measured at step
-/// ~648,960. That is still well within the 750,000 budget.
-///
-/// **Task D9 update**: the newlib-mutex fault is gone too. The cause is now
-/// an `abort()` after `E (0) memspi: no response` (ILLEGAL_INSTRUCTION on
-/// the 442,141st step), so this line prints only after the reboot retry's
-/// `software_reset_cpu` fault (step 681,436): step ~682,319, inside the
-/// 750,000 budget (~9% margin).
-///
-/// **Task D8 update**: the `__clzsi2` fault is gone too (real libgcc
-/// stubs). The cause is now the unstubbed ROM
-/// `esp_rom_newlib_init_common_mutexes` fault on the 417,992nd step, still a
-/// hardware exception, so this line prints at step ~419,414.
-///
-/// **Task D7 update**: the `abort()` is gone too (the ROM layout table is
-/// backed). The cause is now the unstubbed libgcc `__clzsi2` fault on the
-/// 409,759th step (see the module doc's "Task D7 status"). That is a
-/// hardware exception again, so this line prints right away, at step
-/// ~411,500.
-///
-/// **Pre-Task-D5 history** (kept for context): 500,000 steps used to be
-/// comfortably past this (measured at step 401,761, back when `itoa`
-/// faulted mid-format and the truncated abort path printed this header
-/// directly); after Task D4 made `itoa`/`strcat` real, the header only
-/// appeared once `cpu_start`'s abort path's own reboot attempt faulted for
-/// real (measured at step 648,000), hence the 750,000 budget. Both
-/// superseded by the cause above; 750,000 remains a comfortable budget for
-/// the new cause too (measured at 410,197, well under half the budget).
+/// Expected to change only when a later stall is a real fault again; a
+/// panic path is never progress, so do not re-point this at one.
 #[test]
-fn first_console_output_is_the_firmware_s_own_panic_report() {
-    assert_reaches("Guru Meditation Error", 750_000);
-}
-
-/// A console-line ratchet on the panic handler's reboot attempt — **not** a
-/// boot-progress rung. **Renamed in Task D5** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort`):
-/// with the header check now passing (see this file's module doc's "Task
-/// D5 status"), `cpu_start` never calls `abort()` any more, so this is no
-/// longer reached "via cpu_start's abort" -- it's reached via the *new*
-/// unstubbed-`qsort`-call panic's own reboot attempt instead (same
-/// generic ESP-IDF pre-restart text, `components/esp_system/panic.c`,
-/// printed unconditionally right before `panic_restart()`; not
-/// badge-specific or identity data). Measured reaching the console at step
-/// 648,457 -- close to the pre-Task-D5 measurement (645,410) purely by
-/// coincidence of similar code-path length, not because the cause is the
-/// same.
-///
-/// **Fix round 1, M3**: the original 650,000 budget was mislabeled
-/// "comfortable" when its actual margin over 648,457 was 1,543 steps
-/// (~0.2%) -- genuinely tight, not comfortable. Bumped to 660,000 (margin
-/// 11,543 steps, ~1.8%), still comfortably clear of the next event in this
-/// trace (the panic handler's own reboot-retry fault, measured at step
-/// 649,072 -- see `emulator-core/tests/rom_stub_boot.rs`'s renamed pinned-
-/// stall test, which pins that fault step directly) and of the loop's next
-/// iteration (measured at step 889,556).
-///
-/// **Renamed again in Task D6** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`):
-/// `qsort` is now real guest code, so this panic is no longer reached via
-/// its fault. It is reached via `s_prepare_reserved_regions()`'s `abort()`
-/// over the unbacked ROM layout table (see the module doc's "Task D6
-/// status"). "Rebooting..." now prints at step ~646,656, still inside the
-/// 660,000 budget, and the reboot-retry fault follows at step 647,238.
-///
-/// **Renamed again in Task D7** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_reserved_region_overlap_abort`):
-/// the ROM layout table is now backed, so that `abort()` never happens. The
-/// panic is now reached via the unstubbed libgcc `__clzsi2` fault (the
-/// 409,759th step; see the module doc's "Task D7 status"). "Rebooting..."
-/// prints at step ~649,700, still inside the 660,000 budget (~1.6%
-/// margin), and the reboot-retry fault follows on the 650,332nd step.
-/// ([`boot_until_console_contains`] checks every 250,000 steps, so in
-/// practice it first sees the line at its 750,000-step check.)
-///
-/// **Renamed again in Task D8** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_clzsi2_fault`):
-/// `__clzsi2`/`__ffssi2` are now real stubs. The panic is now reached via
-/// the unstubbed ROM `esp_rom_newlib_init_common_mutexes` fault (the
-/// 417,992nd step). "Rebooting..." prints at step ~658,042 and the
-/// reboot-retry fault follows on the 658,657th step. The budget is raised
-/// from 660,000 (which would have left a 0.3% margin) to 700,000
-/// (~6% margin). Still a panic-path line, **not** boot progress.
-///
-/// **Renamed again in Task D9** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_newlib_init_common_mutexes_fault`):
-/// the newlib-mutex stub exists, so the panic is now reached via the
-/// `abort()` after `E (0) memspi: no response` (the 442,141st step).
-/// "Rebooting..." prints at step ~680,821; [`boot_until_console_contains`]
-/// sees it at its 750,000-step check (the 500,000-step check comes too
-/// early). Budget raised from 700,000, which would leave a 2.8% margin over
-/// the measured step, to 750,000 (~9%). Still a panic-path line, **not**
-/// boot progress.
-///
-/// **Renamed again in Task 8** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort`,
-/// then briefly `..._via_the_unstubbed_memchr_fault`): the SPI1 flash
-/// controller now answers RDID, so that abort is gone, and ROM
-/// `memchr`/`memmove` are stubbed. The panic is now reached via the
-/// unstubbed ROM `ets_apb_backup_init_lock_func` fault (the 493,861st step).
-/// "Rebooting..." prints at step ~733,938, which
-/// [`boot_until_console_contains`] sees at its 750,000-step check (~2.2%
-/// margin over the measured step). The budget is raised to 800,000 so a
-/// small shift cannot push the line past the last check. Still a panic-path
-/// line, **not** boot progress.
-///
-/// This rung is **deliberately expected to break** once that ROM call is
-/// handled: whoever makes that fix should delete or replace this test
-/// rather than chase a new pinned value here.
-#[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_ets_apb_backup_init_lock_func_fault(
-) {
-    assert_reaches("Rebooting...", 800_000);
+fn boot_no_longer_reaches_the_panic_handler() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(1_500_000);
+    let console = rt.console_output();
+    assert_eq!(
+        summary.traps,
+        0,
+        "got {summary:?}, pc=0x{:08x}\nconsole:\n{console}",
+        rt.pc()
+    );
+    assert!(
+        !console.contains("Guru Meditation Error"),
+        "console:\n{console}"
+    );
+    assert!(!console.contains("Rebooting..."), "console:\n{console}");
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -770,9 +683,9 @@ fn boot_reaches_spi_flash_detected_chip_generic() {
 /// Milestone 3 Task 8's no-fault rung for the two atomic ROM libc calls after
 /// flash-chip detection: before they were stubbed, boot faulted on ROM
 /// `memchr` on step 490,128 (then `memmove` on step 490,143). With both
-/// real, the first trap of any kind is the `ets_apb_backup_init_lock_func`
-/// fault on step 493,861, so a run of 493,000 steps must show **zero**
-/// traps.
+/// real, the first trap of any kind was the `ets_apb_backup_init_lock_func`
+/// fault on step 493,861 (none at all since Task D10), so a run of 493,000
+/// steps must show **zero** traps.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -790,4 +703,46 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
             .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
         "the sleep_gpio lines after flash detection should be present"
     );
+}
+
+/// Milestone 3 Task D10's no-fault rung. Before it, boot faulted on the
+/// unstubbed ROM `ets_apb_backup_init_lock_func` on step 493,861; the next
+/// two ROM calls, `esp_coex_rom_version_get` and
+/// `esprv_intc_int_set_threshold`, were stubbed in the same task. Boot now
+/// runs fault-free until FreeRTOS's first yield request (step 528,777) and
+/// then spins with no trap at all, so a run to step 528,776 must show
+/// **zero** traps.
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(528_776);
+    assert_eq!(
+        summary.traps,
+        0,
+        "boot must run past the old ets_apb_backup_init_lock_func fault \
+         (step 493,861) with no traps; got {summary:?}, pc=0x{:08x}",
+        rt.pc()
+    );
+}
+
+/// Milestone 3 Task D10, item B's ratchet. With the ROM's SPI-flash legacy
+/// data seeded at boot (`g_rom_flashchip.chip_size` = 4 MiB, from
+/// factory.bin's own header), ESP-IDF's flash init no longer prints `W (0)
+/// spi_flash: Detected size(4096k) larger than the size in the binary image
+/// header(0k). Using the size in the binary image header.` -- a line the
+/// real badge's boot log does not have either. Checked once the last
+/// `sleep_gpio:` line is out (measured at step ~484,416;
+/// [`boot_until_console_contains`] sees it at its 500,000-step check).
+#[test]
+fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
+    let needle = "I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration";
+    let (rt, ok) = boot_until_console_contains(needle, 500_000);
+    let console = rt.console_output();
+    assert!(
+        ok,
+        "never printed {needle:?}; pc=0x{:08x}\nconsole:\n{console}",
+        rt.pc()
+    );
+    assert!(console.contains("I (0) spi_flash: flash io: dio"));
+    assert!(!console.contains("Detected size"), "console:\n{console}");
 }

@@ -16,6 +16,12 @@
 //! that distinction is load-bearing), and jump straight to `entry_addr`,
 //! i.e. we start the emulated CPU at the exact point real hardware would
 //! be at when the 2nd-stage bootloader hands off.
+//!
+//! What the skipped steps leave in *RAM* for the app to read later is
+//! re-created by [`apply_ram_initializers`] (Milestone 3 Task D10): a
+//! generic list of boot-time `(address, bytes)` writes, with the ESP32-C3
+//! data in [`crate::rom`] (applied by
+//! [`boot_from_factory_image_with_rom_stubs`] only, since it is ROM state).
 
 use std::sync::Arc;
 
@@ -113,10 +119,16 @@ pub fn initial_stack_pointer() -> u32 {
 /// libc `qsort`, Milestone 3 Task D6) mapped onto the returned
 /// [`FirmwareBus`], along with its read-only ROM data
 /// ([`crate::rom::install_esp32c3_rom_data`] -- currently the ROM layout
-/// table behind `ets_rom_layout_p`, Milestone 3 Task D7). Stubs cover
-/// routines whose effect can be applied atomically, real guest code covers
-/// the ones that must call back into firmware, and ROM data covers tables the
-/// firmware reads (see [`crate::rom`]'s module doc, entries 14 and 15).
+/// table behind `ets_rom_layout_p`, Milestone 3 Task D7), and finally the
+/// ROM's writable RAM state that the skipped mask-ROM reset and 2nd-stage
+/// bootloader would have left behind ([`apply_ram_initializers`] with
+/// [`crate::rom::esp32c3_rom_ram_initializers`] -- currently the SPI-flash
+/// legacy data, Milestone 3 Task D10; its `chip_size` comes from `image`'s
+/// own header). Stubs cover routines whose effect can be applied atomically,
+/// real guest code covers the ones that must call back into firmware, ROM
+/// data covers read-only tables the firmware reads, and RAM initializers
+/// cover ROM `.data` the firmware reads and writes (see [`crate::rom`]'s
+/// module doc, entries 14, 15 and 20).
 ///
 /// ## Why this is a separate entry point rather than the default
 ///
@@ -140,7 +152,50 @@ pub fn boot_from_factory_image_with_rom_stubs(
     cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs());
     crate::rom::install_esp32c3_rom_code(&mut bus);
     crate::rom::install_esp32c3_rom_data(&mut bus);
+    // Already parsed successfully above; re-parsing just the header is cheap.
+    let header = parse_image(image)?.header;
+    apply_ram_initializers(&mut bus, &crate::rom::esp32c3_rom_ram_initializers(&header));
     Ok((cpu, bus))
+}
+
+/// One boot-time RAM write: `bytes` stored at guest address `addr` (and up)
+/// before the first instruction runs. See [`apply_ram_initializers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RamInitializer {
+    /// Guest address of `bytes[0]`.
+    pub addr: u32,
+    /// The bytes to store, in address order.
+    pub bytes: Vec<u8>,
+}
+
+/// Applies `inits` to `bus`, in order (a later entry overwrites an earlier
+/// one where they overlap), by ordinary byte writes through the bus.
+///
+/// ## Why this exists
+///
+/// The shortcut boot skips the mask ROM's reset code and the 2nd-stage
+/// bootloader (see this module's doc). Some of what those skipped steps
+/// leave in **RAM** is state the app later reads: the mask ROM copies its
+/// own writable `.data` initializers into DRAM, and the bootloader calls ROM
+/// functions that update that `.data`. This is the generic stand-in: a list
+/// of `(address, bytes)` writes applied to already-backed emulated RAM right
+/// after the apertures are backed. It holds no chip knowledge; the ESP32-C3
+/// data and its citations live in `crate::rom`
+/// ([`crate::rom::esp32c3_rom_ram_initializers`]).
+///
+/// It differs from `FirmwareBus::map_rom_data` (Task D7): that maps
+/// *read-only* ROM data in the ROM's own address range, whereas these
+/// writes land in ordinary writable RAM that the firmware keeps updating.
+///
+/// A write that lands outside backed RAM is dropped by the bus's never-panic
+/// catch-all (and logged as unmapped) like any other stray write.
+pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
+    use crate::mem::Bus;
+    for init in inits {
+        for (i, byte) in init.bytes.iter().enumerate() {
+            bus.write8(init.addr.wrapping_add(i as u32), *byte);
+        }
+    }
 }
 
 /// Steps `cpu` once, then advances [`FirmwareBus`]'s peripherals
@@ -298,6 +353,61 @@ mod tests {
         let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
         let (cpu, _bus) = boot_from_factory_image(&image).expect("should boot");
         assert_eq!(cpu.regs.read(2), initial_stack_pointer());
+    }
+
+    #[test]
+    fn ram_initializers_are_written_in_order_into_backed_ram() {
+        let code = [0x13, 0x00, 0x00, 0x00];
+        let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
+
+        apply_ram_initializers(
+            &mut bus,
+            &[
+                RamInitializer {
+                    addr: 0x3fcd_f5c0,
+                    bytes: vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+                },
+                // Overlaps the first one's second word: applied later, so it
+                // wins there.
+                RamInitializer {
+                    addr: 0x3fcd_f5c4,
+                    bytes: 0xdead_beefu32.to_le_bytes().to_vec(),
+                },
+                RamInitializer {
+                    addr: 0x3fcd_fff0,
+                    bytes: 0x3fcd_f5c0u32.to_le_bytes().to_vec(),
+                },
+            ],
+        );
+
+        assert_eq!(bus.read32(0x3fcd_f5c0), 0x4433_2211);
+        assert_eq!(bus.read32(0x3fcd_f5c4), 0xdead_beef);
+        assert_eq!(bus.read32(0x3fcd_fff0), 0x3fcd_f5c0);
+        // Still ordinary writable RAM afterwards.
+        bus.write32(0x3fcd_f5c4, 0x0046_4016);
+        assert_eq!(bus.read32(0x3fcd_f5c4), 0x0046_4016);
+    }
+
+    #[test]
+    fn rom_stub_boot_seeds_the_rom_spiflash_legacy_data_before_the_first_instruction() {
+        let code = [0x13, 0x00, 0x00, 0x00];
+        let mut image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        image[3] = 0x2f; // factory.bin's spi_speed_size: 4 MB flash
+        let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
+
+        // rom_spiflash_legacy_data -> rom_default_spiflash_legacy_data
+        assert_eq!(bus.read32(0x3fcd_fff0), 0x3fcd_f5c0);
+        // g_rom_flashchip, as the bootloader's config_param left it.
+        let chip: Vec<u32> = (0..7).map(|i| bus.read32(0x3fcd_f5c0 + 4 * i)).collect();
+        assert_eq!(
+            chip,
+            [0x0046_4016, 0x0040_0000, 0x1_0000, 0x1000, 0x100, 0xffff, 0]
+        );
+
+        // The plain (ROM-less) boot models no ROM, so seeds nothing.
+        let (_cpu, mut plain) = boot_from_factory_image(&image).expect("should boot");
+        assert_eq!(plain.read32(0x3fcd_fff0), 0);
     }
 
     #[test]

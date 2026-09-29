@@ -42,11 +42,16 @@ ESP32-C3 device), in two complementary modes:
    controller and a synthetic 4 MiB flash chip are modeled (Milestone 3
    Task 8), so the JEDEC ID read succeeds and boot prints `spi_flash:
    detected chip: generic` and the `sleep_gpio:` lines. ROM `memchr`/
-   `memmove` are then real stubs too, and boot faults on the unstubbed ROM
-   `ets_apb_backup_init_lock_func` (step 493,861), so the panic handler
-   runs and loops in `software_reset_cpu` retry — well before reaching any
-   built-in app. The current blocker is that ROM call (a known,
-   documented gap — see
+   `memmove`, `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get`
+   and `esprv_intc_int_set_threshold` are then real stubs too, and the
+   ROM's writable SPI-flash legacy data is seeded at boot (Milestone 3 Task
+   D10), so boot runs with zero traps into FreeRTOS's scheduler start.
+   There it stalls: `vPortYield()` requests the first context switch
+   through the SYSTEM cross-core software interrupt
+   (`SYSTEM_CPU_INTR_FROM_CPU_0_REG`, step 528,777), which is unmodeled, so
+   `vTaskStartScheduler()` returns and the CPU spins on a `j .` — no task
+   runs, well before reaching any built-in app. The current blocker is that
+   unmodeled software interrupt (a known, documented gap — see
    `docs/firmware-emulator-notes.md`'s "Known limitations" section before
    assuming a built-in app is reachable in this mode).
 
@@ -223,15 +228,22 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       linker-script symbol points into) and the ROM data
                       tables (`ESP32C3_ROM_DATA`: the `ets_rom_layout_p`
                       layout table, values from Espressif's ROM ELF),
-                      both installed on the bus by boot.rs alongside the
-                      stub table. Addresses
+                      and the ROM's writable `.data` boot reads
+                      (`esp32c3_rom_ram_initializers`: the SPI-flash legacy
+                      data, `chip_size` from the image header), all
+                      installed by boot.rs alongside the stub table. Addresses
                       sourced from ESP-IDF's own linker scripts, not
                       guessed — see docs/firmware-emulator-notes.md.
   src/boot.rs         "Shortcut boot": loads factory.bin directly into a
                       Cpu/FirmwareBus pair via the app image's own header,
                       skipping mask-ROM/2nd-stage-bootloader emulation
                       entirely (see docs/firmware-emulator-notes.md for
-                      why this is safe to skip).
+                      why this is safe to skip). What those skipped steps leave
+                      in RAM for the app is re-created by a generic list
+                      of boot-time (address, bytes) writes
+                      (`apply_ram_initializers`, Task D10); the ESP32-C3
+                      data (the ROM's SPI-flash legacy data) lives in
+                      rom.rs.
   src/runtime.rs      FirmwareRuntime: the whole emulator as one owned,
                       driveable object. Buttons are addressed by raw slot
                       index here (0 = direct-GPIO START, 1..=8 = shift-

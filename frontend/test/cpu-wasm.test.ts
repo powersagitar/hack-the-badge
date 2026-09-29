@@ -121,7 +121,19 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // follows on the 650,332nd step, past it. See
       // emulator-core/tests/rom_stub_boot.rs's
       // boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message.
-      expect(report.traps).toBe(1);
+      //
+      // Tasks D8, D9 and 8 each moved that single fault later (the last one
+      // was the unstubbed ROM ets_apb_backup_init_lock_func on step
+      // 493,861), so it stayed the only trap in this budget.
+      //
+      // Milestone 3 Task D10: that ROM call and the next two
+      // (esp_coex_rom_version_get, esprv_intc_int_set_threshold) are
+      // stubbed and the ROM's SPI-flash legacy data is seeded, so boot now
+      // runs with zero traps into FreeRTOS's scheduler start, where it spins
+      // (the SYSTEM cross-core software interrupt vPortYield() relies on is
+      // unmodeled; see emulator-core/tests/rom_stub_boot.rs's
+      // boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled).
+      expect(report.traps).toBe(0);
 
       const fb = handle.framebuffer();
       expect(fb.length).toBe(320 * 240);

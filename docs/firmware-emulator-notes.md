@@ -160,10 +160,14 @@ stub can have is one of `RomStubEffect`'s variants
   apply unchanged. Output and format-string-scan length are both capped
   (1 KiB) so a garbage format-string pointer can't hang the emulator.
 
-- `LoadStoreWords` (added in Milestone 3's Task D9) — for a `void` ROM
-  function whose whole effect is copying the words its pointer arguments
-  point at to fixed ROM-internal addresses (`esp_rom_newlib_init_common_mutexes`),
-  done through the bus so later ROM code sees the state.
+- `StoreWords` (added in Milestone 3's Task D9 as `LoadStoreWords`,
+  generalized in Task D10) — for a `void` ROM function whose whole effect
+  is storing words taken from its argument registers to fixed ROM-internal
+  addresses, done through the bus so later ROM code sees the state. Each
+  word is either the one a register points at (`WordSource::Pointee`:
+  `esp_rom_newlib_init_common_mutexes` copies `*a0`/`*a1`) or the
+  register's own value (`WordSource::Register`:
+  `ets_apb_backup_init_lock_func` stores its two function pointers).
 - `Strlen`/`Memcmp`/`Strncmp`/`DivT` (Task D9) — real ROM libc reads and
   computations mirroring the ROM ELF's own code (`DivT` returns `div_t` in
   `a0`/`a1`).
@@ -229,6 +233,37 @@ backed the same split way:
   reads only `dram0_rtos_reserved_start` (offset 4). The other 39 fields
   are `0`. A later consumer of another field must back it from the same
   ELF, not rely on the `0`.
+- Task D10 added a second consumer: the coexistence library's version
+  string `"9387209"` at `0x3ff1_b74c` (ROM `.rodata`), which the stub for
+  `esp_coex_rom_version_get` (`0x4000_18ac`) returns a pointer to, because
+  the caller formats it (`rom.rs` entry 21).
+
+**ROM writable `.data` (Milestone 3 Task D10).** Some mask-ROM state lives
+in ordinary *writable* DRAM, in the ROM-reserved window `0x3fcd_f060..
+0x3fce_0000`: the ROM's reset code copies its `.data` initializers there,
+and the 2nd-stage bootloader updates some of it through ROM calls. The
+shortcut boot skips both, so the app would read zeros. That is ordinary RAM,
+so a read-only `RomDataBlob` doesn't fit. Instead:
+
+- `emulator-core/src/boot.rs`'s `RamInitializer`/`apply_ram_initializers`
+  is a generic list of `(address, bytes)` writes applied, in order, to the
+  already-backed RAM before the first instruction.
+- `rom.rs`'s `esp32c3_rom_ram_initializers(header)` holds the ESP32-C3
+  data, which `boot_from_factory_image_with_rom_stubs` applies. Currently
+  it holds only the SPI-flash legacy data, the one piece of ROM `.data` boot
+  is observed to read: `rom_spiflash_legacy_data` (`0x3fcd_fff0`) pointing
+  at `rom_default_spiflash_legacy_data` (`0x3fcd_f5c0`, 28 bytes, the ROM
+  ELF's initializer), then the bootloader's
+  `esp_rom_spiflash_config_param(device_id 0x464016, chip_size, 0x10000,
+  0x1000, 0x100, 0xffff)` over its `chip` fields. `chip_size` is decoded
+  from factory.bin's own header flash-size nibble (`0x2f` → 4 MB,
+  `esp_app_format.h`), falling back to 2 MB as the bootloader's
+  `update_flash_config()` does. `device_id` is the badge's JEDEC ID
+  byte-swapped the way `bootloader_read_flash_id()` does it.
+- Nothing else is seeded. A temporary read-before-write trace of the whole
+  ROM-reserved window, run to the current stall, found no other read of
+  ROM `.data` (the only other read was all-zero `.bss`, which zeroed RAM
+  already matches). Every value is cited in `rom.rs` entry 20.
 
 This is split across two files on purpose:
 
@@ -776,8 +811,9 @@ predicted these blockers would surface once TIMG unblocks further boot:
    ROM-owned data (two `_lock_t` words). Its pinned test was re-pointed in
    Task D9.
 
-   **Task D9 (newlib-init hooks) and the current stall.** New
-   `RomStubEffect::LoadStoreWords`: for each `(ptr_reg, dst)` pair, load the
+   **Task D9 (newlib-init hooks) and the then-current stall.** New
+   `RomStubEffect::LoadStoreWords` (since Task D10 `StoreWords` with
+   `WordSource::Pointee`): for each `(ptr_reg, dst)` pair, load the
    word `a[ptr_reg]` points at and store it to the fixed address `dst`,
    through the bus; `a0` is untouched (`void` functions).
    `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`,
@@ -837,15 +873,50 @@ predicted these blockers would surface once TIMG unblocks further boot:
    `(unsigned char)c`; `memmove` copies backward when `src < dst < src +
    n`). The stub count is 89.
 
-   **The current stall**: on the 493,861st step boot fetches from
-   `0x4000_0060`, the unstubbed ROM `ets_apb_backup_init_lock_func`
-   (`esp32c3.rom.ld`; caller RA `0x4200_155c`; the ROM ELF's body at
-   `0x40045fe8` stores its two arguments into ROM statics). It is neither
-   flash nor libc, so Task 8 stopped there. The fault prints "Guru
-   Meditation Error" (step ~494,744), then "Rebooting..." (~733,938), then
-   the unstubbed `software_reset_cpu` faults on step 734,553. Pinned in
+   **The stall at the end of Task 8** (now fixed, see Task D10 below): on
+   the 493,861st step boot fetched from `0x4000_0060`, the unstubbed ROM
+   `ets_apb_backup_init_lock_func` (`esp32c3.rom.ld`; caller RA
+   `0x4200_155c`), printed "Guru Meditation Error" (step ~494,744) and
+   "Rebooting..." (~733,938), and looped on the unstubbed
+   `software_reset_cpu`.
+
+   **Task D10 (APB lock hooks, ROM `.data`, scheduler start) and the
+   current stall.** `ets_apb_backup_init_lock_func` is called by
+   `esp_apb_backup_dma_lock_init()`
+   (`components/esp_system/port/soc/esp32c3/apb_backup_dma.c`, via
+   `init_apb_dma` in `startup_funcs.c`). Its ROM body stores the two
+   function-pointer *values* into the ROM statics `0x3fcd_f654`/
+   `0x3fcd_f658`, so D9's effect was generalized to `StoreWords` with a
+   per-word `WordSource` (`Pointee` for D9's copy, `Register` here). The
+   ROM's SPI-flash legacy data is now seeded at boot (limitation 8 below,
+   resolved; "ROM writable `.data`" above), so the `(0k)` flash-size
+   warning is gone and no access lands at address `0x0`..`0x7` any more.
+   Two more atomic ROM calls follow, both now stubbed (`rom.rs` entry 21):
+   `esp_coex_rom_version_get` (`0x4000_18ac`, step 498,924, from the
+   coexistence library's `coex_pre_init()`; returns the ROM version string,
+   backed as ROM data) and `esprv_intc_int_set_threshold` (`0x4000_05e4`,
+   step 528,694, from FreeRTOS's `xPortStartScheduler()`; stores `a0` = 1
+   to `CPU_INT_THRESH_REG`). The stub count is 92.
+
+   **The current stall is a peripheral, with zero traps.**
+   `xPortStartScheduler()` (`components/freertos/FreeRTOS-Kernel/portable/
+   riscv/port.c`) enables interrupts and calls `vPortYield()`, which asks
+   for the first context switch through the cross-core software interrupt:
+   `esp_crosscore_int_send_yield()` writes `SYSTEM_CPU_INTR_FROM_CPU_0_REG`
+   (`0x600c_0028`, `soc/system_reg.h`; `crosscore_int_ll_trigger_interrupt`
+   in `hal/esp32c3/include/hal/crosscore_int_ll.h`) on the 528,777th step.
+   The SYSTEM peripheral is unmodeled, so the write lands in the unmapped
+   catch-all and no interrupt fires. The yield returns,
+   `xPortStartScheduler()` returns, `vTaskStartScheduler()` returns to
+   `esp_startup_start_app()` (`components/freertos/app_startup.c`, which
+   had created the `main` task), and from step 528,805 the CPU spins on a
+   `j .` at `0x4200_0cd2`. No task ever runs, so the real badge's next line,
+   `main_task: Started on CPU0`, never prints. Nothing panics. Pinned in
    `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_on_the_unstubbed_ets_apb_backup_init_lock_func_call_and_reaches_the_panic_handlers_reboot_message`.
+   `boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled`.
+   Modeling that software interrupt (routing it through the interrupt
+   matrix to a CPU line) is the next step; the FreeRTOS tick (item 2) and
+   `wfi` (item 4) will be needed right after.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -858,6 +929,10 @@ predicted these blockers would surface once TIMG unblocks further boot:
    the shared `unmapped_log` ring buffer other regions use — worth fixing
    first, since the next stalls will otherwise be invisible to the same
    trap-count-based diagnosis method that found the TIMG stall.
+   Boot now reaches this code: in Task D10's run, just before
+   `xPortStartScheduler()` sets the interrupt threshold (step ~528,500),
+   writes to `SYSTIMER_UNIT1_LOAD_HI_REG`/`_LO_REG`/`SYSTIMER_UNIT1_LOAD_REG`
+   (`+0x14`/`+0x18`/`+0x60`, `soc/systimer_reg.h`) went to the unmapped log.
 3. **SPI2 can't be driven by ESP-IDF's `spi_master` driver as-is.** Real
    `spi_ll_apply_config` sets `SPI_CMD_REG`'s `UPDATE` bit and spins on it
    clearing — `emulator-core/src/peripherals/spi.rs` currently stores it as
@@ -895,20 +970,25 @@ predicted these blockers would surface once TIMG unblocks further boot:
    if boot gets past heap init and stalls again on an unmapped read inside
    the DROM aperture near its top end.
 
-8. **The ROM's SPI-flash legacy data is not initialized** (found in Task
-   8). ESP-IDF reads the flash chip's size and ID from `g_rom_flashchip`,
-   i.e. `rom_spiflash_legacy_data->chip` (`rom_spiflash_legacy_data` is the
+8. **Resolved in Task D10: the ROM's SPI-flash legacy data was not
+   initialized** (found in Task 8). The shortcut boot now seeds it (see
+   "ROM writable `.data`" above). The original finding: ESP-IDF reads the
+   flash chip's size and ID from `g_rom_flashchip`, i.e.
+   `rom_spiflash_legacy_data->chip` (`rom_spiflash_legacy_data` is the
    ROM data word at `0x3fcd_fff0`, `esp32c3.rom.ld`). On real hardware the
    mask ROM's startup sets that pointer to its own
    `rom_default_spiflash_legacy_data` (`0x3fcd_f5c0` per the ROM ELF) and
    the 2nd-stage bootloader writes the chip size from the image header. The
-   shortcut boot does neither, so the pointer reads 0: `esp_flash` sees a
+   shortcut boot did neither, so the pointer read 0: `esp_flash` saw a
    0-byte chip (the `Detected size(4096k) larger than ... (0k)` warning)
-   and the ID/size accesses land at addresses `0x0`/`0x4`. Nothing has
-   failed on it yet, but `esp_flash_default_chip->size` is 0.
+   and the ID/size accesses landed at addresses `0x0`/`0x4`. Nothing had
+   failed on it, but `esp_flash_default_chip->size` was 0.
 
-None of the above are correctness bugs *today* — they're dormant because
-boot doesn't reach the code paths that would exercise them. They're
+Item 8 was a live divergence, not a dormant one: it printed a warning the
+real badge doesn't and sent real accesses to address 0, until Task D10
+fixed it. Items 2 to 7 are not correctness bugs *today* — they're dormant
+because boot doesn't reach the code paths that would exercise them (item 2
+is about to be reached; see item 1's current stall). They're
 recorded here so Milestone 3 starts from a known list instead of
 rediscovering each one by stepping through a debugger again.
 
@@ -933,6 +1013,12 @@ memory only (program ANDs, so bits only go 1 -> 0); nothing is written back
 to any file. `emulator-core/tests/flash_partition_table.rs` checks the
 synthesized table byte-for-byte against the real chip's, but only when
 `BADGE_FULL_DUMP` points at the local dump; without it the test skips.
+The firmware learns the chip's size and ID not from the chip but from the
+ROM's SPI-flash legacy data (`g_rom_flashchip`), which the shortcut boot
+seeds (Task D10, "ROM writable `.data`" above): `device_id` `0x464016`
+(this chip's JEDEC ID `0x46 0x40 0x16`, as the bootloader byte-swaps it) and
+`chip_size` 4 MiB (from factory.bin's header), which matches this model's
+size, so `esp_flash` no longer warns about a size mismatch.
 
 ## Data-handling note: what NOT to re-add
 
