@@ -335,16 +335,12 @@ const CMD_USR_AND_PE: u32 = (1 << 18) | (1 << 17);
 
 /// `SPI_MEM_USR_COMMAND` (`SPI_MEM_USER_REG` bit 31).
 pub const USER_USR_COMMAND: u32 = 1 << 31;
-/// `SPI_MEM_USR_ADDR` (`SPI_MEM_USER_REG` bit 30).
-pub const USER_USR_ADDR: u32 = 1 << 30;
 /// `SPI_MEM_USR_MISO` (`SPI_MEM_USER_REG` bit 28).
 pub const USER_USR_MISO: u32 = 1 << 28;
-/// `SPI_MEM_USR_MOSI` (`SPI_MEM_USER_REG` bit 27).
-pub const USER_USR_MOSI: u32 = 1 << 27;
 
 /// `SPI_MEM_USR_COMMAND_VALUE` (`SPI_MEM_USER2_REG` bits `[15:0]`).
 const USER2_COMMAND_VALUE_MASK: u32 = 0xFFFF;
-/// `SPI_MEM_USR_MISO_DBITLEN` / `SPI_MEM_USR_MOSI_DBITLEN` (bits `[9:0]`).
+/// `SPI_MEM_USR_MISO_DBITLEN` (`SPI_MEM_MISO_DLEN_REG` bits `[9:0]`).
 const DLEN_BITLEN_MASK: u32 = 0x3FF;
 
 /// `CMD_RDID` (`spi_flash/include/spi_flash/spi_flash_defs.h`).
@@ -478,6 +474,10 @@ impl Spimem1 {
         }
     }
 
+    /// Runs one `SPI_MEM_USR` transaction. `_flash` is the chip the
+    /// transaction talks to; no command modeled so far (only RDID) reads or
+    /// writes its contents, so it is unused until READ/erase/program are
+    /// observed (see the module doc).
     fn run_user_transaction(&mut self, _flash: &mut EmulatedFlash) {
         self.transactions += 1;
         let user = self.reg(USER_REG);

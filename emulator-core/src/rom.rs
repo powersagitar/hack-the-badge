@@ -606,6 +606,7 @@
 //!       `div`/`rem`). Not stubbed until observed: `strcpy`, `strncpy`,
 //!       `strcmp`, `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
 //!       came in Task 8, entry 18).
+//!
 //!     With these, boot runs fault-free to step 442,140. The next stall is
 //!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
 //!     the SPI1 flash controller (`memspi_host_read_id_hs`,
@@ -617,7 +618,7 @@
 //!
 //! 18. **Atomic ROM libc calls after flash-chip detection** — Milestone 3
 //!     Task 8. With the SPI1 flash controller modeled, boot reaches two more
-//!     ROM libc calls, each now real ([`RomStubEffect`]): `memchr`
+//!     ROM libc calls, each now real ([`crate::cpu::rom_stubs::RomStubEffect`]): `memchr`
 //!     (`0x4000_03c8`, [`MEMCHR`], `esp32c3.rom.libc.ld`; first reached on
 //!     step 490,128 from `0x4211_8854` with `a1 = '\n'`, `a2 = 3`) and
 //!     `memmove` (`0x4000_035c`, [`MEMMOVE`],
