@@ -8,7 +8,11 @@
 //! ESP32-C3-specific interrupt controller/timer up to [`Cpu::raise_interrupt`].
 
 mod decode;
-pub mod encode;
+// The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
+// blobs use is referenced, so the rest would trip `dead_code` now that the
+// module is crate-private.
+#[allow(dead_code)]
+pub(crate) mod encode;
 mod execute;
 mod registers;
 pub mod rom_stubs;

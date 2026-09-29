@@ -656,8 +656,10 @@ predicted these blockers would surface once TIMG unblocks further boot:
    cpu_start-abort scenario purely by coincidence (both are a first
    `INSTRUCTION_ACCESS_FAULT`-class fault immediately followed by the same
    unstubbed reboot-retry fault), not because the cause is related. Pinned
-   down exactly in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`.
+   down at the time in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`
+   (historical name: since Task D6 that test is
+   `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`).
    This is the natural next Milestone 3 candidate: stub `qsort` (a
    self-contained ROM libc algorithm, same "needs a real implementation"
    category as `memcpy`/`memset`/`itoa`/`strcat` — a fabricated return

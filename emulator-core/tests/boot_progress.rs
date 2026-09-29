@@ -181,7 +181,7 @@
 //! `emulator-core/tests/rom_stub_boot.rs`'s renamed pinned-stall test), so
 //! [`boot_reaches_the_panic_handlers_reboot_message_via_cpu_starts_abort`]
 //! is renamed to
-//! [`boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_qsort_fault`]
+//! [`boot_reaches_the_panic_handlers_reboot_message_via_the_reserved_region_overlap_abort`]
 //! below -- same budget, corrected narrative.
 //!
 //! **Task D6 status**: ROM libc `qsort` (`0x4000_0434`) is now real

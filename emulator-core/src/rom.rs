@@ -680,7 +680,9 @@ pub const ITOA: u32 = 0x4000_0448;
 pub const STRCAT: u32 = 0x4000_03d8;
 
 /// ROM libc `qsort`'s fixed address (`esp32c3.rom.libc.ld`: `qsort =
-/// 0x40000434;`, between `ldiv = 0x40000430;` and `rand_r = 0x40000438;`).
+/// 0x40000434;`, between `ldiv = 0x40000430;` in the same script and
+/// `rand_r = 0x40000438;`, which is in `esp32c3.rom.newlib.ld`, not
+/// `esp32c3.rom.libc.ld`).
 /// Unlike every [`NAMED_STUBS`] entry, this is **not** an HLE stub: it is a
 /// 4-byte jump-table slot holding one real `jal x0, <body>` instruction
 /// ([`QSORT_SLOT`]) into a guest-executed body at [`QSORT_BODY_ADDR`] — see
@@ -1812,6 +1814,14 @@ mod tests {
     }
 
     #[test]
+    fn qsort_with_zero_element_size_never_calls_compar_or_writes_the_array() {
+        let bytes = i32_bytes(&[0x1122_3344, 0x5566_7788, 0x0102_0304]);
+        let run = run_qsort(&bytes, 3, 0, Comparator::Words(int32_comparator()));
+        assert_eq!(run.calls, 0, "size 0: compar must not be called");
+        assert_eq!(run.array, bytes, "size 0: array must be untouched");
+    }
+
+    #[test]
     fn qsort_handles_already_sorted_and_reverse_sorted_input() {
         let ascending: Vec<i32> = (0..12).collect();
         let (sorted, calls) = sort_i32(&ascending);
@@ -1973,6 +1983,12 @@ mod tests {
     #[test]
     fn rom_code_never_overlaps_a_stub_and_stays_inside_the_free_rom_range() {
         let table = esp32c3_rom_stubs();
+        for (addr, _) in table.entries_sorted() {
+            assert!(
+                addr < 0x4000_2000,
+                "stub {addr:#x} is not below 0x4000_2000"
+            );
+        }
         for blob in ESP32C3_ROM_CODE {
             let end = blob.base + 4 * blob.words.len() as u32;
             for addr in (blob.base..end).step_by(2) {
