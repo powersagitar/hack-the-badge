@@ -36,14 +36,16 @@ ESP32-C3 device), in two complementary modes:
    boot prints `heap_init: Initializing. RAM available for dynamic
    allocation:`, then all four `heap_init: At ...` region lines once the
    libgcc ROM helpers `__clzsi2`/`__ffssi2` are backed (Milestone 3 Task
-   D8). It then faults on the unstubbed ROM
-   `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`, step 417,992), so the
-   panic handler runs and loops in `software_reset_cpu` retry — well before
-   reaching any built-in app. The current blocker is this unstubbed
-   `esp_rom_newlib_init_common_mutexes` (a known,
-   documented gap — see `docs/firmware-emulator-notes.md`'s "Known
-   limitations" section before assuming a built-in app is reachable in
-   this mode).
+   D8). ROM `esp_rom_newlib_init_common_mutexes` and the ROM libc calls
+   `strlen`/`memcmp`/`strncmp`/`div` are then real stubs (Milestone 3 Task
+   D9), and boot runs on to ESP-IDF's flash-chip detection, which reads the
+   JEDEC ID through the unmodeled SPI1 flash controller: `E (0) memspi: no
+   response` (step 441,439), then an `assert`/`abort()` (step 442,141), so
+   the panic handler runs and loops in `software_reset_cpu` retry — well
+   before reaching any built-in app. The current blocker is this unmodeled
+   SPI1 flash controller (a known, documented gap — see
+   `docs/firmware-emulator-notes.md`'s "Known limitations" section before
+   assuming a built-in app is reachable in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that

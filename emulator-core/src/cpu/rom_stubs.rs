@@ -56,7 +56,9 @@
 //!    functions whose *actual* work matters, the real thing: a real
 //!    register-only computation for [`RomStubEffect::Int64`], or a real
 //!    effect through the bus for [`RomStubEffect::Memset`],
-//!    [`RomStubEffect::Memcpy`], and [`RomStubEffect::BusRegisterWrite`].
+//!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`] and
+//!    [`RomStubEffect::LoadStoreWords`] (plus the read-only libc effects
+//!    `Strlen`/`Memcmp`/`Strncmp`/`DivT`).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.
@@ -229,6 +231,35 @@ pub enum RomStubEffect {
     /// a NUL, not given as an argument), so a corrupt/unterminated string
     /// could otherwise hang this emulator forever.
     Strcat,
+    /// `size_t strlen(const char *s)`: scans NUL-terminated `s = a0` through
+    /// the bus and writes the length to `a0`. The scan is capped at
+    /// [`MAX_STUB_MEMORY_BYTES`], like [`RomStubEffect::Strcat`]'s. Real, not
+    /// a generic status stub: the caller uses the length.
+    Strlen,
+    /// `int memcmp(const void *s1, const void *s2, size_t n)`: compares `n =
+    /// a2` bytes of `s1 = a0` and `s2 = a1` as `unsigned char`, through the
+    /// bus, returning in `a0` the difference of the first differing byte pair
+    /// (`s1[i] - s2[i]`, sign-extended) or 0. Matches the ROM's own code
+    /// (`sub a0, a5, a3` on two `lbu` values; its word-at-a-time fast path
+    /// only skips equal words, so gives the same answer). `n` is capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller branches on the result.
+    Memcmp,
+    /// `int strncmp(const char *s1, const char *s2, size_t n)`: compares at
+    /// most `n = a2` bytes of `s1 = a0`/`s2 = a1` as `unsigned char`,
+    /// stopping after a differing pair or a shared NUL, and returns
+    /// `s1[i] - s2[i]` for the last pair examined (0 if `n == 0` or the
+    /// strings match), in `a0`. Mirrors the ROM's disassembly
+    /// (`0x40058fa6`). `n` capped at [`MAX_STUB_MEMORY_BYTES`].
+    Strncmp,
+    /// `div_t div(int numer, int denom)`: `a0 = numer`, `a1 = denom`; the
+    /// 8-byte `div_t {int quot; int rem;}` is returned in `(a0, a1)` per the
+    /// RV32 psABI. The ROM (`0x400319c6`) computes it with the M-extension
+    /// `div`/`rem` and two fixups that are dead code under RISC-V's
+    /// truncating semantics, so this is plain `div`/`rem` with the
+    /// M-extension's defined edge cases (divide by zero: quot -1, rem
+    /// numer; `i32::MIN / -1`: quot `i32::MIN`, rem 0), same as this CPU
+    /// core's own `DIV`/`REM`.
+    DivT,
     /// `int ets_printf(const char *fmt, ...)` (ROM's own vararg formatter,
     /// and the target of `esp_rom_printf`/every early-boot `ESP_EARLY_LOG*`
     /// line -- `esp32c3.rom.ld: ets_printf = 0x40000040;`,
@@ -261,6 +292,25 @@ pub enum RomStubEffect {
         /// putc-style TX register is driven one character at a time.
         sink_addr: u32,
     },
+    /// A `void` ROM function whose whole effect is "load the word an
+    /// argument register points at, store it to a fixed address", once per
+    /// [`WordLoadStore`] entry, in order, through the bus (Milestone 3 Task
+    /// D9: `esp_rom_newlib_init_common_mutexes(a0, a1)`, which copies `*a0`
+    /// and `*a1` into two ROM-internal statics). Like
+    /// [`RomStubEffect::BusRegisterWrite`] it never touches `a0`: the real
+    /// functions are `void`, and the state the ROM keeps (which later ROM
+    /// code consumes) lands in ordinary emulated memory instead of being
+    /// dropped. Chip-agnostic: `crate::rom` supplies the fixed addresses.
+    LoadStoreWords(&'static [WordLoadStore]),
+}
+
+/// One `*dst = *a[ptr_reg]` word copy for [`RomStubEffect::LoadStoreWords`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WordLoadStore {
+    /// The argument register holding a pointer to the word to read.
+    pub ptr_reg: u8,
+    /// The fixed guest address the loaded word is stored to.
+    pub dst: u32,
 }
 
 /// The address/value computation for [`RomStubEffect::BusRegisterWrite`].
@@ -930,11 +980,52 @@ impl RomStub {
         }
     }
 
+    /// A `void` ROM function that copies the words its pointer arguments
+    /// point at to fixed addresses -- see [`RomStubEffect::LoadStoreWords`].
+    pub const fn load_store_words(name: &'static str, copies: &'static [WordLoadStore]) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::LoadStoreWords(copies),
+        }
+    }
+
     /// A real high-level-emulated `itoa` — see [`RomStubEffect::Itoa`].
     pub const fn itoa(name: &'static str) -> Self {
         Self {
             name,
             effect: RomStubEffect::Itoa,
+        }
+    }
+
+    /// A real high-level-emulated `strlen` — see [`RomStubEffect::Strlen`].
+    pub const fn strlen(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strlen,
+        }
+    }
+
+    /// A real high-level-emulated `memcmp` — see [`RomStubEffect::Memcmp`].
+    pub const fn memcmp(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Memcmp,
+        }
+    }
+
+    /// A real high-level-emulated `strncmp` — see [`RomStubEffect::Strncmp`].
+    pub const fn strncmp(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strncmp,
+        }
+    }
+
+    /// A real high-level-emulated `div` — see [`RomStubEffect::DivT`].
+    pub const fn div_t(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::DivT,
         }
     }
 

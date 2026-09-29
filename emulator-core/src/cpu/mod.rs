@@ -303,6 +303,12 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, result as u32);
                 self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
             }
+            RomStubEffect::LoadStoreWords(copies) => {
+                for copy in copies {
+                    let word = bus.read32(self.regs.read(copy.ptr_reg));
+                    bus.write32(copy.dst, word);
+                }
+            }
             RomStubEffect::Int32Unary(op) => {
                 let a = self.regs.read(rom_stubs::REG_A0);
                 self.regs.write(rom_stubs::REG_A0, op.apply(a));
@@ -387,6 +393,62 @@ impl Cpu {
                     i += 1;
                 }
                 // strcat returns dst, which is already in a0.
+            }
+            RomStubEffect::Strlen => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let mut len: u32 = 0;
+                while len < rom_stubs::MAX_STUB_MEMORY_BYTES && bus.read8(s.wrapping_add(len)) != 0
+                {
+                    len += 1;
+                }
+                self.regs.write(rom_stubs::REG_A0, len);
+            }
+            RomStubEffect::Memcmp => {
+                let s1 = self.regs.read(rom_stubs::REG_A0);
+                let s2 = self.regs.read(rom_stubs::REG_A1);
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                let mut diff: i32 = 0;
+                for i in 0..len {
+                    let x = bus.read8(s1.wrapping_add(i));
+                    let y = bus.read8(s2.wrapping_add(i));
+                    if x != y {
+                        diff = i32::from(x) - i32::from(y);
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, diff as u32);
+            }
+            RomStubEffect::Strncmp => {
+                let s1 = self.regs.read(rom_stubs::REG_A0);
+                let s2 = self.regs.read(rom_stubs::REG_A1);
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                let mut diff: i32 = 0;
+                for i in 0..len {
+                    let x = bus.read8(s1.wrapping_add(i));
+                    let y = bus.read8(s2.wrapping_add(i));
+                    diff = i32::from(x) - i32::from(y);
+                    if diff != 0 || x == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, diff as u32);
+            }
+            RomStubEffect::DivT => {
+                let numer = self.regs.read(rom_stubs::REG_A0) as i32;
+                let denom = self.regs.read(rom_stubs::REG_A1) as i32;
+                let (quot, rem) = if denom == 0 {
+                    (-1, numer)
+                } else {
+                    (numer.wrapping_div(denom), numer.wrapping_rem(denom))
+                };
+                self.regs.write(rom_stubs::REG_A0, quot as u32);
+                self.regs.write(rom_stubs::REG_A1, rem as u32);
             }
             RomStubEffect::Printf { sink_addr } => {
                 let fmt_addr = self.regs.read(rom_stubs::REG_A0);

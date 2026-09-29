@@ -575,10 +575,43 @@
 //!     (0). With both backed, `heap_init` prints all four `heap_init: At
 //!     ...` region lines (step ~415,621). The next stall is on the 417,992nd
 //!     step: ROM `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`,
-//!     `esp32c3.rom.ld`). It is **not** libgcc/libc/string: it copies two
-//!     `_lock_t` pointers into ROM-internal statics (`0x3fcd_f65c`/
-//!     `0x3fcd_f660`, per the ROM ELF's disassembly), so it needs a
-//!     decision on modelling that ROM state. Task D8 stopped there.
+//!     `esp32c3.rom.libc.ld`), which Task D9 (entry 17) backed.
+//!
+//! 17. **Newlib-init hooks and atomic ROM libc calls** — Milestone 3 Task D9.
+//!     - `esp_rom_newlib_init_common_mutexes(_LOCK_T, _LOCK_T)`
+//!       ([`ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES`], `0x4000_0350`;
+//!       `esp32c3.rom.libc.ld`; called by `esp_newlib_locks_init()` in
+//!       IDF v5.5.3's `components/newlib/src/locks.c` with two copies of a
+//!       "magic" `_LOCK_T` -- the ROM has retargetable locking with no
+//!       exported lock symbols on the C3). The ROM ELF
+//!       (`esp32c3_rev3_rom.elf`, esp-rom-elfs 20241011; local-only) shows
+//!       `0x40000350` is a `j 0x4005260e` trampoline to a 7-instruction body:
+//!       `lw a4,0(a0); sw a4,0x660(0x3fcdf000); lw a4,0(a1);
+//!       sw a4,0x65c(0x3fcdf000); ret`. It stores the *pointed-at words*
+//!       (`*a0`, `*a1`), not the pointers, into the ROM statics
+//!       `common_recursive_mutex` (`0x3fcd_f660`) and `common_mutex`
+//!       (`0x3fcd_f65c`) (`llvm-nm` names). Modeled faithfully as
+//!       [`RomStubEffect::LoadStoreWords`] with [`NEWLIB_COMMON_MUTEX_COPIES`]:
+//!       the stores go through the bus into the DRAM aperture (which
+//!       `crate::boot` backs with scratch RAM, including the ROM-reserved
+//!       `0x3fcd_f060..` window), leaving `a0` alone (a `void` function).
+//!     - Atomic ROM libc calls hit next, each real ([`RomStubEffect`]):
+//!       `strlen` (`0x4000_0374`, [`STRLEN`]), `memcmp` (`0x4000_0360`,
+//!       [`MEMCMP`]), `strncmp` (`0x4000_0370`, [`STRNCMP`]), `div`
+//!       (`0x4000_0428`, [`DIV`]; returns `div_t` in `a0`/`a1`). Addresses are
+//!       from `esp32c3.rom.libc.ld`; each is a `j` trampoline to newlib code
+//!       in the ROM ELF whose semantics the doc comment of its effect states
+//!       (`memcmp`/`strncmp` return the unsigned-byte difference; `div` is
+//!       truncating division, its two fixups being dead code under RISC-V
+//!       `div`/`rem`). Not stubbed until observed: `strcpy`, `strncpy`,
+//!       `strcmp`, `strstr`, `bzero`, `memmove`, `ldiv`, ....
+//!     With these, boot runs fault-free to step 442,140. The next stall is
+//!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
+//!     the SPI1 flash controller (`memspi_host_read_id_hs`,
+//!     `components/spi_flash/memspi_host_driver.c`), gets 0 from the
+//!     unmodeled peripheral and logs `E (0) memspi: no response` (step
+//!     441,439), then fails an `assert` and `abort()`s (ILLEGAL_INSTRUCTION,
+//!     step 442,141).
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -599,16 +632,27 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D8**: 82 stubs (D7's 80 plus `__clzsi2` and `__ffssi2`, entry
+//! **As of Task D9**: 87 stubs (D8's 82 plus `esp_rom_newlib_init_common_mutexes`,
+//! `strlen`, `memcmp`, `strncmp`, `div`, entry 17). Boot runs fault-free
+//! through `esp_newlib_init`'s ROM calls to step 442,140, prints `E (0)
+//! memspi: no response` (step 441,439, an *error*: the SPI1 flash
+//! controller is unmodeled, so the JEDEC-ID read returns 0), and aborts on
+//! a failed `assert` (ILLEGAL_INSTRUCTION, 442,141st step). The panic
+//! handler prints "assert failed" (~443,599), "Rebooting..." (~680,821),
+//! faults on `software_reset_cpu` (681,436th step), prints "Guru Meditation
+//! Error" (~682,319) and loops. **The actual blocker is now the unmodeled
+//! SPI1 flash controller.** See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`.
+//! The Task D8 paragraph below is kept as history.
+//!
+//! **As of Task D8** (history): 82 stubs (D7's 80 plus `__clzsi2` and `__ffssi2`, entry
 //! 16). Boot gets through `heap_init`'s whole region list and prints all
 //! four `heap_init: At ...` lines, then faults on the unstubbed ROM
 //! `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`, step 417,992). The
 //! panic handler prints "Guru Meditation Error" (step ~419,414),
 //! "Rebooting..." (~658,042), faults on `software_reset_cpu` (658,657th
-//! step) and loops. **The actual blocker is now the unstubbed
-//! `esp_rom_newlib_init_common_mutexes`.** See `tests/rom_stub_boot.rs`'s
-//! `boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message`.
-//! The Task D7 paragraph below is kept as history.
+//! step) and loops. (Its pinned test was re-pointed in Task D9.) The Task D7
+//! paragraph below is kept as history.
 //!
 //! **As of Task D7** (this table, 80 stubs, one guest-executed routine,
 //! `qsort`, from [`ESP32C3_ROM_CODE`], and the ROM layout table from
@@ -661,8 +705,8 @@ use crate::cpu::encode::{
     S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1,
-    REG_A2,
+    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, WordLoadStore,
+    REG_A0, REG_A1, REG_A2,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
@@ -782,6 +826,58 @@ pub const ITOA: u32 = 0x4000_0448;
 /// (see the module doc's entry 12) -- a real HLE implementation
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strcat`]), same reasoning.
 pub const STRCAT: u32 = 0x4000_03d8;
+
+/// `esp_rom_newlib_init_common_mutexes`'s fixed address
+/// (`esp32c3.rom.libc.ld`: `esp_rom_newlib_init_common_mutexes = 0x40000350;`).
+/// A real HLE effect ([`crate::cpu::rom_stubs::RomStubEffect::LoadStoreWords`]),
+/// see the module doc's entry 17 and [`NEWLIB_COMMON_MUTEX_COPIES`].
+pub const ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES: u32 = 0x4000_0350;
+
+/// The two ROM-internal statics `esp_rom_newlib_init_common_mutexes` stores
+/// into, from the ROM ELF's symbol table (`llvm-nm`): `0x3fcd_f65c` is
+/// `common_mutex` (also aliased as `__lock___tz_mutex` etc.) and
+/// `0x3fcd_f660` is `common_recursive_mutex` (`__lock___malloc_recursive_mutex`
+/// etc.).
+pub const ROM_COMMON_MUTEX: u32 = 0x3fcd_f65c;
+/// See [`ROM_COMMON_MUTEX`].
+pub const ROM_COMMON_RECURSIVE_MUTEX: u32 = 0x3fcd_f660;
+
+/// The ROM's own disassembly (`4005260e <esp_rom_newlib_init_common_mutexes>`,
+/// reached from the `0x40000350` `j` trampoline `__call_...`): `lw a4,0(a0);
+/// sw a4,0x660(0x3fcdf000); lw a4,0(a1); sw a4,0x65c(0x3fcdf000); ret` --
+/// i.e. `*a0 -> 0x3fcdf660`, `*a1 -> 0x3fcdf65c`, in that order.
+const NEWLIB_COMMON_MUTEX_COPIES: &[WordLoadStore] = &[
+    WordLoadStore {
+        ptr_reg: REG_A0,
+        dst: ROM_COMMON_RECURSIVE_MUTEX,
+    },
+    WordLoadStore {
+        ptr_reg: REG_A1,
+        dst: ROM_COMMON_MUTEX,
+    },
+];
+
+/// ROM libc `strlen`'s fixed address (`esp32c3.rom.libc.ld`: `strlen =
+/// 0x40000374;`). A real HLE implementation
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strlen`]); the ROM ELF shows
+/// `0x40000374` is a `j 0x40058e8c <strlen>` trampoline. See the module doc's
+/// entry 17.
+pub const STRLEN: u32 = 0x4000_0374;
+
+/// ROM libc `memcmp`'s fixed address (`esp32c3.rom.libc.ld`: `memcmp =
+/// 0x40000360;`; the ROM ELF shows a `j 0x40058772 <memcmp>` trampoline). Real
+/// HLE ([`crate::cpu::rom_stubs::RomStubEffect::Memcmp`]); module doc entry 17.
+pub const MEMCMP: u32 = 0x4000_0360;
+
+/// ROM libc `strncmp`'s fixed address (`esp32c3.rom.libc.ld`: `strncmp =
+/// 0x40000370;`; trampoline to `0x40058fa6 <strncmp>`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strncmp`]); module doc entry 17.
+pub const STRNCMP: u32 = 0x4000_0370;
+
+/// ROM libc `div`'s fixed address (`esp32c3.rom.libc.ld`: `div =
+/// 0x40000428;`; trampoline to `0x400319c6 <div>`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::DivT`]); module doc entry 17.
+pub const DIV: u32 = 0x4000_0428;
 
 /// ROM libc `qsort`'s fixed address (`esp32c3.rom.libc.ld`: `qsort =
 /// 0x40000434;`, between `ldiv = 0x40000430;` in the same script and
@@ -1118,6 +1214,17 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (0x4000_0588, RomStub::void("ets_update_cpu_frequency")),
     (ITOA, RomStub::itoa("itoa")),
     (STRCAT, RomStub::strcat("strcat")),
+    (STRLEN, RomStub::strlen("strlen")),
+    (MEMCMP, RomStub::memcmp("memcmp")),
+    (STRNCMP, RomStub::strncmp("strncmp")),
+    (DIV, RomStub::div_t("div")),
+    (
+        ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES,
+        RomStub::load_store_words(
+            "esp_rom_newlib_init_common_mutexes",
+            NEWLIB_COMMON_MUTEX_COPIES,
+        ),
+    ),
 ];
 
 /// libgcc's 64-bit integer helpers, which this firmware also links out of ROM
@@ -1389,21 +1496,26 @@ mod tests {
         // real implementation -- never the generic default. Addresses from
         // esp32c3.rom.libc.ld / esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld.
         let table = esp32c3_rom_stubs();
+        // Task D9 gave strlen/memcmp/strncmp real effects (checked below).
         for addr in [
-            0x4000_0374u32, /* strlen */
-            0x4000_03c8,    /* memchr */
+            0x4000_03c8u32, /* memchr */
             0x4000_035c,    /* memmove */
-            0x4000_0360,    /* memcmp */
             0x4000_0364,    /* strcpy */
             0x4000_0368,    /* strncpy */
             0x4000_036c,    /* strcmp */
-            0x4000_0370,    /* strncmp */
         ] {
             assert_eq!(
                 table.lookup(addr),
                 None,
                 "ROM libc address 0x{addr:08x} must not carry a generic stub"
             );
+        }
+        for (addr, effect) in [
+            (STRLEN, RomStubEffect::Strlen),
+            (MEMCMP, RomStubEffect::Memcmp),
+            (STRNCMP, RomStubEffect::Strncmp),
+        ] {
+            assert_eq!(table.lookup(addr).unwrap().effect, effect);
         }
         assert_eq!(
             table.lookup(MEMSET).unwrap().effect,
@@ -1694,6 +1806,152 @@ mod tests {
              immediately without touching a0 is correct HLE, same reasoning \
              as ets_delay_us"
         );
+    }
+
+    #[test]
+    fn newlib_init_common_mutexes_copies_the_pointed_at_words_into_rom_statics() {
+        // esp_rom_newlib_init_common_mutexes(a0 = &recursive, a1 = &plain)
+        // must store *a0 at 0x3fcdf660 and *a1 at 0x3fcdf65c -- the pointed-at
+        // words, not the pointers -- and leave a0 alone (void function).
+        let table = esp32c3_rom_stubs();
+        let stub = table
+            .lookup(ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES)
+            .expect("registered");
+        assert_eq!(stub.name, "esp_rom_newlib_init_common_mutexes");
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        // boot.rs backs the whole DRAM aperture (which includes the
+        // ROM-reserved 0x3fcdf060.. window) with scratch RAM; mirror the
+        // relevant parts here.
+        bus.add_scratch_ram(0x3fc9_0100, 16);
+        bus.add_scratch_ram(0x3fcd_f650, 0x20);
+        bus.write32(0x3fc9_0100, 0xdead_beef);
+        bus.write32(0x3fc9_0104, 0x1234_5678);
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 0x3fc9_0100);
+        cpu.regs.write(REG_A1, 0x3fc9_0104);
+        cpu.regs.pc = ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(cpu.regs.read(REG_A0), 0x3fc9_0100, "void: a0 untouched");
+        assert_eq!(bus.read32(0x3fcd_f660), 0xdead_beef);
+        assert_eq!(bus.read32(0x3fcd_f65c), 0x1234_5678);
+    }
+
+    #[test]
+    fn strlen_stub_returns_the_length_of_a_nul_terminated_string() {
+        let str_addr = 0x3fc9_0200;
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(str_addr, 16);
+        for (i, b) in b"hello\0zz".iter().enumerate() {
+            bus.write8(str_addr + i as u32, *b);
+        }
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, str_addr);
+        cpu.regs.pc = STRLEN;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(STRLEN));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(cpu.regs.read(REG_A0), 5);
+        // Empty string.
+        cpu.regs.write(REG_A0, str_addr + 5);
+        cpu.regs.pc = STRLEN;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.regs.read(REG_A0), 0);
+    }
+
+    #[test]
+    fn memcmp_stub_returns_the_first_differing_byte_difference() {
+        let (a, b) = (0x3fc9_0300, 0x3fc9_0320);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(a, 16);
+        bus.add_scratch_ram(b, 16);
+        for (i, x) in [1u8, 2, 0x90, 4].iter().enumerate() {
+            bus.write8(a + i as u32, *x);
+        }
+        for (i, x) in [1u8, 2, 0x10, 9].iter().enumerate() {
+            bus.write8(b + i as u32, *x);
+        }
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, n: u32| {
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, a);
+            cpu.regs.write(REG_A1, b);
+            cpu.regs.write(REG_A2, n);
+            cpu.regs.pc = MEMCMP;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(MEMCMP));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            cpu.regs.read(REG_A0)
+        };
+        // Bytes are compared as unsigned char: 0x90 - 0x10 = +0x80.
+        assert_eq!(call(&mut cpu, &mut bus, 4), 0x80);
+        assert_eq!(call(&mut cpu, &mut bus, 2), 0, "equal prefix");
+        assert_eq!(call(&mut cpu, &mut bus, 0), 0, "n = 0");
+        // Swap operands' roles: negative difference, as a wrapped i32.
+        bus.write8(a + 2, 0x10);
+        bus.write8(b + 2, 0x90);
+        assert_eq!(call(&mut cpu, &mut bus, 4) as i32, -0x80);
+    }
+
+    #[test]
+    fn strncmp_stub_stops_at_nul_or_n_and_returns_the_byte_difference() {
+        let (a, b) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(a, 16);
+        bus.add_scratch_ram(b, 16);
+        for (i, x) in b"abcX\0".iter().enumerate() {
+            bus.write8(a + i as u32, *x);
+        }
+        for (i, x) in b"abcY\0".iter().enumerate() {
+            bus.write8(b + i as u32, *x);
+        }
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, n: u32| {
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, a);
+            cpu.regs.write(REG_A1, b);
+            cpu.regs.write(REG_A2, n);
+            cpu.regs.pc = STRNCMP;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRNCMP));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            cpu.regs.read(REG_A0) as i32
+        };
+        assert_eq!(call(&mut cpu, &mut bus, 0), 0, "n = 0");
+        assert_eq!(call(&mut cpu, &mut bus, 3), 0, "equal within n");
+        assert_eq!(call(&mut cpu, &mut bus, 4), -1, "'X' - 'Y'");
+        // Equal strings stop at the shared NUL even if n is larger.
+        bus.write8(a + 3, 0);
+        bus.write8(b + 3, 0);
+        bus.write8(a + 4, b'p');
+        bus.write8(b + 4, b'q');
+        assert_eq!(call(&mut cpu, &mut bus, 16), 0, "stops at NUL");
+    }
+
+    #[test]
+    fn div_stub_returns_the_quot_rem_pair_in_a0_a1() {
+        let run = |num: i32, den: i32| {
+            let (cpu, _bus) = run_stub_call(DIV, &[(REG_A0, num as u32), (REG_A1, den as u32)]);
+            (cpu.regs.read(REG_A0) as i32, cpu.regs.read(REG_A1) as i32)
+        };
+        assert_eq!(run(0x50, 0x50), (1, 0), "the observed boot call");
+        assert_eq!(run(17, 5), (3, 2));
+        assert_eq!(run(-17, 5), (-3, -2), "C truncation toward zero");
+        assert_eq!(run(17, -5), (-3, 2));
+        assert_eq!(run(5, 0), (-1, 5), "M-extension divide by zero");
+        assert_eq!(run(i32::MIN, -1), (i32::MIN, 0), "M-extension overflow");
     }
 
     // ---- Milestone 3 Task 7: `ets_printf` full-execution tests ----

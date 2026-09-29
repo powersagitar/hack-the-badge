@@ -160,6 +160,14 @@ stub can have is one of `RomStubEffect`'s variants
   apply unchanged. Output and format-string-scan length are both capped
   (1 KiB) so a garbage format-string pointer can't hang the emulator.
 
+- `LoadStoreWords` (added in Milestone 3's Task D9) — for a `void` ROM
+  function whose whole effect is copying the words its pointer arguments
+  point at to fixed ROM-internal addresses (`esp_rom_newlib_init_common_mutexes`),
+  done through the bus so later ROM code sees the state.
+- `Strlen`/`Memcmp`/`Strncmp`/`DivT` (Task D9) — real ROM libc reads and
+  computations mirroring the ROM ELF's own code (`DivT` returns `div_t` in
+  `a0`/`a1`).
+
 **Guest-executed ROM routines (Milestone 3 Task D6).** A stub's effect runs
 atomically inside one CPU step, so it cannot run guest code. ROM libc
 `qsort` has to call its `compar` argument, which is firmware code, over and
@@ -762,21 +770,48 @@ predicted these blockers would surface once TIMG unblocks further boot:
    fault until observed. `heap_init` now prints all four `heap_init: At
    ...` lines (the last, `RTCRAM`, at step ~415,621).
 
-   **The current stall**: on the 417,992nd step boot fetches from
-   `0x4000_0350`, ROM `esp_rom_newlib_init_common_mutexes`
-   (`esp32c3.rom.ld`; caller RA `0x4200_6a22`). It is not a libgcc/libc/
-   string function: the ROM ELF's disassembly shows it stores
-   `*a0` and `*a1` (the `_lock_t` pointers) into two ROM-internal statics
-   at `0x3fcd_f660` and `0x3fcd_f65c`, i.e. it mutates ROM-owned data. Task
-   D8 stopped there rather than pick a modelling (Void stub vs. really
-   writing the two words). As before, it is a hardware exception, so "Guru
-   Meditation Error" prints at step ~419,414, "Rebooting..." at ~658,042,
-   then the unstubbed `software_reset_cpu` faults on the 658,657th step
-   (next fault at 899,221). Pinned in `emulator-core/tests/rom_stub_boot.rs`.
+   **The stall at the end of Task D8** (now fixed, see Task D9 below): on
+   the 417,992nd step boot fetched from `0x4000_0350`, ROM
+   `esp_rom_newlib_init_common_mutexes` (RA `0x4200_6a22`), which mutates
+   ROM-owned data (two `_lock_t` words). Its pinned test was re-pointed in
+   Task D9.
 
-   **Next candidate**: back `esp_rom_newlib_init_common_mutexes` (a
-   decision is needed on modelling the two ROM-static stores), and
-   re-probe.
+   **Task D9 (newlib-init hooks) and the current stall.** New
+   `RomStubEffect::LoadStoreWords`: for each `(ptr_reg, dst)` pair, load the
+   word `a[ptr_reg]` points at and store it to the fixed address `dst`,
+   through the bus; `a0` is untouched (`void` functions).
+   `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`,
+   `esp32c3.rom.libc.ld`) is called by `esp_newlib_locks_init()` (IDF
+   v5.5.3 `components/newlib/src/locks.c`) with two copies of a magic
+   `_LOCK_T`. The ROM ELF's body (`0x4005260e`) is `lw a4,0(a0); sw
+   a4,0x660(0x3fcdf000); lw a4,0(a1); sw a4,0x65c(0x3fcdf000); ret`, so it
+   stores `*a0` at `0x3fcd_f660` (`common_recursive_mutex`) and `*a1` at
+   `0x3fcd_f65c` (`common_mutex`), the pointed-at words rather than the
+   pointers. Boot then made four atomic ROM libc calls, each now a real
+   stub: `strlen` (`0x4000_0374`), `memcmp` (`0x4000_0360`), `strncmp`
+   (`0x4000_0370`) and `div` (`0x4000_0428`, returning `div_t` in
+   `a0`/`a1`). All are in `esp32c3.rom.libc.ld`; the rest of the string
+   family (`strcpy`, `strncpy`, `strcmp`, `strstr`, `bzero`, `memmove`,
+   `ldiv`) stays unstubbed until observed. The stub count is 87.
+
+   **The current stall**: boot runs fault-free to step 442,140. ESP-IDF's
+   flash-chip detection (`memspi_host_read_id_hs`,
+   `components/spi_flash/memspi_host_driver.c`) issues a JEDEC RDID
+   command through the SPI1 flash controller, which is not modeled; the
+   read returns 0, so the firmware logs `E (0) memspi: no response` (step
+   441,439), fails an `assert` (`assert failed: 0x4039734c <cached
+   disabled>:118`) and `abort()`s (ILLEGAL_INSTRUCTION on the 442,141st
+   step). This is an abort, so "Rebooting..." prints at ~680,821, the
+   unstubbed `software_reset_cpu` faults on step 681,436, "Guru Meditation
+   Error" prints at ~682,319, and the loop's next fault is at 921,911. Pinned
+   in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`.
+
+   **Next candidate**: model the SPI1 flash controller (the flash-command
+   `SPI_MEM_*` registers: CMD/USR/MISO length/`W0..` data) enough for RDID to
+   return the badge's JEDEC ID (`0x46 0x40 0x16` per the handoff notes) and
+   re-probe. This is a peripheral, so it needs the register-faithful,
+   header-cited treatment, not a ROM stub.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -819,7 +854,7 @@ predicted these blockers would surface once TIMG unblocks further boot:
    aligned start (`drom_addr_aligned`) — the source comment says this is
    "for app to find the boot partition." `crate::mem::bus::FirmwareBus`
    doesn't add this extra mapping at all today; nothing in the observed
-   boot trace through Task D7's stall (the unstubbed `esp_rom_newlib_init_common_mutexes`, item 1)
+   boot trace through Task D7's stall (item 1)
    has touched that fixed high address, so it's not yet a confirmed
    blocker — but it's a plausible **candidate cause of a later
    partition-table/`esp_partition_find`-style stall**, worth checking first

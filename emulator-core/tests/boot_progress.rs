@@ -210,6 +210,19 @@
 //! The two panic-text rungs below keep their budgets, with corrected
 //! narratives; one is renamed.
 //!
+//! **Task D9 status**: `esp_rom_newlib_init_common_mutexes` is a real stub
+//! (`RomStubEffect::LoadStoreWords`) and ROM libc `strlen`/`memcmp`/
+//! `strncmp`/`div` are real, so boot runs fault-free to step 442,140. No new
+//! good console line appears: the next line is `E (0) memspi: no response`
+//! (step 441,439), an *error* from the unmodeled SPI1 flash controller, not
+//! progress. It is followed by an `assert failed` `abort()` (ILLEGAL_
+//! INSTRUCTION on the 442,141st step). The progress rung is therefore a
+//! no-trap-through-step assertion
+//! ([`boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site`]).
+//! "Rebooting..." now prints at step ~680,821 and "Guru Meditation Error"
+//! at ~682,319 (after the `software_reset_cpu` fault on step 681,436); both
+//! are panic-path lines, not progress.
+//!
 //! **Task D8 status**: libgcc `__clzsi2`/`__ffssi2` are real HLE stubs, so
 //! `heap_init` prints all four `heap_init: At ...` lines (the last, `RTCRAM`,
 //! at step ~415,621; a new rung, [`boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers`]).
@@ -346,6 +359,12 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// after the failed `software_reset_cpu` reboot retry, measured at step
 /// ~648,960. That is still well within the 750,000 budget.
 ///
+/// **Task D9 update**: the newlib-mutex fault is gone too. The cause is now
+/// an `abort()` after `E (0) memspi: no response` (ILLEGAL_INSTRUCTION on
+/// the 442,141st step), so this line prints only after the reboot retry's
+/// `software_reset_cpu` fault (step 681,436): step ~682,319, inside the
+/// 750,000 budget (~9% margin).
+///
 /// **Task D8 update**: the `__clzsi2` fault is gone too (real libgcc
 /// stubs). The cause is now the unstubbed ROM
 /// `esp_rom_newlib_init_common_mutexes` fault on the 417,992nd step, still a
@@ -420,14 +439,23 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// from 660,000 (which would have left a 0.3% margin) to 700,000
 /// (~6% margin). Still a panic-path line, **not** boot progress.
 ///
-/// This rung is **deliberately expected to break** once a later task backs
-/// `esp_rom_newlib_init_common_mutexes`: at that point this panic path is
-/// never reached either, and whoever makes that fix should delete or
-/// replace this test rather than chase a new pinned value here.
+/// **Renamed again in Task D9** (from
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_newlib_init_common_mutexes_fault`):
+/// the newlib-mutex stub exists, so the panic is now reached via the
+/// `abort()` after `E (0) memspi: no response` (the 442,141st step).
+/// "Rebooting..." prints at step ~680,821; [`boot_until_console_contains`]
+/// sees it at its 750,000-step check (the 500,000-step check comes too
+/// early). Budget raised from 700,000, which would leave a 2.8% margin over
+/// the measured step, to 750,000 (~9%). Still a panic-path line, **not**
+/// boot progress.
+///
+/// This rung is **deliberately expected to break** once a later task models
+/// the SPI1 flash controller: at that point this panic path is never
+/// reached either, and whoever makes that fix should delete or replace this
+/// test rather than chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_newlib_init_common_mutexes_fault(
-) {
-    assert_reaches("Rebooting...", 700_000);
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort() {
+    assert_reaches("Rebooting...", 750_000);
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -663,13 +691,39 @@ fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
 /// the real badge's boot log also has. Measured at step ~415,621. The
 /// 500,000 budget is honest given [`boot_until_console_contains`]'s
 /// 250,000-step chunking (it sees the line at its 500,000-step check;
-/// ~84,000 steps of real margin). The panic that follows (the unstubbed ROM
-/// `esp_rom_newlib_init_common_mutexes`) is *not* progress and has its own
-/// pinned test in `rom_stub_boot.rs`.
+/// ~84,000 steps of real margin). The panic that followed at Task D8
+/// (the unstubbed ROM `esp_rom_newlib_init_common_mutexes`) is gone in Task
+/// D9; see [`boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site`].
 #[test]
 fn boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers() {
     assert_reaches(
         "I (0) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
         500_000,
+    );
+}
+
+/// Milestone 3 Task D9's ratchet rung (the no-new-progress-line fallback,
+/// see the module doc). Before this task boot faulted on the unstubbed ROM
+/// `esp_rom_newlib_init_common_mutexes` at step 417,992. With it and the
+/// libc `strlen`/`memcmp`/`strncmp`/`div` calls after it backed, the first
+/// trap of any kind is the `abort()` at step 442,141, so a run of 440,000
+/// steps -- past the old fault by 22,008 steps -- must show **zero** traps.
+/// (The stall after it, `E (0) memspi: no response`, is the unmodeled SPI1
+/// flash controller: an error, not progress.)
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(440_000);
+    assert_eq!(
+        summary.traps,
+        0,
+        "boot must run past the old newlib-init fault (step 417,992) with no \
+         traps; got {summary:?}, pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(
+        rt.console_output().contains("I (0) heap_init: At 50000020"),
+        "heap_init's last region line should be present"
     );
 }

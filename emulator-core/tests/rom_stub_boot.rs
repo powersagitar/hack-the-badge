@@ -41,7 +41,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later stall (see this file's renamed
-    // `boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message`
+    // `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -87,6 +87,12 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // trap is now the unstubbed ROM `esp_rom_newlib_init_common_mutexes`
     // fault at step 417,992 (see the pinned-stall test below). 350,000 stays
     // clear by ~67,992 steps (~19%).
+    //
+    // Task D9 status: `esp_rom_newlib_init_common_mutexes` and the libc
+    // `strlen`/`memcmp`/`strncmp`/`div` calls after it are real stubs; boot's
+    // first trap is now an `abort()`'s ILLEGAL_INSTRUCTION at step 442,141
+    // (after `E (0) memspi: no response`; see the pinned-stall test below).
+    // 350,000 stays clear by ~92,141 steps (~26%).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -234,59 +240,59 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// list and prints all four `heap_init: At ...` lines (the last, `RTCRAM`,
 /// at step ~415,621).
 ///
-/// **The new stall**: on the 417,992nd step boot fetches from `0x4000_0350`,
-/// ROM `esp_rom_newlib_init_common_mutexes` (`esp32c3.rom.ld`), called from
-/// `esp_newlib_init`'s caller chain (RA `0x4200_6a22`). It is not stubbed,
-/// so this is an `INSTRUCTION_ACCESS_FAULT`. Because this is a hardware
-/// exception, not an `abort()`, the panic handler prints "Guru Meditation
-/// Error" straight away (step ~419,414), then "Rebooting..." (step
-/// ~658,042), then faults on the still-unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`) on the 658,657th step, and loops (next fault on step
-/// 899,221). `software_reset_cpu` stays unstubbed: it is reached only on the
-/// panic path.
+/// **What changed in Task D9**: `esp_rom_newlib_init_common_mutexes`
+/// (`0x4000_0350`) now really copies `*a0`/`*a1` to the ROM statics
+/// `0x3fcd_f660`/`0x3fcd_f65c` (`RomStubEffect::LoadStoreWords`), and the
+/// atomic ROM libc calls `esp_newlib_init`'s successors make -- `strlen`
+/// (`0x4000_0374`), `memcmp` (`0x4000_0360`), `strncmp` (`0x4000_0370`),
+/// `div` (`0x4000_0428`) -- are real HLE stubs. Boot runs on with zero traps
+/// for another ~24,000 steps.
 ///
-/// This test is **deliberately expected to break** once a later task backs
-/// `esp_rom_newlib_init_common_mutexes`. At that point this fault sequence
-/// disappears, and whoever makes that fix should delete or replace this test
-/// rather than chase a new pinned value here.
+/// **The new stall**: ESP-IDF's flash-chip detection (`esp_flash_init` /
+/// memspi) reads the flash JEDEC ID through the SPI1 flash controller,
+/// which this emulator does not model, and logs `E (0) memspi: no response`
+/// (step 441,439). It then fails an `assert` -- `assert failed:
+/// 0x4039734c <cached disabled>:118` printed at step ~443,599 -- so
+/// `abort()` runs `panic_abort()`'s ILLEGAL_INSTRUCTION on the 442,141st step
+/// (mepc `0x4038_e4fa`). Because this is an `abort()`, "Guru Meditation
+/// Error" prints only after the panic handler's reboot retry faults, at step
+/// ~682,319 ("Rebooting..." at ~680,821, the `software_reset_cpu` fault at
+/// step 681,436, next fault at 921,911). `software_reset_cpu` stays
+/// unstubbed: it is reached only on the panic path.
+///
+/// This test is **deliberately expected to break** once a later task models
+/// the SPI1 flash controller; whoever makes that fix should delete or
+/// replace it rather than chase a new pinned value here.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message(
-) {
+fn boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message() {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through ROM qsort, the reserved-region check (Task D6's old
-    // abort), heap_init's whole region list and the libgcc `__clzsi2`/
-    // `__ffssi2` calls (Task D8), with zero traps.
-    let summary = rt.run(417_991);
+    // Phase 1: through the newlib-init ROM calls, heap_init and the start
+    // of flash detection, with zero traps.
+    let summary = rt.run(442_140);
     assert_eq!(
         summary.traps, 0,
-        "boot must run through the reserved-region check without any trap \
-         (pre-Task-D7 it aborted there; pre-Task-D8 it faulted on __clzsi2 at \
-         step 409,759); got {summary:?}"
+        "boot must run through esp_newlib_init's ROM calls without any trap \
+         (pre-Task-D9 it faulted on esp_rom_newlib_init_common_mutexes at \
+         step 417,992); got {summary:?}"
+    );
+    assert!(
+        rt.console_output().contains("E (0) memspi: no response"),
+        "expected the flash-detection error line before the abort; got:\n{}",
+        rt.console_output()
     );
 
-    // Phase 2: the very next step fetches the unstubbed ROM
-    // `esp_rom_newlib_init_common_mutexes`.
+    // Phase 2: the very next step is the abort()'s ILLEGAL_INSTRUCTION.
     let summary = rt.run(1);
-    assert_eq!(
-        summary.traps, 1,
-        "expected the esp_rom_newlib_init_common_mutexes fault; got {summary:?}"
-    );
-    assert_eq!(
-        summary.last_instruction_fault,
-        Some(0x4000_0350),
-        "expected an INSTRUCTION_ACCESS_FAULT on esp_rom_newlib_init_common_mutexes (esp32c3.rom.ld)"
-    );
-    assert_eq!(
-        rt.cpu().csr.mcause,
-        exception_code::INSTRUCTION_ACCESS_FAULT
-    );
+    assert_eq!(summary.traps, 1, "expected the abort trap; got {summary:?}");
+    assert_eq!(rt.cpu().csr.mcause, exception_code::ILLEGAL_INSTRUCTION);
+    assert_eq!(rt.cpu().csr.mepc, 0x4038_e4fa);
 
-    // Phase 3, up to 665,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (the 658,657th step). 6,343
-    // steps of margin, and the next fault is not until step 899,221.
-    let summary = rt.run(665_000 - 417_992);
+    // Phase 3, up to 690,000 total: the panic handler's reboot attempt
+    // faults on unstubbed software_reset_cpu (the 681,436th step). 8,564
+    // steps of margin, and the next fault is not until step 921,911.
+    let summary = rt.run(690_000 - 442_141);
     assert_eq!(
         summary.traps, 1,
         "expected exactly one more trap: the software_reset_cpu \
@@ -312,12 +318,12 @@ fn boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_re
         "the reserved-region overlap error (Task D6's stall) must be gone; got:\n{console}"
     );
     assert!(
-        !console.contains("abort() was called"),
-        "nothing on this path calls abort() any more; got:\n{console}"
+        console.contains("assert failed"),
+        "expected the failed assert's message; got:\n{console}"
     );
     assert!(
         console.contains("Guru Meditation Error"),
-        "expected the panic handler's crash report for the newlib-mutex-init fault; got:\n{console}"
+        "expected the panic handler's crash report; got:\n{console}"
     );
     assert!(
         console.contains("Rebooting..."),
