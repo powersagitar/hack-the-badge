@@ -251,6 +251,21 @@ pub enum RomStubEffect {
     /// strings match), in `a0`. Mirrors the ROM's disassembly
     /// (`0x40058fa6`). `n` capped at [`MAX_STUB_MEMORY_BYTES`].
     Strncmp,
+    /// `void *memchr(const void *s, int c, size_t n)`: scans `n = a2` bytes
+    /// of `s = a0` through the bus for the byte `(unsigned char)c` (`c =
+    /// a1`), returning in `a0` the address of the first match, or 0 (NULL)
+    /// if none. Mirrors the ROM's newlib code (`0x40058758`: `zext.b a1,a1`,
+    /// then a byte-at-a-time `lbu`/`beq` loop to `s + n`). `n` is capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller uses the pointer.
+    Memchr,
+    /// `void *memmove(void *dst, const void *src, size_t n)`: copies `n =
+    /// a2` bytes from `src = a1` to `dst = a0` through the bus so that
+    /// overlapping ranges come out right. Mirrors the ROM's newlib code
+    /// (`0x40058870`): byte-at-a-time, backward when `src < dst < src + n`,
+    /// forward otherwise. Returns `dst`, already in `a0`. `n` is capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real, for the same reason as
+    /// [`RomStubEffect::Memcpy`].
+    Memmove,
     /// `div_t div(int numer, int denom)`: `a0 = numer`, `a1 = denom`; the
     /// 8-byte `div_t {int quot; int rem;}` is returned in `(a0, a1)` per the
     /// RV32 psABI. The ROM (`0x400319c6`) computes it with the M-extension
@@ -1018,6 +1033,22 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strncmp,
+        }
+    }
+
+    /// A real high-level-emulated `memchr` — see [`RomStubEffect::Memchr`].
+    pub const fn memchr(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Memchr,
+        }
+    }
+
+    /// A real high-level-emulated `memmove` — see [`RomStubEffect::Memmove`].
+    pub const fn memmove(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Memmove,
         }
     }
 

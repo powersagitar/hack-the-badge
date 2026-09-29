@@ -828,13 +828,24 @@ predicted these blockers would surface once TIMG unblocks further boot:
    mapping still serves every IROM/DROM read, and SPIMEM1's `flash_chip`
    is separate from XIP's buffer.
 
-   **The current stall**: on the 490,128th step boot fetches from
-   `0x4000_03c8`, the unstubbed ROM libc `memchr` (`esp32c3.rom.libc.ld`;
-   caller `0x4211_8854`, `a0 = 0x3c14_e9ec`, `a1 = '\n'`, `a2 = 3`). The
-   fault prints "Guru Meditation Error" (step ~491,011), then "Rebooting..."
-   (~730,066), then the unstubbed `software_reset_cpu` faults on step
-   730,681. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message`.
+   Boot then faulted on two atomic ROM libc calls, both now real HLE stubs
+   (`emulator-core/src/rom.rs` entry 18): `memchr` (`0x4000_03c8`,
+   `esp32c3.rom.libc.ld`; step 490,128, caller `0x4211_8854`, `a1 = '\n'`,
+   `a2 = 3`) and `memmove` (`0x4000_035c`,
+   `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`; step 490,143).
+   Their semantics follow the ROM ELF's newlib code (`memchr` compares
+   `(unsigned char)c`; `memmove` copies backward when `src < dst < src +
+   n`). The stub count is 89.
+
+   **The current stall**: on the 493,861st step boot fetches from
+   `0x4000_0060`, the unstubbed ROM `ets_apb_backup_init_lock_func`
+   (`esp32c3.rom.ld`; caller RA `0x4200_155c`; the ROM ELF's body at
+   `0x40045fe8` stores its two arguments into ROM statics). It is neither
+   flash nor libc, so Task 8 stopped there. The fault prints "Guru
+   Meditation Error" (step ~494,744), then "Rebooting..." (~733,938), then
+   the unstubbed `software_reset_cpu` faults on step 734,553. Pinned in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_ets_apb_backup_init_lock_func_call_and_reaches_the_panic_handlers_reboot_message`.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`

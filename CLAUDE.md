@@ -41,10 +41,11 @@ ESP32-C3 device), in two complementary modes:
    D9), and boot runs on to ESP-IDF's flash-chip detection. The SPI1 flash
    controller and a synthetic 4 MiB flash chip are modeled (Milestone 3
    Task 8), so the JEDEC ID read succeeds and boot prints `spi_flash:
-   detected chip: generic` and the `sleep_gpio:` lines. It then faults on
-   the unstubbed ROM libc `memchr` (step 490,128), so the panic handler
+   detected chip: generic` and the `sleep_gpio:` lines. ROM `memchr`/
+   `memmove` are then real stubs too, and boot faults on the unstubbed ROM
+   `ets_apb_backup_init_lock_func` (step 493,861), so the panic handler
    runs and loops in `software_reset_cpu` retry — well before reaching any
-   built-in app. The current blocker is that `memchr` call (a known,
+   built-in app. The current blocker is that ROM call (a known,
    documented gap — see
    `docs/firmware-emulator-notes.md`'s "Known limitations" section before
    assuming a built-in app is reachable in this mode).

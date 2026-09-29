@@ -217,7 +217,8 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 
 /// This test **pins today's panic path, not boot progress past it**.
 /// **Renamed and re-pointed in Task 8** (from
-/// `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`),
+/// `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`,
+/// then briefly `boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message`),
 /// previously renamed and re-pointed in Task D7 (from
 /// `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`,
 /// itself renamed in Task D6 from
@@ -257,31 +258,36 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// gone: boot prints `I (0) spi_flash: detected chip: generic` (step
 /// ~446,991), `flash io: dio`, and the two `sleep_gpio:` lines.
 ///
-/// **The new stall**: on the 490,128th step boot fetches from `0x4000_03c8`,
-/// the unstubbed ROM libc `memchr` (`esp32c3.rom.libc.ld`), called from
-/// `0x4211_8854` with `a0 = 0x3c14_e9ec`, `a1 = '\n'`, `a2 = 3`. The
+/// **What changed in Task 8 (ROM libc)**: the two atomic ROM libc calls
+/// right after, `memchr` (`0x4000_03c8`, first reached on step 490,128) and
+/// `memmove` (`0x4000_035c`, step 490,143), are real HLE stubs.
+///
+/// **The new stall**: on the 493,861st step boot fetches from `0x4000_0060`,
+/// the unstubbed ROM `ets_apb_backup_init_lock_func` (`esp32c3.rom.ld`;
+/// caller RA `0x4200_155c`). It is not a flash or libc routine. The
 /// `INSTRUCTION_ACCESS_FAULT` prints "Guru Meditation Error" right away
-/// (step ~491,011), then "Rebooting..." (~730,066), and the panic handler's
+/// (step ~494,744), then "Rebooting..." (~733,938), and the panic handler's
 /// reboot attempt faults on the unstubbed `software_reset_cpu` on step
-/// 730,681 (next fault 971,175). `software_reset_cpu` stays unstubbed: it
+/// 734,553 (next fault 975,150). `software_reset_cpu` stays unstubbed: it
 /// is reached only on the panic path.
 ///
-/// This test is **deliberately expected to break** once `memchr` is
-/// stubbed; whoever makes that fix should delete or replace it rather than
-/// chase a new pinned value here.
+/// This test is **deliberately expected to break** once
+/// `ets_apb_backup_init_lock_func` is handled; whoever makes that fix should
+/// delete or replace it rather than chase a new pinned value here.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message(
+fn boot_currently_faults_on_the_unstubbed_ets_apb_backup_init_lock_func_call_and_reaches_the_panic_handlers_reboot_message(
 ) {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through flash-chip detection with zero traps.
-    let summary = rt.run(490_127);
+    // Phase 1: through flash-chip detection and the memchr/memmove calls
+    // with zero traps.
+    let summary = rt.run(493_860);
     assert_eq!(
         summary.traps, 0,
-        "boot must run through flash-chip detection without any trap \
-         (pre-Task-8 it aborted after `memspi: no response` at step \
-         442,141); got {summary:?}"
+        "boot must run through flash-chip detection and ROM memchr/memmove \
+         without any trap (pre-Task-8 it aborted after `memspi: no \
+         response` at step 442,141); got {summary:?}"
     );
     assert!(
         rt.console_output()
@@ -295,22 +301,23 @@ fn boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_hand
         rt.console_output()
     );
 
-    // Phase 2: the very next step is the memchr fetch fault.
+    // Phase 2: the very next step is the ets_apb_backup_init_lock_func
+    // fetch fault.
     let summary = rt.run(1);
     assert_eq!(
         summary.traps, 1,
-        "expected the memchr fault; got {summary:?}"
+        "expected the fetch fault; got {summary:?}"
     );
     assert_eq!(
         rt.cpu().csr.mcause,
         exception_code::INSTRUCTION_ACCESS_FAULT
     );
-    assert_eq!(summary.last_instruction_fault, Some(0x4000_03c8));
+    assert_eq!(summary.last_instruction_fault, Some(0x4000_0060));
 
-    // Phase 3, up to 740,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (the 730,681st step). 9,319
-    // steps of margin, and the next fault is not until step 971,175.
-    let summary = rt.run(740_000 - 490_128);
+    // Phase 3, up to 745,000 total: the panic handler's reboot attempt
+    // faults on unstubbed software_reset_cpu (the 734,553rd step). 10,447
+    // steps of margin, and the next fault is not until step 975,150.
+    let summary = rt.run(745_000 - 493_861);
     assert_eq!(
         summary.traps, 1,
         "expected exactly one more trap: the software_reset_cpu \

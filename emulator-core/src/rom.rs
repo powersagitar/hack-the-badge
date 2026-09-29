@@ -604,14 +604,29 @@
 //!       (`memcmp`/`strncmp` return the unsigned-byte difference; `div` is
 //!       truncating division, its two fixups being dead code under RISC-V
 //!       `div`/`rem`). Not stubbed until observed: `strcpy`, `strncpy`,
-//!       `strcmp`, `strstr`, `bzero`, `memmove`, `ldiv`, ....
+//!       `strcmp`, `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
+//!       came in Task 8, entry 18).
 //!     With these, boot runs fault-free to step 442,140. The next stall is
 //!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
 //!     the SPI1 flash controller (`memspi_host_read_id_hs`,
 //!     `components/spi_flash/memspi_host_driver.c`), gets 0 from the
 //!     unmodeled peripheral and logs `E (0) memspi: no response` (step
 //!     441,439), then fails an `assert` and `abort()`s (ILLEGAL_INSTRUCTION,
-//!     step 442,141).
+//!     step 442,141). (Task 8 modeled that controller: see
+//!     `crate::peripherals::flash`.)
+//!
+//! 18. **Atomic ROM libc calls after flash-chip detection** — Milestone 3
+//!     Task 8. With the SPI1 flash controller modeled, boot reaches two more
+//!     ROM libc calls, each now real ([`RomStubEffect`]): `memchr`
+//!     (`0x4000_03c8`, [`MEMCHR`], `esp32c3.rom.libc.ld`; first reached on
+//!     step 490,128 from `0x4211_8854` with `a1 = '\n'`, `a2 = 3`) and
+//!     `memmove` (`0x4000_035c`, [`MEMMOVE`],
+//!     `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`; step 490,143).
+//!     Both are `j` trampolines to newlib code in the ROM ELF (`0x40058758`,
+//!     `0x40058870`) whose semantics their effects' doc comments state. The
+//!     next stall is on the 493,861st step: ROM
+//!     `ets_apb_backup_init_lock_func` (`0x4000_0060`, `esp32c3.rom.ld`),
+//!     neither libc nor flash, so Task 8 stopped there.
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -620,8 +635,8 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`memmove`, `memcmp`, `strcpy`, `strncpy`,
-//! `strcmp`, `strncmp`, `strlen`, `atoi`, …) and the float half of ROM
+//! The rest of ROM libc/newlib (`strcpy`, `strncpy`,
+//! `strcmp`, `atoi`, …) and the float half of ROM
 //! libgcc are **absent by design**, for the same reason `memset` and
 //! `__udivdi3` are special-cased rather than defaulted: a generic
 //! "return 0, do nothing" stub for a function whose *output* the caller uses
@@ -632,7 +647,19 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D9**: 87 stubs (D8's 82 plus `esp_rom_newlib_init_common_mutexes`,
+//! **As of Task 8**: 89 stubs (D9's 87 plus `memchr` and `memmove`, entry
+//! 18). The SPI1 flash controller is modeled (`crate::peripherals::flash`),
+//! so flash-chip detection succeeds (`I (0) spi_flash: detected chip:
+//! generic`, step ~446,991). Boot runs fault-free to step 493,860, then
+//! faults on the unstubbed ROM `ets_apb_backup_init_lock_func`
+//! (`0x4000_0060`, 493,861st step). The panic handler prints "Guru
+//! Meditation Error" (~494,744), "Rebooting..." (~733,938), faults on
+//! `software_reset_cpu` (734,553rd step) and loops. See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_faults_on_the_unstubbed_ets_apb_backup_init_lock_func_call_and_reaches_the_panic_handlers_reboot_message`.
+//! The Task D9 paragraph below is kept as history.
+//!
+//! **As of Task D9** (history): 87 stubs (D8's 82 plus `esp_rom_newlib_init_common_mutexes`,
 //! `strlen`, `memcmp`, `strncmp`, `div`, entry 17). Boot runs fault-free
 //! through `esp_newlib_init`'s ROM calls to step 442,140, prints `E (0)
 //! memspi: no response` (step 441,439, an *error*: the SPI1 flash
@@ -640,10 +667,8 @@
 //! a failed `assert` (ILLEGAL_INSTRUCTION, 442,141st step). The panic
 //! handler prints "assert failed" (~443,599), "Rebooting..." (~680,821),
 //! faults on `software_reset_cpu` (681,436th step), prints "Guru Meditation
-//! Error" (~682,319) and loops. **The actual blocker is now the unmodeled
-//! SPI1 flash controller.** See `tests/rom_stub_boot.rs`'s
-//! `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`.
-//! The Task D8 paragraph below is kept as history.
+//! Error" (~682,319) and loops. (Its pinned test was re-pointed in Task
+//! 8.) The Task D8 paragraph below is kept as history.
 //!
 //! **As of Task D8** (history): 82 stubs (D7's 80 plus `__clzsi2` and `__ffssi2`, entry
 //! 16). Boot gets through `heap_init`'s whole region list and prints all
@@ -878,6 +903,19 @@ pub const STRNCMP: u32 = 0x4000_0370;
 /// 0x40000428;`; trampoline to `0x400319c6 <div>`). Real HLE
 /// ([`crate::cpu::rom_stubs::RomStubEffect::DivT`]); module doc entry 17.
 pub const DIV: u32 = 0x4000_0428;
+
+/// ROM libc `memchr`'s fixed address (`esp32c3.rom.libc.ld`: `memchr =
+/// 0x400003c8;`; the ROM ELF shows a `j 0x40058758 <memchr>` trampoline).
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Memchr`]); module doc
+/// entry 18.
+pub const MEMCHR: u32 = 0x4000_03c8;
+
+/// ROM libc `memmove`'s fixed address
+/// (`esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`: `memmove =
+/// 0x4000035c;`; the ROM ELF shows a `j 0x40058870 <memmove>` trampoline).
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Memmove`]); module doc
+/// entry 18.
+pub const MEMMOVE: u32 = 0x4000_035c;
 
 /// ROM libc `qsort`'s fixed address (`esp32c3.rom.libc.ld`: `qsort =
 /// 0x40000434;`, between `ldiv = 0x40000430;` in the same script and
@@ -1217,6 +1255,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRLEN, RomStub::strlen("strlen")),
     (MEMCMP, RomStub::memcmp("memcmp")),
     (STRNCMP, RomStub::strncmp("strncmp")),
+    (MEMCHR, RomStub::memchr("memchr")),
+    (MEMMOVE, RomStub::memmove("memmove")),
     (DIV, RomStub::div_t("div")),
     (
         ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES,
@@ -1498,9 +1538,7 @@ mod tests {
         let table = esp32c3_rom_stubs();
         // Task D9 gave strlen/memcmp/strncmp real effects (checked below).
         for addr in [
-            0x4000_03c8u32, /* memchr */
-            0x4000_035c,    /* memmove */
-            0x4000_0364,    /* strcpy */
+            0x4000_0364u32, /* strcpy */
             0x4000_0368,    /* strncpy */
             0x4000_036c,    /* strcmp */
         ] {
@@ -1514,6 +1552,8 @@ mod tests {
             (STRLEN, RomStubEffect::Strlen),
             (MEMCMP, RomStubEffect::Memcmp),
             (STRNCMP, RomStubEffect::Strncmp),
+            (MEMCHR, RomStubEffect::Memchr),
+            (MEMMOVE, RomStubEffect::Memmove),
         ] {
             assert_eq!(table.lookup(addr).unwrap().effect, effect);
         }
@@ -1865,6 +1905,85 @@ mod tests {
         cpu.regs.pc = STRLEN;
         cpu.step(&mut bus);
         assert_eq!(cpu.regs.read(REG_A0), 0);
+    }
+
+    #[test]
+    fn memchr_stub_returns_a_pointer_to_the_first_match_or_null() {
+        let buf = 0x3fc9_0280;
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(buf, 16);
+        for (i, b) in b"ab\ncd\n\xff".iter().enumerate() {
+            bus.write8(buf + i as u32, *b);
+        }
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, c: u32, n: u32| {
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, buf);
+            cpu.regs.write(REG_A1, c);
+            cpu.regs.write(REG_A2, n);
+            cpu.regs.pc = MEMCHR;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(MEMCHR));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            cpu.regs.read(REG_A0)
+        };
+        assert_eq!(
+            call(&mut cpu, &mut bus, b'\n' as u32, 7),
+            buf + 2,
+            "first match"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, b'\n' as u32, 2),
+            0,
+            "outside n: NULL"
+        );
+        assert_eq!(call(&mut cpu, &mut bus, b'z' as u32, 7), 0, "absent: NULL");
+        assert_eq!(call(&mut cpu, &mut bus, b'a' as u32, 0), 0, "n = 0: NULL");
+        // c is converted to unsigned char (the ROM's `zext.b a1, a1`).
+        assert_eq!(call(&mut cpu, &mut bus, 0xFFFF_FFFF, 7), buf + 6);
+        assert_eq!(call(&mut cpu, &mut bus, 0x100 | b'c' as u32, 7), buf + 3);
+    }
+
+    #[test]
+    fn memmove_stub_copies_overlapping_ranges_correctly_and_returns_dst() {
+        let buf = 0x3fc9_02c0;
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(buf, 16);
+        let fill = |bus: &mut FirmwareBus| {
+            for (i, b) in b"abcdefgh".iter().enumerate() {
+                bus.write8(buf + i as u32, *b);
+            }
+        };
+        let read =
+            |bus: &mut FirmwareBus| -> Vec<u8> { (0..8).map(|i| bus.read8(buf + i)).collect() };
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, dst: u32, src: u32, n: u32| {
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, dst);
+            cpu.regs.write(REG_A1, src);
+            cpu.regs.write(REG_A2, n);
+            cpu.regs.pc = MEMMOVE;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(MEMMOVE));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            assert_eq!(cpu.regs.read(REG_A0), dst, "memmove returns dst");
+        };
+        // dst above src, overlapping: a naive forward copy would smear "a".
+        fill(&mut bus);
+        call(&mut cpu, &mut bus, buf + 2, buf, 5);
+        assert_eq!(read(&mut bus), b"ababcdeh");
+        // dst below src, overlapping.
+        fill(&mut bus);
+        call(&mut cpu, &mut bus, buf, buf + 2, 5);
+        assert_eq!(read(&mut bus), b"cdefgfgh");
+        // n = 0 copies nothing.
+        fill(&mut bus);
+        call(&mut cpu, &mut bus, buf, buf + 4, 0);
+        assert_eq!(read(&mut bus), b"abcdefgh");
     }
 
     #[test]

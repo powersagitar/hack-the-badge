@@ -439,6 +439,38 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, diff as u32);
             }
+            RomStubEffect::Memchr => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let c = self.regs.read(rom_stubs::REG_A1) as u8;
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                let found = (0..len)
+                    .map(|i| s.wrapping_add(i))
+                    .find(|&addr| bus.read8(addr) == c)
+                    .unwrap_or(0);
+                self.regs.write(rom_stubs::REG_A0, found);
+            }
+            RomStubEffect::Memmove => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                // Direction choice instead of a host-side temporary buffer
+                // (which a garbage `n` near the cap would make huge): copy
+                // backward when `dst` lies inside `[src, src + n)`, forward
+                // otherwise -- same result as newlib's memmove.
+                let backward = dst.wrapping_sub(src) < len && dst != src;
+                for k in 0..len {
+                    let i = if backward { len - 1 - k } else { k };
+                    let byte = bus.read8(src.wrapping_add(i));
+                    bus.write8(dst.wrapping_add(i), byte);
+                }
+                // `memmove` returns `dst`, which is already in `a0`.
+            }
             RomStubEffect::DivT => {
                 let numer = self.regs.read(rom_stubs::REG_A0) as i32;
                 let denom = self.regs.read(rom_stubs::REG_A1) as i32;

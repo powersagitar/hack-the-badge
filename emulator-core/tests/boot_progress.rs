@@ -455,20 +455,23 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// boot progress.
 ///
 /// **Renamed again in Task 8** (from
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort`):
-/// the SPI1 flash controller now answers RDID, so that abort is gone. The
-/// panic is now reached via the unstubbed ROM `memchr` fault (the 490,128th
-/// step). "Rebooting..." prints at step ~730,066, which
-/// [`boot_until_console_contains`] sees at its 750,000-step check (~2.7%
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort`,
+/// then briefly `..._via_the_unstubbed_memchr_fault`): the SPI1 flash
+/// controller now answers RDID, so that abort is gone, and ROM
+/// `memchr`/`memmove` are stubbed. The panic is now reached via the
+/// unstubbed ROM `ets_apb_backup_init_lock_func` fault (the 493,861st step).
+/// "Rebooting..." prints at step ~733,938, which
+/// [`boot_until_console_contains`] sees at its 750,000-step check (~2.2%
 /// margin over the measured step). The budget is raised to 800,000 so a
 /// small shift cannot push the line past the last check. Still a panic-path
 /// line, **not** boot progress.
 ///
-/// This rung is **deliberately expected to break** once `memchr` is
-/// stubbed: whoever makes that fix should delete or replace this test
+/// This rung is **deliberately expected to break** once that ROM call is
+/// handled: whoever makes that fix should delete or replace this test
 /// rather than chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_memchr_fault() {
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_ets_apb_backup_init_lock_func_fault(
+) {
     assert_reaches("Rebooting...", 800_000);
 }
 
@@ -761,5 +764,30 @@ fn boot_reaches_spi_flash_detected_chip_generic() {
     assert!(
         !rt.console_output().contains("memspi: no response"),
         "the pre-Task-8 RDID failure must be gone"
+    );
+}
+
+/// Milestone 3 Task 8's no-fault rung for the two atomic ROM libc calls after
+/// flash-chip detection: before they were stubbed, boot faulted on ROM
+/// `memchr` on step 490,128 (then `memmove` on step 490,143). With both
+/// real, the first trap of any kind is the `ets_apb_backup_init_lock_func`
+/// fault on step 493,861, so a run of 493,000 steps must show **zero**
+/// traps.
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(493_000);
+    assert_eq!(
+        summary.traps,
+        0,
+        "boot must run past the old memchr fault (step 490,128) with no \
+         traps; got {summary:?}, pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(
+        rt.console_output()
+            .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
+        "the sleep_gpio lines after flash detection should be present"
     );
 }
