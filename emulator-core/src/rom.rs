@@ -561,6 +561,25 @@
 //!     libgcc bit-count helper, not ROM data or a ROM libc/string call, so
 //!     Task D7 stopped there.
 //!
+//! 16. **libgcc's unary 32-bit bit-count helpers** ([`LIBGCC_INT32_FAMILY`],
+//!     `esp32c3.rom.libgcc.ld`) — Milestone 3 Task D8's stall.
+//!     `__clzsi2` (`0x4000_079c`) is TLSF's `fls()` (`32 - clz(size)`,
+//!     observed `a0 = 0x2e6c`, result 18); `__ffssi2` (`0x4000_07d4`) is
+//!     `ffs()` (observed `a0 = 0x200`, result 10, caller `0x4039_5c08`).
+//!     Both are **real** ([`RomStubEffect::Int32Unary`]/[`Int32UnaryOp`]): a
+//!     value in `a0`, a value out in `a0`, `pc = ra`. Semantics are from the
+//!     GCC internals manual, "Integer library routines". `__clzsi2(0)` is
+//!     *undefined* there; the stub returns 32 (`leading_zeros`), the natural
+//!     "every bit is a leading zero" answer, and the one that makes the
+//!     `32 - clz(x)` bit-length idiom return 0. `__ffssi2(0)` is defined
+//!     (0). With both backed, `heap_init` prints all four `heap_init: At
+//!     ...` region lines (step ~415,621). The next stall is on the 417,992nd
+//!     step: ROM `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`,
+//!     `esp32c3.rom.ld`). It is **not** libgcc/libc/string: it copies two
+//!     `_lock_t` pointers into ROM-internal statics (`0x3fcd_f65c`/
+//!     `0x3fcd_f660`, per the ROM ELF's disassembly), so it needs a
+//!     decision on modelling that ROM state. Task D8 stopped there.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -579,6 +598,17 @@
 //! stub is not.
 //!
 //! ## Where this gets boot to
+//!
+//! **As of Task D8**: 82 stubs (D7's 80 plus `__clzsi2` and `__ffssi2`, entry
+//! 16). Boot gets through `heap_init`'s whole region list and prints all
+//! four `heap_init: At ...` lines, then faults on the unstubbed ROM
+//! `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`, step 417,992). The
+//! panic handler prints "Guru Meditation Error" (step ~419,414),
+//! "Rebooting..." (~658,042), faults on `software_reset_cpu` (658,657th
+//! step) and loops. **The actual blocker is now the unstubbed
+//! `esp_rom_newlib_init_common_mutexes`.** See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message`.
+//! The Task D7 paragraph below is kept as history.
 //!
 //! **As of Task D7** (this table, 80 stubs, one guest-executed routine,
 //! `qsort`, from [`ESP32C3_ROM_CODE`], and the ROM layout table from
@@ -631,7 +661,8 @@ use crate::cpu::encode::{
     S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1, REG_A2,
+    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, REG_A0, REG_A1,
+    REG_A2,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
@@ -1111,6 +1142,15 @@ const LIBGCC_INT64_FAMILY: &[(u32, &str, Int64Op)] = &[
     (0x4000_08bc, "__umoddi3", Int64Op::UMod),
 ];
 
+/// libgcc's unary 32-bit bit-counting helpers (`esp32c3.rom.libgcc.ld`), real
+/// implementations -- see [`Int32UnaryOp`]. `__clzsi2` is TLSF's `fls()` in
+/// the heap allocator (Task D8's stall); `__ffssi2` is the next observed call (a0 = 0x200); others such as `__ctzsi2` are left
+/// to fault loudly until something calls them.
+const LIBGCC_INT32_FAMILY: &[(u32, &str, Int32UnaryOp)] = &[
+    (0x4000_079c, "__clzsi2", Int32UnaryOp::Clz),
+    (0x4000_07d4, "__ffssi2", Int32UnaryOp::Ffs),
+];
+
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM
 /// side of what ESP-IDF calls `regi2c` — see the module doc.
 const REGI2C_FAMILY: &[(u32, &str, bool)] = &[
@@ -1194,6 +1234,9 @@ pub fn esp32c3_rom_stubs() -> RomStubTable {
     for (addr, name, op) in LIBGCC_INT64_FAMILY {
         table.insert(*addr, RomStub::int64(name, *op));
     }
+    for (addr, name, op) in LIBGCC_INT32_FAMILY {
+        table.insert(*addr, RomStub::int32_unary(name, *op));
+    }
     for (addr, name, returns_a_value) in REGI2C_FAMILY {
         let stub = if *returns_a_value {
             RomStub::returning(name, 0)
@@ -1263,6 +1306,11 @@ mod tests {
             assert_eq!(stub.name, *name);
             assert_eq!(stub.effect, RomStubEffect::Int64(*op), "{name}");
         }
+        for (addr, name, op) in LIBGCC_INT32_FAMILY {
+            let stub = table.lookup(*addr).expect("stubbed");
+            assert_eq!(stub.name, *name);
+            assert_eq!(stub.effect, RomStubEffect::Int32Unary(*op), "{name}");
+        }
         for (addr, name, returns_a_value) in REGI2C_FAMILY {
             let stub = table
                 .lookup(*addr)
@@ -1284,9 +1332,15 @@ mod tests {
         let named = NAMED_STUBS.iter().map(|(a, _)| *a);
         let cache = CACHE_FAMILY.iter().map(|(a, _)| *a);
         let libgcc = LIBGCC_INT64_FAMILY.iter().map(|(a, _, _)| *a);
+        let libgcc32 = LIBGCC_INT32_FAMILY.iter().map(|(a, _, _)| *a);
         let regi2c = REGI2C_FAMILY.iter().map(|(a, _, _)| *a);
         let mut total = 0usize;
-        for addr in named.chain(cache).chain(libgcc).chain(regi2c) {
+        for addr in named
+            .chain(cache)
+            .chain(libgcc)
+            .chain(libgcc32)
+            .chain(regi2c)
+        {
             assert!(seen.insert(addr), "0x{addr:08x} is listed twice");
             total += 1;
         }

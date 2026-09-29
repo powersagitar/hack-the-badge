@@ -210,6 +210,15 @@
 //! The two panic-text rungs below keep their budgets, with corrected
 //! narratives; one is renamed.
 //!
+//! **Task D8 status**: libgcc `__clzsi2`/`__ffssi2` are real HLE stubs, so
+//! `heap_init` prints all four `heap_init: At ...` lines (the last, `RTCRAM`,
+//! at step ~415,621; a new rung, [`boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers`]).
+//! On the 417,992nd step boot then faults on the unstubbed ROM
+//! `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`). "Guru Meditation
+//! Error" prints at step ~419,414 and "Rebooting..." at ~658,042 (panic-path
+//! lines, not progress); the reboot-retry fault follows on the 658,657th
+//! step.
+//!
 //! **Task D7 status**: the ROM layout table is now backed
 //! (`emulator_core::rom::ESP32C3_ROM_DATA`: the `ets_rom_layout_p` word at
 //! `0x3ff1fffc` and the `ets_rom_layout_t` it points at, with
@@ -337,6 +346,11 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// after the failed `software_reset_cpu` reboot retry, measured at step
 /// ~648,960. That is still well within the 750,000 budget.
 ///
+/// **Task D8 update**: the `__clzsi2` fault is gone too (real libgcc
+/// stubs). The cause is now the unstubbed ROM
+/// `esp_rom_newlib_init_common_mutexes` fault on the 417,992nd step, still a
+/// hardware exception, so this line prints at step ~419,414.
+///
 /// **Task D7 update**: the `abort()` is gone too (the ROM layout table is
 /// backed). The cause is now the unstubbed libgcc `__clzsi2` fault on the
 /// 409,759th step (see the module doc's "Task D7 status"). That is a
@@ -397,13 +411,23 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// ([`boot_until_console_contains`] checks every 250,000 steps, so in
 /// practice it first sees the line at its 750,000-step check.)
 ///
+/// **Renamed again in Task D8** (from
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_clzsi2_fault`):
+/// `__clzsi2`/`__ffssi2` are now real stubs. The panic is now reached via
+/// the unstubbed ROM `esp_rom_newlib_init_common_mutexes` fault (the
+/// 417,992nd step). "Rebooting..." prints at step ~658,042 and the
+/// reboot-retry fault follows on the 658,657th step. The budget is raised
+/// from 660,000 (which would have left a 0.3% margin) to 700,000
+/// (~6% margin). Still a panic-path line, **not** boot progress.
+///
 /// This rung is **deliberately expected to break** once a later task backs
-/// `__clzsi2`: at that point this panic path is never reached either, and
-/// whoever makes that fix should delete or replace this test rather than
-/// chase a new pinned value here.
+/// `esp_rom_newlib_init_common_mutexes`: at that point this panic path is
+/// never reached either, and whoever makes that fix should delete or
+/// replace this test rather than chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_clzsi2_fault() {
-    assert_reaches("Rebooting...", 660_000);
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_newlib_init_common_mutexes_fault(
+) {
+    assert_reaches("Rebooting...", 700_000);
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -629,5 +653,23 @@ fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
         !rt.console_output().contains("memory_layout"),
         "the reserved-region overlap error must never print again; got console:\n{}",
         rt.console_output()
+    );
+}
+
+/// Milestone 3 Task D8's ratchet rung: the newest *boot-progress* console
+/// line boot reaches. With libgcc `__clzsi2` (TLSF's `fls()`) and `__ffssi2`
+/// (`ffs()`) backed, `heap_init` walks its whole region list and prints the
+/// last of its four `heap_init: At ...` lines (the `RTCRAM` region), which
+/// the real badge's boot log also has. Measured at step ~415,621. The
+/// 500,000 budget is honest given [`boot_until_console_contains`]'s
+/// 250,000-step chunking (it sees the line at its 500,000-step check;
+/// ~84,000 steps of real margin). The panic that follows (the unstubbed ROM
+/// `esp_rom_newlib_init_common_mutexes`) is *not* progress and has its own
+/// pinned test in `rom_stub_boot.rs`.
+#[test]
+fn boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers() {
+    assert_reaches(
+        "I (0) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
+        500_000,
     );
 }

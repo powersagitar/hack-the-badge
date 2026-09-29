@@ -157,6 +157,10 @@ pub enum RomStubEffect {
     /// caller immediately uses, so a fabricated answer is worse than a fault.
     /// See [`Int64Op`] for the operand/result register convention.
     Int64(Int64Op),
+    /// One of libgcc's unary 32-bit bit-counting helpers: reads `a0`, writes
+    /// the result to `a0`. See [`Int32UnaryOp`]. Real, not fabricated, for
+    /// the same reason as [`RomStubEffect::Int64`].
+    Int32Unary(Int32UnaryOp),
     /// `void *memcpy(void *dst, const void *src, size_t n)`: copies `n = a2`
     /// bytes from `src = a1` to `dst = a0`, through the bus, one byte at a
     /// time (this project's whole `Bus` interface is byte/half/word
@@ -367,6 +371,37 @@ impl Int64Op {
             Int64Op::Shl => lhs << shamt,
             Int64Op::LShr => lhs >> shamt,
             Int64Op::AShr => ((lhs as i64) >> shamt) as u64,
+        }
+    }
+}
+
+/// A unary 32-bit libgcc helper: `int f(unsigned int a)`, argument in `a0`,
+/// result in `a0` (RV32 psABI).
+///
+/// Semantics come from the GCC internals manual, "Integer library routines".
+/// Only routines a boot run has actually called are listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Int32UnaryOp {
+    /// `int __clzsi2 (unsigned int a)`: the number of leading 0-bits in `a`,
+    /// starting at the most significant bit. The manual says the result is
+    /// **undefined if `a` is 0**; this returns 32 (`u32::leading_zeros`), the
+    /// natural "all bits are leading zeros" answer, which is also what the
+    /// `32 - clz(x)` "bit length" idiom (TLSF's `fls`) wants for zero.
+    Clz,
+    /// `int __ffssi2 (int a)`: one plus the index of the least significant
+    /// 1-bit of `a`, or 0 if `a` is 0 (fully defined, unlike `Clz`).
+    Ffs,
+}
+
+impl Int32UnaryOp {
+    /// Applies this operation to the `a0` argument.
+    pub fn apply(self, a: u32) -> u32 {
+        match self {
+            Int32UnaryOp::Clz => a.leading_zeros(),
+            Int32UnaryOp::Ffs => match a {
+                0 => 0,
+                _ => a.trailing_zeros() + 1,
+            },
         }
     }
 }
@@ -920,6 +955,15 @@ impl RomStub {
         }
     }
 
+    /// A real high-level-emulated libgcc unary 32-bit helper -- see
+    /// [`Int32UnaryOp`].
+    pub const fn int32_unary(name: &'static str, op: Int32UnaryOp) -> Self {
+        RomStub {
+            name,
+            effect: RomStubEffect::Int32Unary(op),
+        }
+    }
+
     /// A real high-level-emulated libgcc 64-bit helper — see [`Int64Op`].
     pub const fn int64(name: &'static str, op: Int64Op) -> Self {
         Self {
@@ -1298,7 +1342,10 @@ mod tests {
         // low/high pair instead -- so this test actually discriminates a
         // broken alignment rule from a correct one.
         let (text, _) = run_printf(b"%llu", vec![0x00ba_dbad, 1, 0]);
-        assert_eq!(text, "1", "expected the aligned pair (slots 2:3 = 1,0), not slots 1:2");
+        assert_eq!(
+            text, "1",
+            "expected the aligned pair (slots 2:3 = 1,0), not slots 1:2"
+        );
     }
 
     #[test]

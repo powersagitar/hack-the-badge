@@ -303,6 +303,10 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, result as u32);
                 self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
             }
+            RomStubEffect::Int32Unary(op) => {
+                let a = self.regs.read(rom_stubs::REG_A0);
+                self.regs.write(rom_stubs::REG_A0, op.apply(a));
+            }
             RomStubEffect::BusRegisterWrite(write) => {
                 use rom_stubs::BusRegisterOp;
                 let addr = match write.index_reg {
@@ -1751,6 +1755,66 @@ mod tests {
         cpu2.regs.pc = ROM_STUB_ADDR;
         cpu2.step(&mut bus2);
         assert_eq!(bus2.read32(0x200), 1 << 2);
+    }
+
+    #[test]
+    fn clzsi2_rom_stub_counts_leading_zeros_from_a0_and_returns_via_ra() {
+        use rom_stubs::Int32UnaryOp;
+        // (input, expected) -- 0x2e6c is the observed TLSF call; 0 is
+        // documented as 32.
+        for (input, expected) in [
+            (0x2e6cu32, 18u32),
+            (1, 31),
+            (0x8000_0000, 0),
+            (0xffff_ffff, 0),
+            (0, 32),
+        ] {
+            let mut cpu = Cpu::new();
+            let mut table = RomStubTable::new();
+            table.insert(
+                ROM_STUB_ADDR,
+                RomStub::int32_unary("__clzsi2", Int32UnaryOp::Clz),
+            );
+            cpu.set_rom_stubs(table);
+            cpu.regs.write(10, input);
+            cpu.regs.write(11, 0x1234); // a1 must survive
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            let mut bus = rom_stub_test_bus();
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+            assert_eq!(cpu.regs.read(10), expected, "clz({input:#x})");
+            assert_eq!(cpu.regs.read(11), 0x1234);
+            assert_eq!(cpu.regs.pc, 0x40);
+        }
+    }
+
+    #[test]
+    fn ffssi2_rom_stub_returns_one_plus_lowest_set_bit_index_or_zero() {
+        use rom_stubs::Int32UnaryOp;
+        // 0x200 is the observed boot call (bit 9 -> 10).
+        for (input, expected) in [
+            (0x200u32, 10u32),
+            (1, 1),
+            (0x8000_0000, 32),
+            (0xffff_ffff, 1),
+            (0, 0),
+        ] {
+            let mut cpu = Cpu::new();
+            let mut table = RomStubTable::new();
+            table.insert(
+                ROM_STUB_ADDR,
+                RomStub::int32_unary("__ffssi2", Int32UnaryOp::Ffs),
+            );
+            cpu.set_rom_stubs(table);
+            cpu.regs.write(10, input);
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            let mut bus = rom_stub_test_bus();
+            cpu.step(&mut bus);
+            assert_eq!(cpu.regs.read(10), expected, "ffs({input:#x})");
+            assert_eq!(cpu.regs.pc, 0x40);
+        }
     }
 
     #[test]

@@ -735,7 +735,8 @@ predicted these blockers would surface once TIMG unblocks further boot:
    normal `I (0) heap_init: Initializing. RAM available for dynamic
    allocation:`.
 
-   **The current stall**: on the 409,759th step, boot fetches from
+   **The stall at the end of Task D7** (now fixed, see Task D8 below): on
+   the 409,759th step, boot fetches from
    `0x4000_079c`, which is the unstubbed libgcc `__clzsi2`
    (`esp32c3.rom.libgcc.ld`). The caller (`0x4212_9480`) computes
    `32 - __clzsi2(size)` (`a0 = 0x2e6c`), a TLSF "find last set" while
@@ -744,18 +745,38 @@ predicted these blockers would surface once TIMG unblocks further boot:
    away (step ~411,500), then "Rebooting..." (step ~649,700), faults on the
    unstubbed `software_reset_cpu` (650,332nd step) and loops. Pinned in
    `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`.
+   `boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message`
+   (historical name: it pinned this `__clzsi2` fault until Task D8).
 
-   **Next candidate**: back `__clzsi2`, and re-probe. It needs a new
-   `RomStubEffect` (the existing `Int64Op` family is 64-bit binary
-   operations; this is a 32-bit unary bit count). Its semantics are
-   defined by GCC's internals manual ("Integer library routines":
-   "These functions return the number of leading 0-bits in a, starting at
-   the most significant bit position. If a is zero, the result is
-   undefined."). The rest of the bit-count family in
-   `esp32c3.rom.libgcc.ld` (`__clzdi2`, `__ctzsi2`, …) is left to fault
-   until observed, per `rom.rs`'s scoping. Task D7 stopped here because
-   this is a libgcc helper, not ROM data or a ROM libc/string call.
+   **Task D8 (libgcc unary helpers) and the current stall.** New
+   `RomStubEffect::Int32Unary(Int32UnaryOp)`: a real value in `a0`, a real
+   value out in `a0`, `pc = ra`. Semantics come from the GCC internals
+   manual ("Integer library routines"). `__clzsi2` (`0x4000_079c`) returns
+   the number of leading 0-bits; the manual leaves `a == 0` undefined and
+   the stub returns 32 (`u32::leading_zeros`), so TLSF's `32 - clz(x)` idiom
+   gives 0 for zero. It was observed with `a0 = 0x2e6c` (result 18). The
+   next call, `__ffssi2` (`0x4000_07d4`, `a0 = 0x200`, result 10, caller
+   `0x4039_5c08`), returns one plus the index of the lowest set bit, or 0
+   for 0 (defined). Both are in `esp32c3.rom.libgcc.ld`. The rest of the
+   bit-count family (`__clzdi2`, `__ctzsi2`, `__popcountsi2`, …) is left to
+   fault until observed. `heap_init` now prints all four `heap_init: At
+   ...` lines (the last, `RTCRAM`, at step ~415,621).
+
+   **The current stall**: on the 417,992nd step boot fetches from
+   `0x4000_0350`, ROM `esp_rom_newlib_init_common_mutexes`
+   (`esp32c3.rom.ld`; caller RA `0x4200_6a22`). It is not a libgcc/libc/
+   string function: the ROM ELF's disassembly shows it stores
+   `*a0` and `*a1` (the `_lock_t` pointers) into two ROM-internal statics
+   at `0x3fcd_f660` and `0x3fcd_f65c`, i.e. it mutates ROM-owned data. Task
+   D8 stopped there rather than pick a modelling (Void stub vs. really
+   writing the two words). As before, it is a hardware exception, so "Guru
+   Meditation Error" prints at step ~419,414, "Rebooting..." at ~658,042,
+   then the unstubbed `software_reset_cpu` faults on the 658,657th step
+   (next fault at 899,221). Pinned in `emulator-core/tests/rom_stub_boot.rs`.
+
+   **Next candidate**: back `esp_rom_newlib_init_common_mutexes` (a
+   decision is needed on modelling the two ROM-static stores), and
+   re-probe.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -798,7 +819,7 @@ predicted these blockers would surface once TIMG unblocks further boot:
    aligned start (`drom_addr_aligned`) — the source comment says this is
    "for app to find the boot partition." `crate::mem::bus::FirmwareBus`
    doesn't add this extra mapping at all today; nothing in the observed
-   boot trace through Task D7's stall (the unstubbed `__clzsi2`, item 1)
+   boot trace through Task D7's stall (the unstubbed `esp_rom_newlib_init_common_mutexes`, item 1)
    has touched that fixed high address, so it's not yet a confirmed
    blocker — but it's a plausible **candidate cause of a later
    partition-table/`esp_partition_find`-style stall**, worth checking first

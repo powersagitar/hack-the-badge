@@ -41,7 +41,7 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // timer (`crate::peripherals::rtc_cntl`) let boot's delay loop actually
     // terminate instead of spinning forever, and boot now runs past this
     // budget into a *new*, later stall (see this file's renamed
-    // `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`
+    // `boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message`
     // below, which pins the current one). 350,000 keeps this test's
     // original claim -- "gets past the mask ROM wall with zero faults, and
     // reaches every one of the named early-boot ROM calls below" -- true.
@@ -82,6 +82,11 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // trap is now the unstubbed libgcc `__clzsi2` fault at step 409,759
     // (see the pinned-stall test below). 350,000 stays clear by ~59,759
     // steps (~17%).
+    //
+    // Task D8 status: `__clzsi2`/`__ffssi2` are now real stubs; boot's first
+    // trap is now the unstubbed ROM `esp_rom_newlib_init_common_mutexes`
+    // fault at step 417,992 (see the pinned-stall test below). 350,000 stays
+    // clear by ~67,992 steps (~19%).
     const STEP_BUDGET: usize = 350_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -223,61 +228,65 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// 409,036 (later than D6's 408,906 because the input differs: entry 0 now
 /// sorts last, not first).
 ///
-/// **The new stall**: boot prints ESP-IDF's normal
-/// `I (0) heap_init: Initializing. RAM available for dynamic allocation:`
-/// and then, on the 409,759th step, fetches from `0x4000_079c`, which is
-/// libgcc `__clzsi2` (`esp32c3.rom.libgcc.ld`). It is not stubbed, so this
-/// is an `INSTRUCTION_ACCESS_FAULT`. The caller (`0x4212_9480`) computes
-/// `32 - __clzsi2(size)` (a TLSF "find last set" for the heap being
-/// registered; `a0 = 0x2e6c` here). Because this is a hardware exception,
-/// not an `abort()`, the panic handler prints "Guru Meditation Error"
-/// straight away (step ~411,500), then "Rebooting..." (step ~649,700), then
-/// faults on the still-unstubbed ROM `software_reset_cpu` (`0x4000_0094`)
-/// on the 650,332nd step, and loops (next fault on step 890,793).
-/// `software_reset_cpu` stays unstubbed: it is reached only on the panic
-/// path. `__clzsi2` was left for a later task: it is a libgcc bit-count
-/// helper, outside Task D7's "ROM data, or an atomic ROM libc/string call"
-/// continuation rule.
+/// **What changed in Task D8**: libgcc `__clzsi2` (`0x4000_079c`) and
+/// `__ffssi2` (`0x4000_07d4`) are now real HLE stubs
+/// (`RomStubEffect::Int32Unary`), so heap_init runs to the end of its region
+/// list and prints all four `heap_init: At ...` lines (the last, `RTCRAM`,
+/// at step ~415,621).
+///
+/// **The new stall**: on the 417,992nd step boot fetches from `0x4000_0350`,
+/// ROM `esp_rom_newlib_init_common_mutexes` (`esp32c3.rom.ld`), called from
+/// `esp_newlib_init`'s caller chain (RA `0x4200_6a22`). It is not stubbed,
+/// so this is an `INSTRUCTION_ACCESS_FAULT`. Because this is a hardware
+/// exception, not an `abort()`, the panic handler prints "Guru Meditation
+/// Error" straight away (step ~419,414), then "Rebooting..." (step
+/// ~658,042), then faults on the still-unstubbed ROM `software_reset_cpu`
+/// (`0x4000_0094`) on the 658,657th step, and loops (next fault on step
+/// 899,221). `software_reset_cpu` stays unstubbed: it is reached only on the
+/// panic path.
 ///
 /// This test is **deliberately expected to break** once a later task backs
-/// `__clzsi2`. At that point this fault sequence disappears, and whoever
-/// makes that fix should delete or replace this test rather than chase a
-/// new pinned value here.
+/// `esp_rom_newlib_init_common_mutexes`. At that point this fault sequence
+/// disappears, and whoever makes that fix should delete or replace this test
+/// rather than chase a new pinned value here.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message(
+fn boot_currently_faults_on_the_unstubbed_newlib_init_common_mutexes_call_and_reaches_the_panic_handlers_reboot_message(
 ) {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
     // Phase 1: through ROM qsort, the reserved-region check (Task D6's old
-    // abort) and heap_init's first line, with zero traps.
-    let summary = rt.run(409_758);
+    // abort), heap_init's whole region list and the libgcc `__clzsi2`/
+    // `__ffssi2` calls (Task D8), with zero traps.
+    let summary = rt.run(417_991);
     assert_eq!(
         summary.traps, 0,
         "boot must run through the reserved-region check without any trap \
-         (pre-Task-D7 it aborted there; first trap at step 409,071); got {summary:?}"
+         (pre-Task-D7 it aborted there; pre-Task-D8 it faulted on __clzsi2 at \
+         step 409,759); got {summary:?}"
     );
 
-    // Phase 2: the very next step fetches the unstubbed ROM `__clzsi2`.
+    // Phase 2: the very next step fetches the unstubbed ROM
+    // `esp_rom_newlib_init_common_mutexes`.
     let summary = rt.run(1);
     assert_eq!(
         summary.traps, 1,
-        "expected the __clzsi2 fault; got {summary:?}"
+        "expected the esp_rom_newlib_init_common_mutexes fault; got {summary:?}"
     );
     assert_eq!(
         summary.last_instruction_fault,
-        Some(0x4000_079c),
-        "expected an INSTRUCTION_ACCESS_FAULT on __clzsi2 (esp32c3.rom.libgcc.ld)"
+        Some(0x4000_0350),
+        "expected an INSTRUCTION_ACCESS_FAULT on esp_rom_newlib_init_common_mutexes (esp32c3.rom.ld)"
     );
     assert_eq!(
         rt.cpu().csr.mcause,
         exception_code::INSTRUCTION_ACCESS_FAULT
     );
 
-    // Phase 3, up to 660,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (the 650,332nd step). 9,668
-    // steps of margin, and the next fault is not until step 890,793.
-    let summary = rt.run(660_000 - 409_759);
+    // Phase 3, up to 665,000 total: the panic handler's reboot attempt
+    // faults on unstubbed software_reset_cpu (the 658,657th step). 6,343
+    // steps of margin, and the next fault is not until step 899,221.
+    let summary = rt.run(665_000 - 417_992);
     assert_eq!(
         summary.traps, 1,
         "expected exactly one more trap: the software_reset_cpu \
@@ -308,7 +317,7 @@ fn boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_hand
     );
     assert!(
         console.contains("Guru Meditation Error"),
-        "expected the panic handler's crash report for the __clzsi2 fault; got:\n{console}"
+        "expected the panic handler's crash report for the newlib-mutex-init fault; got:\n{console}"
     );
     assert!(
         console.contains("Rebooting..."),

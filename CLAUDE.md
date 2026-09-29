@@ -34,10 +34,13 @@ ESP32-C3 device), in two complementary modes:
    read from Espressif's published ESP32-C3 ROM ELF (Milestone 3 Task D7),
    so its caller `s_prepare_reserved_regions()` passes its overlap check and
    boot prints `heap_init: Initializing. RAM available for dynamic
-   allocation:`. It then faults on the unstubbed libgcc ROM helper
-   `__clzsi2` (`0x4000_079c`, step ~409,759), so the panic handler runs and
-   loops in `software_reset_cpu` retry — well before reaching any built-in
-   app. The current blocker is this unstubbed `__clzsi2` (a known,
+   allocation:`, then all four `heap_init: At ...` region lines once the
+   libgcc ROM helpers `__clzsi2`/`__ffssi2` are backed (Milestone 3 Task
+   D8). It then faults on the unstubbed ROM
+   `esp_rom_newlib_init_common_mutexes` (`0x4000_0350`, step 417,992), so the
+   panic handler runs and loops in `software_reset_cpu` retry — well before
+   reaching any built-in app. The current blocker is this unstubbed
+   `esp_rom_newlib_init_common_mutexes` (a known,
    documented gap — see `docs/firmware-emulator-notes.md`'s "Known
    limitations" section before assuming a built-in app is reachable in
    this mode).
