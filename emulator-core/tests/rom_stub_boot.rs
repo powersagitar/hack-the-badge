@@ -216,7 +216,9 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// This test **pins today's panic path, not boot progress past it**.
-/// **Renamed and re-pointed in Task D7** (from
+/// **Renamed and re-pointed in Task 8** (from
+/// `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`),
+/// previously renamed and re-pointed in Task D7 (from
 /// `boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message`,
 /// itself renamed in Task D6 from
 /// `boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message`,
@@ -248,51 +250,67 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// `div` (`0x4000_0428`) -- are real HLE stubs. Boot runs on with zero traps
 /// for another ~24,000 steps.
 ///
-/// **The new stall**: ESP-IDF's flash-chip detection (`esp_flash_init` /
-/// memspi) reads the flash JEDEC ID through the SPI1 flash controller,
-/// which this emulator does not model, and logs `E (0) memspi: no response`
-/// (step 441,439). It then fails an `assert` -- `assert failed:
-/// 0x4039734c <cached disabled>:118` printed at step ~443,599 -- so
-/// `abort()` runs `panic_abort()`'s ILLEGAL_INSTRUCTION on the 442,141st step
-/// (mepc `0x4038_e4fa`). Because this is an `abort()`, "Guru Meditation
-/// Error" prints only after the panic handler's reboot retry faults, at step
-/// ~682,319 ("Rebooting..." at ~680,821, the `software_reset_cpu` fault at
-/// step 681,436, next fault at 921,911). `software_reset_cpu` stays
-/// unstubbed: it is reached only on the panic path.
+/// **What changed in Task 8 (sub-unit 2)**: the SPI1 flash controller
+/// (`emulator_core::peripherals::flash::Spimem1`) now answers the JEDEC RDID
+/// command with the badge's ID `0x46 0x40 0x16`, so the `E (0) memspi: no
+/// response` error and its `assert`/`abort()` (Task D9's pinned stall) are
+/// gone: boot prints `I (0) spi_flash: detected chip: generic` (step
+/// ~446,991), `flash io: dio`, and the two `sleep_gpio:` lines.
 ///
-/// This test is **deliberately expected to break** once a later task models
-/// the SPI1 flash controller; whoever makes that fix should delete or
-/// replace it rather than chase a new pinned value here.
+/// **The new stall**: on the 490,128th step boot fetches from `0x4000_03c8`,
+/// the unstubbed ROM libc `memchr` (`esp32c3.rom.libc.ld`), called from
+/// `0x4211_8854` with `a0 = 0x3c14_e9ec`, `a1 = '\n'`, `a2 = 3`. The
+/// `INSTRUCTION_ACCESS_FAULT` prints "Guru Meditation Error" right away
+/// (step ~491,011), then "Rebooting..." (~730,066), and the panic handler's
+/// reboot attempt faults on the unstubbed `software_reset_cpu` on step
+/// 730,681 (next fault 971,175). `software_reset_cpu` stays unstubbed: it
+/// is reached only on the panic path.
+///
+/// This test is **deliberately expected to break** once `memchr` is
+/// stubbed; whoever makes that fix should delete or replace it rather than
+/// chase a new pinned value here.
 #[test]
-fn boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message() {
+fn boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message(
+) {
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through the newlib-init ROM calls, heap_init and the start
-    // of flash detection, with zero traps.
-    let summary = rt.run(442_140);
+    // Phase 1: through flash-chip detection with zero traps.
+    let summary = rt.run(490_127);
     assert_eq!(
         summary.traps, 0,
-        "boot must run through esp_newlib_init's ROM calls without any trap \
-         (pre-Task-D9 it faulted on esp_rom_newlib_init_common_mutexes at \
-         step 417,992); got {summary:?}"
+        "boot must run through flash-chip detection without any trap \
+         (pre-Task-8 it aborted after `memspi: no response` at step \
+         442,141); got {summary:?}"
     );
     assert!(
-        rt.console_output().contains("E (0) memspi: no response"),
-        "expected the flash-detection error line before the abort; got:\n{}",
+        rt.console_output()
+            .contains("I (0) spi_flash: detected chip: generic"),
+        "expected flash-chip detection to succeed; got:\n{}",
+        rt.console_output()
+    );
+    assert!(
+        !rt.console_output().contains("memspi"),
+        "the `memspi: no response` error must be gone; got:\n{}",
         rt.console_output()
     );
 
-    // Phase 2: the very next step is the abort()'s ILLEGAL_INSTRUCTION.
+    // Phase 2: the very next step is the memchr fetch fault.
     let summary = rt.run(1);
-    assert_eq!(summary.traps, 1, "expected the abort trap; got {summary:?}");
-    assert_eq!(rt.cpu().csr.mcause, exception_code::ILLEGAL_INSTRUCTION);
-    assert_eq!(rt.cpu().csr.mepc, 0x4038_e4fa);
+    assert_eq!(
+        summary.traps, 1,
+        "expected the memchr fault; got {summary:?}"
+    );
+    assert_eq!(
+        rt.cpu().csr.mcause,
+        exception_code::INSTRUCTION_ACCESS_FAULT
+    );
+    assert_eq!(summary.last_instruction_fault, Some(0x4000_03c8));
 
-    // Phase 3, up to 690,000 total: the panic handler's reboot attempt
-    // faults on unstubbed software_reset_cpu (the 681,436th step). 8,564
-    // steps of margin, and the next fault is not until step 921,911.
-    let summary = rt.run(690_000 - 442_141);
+    // Phase 3, up to 740,000 total: the panic handler's reboot attempt
+    // faults on unstubbed software_reset_cpu (the 730,681st step). 9,319
+    // steps of margin, and the next fault is not until step 971,175.
+    let summary = rt.run(740_000 - 490_128);
     assert_eq!(
         summary.traps, 1,
         "expected exactly one more trap: the software_reset_cpu \
@@ -316,10 +334,6 @@ fn boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_re
     assert!(
         !console.contains("memory_layout"),
         "the reserved-region overlap error (Task D6's stall) must be gone; got:\n{console}"
-    );
-    assert!(
-        console.contains("assert failed"),
-        "expected the failed assert's message; got:\n{console}"
     );
     assert!(
         console.contains("Guru Meditation Error"),

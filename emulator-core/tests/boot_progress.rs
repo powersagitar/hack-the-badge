@@ -248,6 +248,11 @@
 //! exception, so "Guru Meditation Error" prints right away again (step
 //! ~411,500), and "Rebooting..." follows at step ~649,700. Both panic-text
 //! rungs keep their budgets, with corrected narratives; one is renamed.
+//!
+//! Task 8 status: the SPI1 flash controller answers JEDEC RDID, so flash-chip
+//! detection succeeds. [`boot_reaches_spi_flash_detected_chip_generic`] is
+//! the new rung; the panic rung is re-pointed at the next fault (ROM
+//! `memchr`) and renamed.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -449,13 +454,22 @@ fn first_console_output_is_the_firmware_s_own_panic_report() {
 /// the measured step, to 750,000 (~9%). Still a panic-path line, **not**
 /// boot progress.
 ///
-/// This rung is **deliberately expected to break** once a later task models
-/// the SPI1 flash controller: at that point this panic path is never
-/// reached either, and whoever makes that fix should delete or replace this
-/// test rather than chase a new pinned value here.
+/// **Renamed again in Task 8** (from
+/// `boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort`):
+/// the SPI1 flash controller now answers RDID, so that abort is gone. The
+/// panic is now reached via the unstubbed ROM `memchr` fault (the 490,128th
+/// step). "Rebooting..." prints at step ~730,066, which
+/// [`boot_until_console_contains`] sees at its 750,000-step check (~2.7%
+/// margin over the measured step). The budget is raised to 800,000 so a
+/// small shift cannot push the line past the last check. Still a panic-path
+/// line, **not** boot progress.
+///
+/// This rung is **deliberately expected to break** once `memchr` is
+/// stubbed: whoever makes that fix should delete or replace this test
+/// rather than chase a new pinned value here.
 #[test]
-fn boot_reaches_the_panic_handlers_reboot_message_via_the_memspi_no_response_abort() {
-    assert_reaches("Rebooting...", 750_000);
+fn boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_memchr_fault() {
+    assert_reaches("Rebooting...", 800_000);
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -725,5 +739,27 @@ fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site
     assert!(
         rt.console_output().contains("I (0) heap_init: At 50000020"),
         "heap_init's last region line should be present"
+    );
+}
+
+/// Milestone 3 Task 8's ratchet rung (the plan's `spi_flash: detected chip:
+/// generic`, a line the real badge's boot log also has). The SPI1 flash
+/// controller (`emulator_core::peripherals::flash::Spimem1`) now answers the
+/// JEDEC RDID command with the badge's ID, so ESP-IDF's flash-chip
+/// detection succeeds instead of logging `E (0) memspi: no response` and
+/// aborting. Measured at step ~446,991; [`boot_until_console_contains`]
+/// sees it at its 500,000-step check (~53,000 steps of real margin).
+#[test]
+fn boot_reaches_spi_flash_detected_chip_generic() {
+    let (rt, ok) = boot_until_console_contains("I (0) spi_flash: detected chip: generic", 500_000);
+    assert!(
+        ok,
+        "flash-chip detection should succeed; pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(
+        !rt.console_output().contains("memspi: no response"),
+        "the pre-Task-8 RDID failure must be gone"
     );
 }

@@ -794,24 +794,47 @@ predicted these blockers would surface once TIMG unblocks further boot:
    family (`strcpy`, `strncpy`, `strcmp`, `strstr`, `bzero`, `memmove`,
    `ldiv`) stays unstubbed until observed. The stub count is 87.
 
-   **The current stall**: boot runs fault-free to step 442,140. ESP-IDF's
-   flash-chip detection (`memspi_host_read_id_hs`,
-   `components/spi_flash/memspi_host_driver.c`) issues a JEDEC RDID
-   command through the SPI1 flash controller, which is not modeled; the
-   read returns 0, so the firmware logs `E (0) memspi: no response` (step
-   441,439), fails an `assert` (`assert failed: 0x4039734c <cached
-   disabled>:118`) and `abort()`s (ILLEGAL_INSTRUCTION on the 442,141st
-   step). This is an abort, so "Rebooting..." prints at ~680,821, the
-   unstubbed `software_reset_cpu` faults on step 681,436, "Guru Meditation
-   Error" prints at ~682,319, and the loop's next fault is at 921,911. Pinned
-   in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`.
+   **The stall at the end of Task D9** (now fixed, see Task 8 below): boot
+   ran fault-free to step 442,140, when ESP-IDF's flash-chip detection
+   (`memspi_host_read_id_hs`, `components/spi_flash/memspi_host_driver.c`)
+   read the JEDEC ID through the then-unmodeled SPI1 flash controller, got
+   0, logged `E (0) memspi: no response` (step 441,439), failed an `assert`
+   and `abort()`ed (the 442,141st step).
 
-   **Next candidate**: model the SPI1 flash controller (the flash-command
-   `SPI_MEM_*` registers: CMD/USR/MISO length/`W0..` data) enough for RDID to
-   return the badge's JEDEC ID (`0x46 0x40 0x16` per the handoff notes) and
-   re-probe. This is a peripheral, so it needs the register-faithful,
-   header-cited treatment, not a ROM stub.
+   **Task 8 (emulated flash + SPI1 flash controller) and the current
+   stall.** `emulator-core/src/peripherals/flash.rs` adds `EmulatedFlash`
+   (the 4 MiB chip; see "Emulated flash chip" below) and `Spimem1`, the
+   SPI1 flash controller at `DR_REG_SPI1_BASE = 0x6000_2000`, wired into
+   `FirmwareBus` as a named field. Step 1's trace showed the firmware
+   issuing exactly one flash command, RDID (`0x9F`), three times: once from
+   the app's own `bootloader_flash_update_id()`
+   (`bootloader_flash_execute_command_common`) and twice from
+   `spi_flash_hal_common_command`. So only user-command (`SPI_MEM_USR`)
+   transactions with a command and MISO phase are modeled, and only RDID
+   has an effect: it returns `0x46 0x40 0x16`. The trigger fires on the
+   byte of `SPI_MEM_CMD_REG` holding `SPI_MEM_USR` and self-clears. Other
+   commands complete without effect and are listed by `boot-probe`
+   ("unmodeled commands"; none so far). Boot now prints `I (0) spi_flash:
+   detected chip: generic` (step ~446,991), `flash io: dio`, a `W (0)
+   spi_flash: Detected size(4096k) larger than the size in the binary image
+   header(0k)` warning (not in the real badge's log; see limitation 8), and
+   both `sleep_gpio:` lines. The unmapped `0x600c_4000` read D9 noted is
+   `EXTMEM_ICACHE_CTRL_REG` (`soc/extmem_reg.h`), read by the `assert`
+   message's `<cached disabled>` check on the panic path, not flash
+   machinery; the other EXTMEM accesses on the way (`+0x04`, `+0x08`,
+   `+0x40`, `+0x78..+0x88`, `+0xAC`) are cache control and cache-error
+   interrupt enables, also not flash-MMU table writes. The flash MMU
+   sub-unit is therefore not needed yet: Task D5's page-granular XIP
+   mapping still serves every IROM/DROM read, and SPIMEM1's `flash_chip`
+   is separate from XIP's buffer.
+
+   **The current stall**: on the 490,128th step boot fetches from
+   `0x4000_03c8`, the unstubbed ROM libc `memchr` (`esp32c3.rom.libc.ld`;
+   caller `0x4211_8854`, `a0 = 0x3c14_e9ec`, `a1 = '\n'`, `a2 = 3`). The
+   fault prints "Guru Meditation Error" (step ~491,011), then "Rebooting..."
+   (~730,066), then the unstubbed `software_reset_cpu` faults on step
+   730,681. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message`.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -860,6 +883,18 @@ predicted these blockers would surface once TIMG unblocks further boot:
    partition-table/`esp_partition_find`-style stall**, worth checking first
    if boot gets past heap init and stalls again on an unmapped read inside
    the DROM aperture near its top end.
+
+8. **The ROM's SPI-flash legacy data is not initialized** (found in Task
+   8). ESP-IDF reads the flash chip's size and ID from `g_rom_flashchip`,
+   i.e. `rom_spiflash_legacy_data->chip` (`rom_spiflash_legacy_data` is the
+   ROM data word at `0x3fcd_fff0`, `esp32c3.rom.ld`). On real hardware the
+   mask ROM's startup sets that pointer to its own
+   `rom_default_spiflash_legacy_data` (`0x3fcd_f5c0` per the ROM ELF) and
+   the 2nd-stage bootloader writes the chip size from the image header. The
+   shortcut boot does neither, so the pointer reads 0: `esp_flash` sees a
+   0-byte chip (the `Detected size(4096k) larger than ... (0k)` warning)
+   and the ID/size accesses land at addresses `0x0`/`0x4`. Nothing has
+   failed on it yet, but `esp_flash_default_chip->size` is 0.
 
 None of the above are correctness bugs *today* — they're dormant because
 boot doesn't reach the code paths that would exercise them. They're

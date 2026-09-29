@@ -171,6 +171,15 @@ pub const TIMG1_RANGE: Range<u32> = 0x6002_0000..0x6002_1000;
 /// peripheral's MMIO registers.
 pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_9000;
 
+/// SPI1 / `SPIMEM1` flash-controller registers (`DR_REG_SPI1_BASE`,
+/// confirmed via ESP-IDF v5.5.3's
+/// `components/soc/esp32c3/register/soc/reg_base.h`; also
+/// `REG_SPI_MEM_BASE(1) == DR_REG_SPI0_BASE - 0x1000`, `soc/soc.h`). One 4 KiB
+/// page: `spi_mem_reg.h`'s highest register, `SPI_MEM_DATE_REG`, is at
+/// `+0x3FC`. The controller ESP-IDF's `esp_flash` driver issues flash
+/// commands through; see `crate::peripherals::flash::Spimem1`.
+pub const SPIMEM1_RANGE: Range<u32> = 0x6000_2000..0x6000_3000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

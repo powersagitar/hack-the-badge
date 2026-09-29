@@ -8,8 +8,10 @@
 //! a deduplicated tail of the bus's unmapped-access log (via
 //! [`emulator_core::peripherals::systimer::SysTimer::handles`]/
 //! [`emulator_core::peripherals::intc::InterruptController::handles`]-gated
-//! logging in `crate::mem::bus::FirmwareBus`), and the framebuffer's pixel
-//! diversity.
+//! logging in `crate::mem::bus::FirmwareBus`), the SPI1 flash controller's
+//! transaction count and any flash commands it has no model for (Milestone 3
+//! Task 8, `emulator_core::peripherals::flash::Spimem1`), and the
+//! framebuffer's pixel diversity.
 //!
 //! ## Usage
 //!
@@ -324,6 +326,19 @@ fn main() {
         let rw = if *is_write { "W" } else { "R" };
         println!("0x{addr:08x}  {rw}  count={count}");
     }
+
+    println!("\n== SPIMEM1 (flash controller) ==");
+    let spimem1 = &rt.bus().spimem1;
+    println!("transactions: {}", spimem1.transaction_count());
+    let unmodeled: Vec<String> = spimem1
+        .unmodeled_commands()
+        .iter()
+        .map(|c| format!("0x{c:02x}"))
+        .collect();
+    println!(
+        "unmodeled commands (recent, oldest first): [{}]",
+        unmodeled.join(", ")
+    );
 
     println!("\n== framebuffer ==");
     let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();

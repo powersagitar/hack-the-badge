@@ -88,7 +88,19 @@
 //!    [`crate::peripherals::rtc_cntl::RtcCntl::handles`], even though the
 //!    peripheral itself gives them real (if inert) storage — see that
 //!    module's doc.
-//! 12. **Catch-all**: any address covered by none of the above (every
+//! 12. **SPIMEM1** ([`crate::mem::soc::SPIMEM1_RANGE`], the SPI1 flash
+//!    controller): routed to [`FirmwareBus::spimem1`], same ruling — see
+//!    `crate::peripherals::flash`. A write that sets `SPI_MEM_CMD_REG`'s
+//!    `SPI_MEM_USR` bit runs a flash command against
+//!    [`FirmwareBus::flash_chip`] (the emulated 4 MiB chip), another direct
+//!    cross-field access. Offsets `Spimem1::handles` does not name are
+//!    still logged into [`FirmwareBus::unmapped_log`], like RTC_CNTL's.
+//!    `flash_chip` and the XIP tier's `flash` buffer are separate for now:
+//!    XIP still reads the app image through Task D5's page-granular
+//!    mapping, so a flash write through SPIMEM1 is not visible through XIP
+//!    (no observed code path needs that yet; the flash MMU sub-unit would
+//!    unify them).
+//! 13. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -112,6 +124,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::peripherals::console::Console;
+use crate::peripherals::flash::{EmulatedFlash, Spimem1};
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::rtc_cntl::RtcCntl;
@@ -123,7 +136,7 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 use super::image::SegmentDescriptor;
 use super::soc::{
     is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE, SPI2_RANGE,
-    SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    SPIMEM1_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -291,6 +304,15 @@ pub struct FirmwareBus {
     /// ruling — the RTC timer latch (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/
     /// `TIME_HIGH0_REG`) `rtc_cntl_ll_get_rtc_time()` polls at boot.
     pub rtc_cntl: RtcCntl,
+    /// The SPI1 flash controller (`crate::peripherals::flash::Spimem1`),
+    /// same ruling — runs flash commands against [`FirmwareBus::flash_chip`].
+    pub spimem1: Spimem1,
+    /// The emulated 4 MiB flash chip behind SPIMEM1
+    /// (`crate::peripherals::flash::EmulatedFlash`): blank except a
+    /// synthesized partition table and the app image at `0x10000`. Distinct
+    /// from `flash` above, which only backs XIP reads (see the module doc's
+    /// SPIMEM1 tier for why the two are not unified yet).
+    pub flash_chip: EmulatedFlash,
     /// Capped sink for everything the firmware prints
     /// (`crate::peripherals::console`), fed by
     /// [`FirmwareBus::usb_serial_jtag`]'s TX-byte writes.
@@ -486,6 +508,7 @@ impl FirmwareBus {
             }
         }
 
+        let flash_chip = EmulatedFlash::from_app_image(&flash);
         Self {
             flash,
             xip_regions,
@@ -500,6 +523,8 @@ impl FirmwareBus {
             timg0: Timg::new(),
             timg1: Timg::new(),
             rtc_cntl: RtcCntl::new(),
+            spimem1: Spimem1::new(),
+            flash_chip,
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         }
@@ -670,6 +695,13 @@ impl FirmwareBus {
             }
             return self.rtc_cntl.read_byte(offset);
         }
+        if SPIMEM1_RANGE.contains(&addr) {
+            let offset = addr - SPIMEM1_RANGE.start;
+            if !Spimem1::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.spimem1.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -758,6 +790,18 @@ impl FirmwareBus {
             // `crate::peripherals::rtc_cntl`'s module doc.
             let elapsed_steps = self.systimer.counter();
             self.rtc_cntl.write_byte(offset, val, elapsed_steps);
+            return;
+        }
+        if SPIMEM1_RANGE.contains(&addr) {
+            let offset = addr - SPIMEM1_RANGE.start;
+            if !Spimem1::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            // Cross-peripheral access: a triggering CMD write runs a flash
+            // command against the chip, a separate concrete field. Direct
+            // disjoint field borrows, no trait object -- same ruling as the
+            // SPI2/RTC_CNTL tiers above.
+            self.spimem1.write_byte(offset, val, &mut self.flash_chip);
             return;
         }
         self.record_unmapped(addr, true);
@@ -1376,5 +1420,41 @@ mod tests {
         // Oldest entries (addr 0..10) should have been evicted; the log
         // should now start at addr 10.
         assert_eq!(bus.unmapped_log().front().unwrap().addr, 10);
+    }
+
+    // ---- Milestone 3 Task 8: SPIMEM1 flash controller ----
+
+    /// `memspi_host_read_id_hs`'s RDID through `spi_flash_hal_common_command`,
+    /// as whole-word bus writes at `DR_REG_SPI1_BASE` (see
+    /// `crate::peripherals::flash`'s tests for the per-LL-call breakdown).
+    #[test]
+    fn spimem1_rdid_through_the_bus_reads_the_jedec_id_and_completes() {
+        let mut bus = bus_with(vec![]);
+        let base = 0x6000_2000u32;
+        bus.write32(base + 0x20, 0x7000_009F); // USER2: bitlen 7, cmd 0x9F
+        bus.write32(base + 0x1C, 0xFC00_0000); // USER1: addr bitlen 0x3F
+        bus.write32(base + 0x04, 0); // ADDR
+        bus.write32(base + 0x28, 23); // MISO_DLEN: 24 bits
+        bus.write32(base + 0x18, 0x9000_0000); // USER: usr_command | usr_miso
+        let cmd = bus.read32(base);
+        bus.write32(base, cmd | 0x4_0000); // CMD |= SPI_MEM_USR
+
+        assert_eq!(bus.read32(base), 0, "SPI_MEM_USR must self-clear");
+        assert_eq!(bus.read32(base + 0x58) & 0x00FF_FFFF, 0x0016_4046);
+        assert_eq!(bus.spimem1.transaction_count(), 1);
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "named SPIMEM1 registers are not catch-all traffic"
+        );
+    }
+
+    #[test]
+    fn spimem1_unnamed_offsets_are_logged() {
+        let mut bus = bus_with(vec![]);
+        bus.read32(0x6000_23FC); // SPI_MEM_DATE_REG: not modeled
+        assert!(bus
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == 0x6000_23FC && !a.is_write));
     }
 }

@@ -21,7 +21,10 @@ fn synthesized_partition_table_matches_the_real_chip() {
     let dump = std::fs::read(&path).expect("BADGE_FULL_DUMP is set but unreadable");
     let start = PARTITION_TABLE_OFFSET as usize;
     let end = start + PARTITION_TABLE_MAX_LEN as usize;
-    assert!(dump.len() >= end, "dump too short to hold a partition table");
+    assert!(
+        dump.len() >= end,
+        "dump too short to hold a partition table"
+    );
 
     let flash = EmulatedFlash::from_app_image(&[]);
     let first_diff = (start..end).find(|&off| flash.read(off as u32) != dump[off]);

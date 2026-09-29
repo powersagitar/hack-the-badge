@@ -38,12 +38,14 @@ ESP32-C3 device), in two complementary modes:
    libgcc ROM helpers `__clzsi2`/`__ffssi2` are backed (Milestone 3 Task
    D8). ROM `esp_rom_newlib_init_common_mutexes` and the ROM libc calls
    `strlen`/`memcmp`/`strncmp`/`div` are then real stubs (Milestone 3 Task
-   D9), and boot runs on to ESP-IDF's flash-chip detection, which reads the
-   JEDEC ID through the unmodeled SPI1 flash controller: `E (0) memspi: no
-   response` (step 441,439), then an `assert`/`abort()` (step 442,141), so
-   the panic handler runs and loops in `software_reset_cpu` retry — well
-   before reaching any built-in app. The current blocker is this unmodeled
-   SPI1 flash controller (a known, documented gap — see
+   D9), and boot runs on to ESP-IDF's flash-chip detection. The SPI1 flash
+   controller and a synthetic 4 MiB flash chip are modeled (Milestone 3
+   Task 8), so the JEDEC ID read succeeds and boot prints `spi_flash:
+   detected chip: generic` and the `sleep_gpio:` lines. It then faults on
+   the unstubbed ROM libc `memchr` (step 490,128), so the panic handler
+   runs and loops in `software_reset_cpu` retry — well before reaching any
+   built-in app. The current blocker is that `memchr` call (a known,
+   documented gap — see
    `docs/firmware-emulator-notes.md`'s "Known limitations" section before
    assuming a built-in app is reachable in this mode).
 
@@ -201,7 +203,13 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       committed constants, plus factory.bin at 0x10000.
                       Erase/program use NOR semantics and stay in memory.
                       Never a copy of the physical chip (see the notes'
-                      "Emulated flash chip" section).
+                      "Emulated flash chip" section). Also Spimem1, the
+                      SPI1 flash controller (0x6000_2000): user-command
+                      transactions fire on the SPI_MEM_USR byte of CMD and
+                      self-clear; only RDID (the badge's JEDEC ID) has an
+                      effect so far. The bus holds both as named fields
+                      (spimem1, flash_chip); XIP still reads the app image
+                      via the D5 page mapping, not through flash_chip.
   src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
                       fixed addresses to intercept + what each pretends to
                       have done — including, for the five interrupt-matrix/
