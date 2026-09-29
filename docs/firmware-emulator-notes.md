@@ -866,6 +866,28 @@ boot doesn't reach the code paths that would exercise them. They're
 recorded here so Milestone 3 starts from a known list instead of
 rediscovering each one by stepping through a debugger again.
 
+## Emulated flash chip: what it contains
+
+Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
+flash chip (`emulator-core/src/peripherals/flash.rs`, `EmulatedFlash`), for
+the firmware's own flash driver to read through the SPI1 flash controller.
+It is **synthetic**, never a copy of the physical chip:
+
+- Everything is blank (`0xFF`, NOR flash's erased state) except:
+- a partition table at `0x8000`, synthesized from committed constants: the
+  badge's four entries (`nvs` 0x9000/0x4000, `phy_init` 0xd000/0x1000,
+  `factory` 0x10000/0x2a0000, `storage` 0x2b0000/0x140000) followed by the
+  `0xEBEB` MD5 entry (`CONFIG_PARTITION_TABLE_MD5`); and
+- `factory.bin` at `0x10000`.
+
+So `nvs`, `phy_init` and `storage` start blank, as on a freshly erased
+chip, and no personal data from the physical badge is involved. The
+partition layout itself is not personal data. Erase and program work in
+memory only (program ANDs, so bits only go 1 -> 0); nothing is written back
+to any file. `emulator-core/tests/flash_partition_table.rs` checks the
+synthesized table byte-for-byte against the real chip's, but only when
+`BADGE_FULL_DUMP` points at the local dump; without it the test skips.
+
 ## Data-handling note: what NOT to re-add
 
 An earlier commit on the Milestone 2 branch briefly included

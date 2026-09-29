@@ -34,6 +34,10 @@
 //!   RTC slow-clock calibration (`RTCCALICFG*_REG`, what `rtc_clk_cal()`
 //!   polls at boot) plus inert MWDT watchdog storage. `FirmwareBus` holds
 //!   one `Timg` instance per timer group (`timg0`, `timg1`).
+//! - [`flash`]: [`flash::EmulatedFlash`], the badge's 4 MiB SPI NOR flash
+//!   chip as an in-memory array: blank (`0xFF`) except a synthesized
+//!   partition table at `0x8000` and the app image at `0x10000`, with NOR
+//!   erase/program semantics (writes are in memory only).
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -42,6 +46,7 @@
 //! regions by a manual range check, not a generic abstraction.
 
 pub mod console;
+pub mod flash;
 pub mod gpio;
 pub mod intc;
 pub mod rtc_cntl;

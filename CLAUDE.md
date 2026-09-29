@@ -194,6 +194,14 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       framebuffer. Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
                       from.
+  src/peripherals/flash.rs
+                      EmulatedFlash (Milestone 3 Task 8): the badge's 4 MiB
+                      flash chip as an in-memory array. Synthetic: blank
+                      (0xFF) except a partition table at 0x8000 built from
+                      committed constants, plus factory.bin at 0x10000.
+                      Erase/program use NOR semantics and stay in memory.
+                      Never a copy of the physical chip (see the notes'
+                      "Emulated flash chip" section).
   src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
                       fixed addresses to intercept + what each pretends to
                       have done — including, for the five interrupt-matrix/
