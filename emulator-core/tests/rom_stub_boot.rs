@@ -278,104 +278,118 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// `0x3ff1_b74c`, now backed as ROM data) and `esprv_intc_int_set_threshold`
 /// (`0x4000_05e4`, stores `a0` to `CPU_INT_THRESH_REG`), are stubbed too.
 ///
-/// **The new stall** is not a fault at all: zero traps. FreeRTOS's
+/// **Task D10's stall** (history): zero traps. FreeRTOS's
 /// `xPortStartScheduler()` (IDF `components/freertos/FreeRTOS-Kernel/
-/// portable/riscv/port.c`) sets the interrupt threshold, enables interrupts
-/// and calls `vPortYield()`, which requests the first context switch by
-/// writing `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (`0x600c_0028`,
+/// portable/riscv/port.c`) sets the interrupt threshold to 1, enables
+/// interrupts and calls `vPortYield()`, which requests the first context
+/// switch by writing `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (`0x600c_0028`,
 /// `soc/system_reg.h`; `crosscore_int_ll_trigger_interrupt`) on the
-/// 528,777th step. The SYSTEM peripheral is unmodeled (the write lands in
-/// the unmapped catch-all), so no software interrupt fires, the yield
-/// returns, `xPortStartScheduler()` returns, `vTaskStartScheduler()` returns
-/// to `esp_startup_start_app()`'s caller, and from step 528,805 on the CPU
-/// spins forever on a `j .` at `0x4200_0cd2`. No task (and so no
-/// `main_task:` line, no `app_main`) ever runs.
+/// 528,777th step. The SYSTEM peripheral was unmodeled, so no software
+/// interrupt fired, `vTaskStartScheduler()` returned, and from step 528,805
+/// on the CPU spun forever on a `j .` at `0x4200_0cd2`.
 ///
-/// This test is **deliberately expected to break** once that software
-/// interrupt is modeled; whoever makes that fix should delete or replace it
-/// rather than chase a new pinned value here.
+/// **What changed in Task 4**: the SYSTEM `FROM_CPU_0..3` registers are
+/// modeled as level interrupt sources (`emulator_core::peripherals::system`,
+/// sources 50..=53), and the interrupt matrix
+/// (`emulator_core::peripherals::intc`) is source-indexed and gated by
+/// enable and priority/threshold with the legacy-INTC rule (a line fires iff
+/// its priority is `>=` `CPU_INT_THRESH`). The firmware routes
+/// `ETS_FROM_CPU_INTR0_SOURCE` to CPU line 4 at priority 1, under
+/// threshold 1. So the yield request on step 528,777 is taken as an
+/// interrupt on step 528,778 (`mcause = 0x8000_0004`), the port's ISR
+/// switches to the first task, and FreeRTOS runs: the console prints
+/// `I (0) main_task: Started on CPU0` (step ~536,400) and
+/// `I (0) main_task: Calling app_main()` (step ~555,650).
+///
+/// **The new stall** is a real fault inside `app_main`: on the 571,713th
+/// step it calls the unstubbed ROM `gpio_matrix_out` (`0x4000_05a4`,
+/// `esp32c3.rom.ld`; `a0 = 10`, `a1 = 0x41`, i.e. routing a peripheral
+/// output signal to GPIO10). The panic handler prints "Guru Meditation
+/// Error" (step ~573,200) and "Rebooting..." (step ~811,450), and its reboot
+/// attempt faults on the still-unstubbed ROM `software_reset_cpu`
+/// (`0x4000_0094`) on step 812,080, which loops through "Panic handler
+/// entered multiple times". The panic output is not progress.
+///
+/// This test is **deliberately expected to break** once `gpio_matrix_out`
+/// is backed; whoever makes that fix should re-point it at the next stall.
 #[test]
-fn boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled(
-) {
+fn boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
-    const SPIN_PC: u32 = 0x4200_0cd2;
+    const OLD_SPIN_PC: u32 = 0x4200_0cd2;
+    const GPIO_MATRIX_OUT: u32 = 0x4000_05a4;
+    const SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
 
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
-    // Phase 1: through the old ets_apb_backup_init_lock_func fault site
-    // (493,861) and the coex/threshold ROM calls with zero traps, up to the
-    // step before the yield request.
-    let summary = rt.run(528_776);
+    // Phase 1: fault-free up to and including vPortYield's write of the
+    // cross-core software-interrupt register, which now lands in the modeled
+    // SYSTEM peripheral (not the unmapped catch-all) and asserts the source.
+    let summary = rt.run(528_777);
     assert_eq!(
         summary.traps, 0,
         "expected a fault-free run; got {summary:?}"
     );
-    let console = rt.console_output();
-    assert!(
-        console
-            .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
-        "expected the last sleep_gpio line; got:\n{console}"
-    );
-    assert!(
-        !console.contains("Detected size"),
-        "the (0k) image-header flash-size warning must be gone; got:\n{console}"
+    assert_eq!(
+        rt.bus().system.pending_mask(),
+        0b0001,
+        "FROM_CPU_0 asserted"
     );
     assert!(
         !rt.bus()
             .unmapped_log()
             .iter()
             .any(|a| a.addr & !3 == FROM_CPU_0_REG),
-        "no yield request yet"
+        "SYSTEM_CPU_INTR_FROM_CPU_0_REG is modeled now, not unmapped"
     );
 
-    // Phase 2: the next step is vPortYield's write of the cross-core
-    // software-interrupt register -- four byte writes into the catch-all.
-    rt.run(1);
-    let tail: Vec<(u32, bool)> = rt
-        .bus()
-        .unmapped_log()
-        .iter()
-        .rev()
-        .take(4)
-        .map(|a| (a.addr, a.is_write))
-        .collect();
-    assert_eq!(
-        tail,
-        [
-            (FROM_CPU_0_REG + 3, true),
-            (FROM_CPU_0_REG + 2, true),
-            (FROM_CPU_0_REG + 1, true),
-            (FROM_CPU_0_REG, true),
-        ],
-        "expected SYSTEM_CPU_INTR_FROM_CPU_0_REG to be written (unmodeled)"
-    );
+    // Phase 2: the very next step takes it as an interrupt on CPU line 4
+    // (MAP[ETS_FROM_CPU_INTR0_SOURCE = 50] = 4, PRI[4] = 1 >= THRESH 1).
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 1);
+    assert_eq!(rt.cpu().csr.mcause, 0x8000_0004, "FROM_CPU_0's routed line");
 
-    // Phase 3: nothing answers it; 27 steps later the CPU is on the `j .`.
-    let summary = rt.run(528_804 - 528_777);
-    assert_eq!(summary.traps, 0);
-    assert_eq!(rt.pc(), SPIN_PC);
-
-    // Phase 4: and it stays there, with no trap, no panic and no new output.
-    let console_before = rt.console_output();
-    let summary = rt.run(1_000_000);
-    assert_eq!(summary.traps, 0, "a spin, not a fault; got {summary:?}");
-    assert_eq!(rt.pc(), SPIN_PC);
+    // Phase 3: the scheduler runs the first task and app_main starts; up to
+    // the step before the fault there is no exception, only interrupts, and
+    // the old scheduler-start spin is gone.
+    let summary = rt.run(571_712 - 528_778);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_ne!(rt.pc(), OLD_SPIN_PC);
     let console = rt.console_output();
-    assert_eq!(console, console_before, "nothing more is printed");
-    // Generic ESP-IDF text only, never identity data.
+    assert!(
+        console.contains("I (0) main_task: Started on CPU0"),
+        "console:\n{console}"
+    );
+    assert!(
+        console.contains("I (0) main_task: Calling app_main()"),
+        "console:\n{console}"
+    );
     assert!(
         !console.contains("Guru Meditation Error"),
-        "no panic; got:\n{console}"
+        "console:\n{console}"
     );
-    assert!(
-        !console.contains("Rebooting..."),
-        "no panic; got:\n{console}"
-    );
-    assert!(!console.contains("main_task"), "no task ever runs");
-    assert!(!console.contains("Invalid app image header"));
 
-    // Nothing has been drawn, because the display driver is never reached.
+    // Phase 4: the next step faults fetching the unstubbed ROM gpio_matrix_out.
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 1);
+    assert_eq!(
+        rt.cpu().csr.mcause,
+        exception_code::INSTRUCTION_ACCESS_FAULT
+    );
+    assert_eq!(summary.last_instruction_fault, Some(GPIO_MATRIX_OUT));
+
+    // Phase 5: the panic path, then the reboot attempt's software_reset_cpu
+    // fault (panic output, not progress).
+    let summary = rt.run(812_080 - 571_713);
+    assert_eq!(summary.last_instruction_fault, Some(SOFTWARE_RESET_CPU));
+    let console = rt.console_output();
+    assert!(
+        console.contains("Guru Meditation Error"),
+        "console:\n{console}"
+    );
+    assert!(console.contains("Rebooting..."), "console:\n{console}");
+
+    // Nothing has been drawn: the display is never initialized.
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
 }
 

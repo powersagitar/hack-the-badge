@@ -198,37 +198,36 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
     }
 }
 
-/// Steps `cpu` once, then advances [`FirmwareBus`]'s peripherals
-/// ([`FirmwareBus::tick_peripherals`]: the SYSTIMER's counter plus the
-/// interrupt matrix's poll) exactly once, delivering any newly-pending,
-/// enabled interrupt line into the CPU core via [`Cpu::raise_interrupt`].
+/// Samples the interrupt lines currently asserted to the core
+/// ([`FirmwareBus::asserted_lines`]) into the CPU, steps `cpu` once, then
+/// advances [`FirmwareBus`]'s peripheral time
+/// ([`FirmwareBus::tick_peripherals`]: the SYSTIMER's counter) exactly once.
 ///
-/// This is Task 3's interrupt-delivery driving loop (interrupt matrix +
-/// SYSTIMER, see `crate::peripherals`). Callers that want peripherals (and
-/// therefore interrupts) to actually work should call this instead of
-/// `cpu.step(&mut bus)` directly.
+/// This is the interrupt-delivery driving loop (interrupt matrix + SYSTIMER
+/// + SYSTEM software interrupts, see `crate::peripherals`). Callers that
+/// want peripherals (and therefore interrupts) to actually work should call
+/// this instead of `cpu.step(&mut bus)` directly.
 ///
-/// ## Why exactly one poll per step, and why *after* stepping
+/// ## Level delivery, sampled at the start of each step
 ///
-/// `Cpu::raise_interrupt` (Task 1) marks a single pending-trap slot that's
-/// consumed at the very start of the *next* `step()` call, not the one
-/// during which it was raised — see that method's own doc comment. So the
-/// natural, correctly-synchronized loop is: execute (or take an
-/// already-pending trap for) one instruction, *then* advance peripheral
-/// time by the same one step's worth and check whether that produced a new
-/// interrupt for the CPU to take on its next call. Polling more than once
-/// per `step()` (e.g. in an unsynchronized background loop) would risk
-/// silently dropping an interrupt if two polls both returned `Some` before
-/// the CPU consumed the first one, since `raise_interrupt` only remembers
-/// the most recent call (a known Task 1 limitation) — calling it at most
-/// once per `step()` is the correct granularity to avoid that, not a
-/// shortcut, since real hardware only ever has the CPU take one interrupt
-/// at a time anyway (it re-polls after `mret` returns from the ISR).
+/// The pending-line set is **replaced** every step
+/// ([`Cpu::set_pending_interrupts`]), never OR-accumulated: interrupt
+/// sources on the ESP32-C3 are levels, so once an ISR clears its source
+/// (SYSTIMER `INT_CLR`, a `0` to `SYSTEM_CPU_INTR_FROM_CPU_n_REG`) or a
+/// critical section raises `CPU_INT_THRESH`, the line must stop being
+/// pending instead of being re-taken from a stale sticky bit.
+///
+/// Sampling *before* the step (rather than feeding the step's own
+/// post-tick mask forward) means state changed between steps from outside
+/// the guest — a test's "ISR", a host button press — is seen by the very
+/// next step. For changes the guest makes itself, the timing is identical
+/// either way: a store at step `N`, or an alarm reached in the tick after
+/// step `N`, is taken at step `N + 1` (pinned by
+/// `tests/interrupt_integration.rs`'s precise-step test).
 pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu::StepInfo {
+    cpu.set_pending_interrupts(bus.asserted_lines());
     let info = cpu.step(bus);
-    if let Some(line) = bus.tick_peripherals() {
-        cpu.raise_interrupt(line);
-    }
+    bus.tick_peripherals();
     info
 }
 

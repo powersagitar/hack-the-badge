@@ -42,10 +42,10 @@
 //!   defaulting to 0) without this module needing to name every one of
 //!   them individually.
 //!
-//! This mirrors `crate::peripherals::intc`'s `other_map_regs` pattern
-//! (concrete named registers get real behavior; everything else in the
-//! peripheral's address window is a generic word-storage `HashMap`) rather
-//! than introducing a new idiom.
+//! This mirrors the pattern `crate::peripherals::intc` used for its MAP
+//! registers until Milestone 3 Task 4 (concrete named registers get real
+//! behavior; everything else in the peripheral's address window is a
+//! generic word-storage `HashMap`) rather than introducing a new idiom.
 
 use std::collections::HashMap;
 

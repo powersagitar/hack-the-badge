@@ -354,6 +354,11 @@ pub enum WordSource {
 pub struct BusRegisterWrite {
     pub base: u32,
     pub index_reg: Option<u8>,
+    /// Exclusive upper bound on `a[index_reg]` (the array's length in
+    /// words). An index `>= limit` is a wild guest value: the call is
+    /// dropped (no bus access) and counted in `Cpu::rom_stub_index_drops`.
+    /// `None` = unbounded; ignored when `index_reg` is `None`.
+    pub index_limit: Option<u32>,
     pub op: BusRegisterOp,
 }
 
@@ -1204,6 +1209,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x100,
                     index_reg: Some(REG_A0),
+                    index_limit: Some(8),
                     op: BusRegisterOp::Store { value_reg: REG_A1 },
                 }
             )
@@ -1211,6 +1217,7 @@ mod tests {
             RomStubEffect::BusRegisterWrite(BusRegisterWrite {
                 base: 0x100,
                 index_reg: Some(REG_A0),
+                index_limit: Some(8),
                 op: BusRegisterOp::Store { value_reg: REG_A1 },
             })
         );

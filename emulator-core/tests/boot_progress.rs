@@ -269,9 +269,23 @@
 //! [`boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site`]
 //! (no trap through step 528,776),
 //! [`boot_no_longer_warns_that_the_image_header_says_0k_of_flash`], and
-//! [`boot_no_longer_reaches_the_panic_handler`], which replaces the two
-//! panic-text rungs (Guru Meditation / Rebooting...), since there is no
+//! `boot_no_longer_reaches_the_panic_handler`, which replaced the two
+//! panic-text rungs (Guru Meditation / Rebooting...), since there was no
 //! panic left to reach.
+//!
+//! **Task 4 status**: the SYSTEM `FROM_CPU_0..3` software interrupts are
+//! modeled and the interrupt matrix is source-indexed with enable and
+//! priority/threshold gating (legacy-INTC rule: a line fires iff its
+//! priority `>=` the threshold). vPortYield's request (step 528,777) is
+//! taken as an interrupt on CPU line 4 on the next step, the first context
+//! switch happens, and `main_task` runs: `main_task: Started on CPU0` and
+//! `main_task: Calling app_main()` print. Inside `app_main` boot then faults
+//! on the unstubbed ROM `gpio_matrix_out` (step 571,713), so the panic
+//! handler runs again (see `tests/rom_stub_boot.rs`'s pinned stall). The
+//! no-panic rung is therefore retired (per its own doc, it was never to be
+//! re-pointed at a panic). The new rungs are
+//! [`first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line`] and
+//! [`boot_reaches_main_task_calling_app_main`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -355,37 +369,53 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
     );
 }
 
-/// Replaces the two panic-text rungs this file carried from Task D1 to
-/// Task 8, retired in Task D10: `first_console_output_is_the_firmware_s_own_panic_report`
-/// ("Guru Meditation Error" within 750,000 steps) and
-/// `boot_reaches_the_panic_handlers_reboot_message_via_the_unstubbed_ets_apb_backup_init_lock_func_fault`
-/// ("Rebooting..." within 800,000 steps). Both were panic-path lines, never
-/// boot progress; each task re-pointed them at whatever fault came next
-/// (their full histories are in git). As of Task D10 no fault comes next:
-/// boot runs with **zero traps** into the scheduler-start spin (see the
-/// module doc's "Task D10 status" and `tests/rom_stub_boot.rs`'s pinned
-/// stall), so the panic handler never runs. This rung pins that: over
-/// 1,500,000 steps (the old "Rebooting..." budget, nearly doubled) there is
-/// no trap and neither panic string appears.
-///
-/// Expected to change only when a later stall is a real fault again; a
-/// panic path is never progress, so do not re-point this at one.
+/// Milestone 3 Task 4's proven-state-change rung. Task D10's
+/// `boot_no_longer_reaches_the_panic_handler` (zero traps and no panic text
+/// over 1,500,000 steps) is retired here: its own doc said to change it
+/// only when a later stall is a real fault again, and never to re-point it
+/// at a panic, and as of Task 4 the stall is a real fault again (see the
+/// module doc's "Task 4 status"). What Task 4 proves instead is that the
+/// **first trap of the whole boot is the `FROM_CPU_0` yield interrupt on
+/// its routed line**: zero traps through vPortYield's write (step 528,777),
+/// then exactly one trap on the next step, with `mcause` = interrupt | line
+/// 4 (the line the firmware routes `ETS_FROM_CPU_INTR0_SOURCE` to). And the
+/// scheduler-start spin at `0x4200_0cd2` is gone: up to the step before the
+/// next fault (571,712) no exception is taken.
 #[test]
-fn boot_no_longer_reaches_the_panic_handler() {
+fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_500_000);
-    let console = rt.console_output();
+    let summary = rt.run(528_777);
+    assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 1, "the yield must be taken on the next step");
+    assert_eq!(rt.cpu().csr.mcause, 0x8000_0004);
+    let summary = rt.run(571_712 - 528_778);
     assert_eq!(
-        summary.traps,
-        0,
-        "got {summary:?}, pc=0x{:08x}\nconsole:\n{console}",
-        rt.pc()
+        summary.last_instruction_fault, None,
+        "no exception before app_main's gpio_matrix_out call; got {summary:?}"
     );
+    assert_ne!(
+        rt.pc(),
+        0x4200_0cd2,
+        "the scheduler-start spin must be gone"
+    );
+}
+
+/// Milestone 3 Task 4's console rung: the newest non-panic line. With the
+/// first context switch working, FreeRTOS runs `main_task`, which prints
+/// `I (0) main_task: Started on CPU0` (step ~536,400) and then
+/// `I (0) main_task: Calling app_main()` (step ~555,650), both lines the
+/// real badge's boot log also has. [`boot_until_console_contains`] sees it at
+/// its 750,000-step check.
+#[test]
+fn boot_reaches_main_task_calling_app_main() {
+    let (rt, ok) = boot_until_console_contains("I (0) main_task: Calling app_main()", 750_000);
+    let console = rt.console_output();
+    assert!(ok, "pc=0x{:08x}\nconsole:\n{console}", rt.pc());
     assert!(
-        !console.contains("Guru Meditation Error"),
+        console.contains("I (0) main_task: Started on CPU0"),
         "console:\n{console}"
     );
-    assert!(!console.contains("Rebooting..."), "console:\n{console}");
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module
@@ -709,9 +739,9 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
 /// unstubbed ROM `ets_apb_backup_init_lock_func` on step 493,861; the next
 /// two ROM calls, `esp_coex_rom_version_get` and
 /// `esprv_intc_int_set_threshold`, were stubbed in the same task. Boot now
-/// runs fault-free until FreeRTOS's first yield request (step 528,777) and
-/// then spins with no trap at all, so a run to step 528,776 must show
-/// **zero** traps.
+/// runs fault-free until FreeRTOS's first yield request (step 528,777;
+/// since Task 4 taken as an interrupt on the next step), so a run to step
+/// 528,776 must show **zero** traps.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");

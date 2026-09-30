@@ -4,8 +4,10 @@
 //! This module deliberately knows nothing about ESP32-C3 peripherals, the
 //! memory map, or the interrupt matrix — it only implements the RISC-V
 //! architectural behavior (base I, M, C extensions, Zicsr, and the M-mode
-//! subset of the privileged spec needed for traps). A later task wires an
-//! ESP32-C3-specific interrupt controller/timer up to [`Cpu::raise_interrupt`].
+//! subset of the privileged spec needed for traps). The ESP32-C3 interrupt
+//! matrix drives it from outside through [`Cpu::set_pending_interrupts`]
+//! (`crate::boot::step_with_interrupts`, level delivery);
+//! [`Cpu::raise_interrupt`] is the one-shot variant unit tests use.
 
 mod decode;
 // The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
@@ -73,14 +75,25 @@ pub struct Cpu {
     /// level-triggered hardware, which doesn't "double-pend"). Cleared one
     /// bit at a time by `step()` as each line is taken.
     ///
-    /// Chosen priority when multiple lines are pending simultaneously:
-    /// lowest line number wins (`trailing_zeros()`). This core doesn't yet
-    /// model the ESP32-C3 interrupt matrix's per-line `CPU_INT_PRI_n`
-    /// priority registers (see `peripherals::intc`'s module doc — v1 only
-    /// ever has one real source wired up, so this is moot in practice); this
-    /// is a documented placeholder ordering, not a claim of spec-accurate
-    /// priority arbitration.
+    /// In the real driving loop the whole set is *replaced* every step by
+    /// [`Cpu::set_pending_interrupts`] (level delivery; see
+    /// `crate::boot::step_with_interrupts`), so a bit taken here and still
+    /// asserted by its source simply comes back on the next sample.
+    ///
+    /// Chosen line when several are pending simultaneously: lowest line
+    /// number wins (`trailing_zeros()`). The interrupt matrix
+    /// (`peripherals::intc`) already masks lines whose `CPU_INT_PRI_n` is
+    /// below `CPU_INT_THRESH`, but picking the *highest-priority* line among
+    /// those left is not modeled; this is a documented placeholder ordering,
+    /// not a claim of spec-accurate priority arbitration.
     pending_interrupts: u32,
+    /// How many indexed [`rom_stubs::RomStubEffect::BusRegisterWrite`] stub
+    /// calls were dropped because the guest's index register was out of
+    /// range (see `BusRegisterWrite::index_limit`). The "log" for those
+    /// drops; read via [`Cpu::rom_stub_index_drops`].
+    rom_stub_index_drops: u32,
+    /// `(stub pc, offending index)` of the most recent such drop.
+    last_rom_stub_index_drop: Option<(u32, u32)>,
     /// High-level-emulated ROM-call stubs, checked just before each
     /// instruction fetch. **Empty by default** — an empty table makes the
     /// check a single branch and leaves behavior byte-for-byte identical to
@@ -95,6 +108,8 @@ impl Default for Cpu {
             regs: Registers::new(),
             csr: Csrs::new(),
             pending_interrupts: 0,
+            rom_stub_index_drops: 0,
+            last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
         }
     }
@@ -148,6 +163,17 @@ impl Cpu {
         self.rom_stubs = table;
     }
 
+    /// Number of indexed bus-register-write stub calls dropped for an
+    /// out-of-range index so far.
+    pub fn rom_stub_index_drops(&self) -> u32 {
+        self.rom_stub_index_drops
+    }
+
+    /// `(stub address, offending index)` of the most recent dropped call.
+    pub fn last_rom_stub_index_drop(&self) -> Option<(u32, u32)> {
+        self.last_rom_stub_index_drop
+    }
+
     /// The currently-installed ROM-stub table (empty unless
     /// [`Cpu::set_rom_stubs`] was called).
     pub fn rom_stubs(&self) -> &RomStubTable {
@@ -176,6 +202,17 @@ impl Cpu {
     /// are architecturally synchronous to it.
     pub fn raise_interrupt(&mut self, cause: u32) {
         self.pending_interrupts |= 1u32 << (cause & 0x1f);
+    }
+
+    /// **Replaces** (does not OR into) the pending-line set with `mask`
+    /// (bit `n` = CPU line `n`). This is the level-delivery entry point: the
+    /// driving loop (`crate::boot::step_with_interrupts`) recomputes the set
+    /// of currently-asserted lines from live peripheral state every step and
+    /// hands it here, so a line whose source the ISR has cleared stops being
+    /// pending instead of being taken again from a stale sticky bit.
+    /// [`Cpu::raise_interrupt`] stays for unit tests that want a one-shot.
+    pub fn set_pending_interrupts(&mut self, mask: u32) {
+        self.pending_interrupts = mask;
     }
 
     /// Executes exactly one instruction: fetch, decode, execute, and advance
@@ -320,37 +357,52 @@ impl Cpu {
             RomStubEffect::BusRegisterWrite(write) => {
                 use rom_stubs::BusRegisterOp;
                 let addr = match write.index_reg {
-                    Some(r) => write.base.wrapping_add(self.regs.read(r).wrapping_mul(4)),
-                    None => write.base,
+                    Some(r) => {
+                        let index = self.regs.read(r);
+                        match write.index_limit {
+                            Some(limit) if index >= limit => {
+                                // Out-of-range index (a wild guest value):
+                                // drop the write rather than touch a
+                                // neighbouring register or wrap the address.
+                                self.rom_stub_index_drops += 1;
+                                self.last_rom_stub_index_drop = Some((self.regs.pc, index));
+                                None
+                            }
+                            _ => Some(write.base.wrapping_add(index.wrapping_mul(4))),
+                        }
+                    }
+                    None => Some(write.base),
                 };
-                match write.op {
-                    BusRegisterOp::Store { value_reg } => {
-                        let value = self.regs.read(value_reg);
-                        bus.write32(addr, value);
-                    }
-                    BusRegisterOp::UpdateMask { mask_reg, set } => {
-                        let mask = self.regs.read(mask_reg);
-                        let old = bus.read32(addr);
-                        let new = if set { old | mask } else { old & !mask };
-                        bus.write32(addr, new);
-                    }
-                    BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
-                        // Masked to the 5 bits that address a bit position
-                        // within one 32-bit word: a shift amount of 32 or
-                        // more is out of range for `1u32 << bit` (Rust
-                        // panics on an overflowing shift in debug builds),
-                        // and this mechanism is chip-agnostic -- it has no
-                        // notion of how many bits a caller's register
-                        // *should* mean, only that a 32-bit word has 32.
-                        let bit = self.regs.read(bit_reg) & 0x1F;
-                        let cond = self.regs.read(cond_reg) != 0;
-                        let old = bus.read32(addr);
-                        let new = if cond {
-                            old | (1 << bit)
-                        } else {
-                            old & !(1 << bit)
-                        };
-                        bus.write32(addr, new);
+                if let Some(addr) = addr {
+                    match write.op {
+                        BusRegisterOp::Store { value_reg } => {
+                            let value = self.regs.read(value_reg);
+                            bus.write32(addr, value);
+                        }
+                        BusRegisterOp::UpdateMask { mask_reg, set } => {
+                            let mask = self.regs.read(mask_reg);
+                            let old = bus.read32(addr);
+                            let new = if set { old | mask } else { old & !mask };
+                            bus.write32(addr, new);
+                        }
+                        BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
+                            // Masked to the 5 bits that address a bit position
+                            // within one 32-bit word: a shift amount of 32 or
+                            // more is out of range for `1u32 << bit` (Rust
+                            // panics on an overflowing shift in debug builds),
+                            // and this mechanism is chip-agnostic -- it has no
+                            // notion of how many bits a caller's register
+                            // *should* mean, only that a 32-bit word has 32.
+                            let bit = self.regs.read(bit_reg) & 0x1F;
+                            let cond = self.regs.read(cond_reg) != 0;
+                            let old = bus.read32(addr);
+                            let new = if cond {
+                                old | (1 << bit)
+                            } else {
+                                old & !(1 << bit)
+                            };
+                            bus.write32(addr, new);
+                        }
                     }
                 }
                 // Every ROM function using this effect has a `void` C
@@ -1299,6 +1351,26 @@ mod tests {
     }
 
     #[test]
+    fn set_pending_interrupts_replaces_rather_than_accumulates() {
+        let mut cpu = Cpu::new();
+        cpu.set_pending_interrupts(1 << 5);
+        cpu.set_pending_interrupts(0);
+        // With MIE set, a step must NOT take a trap: the source was de-asserted.
+        cpu.csr.mstatus |= mstatus_bits::MIE;
+        let mut bus = TestBus::with_program(&[addi(0, 0, 0)]);
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+
+        // And a set mask is taken, on the lowest set line.
+        cpu.regs.pc = 0;
+        cpu.csr.mtvec = 0x8000_0000;
+        cpu.set_pending_interrupts((1 << 9) | (1 << 5));
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 5);
+    }
+
+    #[test]
     fn mret_restores_mie_and_returns_to_mepc() {
         let mut cpu = Cpu::new();
         cpu.csr.mepc = 0x100;
@@ -1698,6 +1770,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x200,
                     index_reg: Some(11), // a1 selects the word
+                    index_limit: Some(8),
                     op: BusRegisterOp::Store { value_reg: 12 }, // a2 is the value
                 },
             ),
@@ -1719,6 +1792,52 @@ mod tests {
     }
 
     #[test]
+    fn bus_register_write_out_of_range_index_is_dropped_and_logged_not_written() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_bounded_store",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: Some(11),
+                    index_limit: Some(8), // valid indices 0..8
+                    op: BusRegisterOp::Store { value_reg: 12 },
+                },
+            ),
+        );
+        cpu.set_rom_stubs(table);
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.write(11, 8); // one past the end: 0x200 + 32
+        cpu.regs.write(12, 0xAAAA_AAAA);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let info = cpu.step(&mut bus);
+
+        assert!(!info.trap_taken, "a dropped write must not trap");
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.pc, 0x40, "still returns to ra");
+        assert_eq!(bus.read32(0x200 + 8 * 4), 0, "past-the-end word untouched");
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        assert_eq!(cpu.last_rom_stub_index_drop(), Some((ROM_STUB_ADDR, 8)));
+
+        // A wild index (would wrap the address) is dropped too.
+        cpu.regs.write(11, 0x4000_0000);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.rom_stub_index_drops(), 2);
+        assert_eq!(bus.read32(0x200), 0, "base word untouched");
+
+        // In-range still works.
+        cpu.regs.write(11, 7);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x200 + 7 * 4), 0xAAAA_AAAA);
+        assert_eq!(cpu.rom_stub_index_drops(), 2);
+    }
+
+    #[test]
     fn bus_register_write_store_with_no_index_targets_the_fixed_base_address() {
         let mut cpu = Cpu::new();
         let mut table = RomStubTable::new();
@@ -1729,6 +1848,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x200,
                     index_reg: None,
+                    index_limit: None,
                     op: BusRegisterOp::Store { value_reg: 10 },
                 },
             ),
@@ -1755,6 +1875,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x200,
                     index_reg: None,
+                    index_limit: None,
                     op: BusRegisterOp::UpdateMask {
                         mask_reg: 10,
                         set: true,
@@ -1789,6 +1910,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x200,
                     index_reg: None,
+                    index_limit: None,
                     op: BusRegisterOp::UpdateMask {
                         mask_reg: 10,
                         set: false,
@@ -1823,6 +1945,7 @@ mod tests {
                 BusRegisterWrite {
                     base: 0x200,
                     index_reg: None,
+                    index_limit: None,
                     op: BusRegisterOp::SetOrClearBit {
                         bit_reg: 10,
                         cond_reg: 11,

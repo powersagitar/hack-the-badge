@@ -46,14 +46,18 @@ ESP32-C3 device), in two complementary modes:
    and `esprv_intc_int_set_threshold` are then real stubs too, and the
    ROM's writable SPI-flash legacy data is seeded at boot (Milestone 3 Task
    D10), so boot runs with zero traps into FreeRTOS's scheduler start.
-   There it stalls: `vPortYield()` requests the first context switch
-   through the SYSTEM cross-core software interrupt
-   (`SYSTEM_CPU_INTR_FROM_CPU_0_REG`, step 528,777), which is unmodeled, so
-   `vTaskStartScheduler()` returns and the CPU spins on a `j .` — no task
-   runs, well before reaching any built-in app. The current blocker is that
-   unmodeled software interrupt (a known, documented gap — see
-   `docs/firmware-emulator-notes.md`'s "Known limitations" section before
-   assuming a built-in app is reachable in this mode).
+   The SYSTEM cross-core software interrupt (`SYSTEM_CPU_INTR_FROM_CPU_0_REG`)
+   and a source-indexed, priority/threshold-gated interrupt matrix are then
+   modeled (Milestone 3 Task 4), so `vPortYield()`'s first context-switch
+   request is taken as an interrupt, FreeRTOS runs its first task, and boot
+   prints `main_task: Started on CPU0` and `main_task: Calling app_main()`.
+   Inside `app_main` it then stalls: the unstubbed ROM `gpio_matrix_out`
+   faults (step 571,713), the panic handler runs, and its reboot faults on
+   the unstubbed ROM `software_reset_cpu`. Nothing is drawn yet, well
+   before reaching any built-in app. The current blocker is that ROM call
+   (a known, documented gap — see `docs/firmware-emulator-notes.md`'s
+   "Known limitations" section before assuming a built-in app is reachable
+   in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -196,7 +200,12 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       mem/soc.rs holds the ESP32-C3 address-space ranges
                       plus the ESP32-C3's fixed 64 KiB MMU page size.
   src/peripherals/    SYSTIMER + the ESP32-C3 interrupt matrix (not a
-                      standard PLIC), GPIO + an emulated 74HC165 button
+                      standard PLIC: 64 source MAP registers onto 32 CPU
+                      lines, gated by enable and priority >= threshold,
+                      delivered as levels sampled every step by
+                      boot::step_with_interrupts), SYSTEM's FROM_CPU
+                      software-interrupt registers (system.rs; the rest of
+                      SYSTEM is unmapped), GPIO + an emulated 74HC165 button
                       shift register, and SPI2/GPSPI2 + an ST7789
                       command/pixel-stream interpreter that reconstructs a
                       framebuffer. Each module's doc comment cites the
@@ -218,9 +227,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       via the D5 page mapping, not through flash_chip.
   src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
                       fixed addresses to intercept + what each pretends to
-                      have done — including, for the five interrupt-matrix/
+                      have done — including, for the six interrupt-matrix/
                       interrupt-controller ROM calls, a real read/write of
-                      the `peripherals::intc` registers those calls target),
+                      the `peripherals::intc` registers those calls target,
+                      with indexed calls bounds-checked),
                       paired with cpu/rom_stubs.rs's generic mechanism
                       above. Also the guest-executed ROM code blobs
                       (`ESP32C3_ROM_CODE`: qsort's one-`jal` jump-table

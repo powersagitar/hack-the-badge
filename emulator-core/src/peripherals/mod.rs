@@ -11,7 +11,12 @@
 //!   comparator peripheral.
 //! - [`intc`]: [`intc::InterruptController`], the ESP32-C3's non-PLIC
 //!   interrupt matrix (`INTERRUPT_CORE0`) — per-source MAP registers routing
-//!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG`.
+//!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG` and by
+//!   priority vs. `CPU_INT_THRESH_REG` (Milestone 3 Task 4).
+//! - [`system`]: [`system::System`], the SYSTEM peripheral's four
+//!   `FROM_CPU` software-interrupt registers (Milestone 3 Task 4) — the
+//!   level sources FreeRTOS's `vPortYield` raises to request a context
+//!   switch.
 //! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
 //!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
 //!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
@@ -54,6 +59,7 @@ pub mod gpio;
 pub mod intc;
 pub mod rtc_cntl;
 pub mod spi;
+pub mod system;
 pub mod systimer;
 pub mod timg;
 pub mod usb_serial_jtag;

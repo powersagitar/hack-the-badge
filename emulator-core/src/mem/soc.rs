@@ -118,6 +118,30 @@ pub const SYSTIMER_RANGE: Range<u32> = 0x6002_3000..0x6002_4000;
 /// modeled within it.
 pub const INTERRUPT_CORE0_RANGE: Range<u32> = 0x600c_2000..0x600c_3000;
 
+/// SYSTEM peripheral registers (`DR_REG_SYSTEM_BASE = 0x600c_0000`,
+/// `soc/reg_base.h` v5.5.3). Only the `SYSTEM_CPU_INTR_FROM_CPU_0..3_REG`
+/// software-interrupt registers are modeled (see `crate::peripherals::system`);
+/// every other offset in the page keeps the bus's logged catch-all behavior.
+pub const SYSTEM_RANGE: Range<u32> = 0x600c_0000..0x600c_1000;
+
+/// Interrupt-source numbers: the value `periph_interrupt_t`
+/// (`components/soc/esp32c3/include/soc/interrupts.h`, v5.5.3) gives each
+/// `ETS_*_INTR_SOURCE`, equal to that source's `INTERRUPT_CORE0_*_MAP_REG`
+/// offset divided by 4 (`interrupt_core0_reg.h`: `SPI_INTR_2_MAP_REG` =
+/// `0x04C`, `SYSTIMER_TARGET0_INT_MAP_REG` = `0x094`,
+/// `DMA_CH0_INT_MAP_REG` = `0x0B0`, `CPU_INTR_FROM_CPU_0_MAP_REG` = `0x0C8`).
+pub const SRC_SPI2: u32 = 19; // ETS_SPI2_INTR_SOURCE
+pub const SRC_SYSTIMER_TARGET0: u32 = 37; // ETS_SYSTIMER_TARGET0_INTR_SOURCE
+pub const SRC_SYSTIMER_TARGET1: u32 = 38;
+pub const SRC_SYSTIMER_TARGET2: u32 = 39;
+pub const SRC_DMA_CH0: u32 = 44; // ETS_DMA_CH0_INTR_SOURCE
+pub const SRC_DMA_CH1: u32 = 45;
+pub const SRC_DMA_CH2: u32 = 46;
+pub const SRC_FROM_CPU_INTR0: u32 = 50; // ETS_FROM_CPU_INTR0_SOURCE
+pub const SRC_FROM_CPU_INTR1: u32 = 51;
+pub const SRC_FROM_CPU_INTR2: u32 = 52;
+pub const SRC_FROM_CPU_INTR3: u32 = 53;
+
 /// GPIO peripheral registers (`DR_REG_GPIO_BASE`, confirmed via ESP-IDF
 /// v5.5.3's `soc/reg_base.h`). Same one-4KiB-page rationale as
 /// [`SYSTIMER_RANGE`] (the header's highest-cited `GPIO_*_REG` offset is

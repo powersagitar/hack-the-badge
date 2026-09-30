@@ -313,6 +313,11 @@
 //!       writes `priority` into the `CPU_INT_PRI_<n>_REG` at
 //!       `CPU_INT_PRI_BASE_REG + rv_int_num * 4`.
 //!
+//!     (Task 4: the two indexed calls are bounds-checked via
+//!     `BusRegisterWrite::index_limit` -- `model_num < 64`,
+//!     `rv_int_num < 32` -- and an out-of-range index drops the write and is
+//!     counted in `Cpu::rom_stub_index_drops`.)
+//!
 //!     Every one of these five is still a `void` C function (see the
 //!     deprecated-header signatures above), so `a0` is left untouched, same
 //!     as [`crate::cpu::rom_stubs::RomStubEffect::Void`] — only the register
@@ -752,7 +757,22 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D10**: 92 stubs (Task 8's 89 plus
+//! **As of Task 4** (interrupt matrix + SYSTEM software interrupts): still 92
+//! stubs. `intr_matrix_set` and `esprv_intc_int_set_priority` now bound
+//! their guest index (`BusRegisterWrite::index_limit`: 64 MAP registers, 32
+//! lines), so a wild index is dropped and counted
+//! (`Cpu::rom_stub_index_drops`) instead of landing on a neighbouring
+//! register. With the SYSTEM `FROM_CPU` interrupt modeled, the yield below
+//! is taken, the first task runs, and boot prints `main_task: Calling
+//! app_main()`. The next stall is a ROM call again: inside `app_main`, on
+//! the 571,713th step, the unstubbed `gpio_matrix_out` (`0x4000_05a4`,
+//! `esp32c3.rom.ld`) faults, and the panic path's reboot then faults on the
+//! unstubbed `software_reset_cpu` (`0x4000_0094`, step 812,080). See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call`.
+//! The Task D10 paragraph below is kept as history.
+//!
+//! **As of Task D10** (history): 92 stubs (Task 8's 89 plus
 //! `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get` and
 //! `esprv_intc_int_set_threshold`, entries 19 and 21), three ROM data blobs
 //! (entries 15 and 21) and the seeded SPI-flash legacy data (entry 20). The
@@ -763,10 +783,10 @@
 //! the 528,777th step; the SYSTEM peripheral is unmodeled, so no software
 //! interrupt fires, `vTaskStartScheduler()` returns, and from step 528,805
 //! the CPU spins on a `j .` at `0x4200_0cd2`. No task runs, so the real
-//! badge's next line (`main_task: Started on CPU0`) never prints. See
-//! `tests/rom_stub_boot.rs`'s
-//! `boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled`.
-//! The Task 8 paragraph below is kept as history.
+//! badge's next line (`main_task: Started on CPU0`) never prints. (Pinned
+//! then by `tests/rom_stub_boot.rs`'s
+//! `boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled`,
+//! replaced in Task 4.) The Task 8 paragraph below is kept as history.
 //!
 //! **As of Task 8** (history): 89 stubs (D9's 87 plus `memchr` and `memmove`, entry
 //! 18). The SPI1 flash controller is modeled (`crate::peripherals::flash`),
@@ -859,7 +879,8 @@ use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::image::ImageHeader;
 use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
 use crate::peripherals::intc::{
-    CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_THRESH_REG, CPU_INT_TYPE_REG,
+    CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_THRESH_REG, CPU_INT_TYPE_REG, LINE_COUNT,
+    MAP_SOURCE_COUNT,
 };
 
 /// `rtc_get_reset_reason`'s return value: `POWERON_RESET` from ESP-IDF's
@@ -921,7 +942,9 @@ pub const UART_TX_WAIT_IDLE: u32 = 0x4000_0084;
 /// peripheral interrupt source onto a CPU interrupt line by writing that
 /// source's MAP register in `crate::peripherals::intc::InterruptController`
 /// — a **real** register write as of Fix round 1
-/// ([`BusRegisterOp::Store`], see the module doc's entry 11).
+/// ([`BusRegisterOp::Store`], see the module doc's entry 11). The source
+/// index (`a1`) is bounded by `intc::MAP_SOURCE_COUNT` (Task 4); an
+/// out-of-range one is dropped, never written past the MAP array.
 pub const INTR_MATRIX_SET: u32 = 0x4000_05f4;
 
 /// `esprv_intc_int_disable`'s fixed ROM address (`esp32c3.rom.ld`). Clears
@@ -958,10 +981,11 @@ pub const ESPRV_INTC_INT_SET_THRESHOLD: u32 = 0x4000_05e4;
 /// Writes a `CPU_INT_PRI_<n>_REG` entry
 /// (`crate::peripherals::intc::InterruptController`) — a **real** register
 /// write as of Fix round 1 ([`BusRegisterOp::Store`], see the module doc's
-/// entry 11). That register is real storage but not yet consulted by this
-/// emulator's interrupt arbitration (`InterruptController`'s own "v1 scope"
-/// doc) — writing it for real costs nothing and keeps this stub honest
-/// regardless.
+/// entry 11). Since Milestone 3 Task 4 the interrupt matrix consults it: a
+/// line fires only if its priority is `>=` `CPU_INT_THRESH_REG` (see
+/// `InterruptController`'s module doc). The line index (`a0`) is bounded by
+/// `intc::LINE_COUNT`; an out-of-range one is dropped, never written past
+/// the array.
 pub const ESPRV_INTC_INT_SET_PRIORITY: u32 = 0x4000_05e0;
 
 /// `ets_get_cpu_frequency`'s fixed ROM address (`esp32c3.rom.ld`).
@@ -1478,7 +1502,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
                 // CACHE_CORE0_ACS_INT_MAP_REG run and the module doc's
                 // entry 11.
                 base: INTERRUPT_CORE0_RANGE.start,
-                index_reg: Some(REG_A1),                        // model_num
+                index_reg: Some(REG_A1), // model_num
+                index_limit: Some(MAP_SOURCE_COUNT),
                 op: BusRegisterOp::Store { value_reg: REG_A2 }, // intr_num
             },
         ),
@@ -1490,6 +1515,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
             BusRegisterWrite {
                 base: INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG,
                 index_reg: None,
+                index_limit: None,
                 op: BusRegisterOp::UpdateMask {
                     mask_reg: REG_A0, // mask
                     set: false,
@@ -1504,6 +1530,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
             BusRegisterWrite {
                 base: INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG,
                 index_reg: None,
+                index_limit: None,
                 op: BusRegisterOp::UpdateMask {
                     mask_reg: REG_A0, // unmask
                     set: true,
@@ -1518,6 +1545,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
             BusRegisterWrite {
                 base: INTERRUPT_CORE0_RANGE.start + CPU_INT_TYPE_REG,
                 index_reg: None,
+                index_limit: None,
                 op: BusRegisterOp::SetOrClearBit {
                     bit_reg: REG_A0,  // intr_num
                     cond_reg: REG_A1, // type: INTR_TYPE_LEVEL=0, INTR_TYPE_EDGE=1
@@ -1531,7 +1559,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
             "esprv_intc_int_set_priority",
             BusRegisterWrite {
                 base: INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG,
-                index_reg: Some(REG_A0),                        // rv_int_num
+                index_reg: Some(REG_A0), // rv_int_num
+                index_limit: Some(LINE_COUNT),
                 op: BusRegisterOp::Store { value_reg: REG_A1 }, // priority
             },
         ),
@@ -1543,6 +1572,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
             BusRegisterWrite {
                 base: INTERRUPT_CORE0_RANGE.start + CPU_INT_THRESH_REG,
                 index_reg: None,
+                index_limit: None,
                 op: BusRegisterOp::Store { value_reg: REG_A0 }, // priority_threshold
             },
         ),
@@ -1968,6 +1998,46 @@ mod tests {
         assert_eq!(bus.read32(INTERRUPT_CORE0_RANGE.start + 5 * 4), 3);
         // A neighbouring MAP register must be untouched.
         assert_eq!(bus.read32(INTERRUPT_CORE0_RANGE.start + 4 * 4), 0);
+    }
+
+    #[test]
+    fn intc_indexed_stubs_drop_out_of_range_indices_without_touching_neighbours() {
+        // intr_matrix_set(_, model_num = 64, _): one past the last MAP slot.
+        // Unbounded, this would land on 0x100 = CPU_INT_ENABLE_REG.
+        let (cpu, mut bus) = run_stub_call(
+            INTR_MATRIX_SET,
+            &[(REG_A0, 0), (REG_A1, MAP_SOURCE_COUNT), (REG_A2, 0x1F)],
+        );
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        assert_eq!(
+            bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_ENABLE_REG),
+            0,
+            "must not spill into CPU_INT_ENABLE_REG"
+        );
+        // esprv_intc_int_set_priority(32, 7): one past the last line; would
+        // land on CPU_INT_THRESH_REG.
+        let (cpu, mut bus2) = run_stub_call(
+            ESPRV_INTC_INT_SET_PRIORITY,
+            &[(REG_A0, LINE_COUNT), (REG_A1, 7)],
+        );
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        assert_eq!(
+            bus2.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_THRESH_REG),
+            0,
+            "must not spill into CPU_INT_THRESH_REG"
+        );
+        // Wild (wrapping) values are dropped too, and the last valid slots work.
+        let (cpu, _) = run_stub_call(INTR_MATRIX_SET, &[(REG_A1, 0xFFFF_FFFF), (REG_A2, 1)]);
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        let (cpu, mut bus3) = run_stub_call(
+            INTR_MATRIX_SET,
+            &[(REG_A1, MAP_SOURCE_COUNT - 1), (REG_A2, 6)],
+        );
+        assert_eq!(cpu.rom_stub_index_drops(), 0);
+        assert_eq!(
+            bus3.read32(INTERRUPT_CORE0_RANGE.start + (MAP_SOURCE_COUNT - 1) * 4),
+            6
+        );
     }
 
     #[test]

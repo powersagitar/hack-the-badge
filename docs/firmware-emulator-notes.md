@@ -898,25 +898,74 @@ predicted these blockers would surface once TIMG unblocks further boot:
    step 528,694, from FreeRTOS's `xPortStartScheduler()`; stores `a0` = 1
    to `CPU_INT_THRESH_REG`). The stub count is 92.
 
-   **The current stall is a peripheral, with zero traps.**
+   **Task D10's stall (history) was a peripheral, with zero traps.**
    `xPortStartScheduler()` (`components/freertos/FreeRTOS-Kernel/portable/
    riscv/port.c`) enables interrupts and calls `vPortYield()`, which asks
    for the first context switch through the cross-core software interrupt:
    `esp_crosscore_int_send_yield()` writes `SYSTEM_CPU_INTR_FROM_CPU_0_REG`
    (`0x600c_0028`, `soc/system_reg.h`; `crosscore_int_ll_trigger_interrupt`
    in `hal/esp32c3/include/hal/crosscore_int_ll.h`) on the 528,777th step.
-   The SYSTEM peripheral is unmodeled, so the write lands in the unmapped
-   catch-all and no interrupt fires. The yield returns,
-   `xPortStartScheduler()` returns, `vTaskStartScheduler()` returns to
+   The SYSTEM peripheral was unmodeled, so the write landed in the unmapped
+   catch-all and no interrupt fired. The yield returned,
+   `xPortStartScheduler()` returned, `vTaskStartScheduler()` returned to
    `esp_startup_start_app()` (`components/freertos/app_startup.c`, which
-   had created the `main` task), and from step 528,805 the CPU spins on a
-   `j .` at `0x4200_0cd2`. No task ever runs, so the real badge's next line,
-   `main_task: Started on CPU0`, never prints. Nothing panics. Pinned in
-   `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled`.
-   Modeling that software interrupt (routing it through the interrupt
-   matrix to a CPU line) is the next step; the FreeRTOS tick (item 2) and
-   `wfi` (item 4) will be needed right after.
+   had created the `main` task), and from step 528,805 the CPU spun on a
+   `j .` at `0x4200_0cd2`. The interrupt controller also ignored
+   `CPU_INT_THRESH_REG` (and every `CPU_INT_PRI_<n>_REG`), which D10's
+   `esprv_intc_int_set_threshold` stub had just started writing.
+
+   **Task 4 (interrupt matrix + SYSTEM software interrupts).** Both gaps
+   are resolved:
+   - `emulator-core/src/peripherals/system.rs` models the four
+     `SYSTEM_CPU_INTR_FROM_CPU_<n>_REG` registers (`DR_REG_SYSTEM_BASE` +
+     `0x028`/`0x02C`/`0x030`/`0x034`, `soc/system_reg.h`; bit 0, R/W) as
+     level interrupt sources `ETS_FROM_CPU_INTR0..3_SOURCE` = 50..=53
+     (`soc/interrupts.h`). The rest of the SYSTEM page stays in the logged
+     catch-all.
+   - `emulator-core/src/peripherals/intc.rs` is source-indexed: 64 uniform
+     MAP registers (source `n` = MAP offset `n * 4`, e.g. SPI2 = 19,
+     SYSTIMER target0 = 37, DMA ch0 = 44, FROM_CPU0 = 50; `emulator-core/src/mem/soc.rs`
+     has the `SRC_*` constants). `poll()` takes a `u64` of asserted sources
+     and returns a mask of lines that are routed (line 0 = unrouted),
+     enabled, and have **priority `>=` threshold**. That is the legacy
+     INTC rule: `components/riscv/include/esp_private/interrupt_intc.h`
+     says "all interrupt priority levels strictly less than the threshold
+     level are masked", `components/riscv/vectors.S` raises the threshold
+     to `PRI[mcause] + 1` on ISR entry, and Espressif's QEMU model
+     (`hw/riscv/esp32c3_intmatrix.c`) uses `irq_prio >= irq_thres`. (The
+     plan's text said "strictly greater"; that would have masked every
+     priority-1 line under FreeRTOS's threshold of 1, including this
+     yield.)
+   - Delivery is level-based. `crate::boot::step_with_interrupts` samples
+     `FirmwareBus::asserted_lines()` into `Cpu::set_pending_interrupts`
+     (which replaces the set, never ORs it) at the start of every step, so
+     a source the ISR clears, or a raised threshold, stops the interrupt
+     at once.
+   - The indexed intc ROM stubs (`intr_matrix_set`,
+     `esprv_intc_int_set_priority`) drop an out-of-range index (>= 64 /
+     >= 32) instead of writing a neighbouring register
+     (`BusRegisterWrite::index_limit`).
+
+   The firmware routes FROM_CPU0 to CPU line 4 at priority 1 (threshold
+   1), so the yield on step 528,777 is taken on step 528,778 (`mcause` =
+   `0x8000_0004`; the first trap of the boot). The port switches to the
+   first task, and the console prints `I (0) main_task: Started on CPU0`
+   (step ~536,400) and `I (0) main_task: Calling app_main()` (step
+   ~555,650), both also in the real badge's boot log.
+
+   **The current stall is a ROM call inside `app_main`.** On the 571,713th
+   step the firmware calls the unstubbed ROM `gpio_matrix_out`
+   (`0x4000_05a4`, `esp32c3.rom.ld`) with `a0` = 10 and `a1` = `0x41`
+   (GPIO10 and an output-signal index), and the fetch faults. The panic
+   handler prints "Guru Meditation Error" (step ~573,200) and
+   "Rebooting..." (step ~811,450). Its reboot attempt then faults on the
+   still-unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 812,080)
+   and loops ("Panic handler entered multiple times"). Nothing is drawn.
+   Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call`.
+   Backing `gpio_matrix_out` is next. The FreeRTOS tick (item 2) and
+   `wfi` (item 4) have not been needed yet, but the idle task will need
+   them.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -984,9 +1033,19 @@ predicted these blockers would surface once TIMG unblocks further boot:
    and the ID/size accesses landed at addresses `0x0`/`0x4`. Nothing had
    failed on it, but `esp_flash_default_chip->size` was 0.
 
+9. **Interrupt arbitration and edge interrupts are simplified** (Task 4).
+   When several enabled lines at or above the threshold are pending at
+   once, the CPU core takes the *lowest-numbered* line, not the
+   highest-priority one. `CPU_INT_TYPE_REG` (edge vs. level) and
+   `CPU_INT_CLEAR_REG` are plain storage: every source wired so far
+   (SYSTIMER target0, SYSTEM FROM_CPU) is level-type, and the SYSTIMER's
+   own latched `INT_RAW` stands in for its edge behavior. Neither has
+   mattered in the observed boot. `FirmwareBus::pending_sources()` only
+   includes SYSTIMER target0 and SYSTEM FROM_CPU0..3 so far.
+
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
-fixed it. Items 2 to 7 are not correctness bugs *today* — they're dormant
+fixed it. Items 2 to 7 and 9 are not correctness bugs *today* — they're dormant
 because boot doesn't reach the code paths that would exercise them (item 2
 is about to be reached; see item 1's current stall). They're
 recorded here so Milestone 3 starts from a known list instead of

@@ -8,8 +8,13 @@
 //! This proves the *whole chain* end-to-end, the same way Task 1's
 //! `riscv_integration.rs` proved the CPU core against toy programs: SYSTIMER
 //! peripheral -> interrupt matrix (`InterruptController::poll`) ->
-//! `Cpu::raise_interrupt` -> Task 1's already-merged vectored trap dispatch
-//! (`mtvec_base + 4*line`).
+//! `Cpu::set_pending_interrupts` -> Task 1's already-merged vectored trap
+//! dispatch (`mtvec_base + 4*line`).
+//!
+//! Milestone 3 Task 4 added the level-delivery, threshold and SYSTEM
+//! `FROM_CPU` software-interrupt tests at the end of this file, and the
+//! program now also programs the line's priority (step 4b), as ESP-IDF
+//! does.
 //!
 //! The program (all addresses/values built at runtime via `lui`+`addi`, the
 //! standard RISC-V 32-bit-constant idiom, so nothing here needs a `-0x800`
@@ -146,6 +151,13 @@ fn build_program() -> (Vec<u32>, usize) {
     prog.extend(load_imm32(1, 1 << TARGET_LINE));
     prog.push(sw(2, 1, 0));
 
+    // 4b. CPU_INT_PRI_<TARGET_LINE>_REG = 1, what ESP-IDF's
+    //     esprv_intc_int_set_priority does for a level-1 allocation (and
+    //     what the threshold test below raises THRESH above).
+    prog.extend(load_imm32(2, INTC_BASE + 0x114 + 4 * TARGET_LINE));
+    prog.push(addi(1, 0, 1));
+    prog.push(sw(2, 1, 0));
+
     // 5. TARGET0_CONF_REG = PERIOD_MODE(bit30) | PERIOD
     prog.extend(load_imm32(2, SYSTIMER_BASE + 0x34));
     prog.extend(load_imm32(1, (1 << 30) | PERIOD));
@@ -209,11 +221,11 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
     // COMP0_LOAD write itself happens *during* cpu.step() at step index
     // `comp0_load_step`, i.e. before that step's own advance() call, so the
     // live counter it reads is exactly `comp0_load_step`). The comparator
-    // then edge-fires (INT_RAW latched, poll() returns Some) on the step
-    // where the counter reaches that target, i.e. step index
-    // `comp0_load_step + PERIOD - 1`; `raise_interrupt` marks it pending,
-    // taken at the very next step -- so the trap is taken at step index
-    // `comp0_load_step + PERIOD`.
+    // then edge-fires (INT_RAW latched, the source asserted) in the tick
+    // after step index `comp0_load_step + PERIOD - 1`, where the counter
+    // reaches that target; the next step samples the asserted line at its
+    // start (step_with_interrupts' level delivery) and takes it -- so the
+    // trap is taken at step index `comp0_load_step + PERIOD`.
     let expected_trap_step = comp0_load_step + PERIOD as usize;
 
     const STEP_BUDGET: usize = 200;
@@ -270,5 +282,139 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
             !info.trap_taken,
             "must not trap before step {expected_trap_step} (fired at step {i})"
         );
+    }
+}
+
+/// Level delivery (Task 4): once the ISR clears SYSTIMER's `INT_CLR`, the
+/// line must de-assert -- re-enabling `MIE` must NOT take the interrupt a
+/// second time from a stale sticky pending bit. The next alarm (period
+/// mode, `PERIOD` ticks later) legitimately re-asserts it.
+#[test]
+fn cleared_source_is_not_retaken_but_the_next_alarm_is() {
+    use emulator_core::mem::Bus;
+    let (prog, comp0_load_step) = build_program();
+    let mut bus = build_bus(&prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+
+    let expected_trap_step = comp0_load_step + PERIOD as usize;
+    let mut taken_at = None;
+    for i in 0..200 {
+        if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
+            taken_at = Some(i);
+            break;
+        }
+    }
+    assert_eq!(taken_at, Some(expected_trap_step));
+    assert_eq!(
+        cpu.csr.mstatus & mstatus_bits::MIE,
+        0,
+        "trap entry clears MIE"
+    );
+
+    // "ISR" (test code): clear the source, return into the NOP padding,
+    // and re-enable MIE (what `mret` would do).
+    bus.write32(SYSTIMER_BASE + 0x6c, 1); // INT_CLR = target0
+    assert!(
+        !bus.systimer.target0_pending(),
+        "INT_CLR de-asserts the source"
+    );
+    cpu.regs.pc = PROGRAM_LOAD_ADDR + 4 * (prog.len() as u32 - 64);
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+
+    // Well before the next alarm (PERIOD ticks after the first): no trap.
+    for i in 0..(PERIOD as usize - 5) {
+        let info = step_with_interrupts(&mut cpu, &mut bus);
+        assert!(
+            !info.trap_taken,
+            "level line re-taken at step {i} after clear"
+        );
+    }
+    // The next period's alarm does fire.
+    let mut second = false;
+    for _ in 0..(2 * PERIOD as usize) {
+        if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
+            second = true;
+            break;
+        }
+    }
+    assert!(second, "the next periodic alarm must raise the line again");
+    assert_eq!(cpu.csr.mcause, 0x8000_0000 | TARGET_LINE);
+}
+
+/// Threshold masking (Task 4): raising `CPU_INT_THRESH_REG` above the line's
+/// priority masks it even with `MIE` set (this is how the FreeRTOS RISC-V
+/// port implements critical sections, and what `vectors.S` does on ISR
+/// entry: `THRESH = PRI + 1`); lowering it back to the priority lets it
+/// through (only priorities strictly below the threshold are masked).
+#[test]
+fn raised_threshold_masks_a_pending_line_until_lowered() {
+    use emulator_core::mem::Bus;
+    let (prog, comp0_load_step) = build_program();
+    let mut bus = build_bus(&prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+
+    // Run the setup, then raise THRESH = 2 (line priority 1 + 1) right
+    // before the alarm would fire.
+    for _ in 0..(comp0_load_step + 2) {
+        step_with_interrupts(&mut cpu, &mut bus);
+    }
+    bus.write32(INTC_BASE + 0x194, 2);
+    for i in 0..(PERIOD as usize + 10) {
+        let info = step_with_interrupts(&mut cpu, &mut bus);
+        assert!(!info.trap_taken, "masked by threshold, fired at {i}");
+    }
+    assert_ne!(
+        bus.read32(INTC_BASE + 0x110) & (1 << TARGET_LINE),
+        0,
+        "EIP_STATUS still shows the line pending (ungated)"
+    );
+    bus.write32(INTC_BASE + 0x194, 1); // == the line's priority: admitted
+                                       // Level sampling at the start of each step: the very next step takes it.
+    assert!(
+        step_with_interrupts(&mut cpu, &mut bus).trap_taken,
+        "lowering the threshold lets the pending line through"
+    );
+    assert_eq!(cpu.csr.mcause, 0x8000_0000 | TARGET_LINE);
+}
+
+/// SYSTEM `FROM_CPU_0` software interrupt end to end (Task 4): a whole-word
+/// store through the bus's byte-splitting path asserts the source, and the
+/// first trap taken is on the line MAP[50] routes it to; writing 0 clears it.
+#[test]
+fn from_cpu_software_interrupt_is_taken_on_its_routed_line_and_clears() {
+    use emulator_core::mem::Bus;
+    const LINE: u32 = 3;
+    let prog = vec![addi(0, 0, 0); 64];
+    let mut bus = build_bus(&prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+    cpu.csr.mtvec = 0x8000_0001;
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+
+    bus.write32(INTC_BASE + 50 * 4, LINE); // ETS_FROM_CPU_INTR0_SOURCE = 50
+    bus.write32(INTC_BASE + 0x104, 1 << LINE);
+    bus.write32(INTC_BASE + 0x114 + 4 * LINE, 1);
+    for _ in 0..5 {
+        assert!(!step_with_interrupts(&mut cpu, &mut bus).trap_taken);
+    }
+    bus.write32(0x600c_0028, 1); // vPortYield -> crosscore_int_ll_trigger_interrupt
+    assert_eq!(bus.read32(0x600c_0028), 1, "get_state reads back");
+    let mut taken = false;
+    for _ in 0..4 {
+        if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
+            taken = true;
+            break;
+        }
+    }
+    assert!(taken, "software interrupt must be taken");
+    assert_eq!(cpu.csr.mcause, 0x8000_0000 | LINE);
+
+    bus.write32(0x600c_0028, 0); // crosscore_int_ll_clear_interrupt
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+    for _ in 0..20 {
+        assert!(!step_with_interrupts(&mut cpu, &mut bus).trap_taken);
     }
 }

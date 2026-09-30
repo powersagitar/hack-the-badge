@@ -13,54 +13,95 @@
 //! that line's (possibly OR-of-multiple-sources) signal is allowed through
 //! to the CPU core at all. `mcause`'s low bits for a taken interrupt are
 //! literally the CPU line number (0-31) -- see `crate::cpu::mod`'s
-//! `enter_trap` (already correct for this, per Task 1) and
-//! `crate::boot::step_with_interrupts` (this task's driving loop, which
-//! calls `Cpu::raise_interrupt(line)` with exactly the value
-//! [`InterruptController::poll`] returns).
+//! `enter_trap` and `crate::boot::step_with_interrupts` (the driving loop,
+//! which hands the mask [`InterruptController::poll`] returns to
+//! `Cpu::set_pending_interrupts`).
 //!
-//! ## v1 scope (documented simplification)
+//! ## Source-indexed MAP registers
 //!
-//! Only `SYSTIMER_TARGET0_INT_MAP_REG` (offset `0x094`) has a real signal
-//! wired behind it -- [`InterruptController::poll`] is given
-//! `systimer_target0_pending` (from `SysTimer::target0_pending`) by
-//! `FirmwareBus`, which owns both peripherals as concrete fields per this
-//! plan's pre-flight "no trait-object peripheral dispatch" ruling. Every
-//! other source's MAP register (~60 of them, per the header) is modeled as
-//! plain read/write storage with no source behind it yet, in
-//! [`InterruptController::other_map_regs`] -- so firmware writes to them
-//! aren't silently lost, they just don't do anything in v1.
+//! The MAP region (`0x000..0x100`) is a uniform `[u32; 64]`
+//! ([`InterruptController::map`]) indexed by `offset / 4`. A source's
+//! number is its MAP register's `offset / 4` -- the order of
+//! `periph_interrupt_t` in `components/soc/esp32c3/include/soc/interrupts.h`
+//! (v5.5.3), e.g. `ETS_SPI2_INTR_SOURCE` = 19 (`SPI_INTR_2_MAP_REG`,
+//! `0x04C`), `ETS_SYSTIMER_TARGET0_INTR_SOURCE` = 37
+//! (`SYSTIMER_TARGET0_INT_MAP_REG`, `0x094`), `ETS_DMA_CH0_INTR_SOURCE` = 44
+//! (`0x0B0`), `ETS_FROM_CPU_INTR0_SOURCE` = 50 (`CPU_INTR_FROM_CPU_0_MAP_REG`,
+//! `0x0C8`). The constants live in `crate::mem::soc` (`SRC_*`). A source
+//! routes to line `MAP[src] & 0x1F`; **line 0 means "not routed"** (the MAP
+//! reset value is 0, and ESP-IDF never uses CPU line 0:
+//! `components/riscv/include/esp_private/interrupt_intc.h`'s
+//! `assert_valid_rv_int_num` asserts `rv_int_num != 0`).
 //!
-//! `CPU_INT_PRI_<n>_REG` (32 registers, one per line) and
-//! `CPU_INT_THRESH_REG` are likewise real read/write storage but not
-//! consulted by [`InterruptController::poll`]'s arbitration logic: their
-//! hardware reset value is 0, and a threshold of 0 means "any enabled
-//! interrupt gets through" on real hardware, so treating every enabled
-//! line as always above threshold is priority/threshold-*permissive* by
-//! construction, not silently wrong -- it just doesn't yet implement
-//! priority arbitration between multiple simultaneously-pending lines
-//! (moot for v1 anyway, since only one source -- systimer target0 -- is
-//! wired to a real signal). A later task that wires up a second real
-//! source should revisit this before it becomes observably wrong.
-//! `CPU_INT_TYPE_REG` (edge vs. level per line) and `CPU_INT_CLEAR_REG` are
-//! likewise real storage with no behavior wired to them yet (v1's one real
-//! source, the systimer, is cleared via its own `INT_CLR_REG`, not this
-//! one -- see `systimer::SysTimer`).
+//! ## Priority / threshold rule
+//!
+//! [`InterruptController::poll`] returns the mask of CPU lines that are
+//! (a) routed-to by at least one *asserted* source, (b) enabled in
+//! `CPU_INT_ENABLE_REG`, and (c) whose `CPU_INT_PRI_<n>_REG` priority is
+//! **greater than or equal to** `CPU_INT_THRESH_REG` -- i.e. only
+//! priorities *strictly less than* the threshold are masked. Sources, all
+//! ESP-IDF v5.5.3:
+//! - `components/riscv/include/esp_private/interrupt_intc.h`: "On the
+//!   legacy INTC, all interrupt priority levels strictly less than the
+//!   threshold level are masked" (next to `RVHAL_INTR_ENABLE_THRESH = 1`,
+//!   the threshold `xPortStartScheduler` sets via `esprv_int_set_threshold`
+//!   in `components/freertos/FreeRTOS-Kernel/portable/riscv/port.c`);
+//!   `components/riscv/include/riscv/interrupt.h`'s `esprv_int_set_threshold`
+//!   doc says the same ("lower than the threshold are masked").
+//! - `components/riscv/vectors.S`'s ISR entry sets
+//!   `THRESH = PRI[mcause] + 1` to mask same-level nesting, which only
+//!   makes sense under `>=`.
+//! - Cross-check: Espressif's own QEMU model (`espressif/qemu`,
+//!   `hw/riscv/esp32c3_intmatrix.c`, `esp32c3_intmatrix_line_should_assert`)
+//!   uses `irq_prio[line] >= irq_thres`.
+//!
+//! (Task 4's brief proposed `>` ("strictly greater"); that would mask every
+//! priority-1 line under FreeRTOS's threshold of 1 -- including the
+//! `FROM_CPU_0` yield interrupt on the real firmware's boot -- and
+//! contradicts the sources above, so `>=` is implemented.)
+//!
+//! Both fields are 4 bits wide (`interrupt_core0_reg.h`: `CPU_INT_THRESH`
+//! bitpos `[3:0]`, `CPU_PRI_<n>_MAP` bitpos `[3:0]`), so the comparison
+//! masks to 4 bits. Reset values are 0 for every priority *and* for the
+//! threshold (`default: 4'b0`), so after reset `0 >= 0` lets any routed,
+//! enabled line through, as in QEMU's model; the enable register (reset 0)
+//! is what keeps a fresh controller quiet. ESP-IDF programs each allocated
+//! line's priority (`esp_cpu_intr_set_priority` ->
+//! `esprv_intc_int_set_priority`, `components/esp_hw_support/cpu.c`)
+//! before enabling it. The FreeRTOS port's critical sections raise
+//! `CPU_INT_THRESH_REG` (`rv_utils_set_intlevel_regval`, `interrupt_intc.h`)
+//! rather than only clearing `mstatus.MIE`; honoring the threshold here is
+//! what makes that masking work.
+//!
+//! [`InterruptController::eip_status`] is the ungated view: lines with any
+//! routed pending source, before enable/priority/threshold.
+//!
+//! ## Level delivery
+//!
+//! Sources are supplied as a `u64` bitmask of *currently asserted* levels
+//! ([`InterruptController::poll`]'s `pending_sources`), recomputed by
+//! `FirmwareBus::pending_sources` every step. Nothing is latched here:
+//! once a peripheral's raw status is cleared (e.g. SYSTIMER `INT_CLR`, or a
+//! `0` written to `SYSTEM_CPU_INTR_FROM_CPU_n_REG`) the line de-asserts on
+//! the next step. `CPU_INT_TYPE_REG` (edge vs. level) and
+//! `CPU_INT_CLEAR_REG` are still plain read/write storage: every source
+//! wired so far is level-type, and ESP-IDF's edge handling is not needed
+//! until a stall implicates it.
 //!
 //! ## Who else writes these registers
 //!
 //! Real firmware doesn't only reach these registers by executing its own
-//! instructions: `crate::rom`'s ESP32-C3 mask-ROM HLE stub table gives five
+//! instructions: `crate::rom`'s ESP32-C3 mask-ROM HLE stub table gives six
 //! ROM calls (`intr_matrix_set`, `esprv_intc_int_disable`,
 //! `esprv_intc_int_enable`, `esprv_intc_int_set_type`,
-//! `esprv_intc_int_set_priority` -- Milestone 3's Task D3 fix round) a real
+//! `esprv_intc_int_set_priority`, `esprv_intc_int_set_threshold`) a real
 //! `RomStubEffect::BusRegisterWrite` effect
-//! (`crate::cpu::rom_stubs::RomStubEffect`) that reads/writes the MAP
-//! region, `CPU_INT_ENABLE_REG`, `CPU_INT_TYPE_REG`, and
-//! `CPU_INT_PRI_<n>_REG` through the same `Bus` path an executed
-//! instruction would use -- this module has no way to tell the two apart,
-//! nor does it need to.
-
-use std::collections::HashMap;
+//! (`crate::cpu::rom_stubs::RomStubEffect`) that reads/writes these
+//! registers through the same `Bus` path an executed instruction would use
+//! -- this module has no way to tell the two apart, nor does it need to.
+//! The indexed ones (`intr_matrix_set`, `_set_priority`) are bounded by
+//! [`MAP_SOURCE_COUNT`] / [`LINE_COUNT`] so a wild index can never write past
+//! the arrays into a neighbouring register.
 
 use super::set_byte;
 
@@ -69,7 +110,7 @@ pub const CPU_INT_ENABLE_REG: u32 = 0x104;
 pub const CPU_INT_TYPE_REG: u32 = 0x108;
 pub const CPU_INT_CLEAR_REG: u32 = 0x10C;
 /// Read-only: bit per line, "is this line currently asserted." Computed on
-/// read (needs the systimer's live pending state), not stored -- see
+/// read (needs the live pending sources), not stored -- see
 /// `crate::mem::bus::FirmwareBus`'s dispatch, which special-cases this one
 /// offset to call [`InterruptController::eip_status`] directly rather than
 /// going through [`InterruptController::read_byte`].
@@ -77,28 +118,42 @@ pub const CPU_INT_EIP_STATUS_REG: u32 = 0x110;
 pub const CPU_INT_PRI_BASE_REG: u32 = 0x114; // + 4*n, n in 0..32
 pub const CPU_INT_THRESH_REG: u32 = 0x194;
 
-/// End (exclusive) of the MAP-register region (`SYSTIMER_TARGET0`'s and
-/// every other source's), per the header's lowest/highest MAP register
-/// offsets (`0x000`..`0x0F4`). Anything below this that isn't
-/// `SYSTIMER_TARGET0_INT_MAP_REG` is generic storage in
-/// [`InterruptController::other_map_regs`].
+/// End (exclusive) of the MAP-register region, per the header's
+/// lowest/highest MAP register offsets (`0x000`..`0x0F4`), rounded up to
+/// the `[u32; 64]` storage.
 const MAP_REGION_END: u32 = 0x100;
 
-const LINE_MASK: u32 = 0x1F; // 5 bits: CPU interrupt line 0..=31
+/// Number of MAP registers modeled (`MAP_REGION_END / 4`); the exclusive
+/// upper bound for a source index.
+pub const MAP_SOURCE_COUNT: u32 = MAP_REGION_END / 4;
+/// Number of CPU interrupt lines / `CPU_INT_PRI_<n>_REG` registers.
+pub const LINE_COUNT: u32 = 32;
 
-/// The ESP32-C3 interrupt matrix. See the module doc for what's real vs.
-/// storage-only in v1.
-#[derive(Default)]
+const LINE_MASK: u32 = 0x1F; // 5 bits: CPU interrupt line 0..=31
+const PRIO_MASK: u32 = 0xF; // 4-bit priority / threshold fields
+
+/// The ESP32-C3 interrupt matrix. See the module doc.
 pub struct InterruptController {
-    systimer_target0_map: u32,
-    /// Every other source's MAP register (`offset -> value`), real storage,
-    /// no signal behind any of them in v1. See the module doc.
-    other_map_regs: HashMap<u32, u32>,
+    /// Every source's MAP register, indexed by `offset / 4`.
+    map: [u32; MAP_SOURCE_COUNT as usize],
     cpu_int_enable: u32,
     cpu_int_type: u32,
     cpu_int_clear: u32,
-    cpu_int_pri: [u32; 32],
+    cpu_int_pri: [u32; LINE_COUNT as usize],
     cpu_int_thresh: u32,
+}
+
+impl Default for InterruptController {
+    fn default() -> Self {
+        Self {
+            map: [0; MAP_SOURCE_COUNT as usize],
+            cpu_int_enable: 0,
+            cpu_int_type: 0,
+            cpu_int_clear: 0,
+            cpu_int_pri: [0; LINE_COUNT as usize],
+            cpu_int_thresh: 0,
+        }
+    }
 }
 
 impl InterruptController {
@@ -107,17 +162,12 @@ impl InterruptController {
     }
 
     /// `true` iff `offset`'s word-aligned offset is a register this module
-    /// gives real behavior to: any of the four named single registers, a
+    /// gives real behavior to: any of the named single registers, a
     /// `CPU_INT_PRI_<n>_REG`, `CPU_INT_EIP_STATUS_REG` (computed by
-    /// `crate::mem::bus::FirmwareBus` directly rather than through
-    /// [`InterruptController::read_byte`] -- see that constant's doc comment
-    /// -- but still a real modeled register, not unmapped space), or
-    /// anywhere in the MAP region (every source's MAP register, real
-    /// read/write storage via [`InterruptController::other_map_regs`] even
-    /// where no signal is wired behind it yet -- see the module doc's "v1
-    /// scope" section). Pure function of the word offset, used by
-    /// `FirmwareBus` to additionally log an access past
-    /// `CPU_INT_THRESH_REG` (e.g. the DATE register) as "unmapped."
+    /// `crate::mem::bus::FirmwareBus` directly), or anywhere in the MAP
+    /// region. Pure function of the word offset, used by `FirmwareBus` to
+    /// additionally log an access past `CPU_INT_THRESH_REG` (e.g. the DATE
+    /// register) as "unmapped."
     pub fn handles(offset: u32) -> bool {
         let o = offset & !0b11;
         o < MAP_REGION_END
@@ -132,43 +182,53 @@ impl InterruptController {
             || (CPU_INT_PRI_BASE_REG..CPU_INT_THRESH_REG).contains(&o)
     }
 
-    /// Looks up which CPU line `SYSTIMER_TARGET0` is currently routed to
-    /// (`SYSTIMER_TARGET0_INT_MAP_REG & 0x1F`), and returns `Some(line)`
-    /// only if that source is both pending (`systimer_target0_pending`) and
-    /// that line is enabled in `CPU_INT_ENABLE_REG`. This is exactly what
-    /// the driving loop (`crate::boot::step_with_interrupts`) uses to decide
-    /// whether to call `Cpu::raise_interrupt`.
-    ///
-    /// Priority/threshold are intentionally not consulted here -- see the
-    /// module doc's "v1 scope" section.
-    pub fn poll(&self, systimer_target0_pending: bool) -> Option<u32> {
-        if !systimer_target0_pending {
-            return None;
+    /// Mask of CPU lines with at least one asserted, routed source
+    /// (`pending_sources` bit `s` set and `MAP[s] & 0x1F != 0`), before any
+    /// enable/priority gating.
+    fn routed_lines(&self, pending_sources: u64) -> u32 {
+        let mut lines = 0u32;
+        for (src, map) in self.map.iter().enumerate() {
+            if pending_sources & (1u64 << src) != 0 {
+                let line = map & LINE_MASK;
+                if line != 0 {
+                    lines |= 1 << line;
+                }
+            }
         }
-        let line = self.systimer_target0_map & LINE_MASK;
-        if self.cpu_int_enable & (1 << line) != 0 {
-            Some(line)
-        } else {
-            None
-        }
+        lines
     }
 
-    /// `CPU_INT_EIP_STATUS_REG`'s value: bit `line` set iff [`Self::poll`]
-    /// would currently select `line`. See that offset's doc comment on
-    /// [`CPU_INT_EIP_STATUS_REG`] for why `FirmwareBus` calls this directly
-    /// instead of going through [`Self::read_byte`].
-    pub fn eip_status(&self, systimer_target0_pending: bool) -> u32 {
-        match self.poll(systimer_target0_pending) {
-            Some(line) => 1u32 << line,
-            None => 0,
+    /// The set of CPU lines currently asserted *to the CPU*: routed pending,
+    /// enabled in `CPU_INT_ENABLE_REG`, and with priority greater than or
+    /// equal to `CPU_INT_THRESH_REG` (only priorities strictly below the
+    /// threshold are masked). See the module doc.
+    pub fn poll(&self, pending_sources: u64) -> u32 {
+        if pending_sources == 0 {
+            return 0; // the common case, every step: skip the scans
         }
+        let candidates = self.routed_lines(pending_sources) & self.cpu_int_enable;
+        let thresh = self.cpu_int_thresh & PRIO_MASK;
+        let mut out = 0u32;
+        for line in 0..LINE_COUNT {
+            if candidates & (1 << line) != 0
+                && (self.cpu_int_pri[line as usize] & PRIO_MASK) >= thresh
+            {
+                out |= 1 << line;
+            }
+        }
+        out
+    }
+
+    /// `CPU_INT_EIP_STATUS_REG`'s value: bit `line` set iff some routed
+    /// source is currently asserted, *before* enable/priority gating.
+    pub fn eip_status(&self, pending_sources: u64) -> u32 {
+        self.routed_lines(pending_sources)
     }
 
     pub fn read_byte(&mut self, offset: u32) -> u8 {
         let word_offset = offset & !0b11;
         let idx = (offset & 0b11) as usize;
         let word = match word_offset {
-            SYSTIMER_TARGET0_INT_MAP_REG => self.systimer_target0_map,
             CPU_INT_ENABLE_REG => self.cpu_int_enable,
             CPU_INT_TYPE_REG => self.cpu_int_type,
             CPU_INT_CLEAR_REG => self.cpu_int_clear,
@@ -176,7 +236,7 @@ impl InterruptController {
             o if (CPU_INT_PRI_BASE_REG..CPU_INT_THRESH_REG).contains(&o) => {
                 self.cpu_int_pri[((o - CPU_INT_PRI_BASE_REG) / 4) as usize]
             }
-            o if o < MAP_REGION_END => *self.other_map_regs.get(&o).unwrap_or(&0),
+            o if o < MAP_REGION_END => self.map[(o / 4) as usize],
             _ => 0,
         };
         word.to_le_bytes()[idx]
@@ -186,7 +246,6 @@ impl InterruptController {
         let word_offset = offset & !0b11;
         let idx = offset & 0b11;
         match word_offset {
-            SYSTIMER_TARGET0_INT_MAP_REG => set_byte(&mut self.systimer_target0_map, idx, val),
             CPU_INT_ENABLE_REG => set_byte(&mut self.cpu_int_enable, idx, val),
             CPU_INT_TYPE_REG => set_byte(&mut self.cpu_int_type, idx, val),
             CPU_INT_CLEAR_REG => set_byte(&mut self.cpu_int_clear, idx, val),
@@ -195,11 +254,7 @@ impl InterruptController {
                 let n = ((o - CPU_INT_PRI_BASE_REG) / 4) as usize;
                 set_byte(&mut self.cpu_int_pri[n], idx, val);
             }
-            o if o < MAP_REGION_END => {
-                let mut word = *self.other_map_regs.get(&o).unwrap_or(&0);
-                set_byte(&mut word, idx, val);
-                self.other_map_regs.insert(o, word);
-            }
+            o if o < MAP_REGION_END => set_byte(&mut self.map[(o / 4) as usize], idx, val),
             // CPU_INT_EIP_STATUS_REG is read-only; FirmwareBus already
             // intercepts reads of it before calling into this peripheral,
             // but a write reaching here (if it ever did) is correctly a
@@ -227,53 +282,59 @@ mod tests {
         u32::from_le_bytes(bytes)
     }
 
-    #[test]
-    fn map_register_routes_systimer_target0_to_the_written_line() {
-        let mut ic = InterruptController::new();
-        write_word(&mut ic, SYSTIMER_TARGET0_INT_MAP_REG, 7);
-        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
-        assert_eq!(ic.poll(true), Some(7));
+    /// Routes `src` to `line`, enables it, and gives it priority `pri`
+    /// (what ESP-IDF's `esp_intr_alloc` path does), leaving THRESH alone.
+    fn arm(ic: &mut InterruptController, src: u32, line: u32, pri: u32) {
+        write_word(ic, src * 4, line);
+        let en = read_word(ic, CPU_INT_ENABLE_REG);
+        write_word(ic, CPU_INT_ENABLE_REG, en | (1 << line));
+        write_word(ic, CPU_INT_PRI_BASE_REG + line * 4, pri);
     }
 
     #[test]
-    fn poll_returns_none_when_not_pending() {
+    fn map_register_routes_systimer_target0_to_the_written_line() {
         let mut ic = InterruptController::new();
-        write_word(&mut ic, SYSTIMER_TARGET0_INT_MAP_REG, 7);
-        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
-        assert_eq!(ic.poll(false), None);
+        arm(&mut ic, 37, 7, 1);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 7);
+        assert_eq!(SYSTIMER_TARGET0_INT_MAP_REG, 37 * 4);
     }
 
     #[test]
     fn cpu_int_enable_gating_suppresses_a_pending_but_disabled_line() {
         let mut ic = InterruptController::new();
-        write_word(&mut ic, SYSTIMER_TARGET0_INT_MAP_REG, 3);
+        write_word(&mut ic, 37 * 4, 3);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 3 * 4, 5);
         // CPU_INT_ENABLE_REG left at its reset value (0) -- line 3 disabled.
-        assert_eq!(ic.poll(true), None, "pending+disabled must not fire");
+        assert_eq!(ic.poll(1u64 << 37), 0, "pending+disabled must not fire");
     }
 
     #[test]
-    fn eip_status_reflects_the_asserted_line_only() {
+    fn eip_status_is_the_ungated_routed_view() {
         let mut ic = InterruptController::new();
-        write_word(&mut ic, SYSTIMER_TARGET0_INT_MAP_REG, 12);
-        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 12);
-        assert_eq!(ic.eip_status(true), 1 << 12);
-        assert_eq!(ic.eip_status(false), 0);
+        write_word(&mut ic, 37 * 4, 12);
+        // Not enabled, priority 0: poll masks it, eip_status still shows it.
+        assert_eq!(ic.eip_status(1u64 << 37), 1 << 12);
+        assert_eq!(ic.poll(1u64 << 37), 0);
+        assert_eq!(ic.eip_status(0), 0);
     }
 
     #[test]
     fn map_register_masks_to_5_bits_for_the_line_number() {
         let mut ic = InterruptController::new();
         // Only the low 5 bits are architecturally meaningful.
-        write_word(&mut ic, SYSTIMER_TARGET0_INT_MAP_REG, 0xFFFF_FFE1); // low5 = 1
+        write_word(&mut ic, 37 * 4, 0xFFFF_FFE1); // low5 = 1
         write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 1);
-        assert_eq!(ic.poll(true), Some(1));
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 4, 1);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 1);
     }
 
     #[test]
-    fn other_map_registers_and_pri_thresh_are_real_readback_storage() {
+    fn map_registers_pri_and_thresh_are_real_readback_storage() {
         let mut ic = InterruptController::new();
         write_word(&mut ic, 0x054, 9); // e.g. UART_INTR_MAP_REG offset, arbitrary
         assert_eq!(read_word(&mut ic, 0x054), 9);
+        write_word(&mut ic, 0x0FC, 4); // last slot of the [u32; 64] region
+        assert_eq!(read_word(&mut ic, 0x0FC), 4);
 
         write_word(&mut ic, CPU_INT_PRI_BASE_REG + 4 * 5, 0xA); // line 5's priority
         assert_eq!(read_word(&mut ic, CPU_INT_PRI_BASE_REG + 4 * 5), 0xA);
@@ -291,5 +352,97 @@ mod tests {
         assert_eq!(read_word(&mut ic, CPU_INT_TYPE_REG), 0xDEAD_BEEF);
         write_word(&mut ic, CPU_INT_CLEAR_REG, 0x1234);
         assert_eq!(read_word(&mut ic, CPU_INT_CLEAR_REG), 0x1234);
+    }
+
+    #[test]
+    fn routed_enabled_source_above_threshold_asserts_its_line() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 19 * 4, 5); // SPI2 -> line 5
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 5);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 5 * 4, 3);
+        write_word(&mut ic, CPU_INT_THRESH_REG, 1);
+        assert_eq!(ic.poll(1u64 << 19), 1 << 5);
+        assert_eq!(ic.poll(0), 0);
+    }
+
+    /// Legacy INTC rule (module doc): only priorities *strictly less than*
+    /// the threshold are masked.
+    #[test]
+    fn priority_below_threshold_is_masked_at_or_above_fires() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 37 * 4, 7);
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 7 * 4, 2);
+        write_word(&mut ic, CPU_INT_THRESH_REG, 3);
+        assert_eq!(ic.poll(1u64 << 37), 0, "pri < thresh must not fire");
+        assert_eq!(
+            ic.eip_status(1u64 << 37),
+            1 << 7,
+            "still visible as pending"
+        );
+        write_word(&mut ic, CPU_INT_THRESH_REG, 2);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 7, "pri == thresh fires");
+        write_word(&mut ic, CPU_INT_THRESH_REG, 1);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 7, "pri > thresh fires");
+    }
+
+    /// The real boot's case: FreeRTOS runs at `RVHAL_INTR_ENABLE_THRESH` = 1
+    /// with every level-1 line at priority 1; a same-level ISR raises the
+    /// threshold to `pri + 1` (`vectors.S`), which masks it.
+    #[test]
+    fn freertos_threshold_one_admits_priority_one_and_isr_bump_masks_it() {
+        let mut ic = InterruptController::new();
+        arm(&mut ic, 50, 4, 1); // FROM_CPU_INTR0 -> line 4, priority 1
+        write_word(&mut ic, CPU_INT_THRESH_REG, 1);
+        assert_eq!(ic.poll(1u64 << 50), 1 << 4);
+        write_word(&mut ic, CPU_INT_THRESH_REG, 2);
+        assert_eq!(ic.poll(1u64 << 50), 0);
+    }
+
+    #[test]
+    fn reset_priority_and_threshold_admit_an_enabled_routed_line() {
+        // Reset PRI = THRESH = 0 => `0 >= 0`; ENABLE (reset 0) is the gate.
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 37 * 4, 7);
+        assert_eq!(ic.poll(1u64 << 37), 0, "not enabled");
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 7);
+    }
+
+    #[test]
+    fn two_sources_on_two_lines_both_assert() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 37 * 4, 7);
+        write_word(&mut ic, 44 * 4, 9);
+        write_word(&mut ic, CPU_INT_ENABLE_REG, (1 << 7) | (1 << 9));
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 7 * 4, 1);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 9 * 4, 1);
+        assert_eq!(ic.poll((1u64 << 37) | (1u64 << 44)), (1 << 7) | (1 << 9));
+    }
+
+    #[test]
+    fn two_sources_sharing_a_line_or_together() {
+        let mut ic = InterruptController::new();
+        arm(&mut ic, 37, 7, 1);
+        write_word(&mut ic, 44 * 4, 7);
+        assert_eq!(ic.poll(1u64 << 44), 1 << 7);
+        assert_eq!(ic.poll((1u64 << 44) | (1u64 << 37)), 1 << 7);
+    }
+
+    #[test]
+    fn unrouted_source_line_zero_never_fires() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 1);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG, 7);
+        assert_eq!(ic.poll(1u64 << 19), 0);
+        assert_eq!(ic.eip_status(1u64 << 19), 0);
+    }
+
+    #[test]
+    fn deasserted_source_stops_asserting_level() {
+        let mut ic = InterruptController::new();
+        arm(&mut ic, 50, 4, 1);
+        assert_eq!(ic.poll(1u64 << 50), 1 << 4);
+        assert_eq!(ic.poll(0), 0, "no latching: level follows the source");
     }
 }

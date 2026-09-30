@@ -37,14 +37,20 @@
 //! 4. **SYSTIMER** ([`crate::mem::soc::SYSTIMER_RANGE`]): routed to
 //!    [`FirmwareBus::systimer`], a concrete named field per this plan's
 //!    pre-flight "no trait-object peripheral dispatch" ruling — see
-//!    `crate::peripherals` and `crate::peripherals::systimer`.
+//!    `crate::peripherals` and `crate::peripherals::systimer`. Then
+//!    **SYSTEM** ([`crate::mem::soc::SYSTEM_RANGE`], Milestone 3 Task 4):
+//!    only the four `SYSTEM_CPU_INTR_FROM_CPU_<n>_REG` software-interrupt
+//!    registers (`crate::peripherals::system::System::handles`) are routed
+//!    to [`FirmwareBus::system`]; every other SYSTEM offset falls through to
+//!    the logged catch-all below, as before.
 //! 5. **INTERRUPT_CORE0** ([`crate::mem::soc::INTERRUPT_CORE0_RANGE`]):
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
-//!    (`CPU_INT_EIP_STATUS_REG`) needs `systimer`'s live pending state to
-//!    answer a read, which is exactly the cross-peripheral access the
-//!    ruling anticipated: [`FirmwareBus::read_byte`] reads both concrete
-//!    fields directly, no trait object involved.
+//!    (`CPU_INT_EIP_STATUS_REG`) needs the live asserted interrupt sources
+//!    ([`FirmwareBus::pending_sources`]: SYSTIMER and SYSTEM) to answer a
+//!    read, which is exactly the cross-peripheral access the ruling
+//!    anticipated: [`FirmwareBus::read_byte`] reads the concrete fields
+//!    directly, no trait object involved.
 //! 6. **GPIO** ([`crate::mem::soc::GPIO_RANGE`]): routed to
 //!    [`FirmwareBus::gpio`], same ruling — see `crate::peripherals::gpio`
 //!    for the register model and the emulated 74HC165 button shift
@@ -129,6 +135,7 @@ use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
+use crate::peripherals::system::System;
 use crate::peripherals::systimer::SysTimer;
 use crate::peripherals::timg::Timg;
 use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
@@ -136,7 +143,8 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 use super::image::SegmentDescriptor;
 use super::soc::{
     is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE, SPI2_RANGE,
-    SPIMEM1_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SRC_SYSTIMER_TARGET0, SYSTEM_RANGE, SYSTIMER_RANGE,
+    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -284,6 +292,9 @@ pub struct FirmwareBus {
     /// The `INTERRUPT_CORE0` interrupt matrix (`crate::peripherals::intc`),
     /// same ruling.
     pub intc: InterruptController,
+    /// The SYSTEM peripheral (`crate::peripherals::system`), same ruling —
+    /// only the `FROM_CPU_0..3` software-interrupt registers are modeled.
+    pub system: System,
     /// The GPIO peripheral (`crate::peripherals::gpio`), same ruling —
     /// includes the emulated 74HC165 button shift register.
     pub gpio: Gpio,
@@ -517,6 +528,7 @@ impl FirmwareBus {
             rom_data: Vec::new(),
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
+            system: System::new(),
             gpio: Gpio::new(),
             spi: Spi::new(),
             usb_serial_jtag: UsbSerialJtag::new(),
@@ -530,15 +542,37 @@ impl FirmwareBus {
         }
     }
 
+    /// The OR of every peripheral's currently-asserted interrupt *source*
+    /// levels (bit `n` = source number `n`, `crate::mem::soc::SRC_*`). A
+    /// pure recomputation from live peripheral state -- nothing latched --
+    /// so a source de-asserts the moment its peripheral clears it. Sources
+    /// so far: SYSTIMER target0 and the SYSTEM `FROM_CPU_0..3` software
+    /// interrupts.
+    pub fn pending_sources(&self) -> u64 {
+        let mut p = 0u64;
+        if self.systimer.target0_pending() {
+            p |= 1u64 << SRC_SYSTIMER_TARGET0;
+        }
+        p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
+        p
+    }
+
+    /// The mask of CPU interrupt lines asserted to the core right now:
+    /// [`InterruptController::poll`] over [`FirmwareBus::pending_sources`].
+    /// A pure function of live peripheral state -- this is what
+    /// `crate::boot::step_with_interrupts` samples into
+    /// `Cpu::set_pending_interrupts` at the start of every step.
+    pub fn asserted_lines(&self) -> u32 {
+        self.intc.poll(self.pending_sources())
+    }
+
     /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
-    /// ticks and polls [`FirmwareBus::intc`] for a newly-pending, enabled
-    /// interrupt line. Call exactly once per `Cpu::step()` — see
-    /// `crate::boot::step_with_interrupts`, the driving loop that does so
-    /// and feeds the result into `Cpu::raise_interrupt`.
-    pub fn tick_peripherals(&mut self) -> Option<u32> {
+    /// ticks and returns [`FirmwareBus::asserted_lines`] as of the end of
+    /// that tick (the set the next step will sample). Call exactly once per
+    /// `Cpu::step()` — see `crate::boot::step_with_interrupts`.
+    pub fn tick_peripherals(&mut self) -> u32 {
         self.systimer.advance();
-        let pending = self.systimer.target0_pending();
-        self.intc.poll(pending)
+        self.asserted_lines()
     }
 
     /// Adds a fresh, zero-initialized, real read/write RAM region
@@ -656,6 +690,9 @@ impl FirmwareBus {
             }
             return self.systimer.read_byte(offset);
         }
+        if SYSTEM_RANGE.contains(&addr) && System::handles(addr - SYSTEM_RANGE.start) {
+            return self.system.read_byte(addr - SYSTEM_RANGE.start);
+        }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
             let offset = addr - INTERRUPT_CORE0_RANGE.start;
             if !InterruptController::handles(offset) {
@@ -666,7 +703,7 @@ impl FirmwareBus {
                 // state. Both fields are concrete on `self`, so this is
                 // just direct field access — exactly what the pre-flight
                 // "no trait-object peripheral dispatch" ruling anticipated.
-                let word = self.intc.eip_status(self.systimer.target0_pending());
+                let word = self.intc.eip_status(self.pending_sources());
                 return word.to_le_bytes()[(offset & 0b11) as usize];
             }
             return self.intc.read_byte(offset);
@@ -729,6 +766,10 @@ impl FirmwareBus {
                 self.record_unmapped(addr, true);
             }
             self.systimer.write_byte(offset, val);
+            return;
+        }
+        if SYSTEM_RANGE.contains(&addr) && System::handles(addr - SYSTEM_RANGE.start) {
+            self.system.write_byte(addr - SYSTEM_RANGE.start, val);
             return;
         }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
