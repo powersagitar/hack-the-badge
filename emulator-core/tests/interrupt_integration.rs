@@ -29,9 +29,9 @@
 //! 4. Enables that line in `CPU_INT_ENABLE_REG`.
 //! 5. Configures `TARGET0_CONF_REG` for period mode with `PERIOD = 20`.
 //! 6. Pulses `COMP0_LOAD_REG` to arm target0 (see
-//!    `emulator_core::peripherals::systimer`'s module doc, "Period-mode
-//!    arming," for why this is the step that actually gives period mode its
-//!    first target).
+//!    `emulator_core::peripherals::systimer`'s module doc, "Comparator
+//!    model": the load latches the unit-0 counter as the period base, so the
+//!    first alarm is `PERIOD` ticks after this step).
 //! 7. Read-modify-writes `SYSTIMER_CONF_REG` to set `TARGET0_WORK_EN`
 //!    (preserving the reset-default `TIMER_UNIT0_WORK_EN`).
 //! 8. Enables target0's interrupt in `SYSTIMER_INT_ENA_REG`.
@@ -127,7 +127,7 @@ fn load_imm32(rd: u8, val: u32) -> Vec<u32> {
 /// Builds the synthetic firmware program described in the module doc.
 /// Returns the encoded instruction words and the (0-indexed) instruction
 /// index of the `sw` that pulses `COMP0_LOAD_REG` -- the emulator's
-/// `SysTimer::advance` sees `PERIOD` more ticks after this exact step, so
+/// `SysTimer::advance_by` sees `PERIOD` more ticks after this exact step, so
 /// the caller can compute precisely which step the interrupt must fire on
 /// rather than merely bounding it.
 fn build_program() -> (Vec<u32>, usize) {
@@ -213,15 +213,15 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
     let mut cpu = Cpu::new();
     cpu.regs.pc = PROGRAM_LOAD_ADDR;
 
-    // Per SysTimer::advance's edge-detection (see its module doc): the
-    // COMP0_LOAD write at step `comp0_load_step` arms target0 =
-    // counter-at-that-instant + PERIOD, where counter-at-that-instant
-    // equals `comp0_load_step` (SysTimer::advance increments once per
+    // Per SysTimer's comparator model (see its module doc): the
+    // COMP0_LOAD write at step `comp0_load_step` latches load_base =
+    // counter-at-that-instant, so the first alarm is at load_base + PERIOD.
+    // counter-at-that-instant equals `comp0_load_step` (SysTimer::advance increments once per
     // step_with_interrupts call, so after N calls the counter is N; the
     // COMP0_LOAD write itself happens *during* cpu.step() at step index
     // `comp0_load_step`, i.e. before that step's own advance() call, so the
     // live counter it reads is exactly `comp0_load_step`). The comparator
-    // then edge-fires (INT_RAW latched, the source asserted) in the tick
+    // then fires (INT_RAW latched, the source asserted) in the tick
     // after step index `comp0_load_step + PERIOD - 1`, where the counter
     // reaches that target; the next step samples the asserted line at its
     // start (step_with_interrupts' level delivery) and takes it -- so the
@@ -267,7 +267,7 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
     // saw it asserted the step before) even though the CPU has since moved
     // on to the trap handler address.
     assert!(
-        bus.systimer.target0_pending(),
+        (bus.systimer.pending_sources() & (1 << 37) != 0),
         "SysTimer's own raw&ena state must still show the fired interrupt \
          (nothing in this test cleared it)"
     );
@@ -316,7 +316,7 @@ fn cleared_source_is_not_retaken_but_the_next_alarm_is() {
     // and re-enable MIE (what `mret` would do).
     bus.write32(SYSTIMER_BASE + 0x6c, 1); // INT_CLR = target0
     assert!(
-        !bus.systimer.target0_pending(),
+        !(bus.systimer.pending_sources() & (1 << 37) != 0),
         "INT_CLR de-asserts the source"
     );
     cpu.regs.pc = PROGRAM_LOAD_ADDR + 4 * (prog.len() as u32 - 64);
@@ -418,4 +418,63 @@ fn from_cpu_software_interrupt_is_taken_on_its_routed_line_and_clears() {
     for _ in 0..20 {
         assert!(!step_with_interrupts(&mut cpu, &mut bus).trap_taken);
     }
+}
+
+// Shared by the two arbitration tests below.
+//
+// Priority arbitration (Task 5, carry-over from Task 4's review): with two
+// lines pending at once, the CPU takes the **highest-priority** one first,
+// and among equal priorities the **lowest line number** -- ESP32-C3 TRM
+// v1.4, section 1.5.2 "Functional Description" (Interrupt Controller):
+// "Interrupts with same priority are statically prioritized by their IDs,
+// lowest ID having highest priority" and "A pending interrupt will cause
+// CPU to enter trap if no other pending interrupt has higher priority."
+// Routes SYSTIMER target0 and FROM_CPU_0 to the given lines/priorities,
+// asserts both, and returns the line the CPU takes first. The first case
+// puts the SYSTIMER tick on the higher-numbered line, so lowest-line-first
+// would get it wrong.
+fn two_pending_lines(systimer_line: u32, systimer_pri: u32, swi_line: u32, swi_pri: u32) -> u32 {
+    use emulator_core::mem::Bus;
+    let prog = vec![addi(0, 0, 0); 64];
+    let mut bus = build_bus(&prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+    cpu.csr.mtvec = 0x8000_0001;
+
+    // SYSTIMER target0 -> systimer_line; FROM_CPU_0 -> swi_line.
+    bus.write32(INTC_BASE + 0x094, systimer_line);
+    bus.write32(INTC_BASE + 50 * 4, swi_line);
+    bus.write32(INTC_BASE + 0x104, (1 << systimer_line) | (1 << swi_line));
+    bus.write32(INTC_BASE + 0x114 + 4 * systimer_line, systimer_pri);
+    bus.write32(INTC_BASE + 0x114 + 4 * swi_line, swi_pri);
+    // Arm target0 on unit 0 (works out of reset), period 5.
+    bus.write32(SYSTIMER_BASE + 0x34, (1 << 30) | 5);
+    bus.write32(SYSTIMER_BASE + 0x50, 1);
+    let conf = bus.read32(SYSTIMER_BASE);
+    bus.write32(SYSTIMER_BASE, conf | (1 << 24));
+    bus.write32(SYSTIMER_BASE + 0x64, 1);
+    for _ in 0..6 {
+        step_with_interrupts(&mut cpu, &mut bus); // MIE clear: nothing taken
+    }
+    bus.write32(0x600c_0028, 1); // FROM_CPU_0
+    assert_eq!(bus.asserted_lines(), (1 << systimer_line) | (1 << swi_line));
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+    assert!(step_with_interrupts(&mut cpu, &mut bus).trap_taken);
+    cpu.csr.mcause & 0x1f
+}
+
+#[test]
+fn highest_priority_pending_line_is_taken_first() {
+    assert_eq!(
+        two_pending_lines(9, 3, 3, 1),
+        9,
+        "SYSTIMER (pri 3) beats FROM_CPU (pri 1)"
+    );
+    assert_eq!(two_pending_lines(9, 1, 3, 3), 3, "and vice versa");
+}
+
+#[test]
+fn equal_priority_ties_go_to_the_lowest_line() {
+    assert_eq!(two_pending_lines(9, 2, 3, 2), 3);
+    assert_eq!(two_pending_lines(2, 2, 7, 2), 2);
 }

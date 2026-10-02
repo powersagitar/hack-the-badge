@@ -80,13 +80,17 @@ pub struct Cpu {
     /// `crate::boot::step_with_interrupts`), so a bit taken here and still
     /// asserted by its source simply comes back on the next sample.
     ///
-    /// Chosen line when several are pending simultaneously: lowest line
-    /// number wins (`trailing_zeros()`). The interrupt matrix
-    /// (`peripherals::intc`) already masks lines whose `CPU_INT_PRI_n` is
-    /// below `CPU_INT_THRESH`, but picking the *highest-priority* line among
-    /// those left is not modeled; this is a documented placeholder ordering,
-    /// not a claim of spec-accurate priority arbitration.
+    /// Chosen line when several are pending simultaneously: the one with
+    /// the highest [`Cpu::interrupt_priorities`] entry, ties going to the
+    /// lowest line number -- see [`select_interrupt_line`].
     pending_interrupts: u32,
+    /// Per-line priority used only to arbitrate between simultaneously
+    /// pending lines (higher wins). All zero by default, which makes the
+    /// choice purely lowest-line-first. The driving loop supplies the
+    /// interrupt controller's `CPU_INT_PRI_n` values here whenever more
+    /// than one line is pending ([`Cpu::set_interrupt_priorities`]); the core itself knows nothing
+    /// about where priorities come from.
+    interrupt_priorities: [u8; 32],
     /// How many indexed [`rom_stubs::RomStubEffect::BusRegisterWrite`] stub
     /// calls were dropped because the guest's index register was out of
     /// range (see `BusRegisterWrite::index_limit`). The "log" for those
@@ -102,12 +106,34 @@ pub struct Cpu {
     rom_stubs: RomStubTable,
 }
 
+/// Picks the line to take from a non-zero `pending` mask: the highest
+/// `priorities[line]`, ties going to the lowest line number. This is the
+/// ESP32-C3 interrupt controller's arbitration rule (ESP32-C3 TRM v1.4,
+/// section 1.5.2: "A pending interrupt will cause CPU to enter trap if no
+/// other pending interrupt has higher priority" and "Interrupts with same
+/// priority are statically prioritized by their IDs, lowest ID having
+/// highest priority"); with an all-zero table it is plain lowest-line-first.
+pub fn select_interrupt_line(pending: u32, priorities: &[u8; 32]) -> u32 {
+    debug_assert_ne!(pending, 0);
+    let mut best = pending.trailing_zeros();
+    let mut rest = pending & (pending - 1);
+    while rest != 0 {
+        let line = rest.trailing_zeros();
+        if priorities[line as usize] > priorities[best as usize] {
+            best = line;
+        }
+        rest &= rest - 1;
+    }
+    best
+}
+
 impl Default for Cpu {
     fn default() -> Self {
         Self {
             regs: Registers::new(),
             csr: Csrs::new(),
             pending_interrupts: 0,
+            interrupt_priorities: [0; 32],
             rom_stub_index_drops: 0,
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
@@ -215,6 +241,13 @@ impl Cpu {
         self.pending_interrupts = mask;
     }
 
+    /// Replaces the per-line priority table used to pick among several
+    /// pending lines (see [`select_interrupt_line`]). Masking by priority vs.
+    /// threshold is the interrupt controller's job, not this table's.
+    pub fn set_interrupt_priorities(&mut self, priorities: [u8; 32]) {
+        self.interrupt_priorities = priorities;
+    }
+
     /// Executes exactly one instruction: fetch, decode, execute, and advance
     /// `pc` — or, if an interrupt is pending (via [`Cpu::raise_interrupt`])
     /// *and* `mstatus.MIE` is set, or the instruction just decoded raises a
@@ -234,7 +267,7 @@ impl Cpu {
         let pc_before = self.regs.pc;
 
         if self.pending_interrupts != 0 && self.csr.mstatus & mstatus_bits::MIE != 0 {
-            let line = self.pending_interrupts.trailing_zeros();
+            let line = select_interrupt_line(self.pending_interrupts, &self.interrupt_priorities);
             self.pending_interrupts &= !(1u32 << line);
             self.enter_trap(line, true, 0);
             return StepInfo {
@@ -1418,6 +1451,30 @@ mod tests {
     }
 
     #[test]
+    fn select_interrupt_line_prefers_priority_then_lowest_line() {
+        let mut pri = [0u8; 32];
+        assert_eq!(select_interrupt_line((1 << 9) | (1 << 5), &pri), 5);
+        pri[9] = 3;
+        pri[5] = 1;
+        assert_eq!(select_interrupt_line((1 << 9) | (1 << 5), &pri), 9);
+        pri[2] = 3;
+        assert_eq!(
+            select_interrupt_line((1 << 9) | (1 << 5) | (1 << 2), &pri),
+            2
+        );
+        assert_eq!(select_interrupt_line(1 << 31, &pri), 31);
+
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x8000_0000;
+        cpu.csr.mstatus |= mstatus_bits::MIE;
+        cpu.set_interrupt_priorities(pri);
+        cpu.set_pending_interrupts((1 << 9) | (1 << 5));
+        let mut bus = TestBus::with_program(&[addi(0, 0, 0)]);
+        assert!(cpu.step(&mut bus).trap_taken);
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 9);
+    }
+
+    #[test]
     fn mret_restores_mie_and_returns_to_mepc() {
         let mut cpu = Cpu::new();
         cpu.csr.mepc = 0x100;
@@ -1546,8 +1603,8 @@ mod tests {
 
         cpu.csr.mstatus |= mstatus_bits::MIE;
 
-        // Lowest line number is taken first (this core's documented, v1
-        // placeholder priority ordering -- see `Cpu::pending_interrupts`).
+        // Equal (default, all-zero) priorities: lowest line number first
+        // (see `select_interrupt_line`).
         let info = cpu.step(&mut bus);
         assert!(info.trap_taken);
         assert_eq!(cpu.csr.mcause, 0x8000_0000 | 3, "line 3 taken first");

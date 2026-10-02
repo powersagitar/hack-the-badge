@@ -62,9 +62,10 @@ ESP32-C3 device), in two complementary modes:
    (Milestone 3 Task D12). One SPI2 transaction completes, `app_main`'s
    task blocks, and the FreeRTOS IDLE task's `wfi` then traps as an
    illegal instruction (step 596,609), because the core does not implement
-   `wfi` yet; the panic handler reboot-loops. Nothing is drawn yet, well
-   before reaching any built-in app. The current blocker is `wfi` (a
-   known, documented gap —
+   `wfi` yet (by then the FreeRTOS tick, SYSTIMER alarm 0 on counter 1, is
+   armed — Milestone 3 Task 5 modeled the full SYSTIMER); the panic
+   handler reboot-loops. Nothing is drawn yet, well before reaching any
+   built-in app. The current blocker is `wfi` (a known, documented gap —
    see `docs/firmware-emulator-notes.md`'s "Known limitations" section
    before assuming a built-in app is reachable in this mode).
 
@@ -209,15 +210,19 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       mem/image.rs parses the ESP-IDF app-image format;
                       mem/soc.rs holds the ESP32-C3 address-space ranges
                       plus the ESP32-C3's fixed 64 KiB MMU page size.
-  src/peripherals/    SYSTIMER + the ESP32-C3 interrupt matrix (not a
-                      standard PLIC: 64 source MAP registers onto 32 CPU
-                      lines, gated by enable and priority >= threshold,
-                      delivered as levels sampled every step by
-                      boot::step_with_interrupts), SYSTEM's FROM_CPU
-                      software-interrupt registers (system.rs; the rest of
-                      SYSTEM is unmapped), GPIO (including the GPIO
-                      matrix's FUNCn_IN/OUT_SEL_CFG routing registers,
-                      stored but not yet consulted, Task D11) + an emulated
+  src/peripherals/    SYSTIMER (2 counters, 3 comparators, HAL-faithful
+                      alarm sequencing; advance_by/ticks_until_next_alarm
+                      for fast-forward, Task 5) + the ESP32-C3 interrupt
+                      matrix (not a standard PLIC: 64 source MAP registers
+                      onto 32 CPU lines, gated by enable and priority >=
+                      threshold, delivered as levels sampled every step by
+                      boot::step_with_interrupts; the core takes the
+                      highest-priority pending line, ties to the lowest),
+                      SYSTEM's FROM_CPU software-interrupt registers
+                      (system.rs; the rest of SYSTEM is unmapped), GPIO
+                      (including the GPIO matrix's FUNCn_IN/OUT_SEL_CFG
+                      routing registers, stored but not yet consulted,
+                      Task D11) + an emulated
                       74HC165 button shift register, and SPI2/GPSPI2 (UPDATE
                       self-clear, TRANS_DONE interrupt, Task 9; no DMA
                       yet) + an ST7789

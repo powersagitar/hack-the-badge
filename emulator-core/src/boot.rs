@@ -231,8 +231,19 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 /// either way: a store at step `N`, or an alarm reached in the tick after
 /// step `N`, is taken at step `N + 1` (pinned by
 /// `tests/interrupt_integration.rs`'s precise-step test).
+///
+/// When several lines are asserted at once, the core takes the highest
+/// `CPU_INT_PRI_n` first, ties to the lowest line (ESP32-C3 TRM v1.4
+/// section 1.5.2; [`crate::cpu::select_interrupt_line`]), so the
+/// interrupt controller's priorities are handed to the core whenever more
+/// than one line is pending (the only case they matter).
 pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu::StepInfo {
-    cpu.set_pending_interrupts(bus.asserted_lines());
+    let lines = bus.asserted_lines();
+    cpu.set_pending_interrupts(lines);
+    if lines & lines.wrapping_sub(1) != 0 {
+        // Several lines asserted: the core arbitrates by priority.
+        cpu.set_interrupt_priorities(bus.intc.line_priorities());
+    }
     let info = cpu.step(bus);
     bus.tick_peripherals();
     info

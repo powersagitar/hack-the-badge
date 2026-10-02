@@ -7,8 +7,9 @@
 //! See each submodule's doc comment for register-layout citations and the
 //! judgment calls their exact behavior required.
 //!
-//! - [`systimer`]: [`systimer::SysTimer`], the free-running 52-bit counter +
-//!   comparator peripheral.
+//! - [`systimer`]: [`systimer::SysTimer`], two 52-bit counters and three
+//!   comparators driving `SRC_SYSTIMER_TARGET0..2` (Milestone 3 Task 5): the
+//!   FreeRTOS tick (alarm 0 on counter 1) and esp_timer (alarm 2 on counter 0).
 //! - [`intc`]: [`intc::InterruptController`], the ESP32-C3's non-PLIC
 //!   interrupt matrix (`INTERRUPT_CORE0`) — per-source MAP registers routing
 //!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG` and by

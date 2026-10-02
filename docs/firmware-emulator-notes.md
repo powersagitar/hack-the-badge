@@ -1050,24 +1050,31 @@ predicted these blockers would surface once TIMG unblocks further boot:
    Nothing is drawn. `main_task: Calling app_main()` is still the newest
    console line. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
    `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi`.
-   Once `wfi` waits (plan Task 6), the FreeRTOS tick (item 2) is the likely
-   next need, since that is what wakes a blocked task.
-2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
-   `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
-   with real behavior, but ESP-IDF's `vSystimerSetup`
-   (`components/freertos/port_systick.c`) actually connects the FreeRTOS
-   tick alarm to **counter 1**, not counter 0. The model's `COMP0_LOAD_REG`
-   sequencing assumption is also contradicted by the real HAL's call order
-   (`systimer_hal_set_alarm_period` pulses the load while still in oneshot
-   mode, switching to period mode afterward). Also: SYSTIMER/INTERRUPT_CORE0
-   registers with no named field silently no-op instead of logging through
-   the shared `unmapped_log` ring buffer other regions use — worth fixing
-   first, since the next stalls will otherwise be invisible to the same
-   trap-count-based diagnosis method that found the TIMG stall.
-   Boot now reaches this code: in Task D10's run, just before
-   `xPortStartScheduler()` sets the interrupt threshold (step ~528,500),
-   writes to `SYSTIMER_UNIT1_LOAD_HI_REG`/`_LO_REG`/`SYSTIMER_UNIT1_LOAD_REG`
-   (`+0x14`/`+0x18`/`+0x60`, `soc/systimer_reg.h`) went to the unmapped log.
+   Once `wfi` waits (plan Task 6), the FreeRTOS tick is what wakes the
+   blocked task. Task 5 modeled it (item 2, resolved): by the `wfi`,
+   `vSystimerSetup` has run, so alarm 0 is armed in period mode on counter
+   1 with a 160,000-tick period (10 ms at 16 MHz, `CONFIG_FREERTOS_HZ`
+   100), `INT_ENA` has bits 0 and 2 set, and the first tick is 91,440
+   ticks away (= steps, at 1 tick per step). esp_timer's alarm 2 is not
+   enabled in `CONF` yet.
+2. **SYSTIMER: resolved (Milestone 3 Task 5).** Milestone 2 modeled only
+   unit 0/target 0, with a `COMP0_LOAD` rule that contradicted the real
+   HAL order. `emulator-core/src/peripherals/systimer.rs` now models both
+   counters and all three comparators, register-faithful to
+   `soc/systimer_reg.h` (including `CONF`'s reset value `0x4600_0000`), and
+   one comparator model (documented and cited in its module doc) that
+   satisfies both real call sequences: FreeRTOS's `vSystimerSetup` (alarm
+   0 on counter 1, load pulsed while still oneshot, then period mode) and
+   esp_timer's `systimer_hal_set_alarm_target` (alarm 2 on counter 0,
+   oneshot, `MISS_COMPENSATE`). Each target drives its own source
+   (`SRC_SYSTIMER_TARGET0..2`, 37..39) as a level. `advance_by(ticks)` and
+   `ticks_until_next_alarm()` are there for WFI fast-forward (plan Task 6);
+   a jump across several periods fires once and re-arms to the next future
+   period. Every modeled offset is in `SysTimer::handles`, so the rest
+   (only `DATE`) is logged as unmapped; the RTC timer now reads
+   `SysTimer::elapsed_ticks()` (monotonic) rather than a unit counter that
+   firmware can stop or reload. Tick rate is still the 1-tick-per-step
+   placeholder (real: 16 MHz), so a 10 ms FreeRTOS tick is 160,000 steps.
 3. **SPI2 has no DMA transmit path yet.** Task 9 made SPI2's registers
    match what `spi_ll.h` expects (`emulator-core/src/peripherals/spi.rs`'s
    module doc): `SPI_UPDATE` (`WT`) reads back 0 at once
@@ -1129,22 +1136,24 @@ predicted these blockers would surface once TIMG unblocks further boot:
    and the ID/size accesses landed at addresses `0x0`/`0x4`. Nothing had
    failed on it, but `esp_flash_default_chip->size` was 0.
 
-9. **Interrupt arbitration and edge interrupts are simplified** (Task 4).
-   When several enabled lines at or above the threshold are pending at
-   once, the CPU core takes the *lowest-numbered* line, not the
-   highest-priority one. `CPU_INT_TYPE_REG` (edge vs. level) and
+9. **Edge interrupts are simplified** (Task 4). Arbitration is no longer
+   simplified: since Task 5, when several enabled lines at or above the
+   threshold are pending at once, the core takes the highest-priority one,
+   ties to the lowest line number (ESP32-C3 TRM v1.4 section 1.5.2;
+   `cpu::select_interrupt_line`). `CPU_INT_TYPE_REG` (edge vs. level) and
    `CPU_INT_CLEAR_REG` are plain storage: every source wired so far
    (SYSTIMER target0, SYSTEM FROM_CPU, SPI2 TRANS_DONE) is level-type,
    and the SYSTIMER's own latched `INT_RAW` stands in for its edge behavior. Neither has
    mattered in the observed boot. `FirmwareBus::pending_sources()` only
-   includes SYSTIMER target0, SYSTEM FROM_CPU0..3 and SPI2 (Task 9) so far.
+   includes SYSTIMER targets 0..2 (Task 5), SYSTEM FROM_CPU0..3 and SPI2
+   (Task 9) so far.
 
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
-fixed it. Items 2 to 7 and 9 are not correctness bugs *today* — they're dormant
-because boot doesn't reach the code paths that would exercise them (item 2
-is about to be reached, and item 3 with the first SPI2 transaction; see
-item 1's current stall). They're
+fixed it. Item 2 is resolved (Task 5). Items 3 to 7 and 9 are not
+correctness bugs *today* — they're dormant because boot doesn't reach the
+code paths that would exercise them (item 3 is reached with the first
+SPI2 transaction; see item 1's current stall). They're
 recorded here so Milestone 3 starts from a known list instead of
 rediscovering each one by stepping through a debugger again.
 

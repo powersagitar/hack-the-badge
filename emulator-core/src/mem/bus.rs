@@ -86,9 +86,9 @@
 //!    `crate::peripherals::rtc_cntl` for the RTC timer latch model
 //!    `rtc_cntl_ll_get_rtc_time()` polls at boot. A triggering write (one
 //!    that sets `TIME_UPDATE_REG`'s `TIME_UPDATE` bit) needs `systimer`'s
-//!    live unit0 counter as its "elapsed time" source — another
+//!    monotonic tick count (`SysTimer::elapsed_ticks`) as its "elapsed time" source — another
 //!    cross-peripheral read the "no trait-object dispatch" ruling
-//!    anticipated: [`FirmwareBus::write_byte`] reads `self.systimer.counter()`
+//!    anticipated: [`FirmwareBus::write_byte`] reads `self.systimer.elapsed_ticks()`
 //!    directly and hands it to
 //!    [`crate::peripherals::rtc_cntl::RtcCntl::write_byte`], no trait object
 //!    involved. Like SYSTIMER/INTC, not-yet-modeled RTC_CNTL registers are
@@ -145,8 +145,8 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 use super::image::SegmentDescriptor;
 use super::soc::{
     is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE, SPI2_RANGE,
-    SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SRC_SYSTIMER_TARGET0, SYSTEM_RANGE, SYSTIMER_RANGE,
-    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE,
+    USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -548,13 +548,10 @@ impl FirmwareBus {
     /// levels (bit `n` = source number `n`, `crate::mem::soc::SRC_*`). A
     /// pure recomputation from live peripheral state -- nothing latched --
     /// so a source de-asserts the moment its peripheral clears it. Sources
-    /// so far: SYSTIMER target0, the SYSTEM `FROM_CPU_0..3` software
-    /// interrupts, and SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9).
+    /// so far: SYSTIMER targets 0..2 (`SRC_SYSTIMER_TARGET0..2`, Task 5), the
+    /// SYSTEM `FROM_CPU_0..3` software interrupts, and SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9).
     pub fn pending_sources(&self) -> u64 {
-        let mut p = 0u64;
-        if self.systimer.target0_pending() {
-            p |= 1u64 << SRC_SYSTIMER_TARGET0;
-        }
+        let mut p = self.systimer.pending_sources();
         p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
         p |= self.spi.pending_sources();
         p
@@ -832,7 +829,7 @@ impl FirmwareBus {
             // is just direct field access, the same pattern the
             // INTERRUPT_CORE0/SPI2 tiers above already use. See
             // `crate::peripherals::rtc_cntl`'s module doc.
-            let elapsed_steps = self.systimer.counter();
+            let elapsed_steps = self.systimer.elapsed_ticks();
             self.rtc_cntl.write_byte(offset, val, elapsed_steps);
             return;
         }

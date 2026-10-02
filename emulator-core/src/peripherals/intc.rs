@@ -219,6 +219,14 @@ impl InterruptController {
         out
     }
 
+    /// Each CPU line's 4-bit `CPU_INT_PRI_n` priority, for the core's
+    /// arbitration among simultaneously asserted lines
+    /// (`crate::cpu::select_interrupt_line`: highest priority first, ties to
+    /// the lowest line -- ESP32-C3 TRM v1.4 section 1.5.2).
+    pub fn line_priorities(&self) -> [u8; 32] {
+        self.cpu_int_pri.map(|p| (p & PRIO_MASK) as u8)
+    }
+
     /// `CPU_INT_EIP_STATUS_REG`'s value: bit `line` set iff some routed
     /// source is currently asserted, *before* enable/priority gating.
     pub fn eip_status(&self, pending_sources: u64) -> u32 {

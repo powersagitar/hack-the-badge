@@ -82,13 +82,14 @@
 //! snapshots its live value into `TIME_LOW0`/`TIME_HIGH0`. This emulator has
 //! no free-running background clock -- the only notion of "elapsed time" it
 //! has is the CPU's own instruction count, which `crate::peripherals::systimer::SysTimer`
-//! already tracks as its live `unit0_counter` (advanced by exactly
+//! already tracks as its monotonic `elapsed_ticks()` (advanced by exactly
 //! [`crate::peripherals::systimer::TICKS_PER_STEP`] -- documented there as 1
 //! tick per `Cpu::step()`, a placeholder since `Cpu::step()` has no
 //! cycle-accurate timing model). Rather than add a second, redundant
 //! step-counting field here, [`RtcCntl::write_byte`] takes that live
-//! SYSTIMER counter value as a parameter at the moment of the trigger --
-//! `crate::mem::bus::FirmwareBus` passes `self.systimer.counter()` directly,
+//! SYSTIMER tick count as a parameter at the moment of the trigger --
+//! `crate::mem::bus::FirmwareBus` passes `self.systimer.elapsed_ticks()` directly
+//! (not a unit counter, which firmware can stop or reload -- Task 5),
 //! the same "concrete field, no trait object" cross-peripheral read pattern
 //! already used for INTC's `CPU_INT_EIP_STATUS_REG` and SPI2's D/C-line
 //! read (see `mem::bus`'s module doc).
@@ -226,7 +227,7 @@ impl RtcCntl {
         word.to_le_bytes()[idx]
     }
 
-    /// `elapsed_steps` is the live SYSTIMER unit0 counter value at the
+    /// `elapsed_steps` is SYSTIMER's monotonic `elapsed_ticks()` at the
     /// moment of this specific byte write -- see the module doc's "Deriving
     /// the counter value" section. Only consulted when this write is the
     /// one that completes the `TIME_UPDATE` trigger; ignored otherwise (so
