@@ -252,14 +252,12 @@ impl Cpu {
         self.pending_interrupts = mask;
     }
 
-    /// Replaces the per-line priority table used to pick among several
-    /// pending lines (see [`select_interrupt_line`]). Masking by priority vs.
-    /// threshold is the interrupt controller's job, not this table's.
     /// `true` while the core is parked by a `WFI` (RISC-V privileged spec
     /// v1.12, section 3.3.3, "Wait for Interrupt"): the `WFI` itself has
     /// retired (`pc` is past it), and each [`Cpu::step`] executes nothing --
     /// it returns `StepInfo { trap_taken: false, instr_len: 0, .. }` with
-    /// `pc` unchanged -- until [`Cpu::pending_interrupts`] is non-zero.
+    /// `pc` unchanged -- until the pending-line set (as handed in by
+    /// [`Cpu::set_pending_interrupts`]) is non-zero.
     ///
     /// Waking ignores `mstatus.MIE`, as the spec requires ("WFI is also
     /// required to resume execution for locally enabled interrupts pending
@@ -279,6 +277,9 @@ impl Cpu {
         self.waiting
     }
 
+    /// Replaces the per-line priority table used to pick among several
+    /// pending lines (see [`select_interrupt_line`]). Masking by priority vs.
+    /// threshold is the interrupt controller's job, not this table's.
     pub fn set_interrupt_priorities(&mut self, priorities: [u8; 32]) {
         self.interrupt_priorities = priorities;
     }

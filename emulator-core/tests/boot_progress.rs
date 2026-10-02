@@ -998,11 +998,13 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 /// status"). Before it, the FreeRTOS idle task's `wfi` on step 596,609 was
 /// an illegal instruction and the panic handler ran. Now it waits, and the
 /// driving loop jumps SYSTIMER to the next alarm while it does. Over a run
-/// to just short of the next exception (step 5,555,258, ROM `MD5Init`):
+/// to short of the next exception (step 5,555,258, ROM `MD5Init`; the
+/// budget was 5,555,000 steps, now 5,550,000 for a wider margin):
 /// - no exception is taken (the last trap is an interrupt) and no panic
 ///   text prints;
 /// - SYSTIMER time ran **ahead** of the step count, which only the idle
-///   fast-forward can do: measured 1,827,031 extra ticks over 12 waits
+///   fast-forward can do: measured (at the old 5,555,000-step budget)
+///   1,827,031 extra ticks over 12 waits
 ///   (asserted `>= 1_500_000`, about 9.4 tick periods, so at least ~10 of
 ///   the waits must have jumped most of a period);
 /// - counter 1, the FreeRTOS tick's counter, is past 40 tick periods of
@@ -1011,7 +1013,7 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 #[test]
 fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(5_555_000);
+    let summary = rt.run(5_550_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
         rt.cpu().csr.mcause & 0x8000_0000,
