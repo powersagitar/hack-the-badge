@@ -567,12 +567,12 @@ impl FirmwareBus {
     }
 
     /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
-    /// ticks and returns [`FirmwareBus::asserted_lines`] as of the end of
-    /// that tick (the set the next step will sample). Call exactly once per
-    /// `Cpu::step()` — see `crate::boot::step_with_interrupts`.
-    pub fn tick_peripherals(&mut self) -> u32 {
+    /// ticks. Call exactly once per `Cpu::step()` — see
+    /// `crate::boot::step_with_interrupts`, which samples
+    /// [`FirmwareBus::asserted_lines`] itself at the start of the next step,
+    /// so this returns nothing.
+    pub fn tick_peripherals(&mut self) {
         self.systimer.advance();
-        self.asserted_lines()
     }
 
     /// Adds a fresh, zero-initialized, real read/write RAM region

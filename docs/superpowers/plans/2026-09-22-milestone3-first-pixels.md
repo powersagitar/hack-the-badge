@@ -37,7 +37,7 @@
 
 1. **Multi-byte register writes arrive as 4 ascending byte writes** (`FirmwareBus::write32` → `write_byte(addr+0..3)`). Any write-triggered side effect must fire on the byte containing the trigger bit and must read other fields from the *same* write's already-applied bytes — tests in every new peripheral task write whole words via a byte-splitting helper and assert the side effect fires exactly once.
 2. **Level vs sticky interrupts:** after a peripheral's raw status is cleared by the ISR, the CPU must not take the interrupt again. Task 4 replaces sticky `raise_interrupt` accumulation in the boot loop with per-step level recomputation, and tests it.
-3. **Interrupt priority/threshold masking:** ESP-IDF's RISC-V port masks interrupts in critical sections via `CPU_INT_THRESH_REG`, not `mstatus.MIE`. A line whose priority ≤ threshold must not fire (Task 4 test).
+3. **Interrupt priority/threshold masking:** ESP-IDF's RISC-V port masks interrupts in critical sections via `CPU_INT_THRESH_REG`, not `mstatus.MIE`. A line whose priority < threshold must not fire; priority == threshold is delivered (Task 4 test). (Corrected in Task D11: ESP-IDF v5.5.3 `components/riscv/include/esp_private/interrupt_intc.h:24` and `components/riscv/vectors.S:424-432` mask a line iff its priority is below the threshold.)
 4. **WFI with nothing armed** must not hang the host: `run(budget)` always returns after at most `budget` steps even if the CPU waits forever (Task 6 test).
 5. **Console buffer growth:** a firmware stuck in a print loop must not grow memory unboundedly — console buffer is capped (Task 1 test).
 
@@ -408,10 +408,11 @@ Then run `boot-probe` to see what the console now shows past TIMG. Add one `#[te
 **Interfaces:**
 - Produces:
   - `mem::soc` interrupt source numbers (verify + cite `components/soc/esp32c3/include/soc/interrupts.h`, enum `periph_interrupt_t`): `pub const SRC_SPI2: u32 = 19; pub const SRC_SYSTIMER_TARGET0: u32 = 37; SRC_SYSTIMER_TARGET1 = 38; SRC_SYSTIMER_TARGET2 = 39; SRC_DMA_CH0 = 44; SRC_DMA_CH1 = 45; SRC_DMA_CH2 = 46;` (37 is already confirmed: `SYSTIMER_TARGET0_INT_MAP_REG == 0x94 == 37*4`).
-  - `InterruptController::poll(&self, pending_sources: u64) -> u32` — returns a **mask of CPU lines** that are asserted, enabled (`CPU_INT_ENABLE`), and whose priority (`CPU_INT_PRI_n`) is strictly greater than `CPU_INT_THRESH`. A source maps to line `MAP[src] & 0x1F`; line 0 means "not routed" (ESP-IDF never uses line 0).
+  - `InterruptController::poll(&self, pending_sources: u64) -> u32` — returns a **mask of CPU lines** that are asserted, enabled (`CPU_INT_ENABLE`), and whose priority (`CPU_INT_PRI_n`) is at least `CPU_INT_THRESH` (a line is masked iff priority < threshold). A source maps to line `MAP[src] & 0x1F`; line 0 means "not routed" (ESP-IDF never uses line 0).
+    - Note (Task D11 correction): an earlier draft said "strictly greater than". The accepted rule follows ESP-IDF v5.5.3 `components/riscv/include/esp_private/interrupt_intc.h:24` and `components/riscv/vectors.S:424-432`. The `priority_at_or_below_threshold_is_masked` sketch below predates the ruling; the landed test admits priority == threshold.
   - `InterruptController::eip_status(&self, pending_sources: u64) -> u32` — mask of lines with any routed pending source, before enable/priority gating.
   - `FirmwareBus::pending_sources(&self) -> u64` — OR of each peripheral's asserted sources (for now only SYSTIMER target0 via the existing `target0_pending()`; later tasks extend it).
-  - `FirmwareBus::tick_peripherals(&mut self) -> u32` (line mask; was `Option<u32>`).
+  - `FirmwareBus::tick_peripherals(&mut self) -> u32` (line mask; was `Option<u32>`). (Task D11: now returns `()`; `step_with_interrupts` samples `asserted_lines()` at the start of each step instead.)
   - `Cpu::set_pending_interrupts(&mut self, mask: u32)` — replaces (not ORs) the pending line set. `step_with_interrupts` calls it with `tick_peripherals()` each step. `raise_interrupt` stays for unit tests.
 - Remove the special-case `systimer_target0_map` field: MAP registers become a uniform `[u32; 64]` indexed by `offset / 4` for `offset < MAP_REGION_END` (keep the `SYSTIMER_TARGET0_INT_MAP_REG` constant for tests).
 

@@ -370,8 +370,9 @@ fn raised_threshold_masks_a_pending_line_until_lowered() {
         0,
         "EIP_STATUS still shows the line pending (ungated)"
     );
-    bus.write32(INTC_BASE + 0x194, 1); // == the line's priority: admitted
-                                       // Level sampling at the start of each step: the very next step takes it.
+    // Threshold == the line's priority: admitted.
+    bus.write32(INTC_BASE + 0x194, 1);
+    // Level sampling at the start of each step: the very next step takes it.
     assert!(
         step_with_interrupts(&mut cpu, &mut bus).trap_taken,
         "lowering the threshold lets the pending line through"
