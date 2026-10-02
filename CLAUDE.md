@@ -51,13 +51,15 @@ ESP32-C3 device), in two complementary modes:
    modeled (Milestone 3 Task 4), so `vPortYield()`'s first context-switch
    request is taken as an interrupt, FreeRTOS runs its first task, and boot
    prints `main_task: Started on CPU0` and `main_task: Calling app_main()`.
-   Inside `app_main` it then stalls: the unstubbed ROM `gpio_matrix_out`
-   faults (step 571,713), the panic handler runs, and its reboot faults on
-   the unstubbed ROM `software_reset_cpu`. Nothing is drawn yet, well
-   before reaching any built-in app. The current blocker is that ROM call
-   (a known, documented gap — see `docs/firmware-emulator-notes.md`'s
-   "Known limitations" section before assuming a built-in app is reachable
-   in this mode).
+   Inside `app_main`, ROM `gpio_matrix_out`/`gpio_matrix_in` are real stubs
+   that program the GPIO matrix (Milestone 3 Task D11), so the SPI bus
+   setup routes SPI2 onto the display pads. Boot then spins, with no
+   exception and no panic, in `spi_hal_init()`'s poll on SPI2's
+   `SPI_UPDATE` bit (step 584,618 on), which the SPI2 model does not
+   self-clear yet. Nothing is drawn yet, well before reaching any built-in
+   app. The current blocker is that SPI2 bit (a known, documented gap —
+   see `docs/firmware-emulator-notes.md`'s "Known limitations" section
+   before assuming a built-in app is reachable in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -161,7 +163,8 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       instruction — a return value, a real memcpy/memset,
                       or (as of Milestone 3's Task D3 fix round) a
                       runtime-computed peripheral-register write via
-                      `RomStubEffect::BusRegisterWrite` — paired with the
+                      `RomStubEffect::BusRegisterWrite` (or a sequence of
+                      them, `BusRegisterWrites`, Task D11) — paired with the
                       chip-specific data in src/rom.rs, below. A stub
                       can't run guest code, so ROM routines that call
                       back into firmware (qsort's comparator) are real
@@ -205,8 +208,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       delivered as levels sampled every step by
                       boot::step_with_interrupts), SYSTEM's FROM_CPU
                       software-interrupt registers (system.rs; the rest of
-                      SYSTEM is unmapped), GPIO + an emulated 74HC165 button
-                      shift register, and SPI2/GPSPI2 + an ST7789
+                      SYSTEM is unmapped), GPIO (including the GPIO
+                      matrix's FUNCn_IN/OUT_SEL_CFG routing registers,
+                      stored but not yet consulted, Task D11) + an emulated
+                      74HC165 button shift register, and SPI2/GPSPI2 + an ST7789
                       command/pixel-stream interpreter that reconstructs a
                       framebuffer. Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
@@ -230,7 +235,9 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       have done — including, for the six interrupt-matrix/
                       interrupt-controller ROM calls, a real read/write of
                       the `peripherals::intc` registers those calls target,
-                      with indexed calls bounds-checked),
+                      and for ROM `gpio_matrix_out`/`gpio_matrix_in`, of
+                      the `peripherals::gpio` matrix registers, with indexed
+                      calls bounds-checked),
                       paired with cpu/rom_stubs.rs's generic mechanism
                       above. Also the guest-executed ROM code blobs
                       (`ESP32C3_ROM_CODE`: qsort's one-`jal` jump-table

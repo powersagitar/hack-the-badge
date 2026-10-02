@@ -286,6 +286,16 @@
 //! re-pointed at a panic). The new rungs are
 //! [`first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line`] and
 //! [`boot_reaches_main_task_calling_app_main`].
+//!
+//! **Task D11 status**: ROM `gpio_matrix_out`/`gpio_matrix_in` are real
+//! stubs writing the GPIO matrix registers, so `app_main`'s SPI bus setup
+//! (`spicommon_bus_initialize_io()`) runs through and the panic is gone
+//! again. Boot then spins, with no exception, in `spi_hal_init()`'s
+//! `spi_ll_apply_config()` poll on SPI2's `SPI_UPDATE` bit (step 584,618
+//! on; see `tests/rom_stub_boot.rs`'s pinned stall). No new console line
+//! appears (`main_task: Calling app_main()` is still the newest), so, as in
+//! Tasks D2 and D10, the rung is a no-fault one:
+//! [`boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -392,7 +402,7 @@ fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let summary = rt.run(571_712 - 528_778);
     assert_eq!(
         summary.last_instruction_fault, None,
-        "no exception before app_main's gpio_matrix_out call; got {summary:?}"
+        "no exception through step 571,712 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
     );
     assert_ne!(
         rt.pc(),
@@ -416,6 +426,45 @@ fn boot_reaches_main_task_calling_app_main() {
         console.contains("I (0) main_task: Started on CPU0"),
         "console:\n{console}"
     );
+}
+
+/// Milestone 3 Task D11's no-new-console-line fallback rung (see the module
+/// doc's "Task D11 status"). Before it, `app_main` faulted on the unstubbed
+/// ROM `gpio_matrix_out` on step 571,713 and the panic handler ran. Both
+/// GPIO-matrix ROM calls are now real stubs, so a run well past that step
+/// -- 1,500,000 steps, past where the old panic printed "Rebooting..."
+/// (~811,450) -- must show **no exception** (interrupts are fine: the
+/// FreeRTOS yield is one) and no panic text, and still have
+/// `main_task: Calling app_main()` as the newest good line.
+#[test]
+fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(1_500_000);
+    assert_eq!(
+        summary.last_instruction_fault,
+        None,
+        "got {summary:?}, pc=0x{:08x}",
+        rt.pc()
+    );
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt, not an exception; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    let console = rt.console_output();
+    assert!(
+        console.contains("I (0) main_task: Calling app_main()"),
+        "console:
+{console}"
+    );
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(
+            !console.contains(panic_text),
+            "console:
+{console}"
+        );
+    }
 }
 
 /// Milestone 3 Task D2's no-new-console-line fallback rung (see the module

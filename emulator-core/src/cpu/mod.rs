@@ -295,6 +295,82 @@ impl Cpu {
         }
     }
 
+    /// The word address a [`rom_stubs::BusRegisterWrite`] targets with the
+    /// current argument registers: `base + a[index_reg] * 4`, or `base` when
+    /// unindexed. An index at or past `index_limit` is a wild guest value:
+    /// returns `None` and records the drop (`rom_stub_index_drops`,
+    /// `last_rom_stub_index_drop`) instead of touching a neighbouring
+    /// register or wrapping the address.
+    fn bus_register_write_addr(&mut self, write: &rom_stubs::BusRegisterWrite) -> Option<u32> {
+        let Some(r) = write.index_reg else {
+            return Some(write.base);
+        };
+        let index = self.regs.read(r);
+        match write.index_limit {
+            Some(limit) if index >= limit => {
+                self.rom_stub_index_drops += 1;
+                self.last_rom_stub_index_drop = Some((self.regs.pc, index));
+                None
+            }
+            _ => Some(write.base.wrapping_add(index.wrapping_mul(4))),
+        }
+    }
+
+    /// Performs one [`rom_stubs::BusRegisterOp`] on the word at `addr`,
+    /// reading its operands from the argument registers.
+    fn apply_bus_register_op<B: Bus>(
+        &mut self,
+        op: rom_stubs::BusRegisterOp,
+        addr: u32,
+        bus: &mut B,
+    ) {
+        use rom_stubs::BusRegisterOp;
+        match op {
+            BusRegisterOp::Store { value_reg } => {
+                let value = self.regs.read(value_reg);
+                bus.write32(addr, value);
+            }
+            BusRegisterOp::UpdateMask { mask_reg, set } => {
+                let mask = self.regs.read(mask_reg);
+                let old = bus.read32(addr);
+                let new = if set { old | mask } else { old & !mask };
+                bus.write32(addr, new);
+            }
+            BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
+                // Masked to the 5 bits that address a bit position within
+                // one 32-bit word: a shift amount of 32 or more is out of
+                // range for `1u32 << bit` (Rust panics on an overflowing
+                // shift in debug builds), and this mechanism is
+                // chip-agnostic -- it has no notion of how many bits a
+                // caller's register *should* mean, only that a 32-bit word
+                // has 32.
+                let bit = self.regs.read(bit_reg) & 0x1F;
+                let cond = self.regs.read(cond_reg) != 0;
+                let old = bus.read32(addr);
+                let new = if cond {
+                    old | (1 << bit)
+                } else {
+                    old & !(1 << bit)
+                };
+                bus.write32(addr, new);
+            }
+            BusRegisterOp::StoreComposed { value_reg, flags } => {
+                let mut value = self.regs.read(value_reg);
+                for flag in flags {
+                    if flag.cond.holds(self.regs.read(flag.reg)) {
+                        value |= flag.bits;
+                    }
+                }
+                bus.write32(addr, value);
+            }
+            BusRegisterOp::StoreBit { bit_reg } => {
+                // Same 5-bit mask as `SetOrClearBit`, for the same reason.
+                let bit = self.regs.read(bit_reg) & 0x1F;
+                bus.write32(addr, 1 << bit);
+            }
+        }
+    }
+
     /// Runs one high-level-emulated ROM stub's [`rom_stubs::RomStubEffect`],
     /// then redirects `pc` to the return address the caller left in `ra`. See
     /// [`rom_stubs`]'s module doc for the reasoning and the known
@@ -355,59 +431,30 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, op.apply(a));
             }
             RomStubEffect::BusRegisterWrite(write) => {
-                use rom_stubs::BusRegisterOp;
-                let addr = match write.index_reg {
-                    Some(r) => {
-                        let index = self.regs.read(r);
-                        match write.index_limit {
-                            Some(limit) if index >= limit => {
-                                // Out-of-range index (a wild guest value):
-                                // drop the write rather than touch a
-                                // neighbouring register or wrap the address.
-                                self.rom_stub_index_drops += 1;
-                                self.last_rom_stub_index_drop = Some((self.regs.pc, index));
-                                None
-                            }
-                            _ => Some(write.base.wrapping_add(index.wrapping_mul(4))),
-                        }
-                    }
-                    None => Some(write.base),
-                };
-                if let Some(addr) = addr {
-                    match write.op {
-                        BusRegisterOp::Store { value_reg } => {
-                            let value = self.regs.read(value_reg);
-                            bus.write32(addr, value);
-                        }
-                        BusRegisterOp::UpdateMask { mask_reg, set } => {
-                            let mask = self.regs.read(mask_reg);
-                            let old = bus.read32(addr);
-                            let new = if set { old | mask } else { old & !mask };
-                            bus.write32(addr, new);
-                        }
-                        BusRegisterOp::SetOrClearBit { bit_reg, cond_reg } => {
-                            // Masked to the 5 bits that address a bit position
-                            // within one 32-bit word: a shift amount of 32 or
-                            // more is out of range for `1u32 << bit` (Rust
-                            // panics on an overflowing shift in debug builds),
-                            // and this mechanism is chip-agnostic -- it has no
-                            // notion of how many bits a caller's register
-                            // *should* mean, only that a 32-bit word has 32.
-                            let bit = self.regs.read(bit_reg) & 0x1F;
-                            let cond = self.regs.read(cond_reg) != 0;
-                            let old = bus.read32(addr);
-                            let new = if cond {
-                                old | (1 << bit)
-                            } else {
-                                old & !(1 << bit)
-                            };
-                            bus.write32(addr, new);
-                        }
-                    }
+                if let Some(addr) = self.bus_register_write_addr(&write) {
+                    self.apply_bus_register_op(write.op, addr, bus);
                 }
                 // Every ROM function using this effect has a `void` C
                 // signature (see `RomStubEffect::BusRegisterWrite`'s doc) --
                 // `a0` is left untouched, same as `RomStubEffect::Void`.
+            }
+            RomStubEffect::BusRegisterWrites(writes) => {
+                // All-or-nothing: check every index (stopping at, and
+                // counting, the first out-of-range one) before the first
+                // write -- see the variant's doc. The second pass recomputes
+                // the same addresses (no registers change in between) rather
+                // than collecting them, keeping `step()` allocation-free.
+                if writes
+                    .iter()
+                    .all(|write| self.bus_register_write_addr(write).is_some())
+                {
+                    for write in writes {
+                        if let Some(addr) = self.bus_register_write_addr(write) {
+                            self.apply_bus_register_op(write.op, addr, bus);
+                        }
+                    }
+                }
+                // `void`, like `BusRegisterWrite`: `a0` untouched.
             }
             RomStubEffect::Itoa => {
                 let value = self.regs.read(rom_stubs::REG_A0) as i32;
@@ -1976,6 +2023,164 @@ mod tests {
         cpu2.regs.pc = ROM_STUB_ADDR;
         cpu2.step(&mut bus2);
         assert_eq!(bus2.read32(0x200), 1 << 2);
+    }
+
+    // ---- Milestone 3 Task D11: composed values, bit stores, sequences ----
+
+    use rom_stubs::{CondBits, RegCond};
+
+    const FAKE_FLAGS: &[CondBits] = &[
+        CondBits {
+            reg: 12, // a2
+            cond: RegCond::NonZero,
+            bits: 0x100,
+        },
+        CondBits {
+            reg: 10, // a0
+            cond: RegCond::NotEqual(0x3a),
+            bits: 0x40,
+        },
+    ];
+
+    fn fake_composed_store_table() -> RomStubTable {
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_composed_store",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    index_limit: None,
+                    op: BusRegisterOp::StoreComposed {
+                        value_reg: 11, // a1
+                        flags: FAKE_FLAGS,
+                    },
+                },
+            ),
+        );
+        table
+    }
+
+    #[test]
+    fn bus_register_write_store_composed_ors_in_each_flag_whose_condition_holds() {
+        // (a0, a1, a2) -> expected word
+        for (a0, a1, a2, expected) in [
+            (5u32, 0x41u32, 0u32, 0x41 | 0x40), // a2 == 0, a0 != 0x3a
+            (5, 0x41, 7, 0x41 | 0x100 | 0x40),  // a2 != 0: any nonzero counts
+            (0x3a, 0x41, 1, 0x41 | 0x100),      // a0 == 0x3a: no 0x40
+            (0x3a, 0x41, 0, 0x41),              // neither flag
+        ] {
+            let mut cpu = Cpu::new();
+            cpu.set_rom_stubs(fake_composed_store_table());
+            let mut bus = rom_stub_test_bus();
+            bus.write32(0x200, 0xFFFF_0000); // overwritten outright, not merged
+            cpu.regs.write(10, a0);
+            cpu.regs.write(11, a1);
+            cpu.regs.write(12, a2);
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            cpu.step(&mut bus);
+            assert_eq!(bus.read32(0x200), expected, "a0={a0:#x} a2={a2}");
+            assert_eq!(cpu.regs.read(10), a0, "void: a0 untouched");
+            assert_eq!(cpu.regs.pc, 0x40);
+        }
+    }
+
+    #[test]
+    fn bus_register_write_store_bit_writes_only_that_bit_outright() {
+        // A write-1-to-set register's shape: the word written is exactly
+        // `1 << a[bit_reg]`, never a read-modify-write.
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_write(
+                "fake_w1ts",
+                BusRegisterWrite {
+                    base: 0x200,
+                    index_reg: None,
+                    index_limit: None,
+                    op: BusRegisterOp::StoreBit { bit_reg: 10 },
+                },
+            ),
+        );
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(table);
+        let mut bus = rom_stub_test_bus();
+        bus.write32(0x200, 0b1);
+        cpu.regs.write(10, 5);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x200), 1 << 5);
+        // A bit index of 32 or more is masked to 5 bits, never a panic.
+        cpu.regs.write(10, 33);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        cpu.step(&mut bus);
+        assert_eq!(bus.read32(0x200), 1 << 1);
+    }
+
+    const FAKE_SEQUENCE: &[BusRegisterWrite] = &[
+        BusRegisterWrite {
+            base: 0x200,
+            index_reg: Some(10), // a0
+            index_limit: Some(4),
+            op: BusRegisterOp::Store { value_reg: 11 },
+        },
+        BusRegisterWrite {
+            base: 0x280,
+            index_reg: None,
+            index_limit: None,
+            op: BusRegisterOp::StoreBit { bit_reg: 10 },
+        },
+    ];
+
+    #[test]
+    fn bus_register_writes_runs_every_write_in_order() {
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_writes("fake_sequence", FAKE_SEQUENCE),
+        );
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(table);
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.write(10, 3);
+        cpu.regs.write(11, 0x41);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let info = cpu.step(&mut bus);
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(bus.read32(0x200 + 3 * 4), 0x41);
+        assert_eq!(bus.read32(0x280), 1 << 3);
+        assert_eq!(cpu.regs.read(10), 3, "void: a0 untouched");
+        assert_eq!(cpu.regs.pc, 0x40);
+        assert_eq!(cpu.rom_stub_index_drops(), 0);
+    }
+
+    #[test]
+    fn bus_register_writes_drops_the_whole_call_when_any_index_is_out_of_range() {
+        // The ROM's early-return guard skips *both* stores, so an
+        // out-of-range index must not leave the second write half-applied.
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::bus_register_writes("fake_sequence", FAKE_SEQUENCE),
+        );
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(table);
+        let mut bus = rom_stub_test_bus();
+        cpu.regs.write(10, 4); // one past the end
+        cpu.regs.write(11, 0x41);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(cpu.regs.pc, 0x40, "still returns to ra");
+        assert_eq!(bus.read32(0x200 + 4 * 4), 0);
+        assert_eq!(bus.read32(0x280), 0, "the second write is skipped too");
+        assert_eq!(cpu.rom_stub_index_drops(), 1, "one drop per call");
+        assert_eq!(cpu.last_rom_stub_index_drop(), Some((ROM_STUB_ADDR, 4)));
     }
 
     #[test]

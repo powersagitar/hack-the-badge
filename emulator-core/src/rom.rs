@@ -738,6 +738,51 @@
 //!     interrupt, so the scheduler never starts (see "Where this gets boot
 //!     to").
 //!
+//! 22. **ROM GPIO-matrix routing: `gpio_matrix_out` and `gpio_matrix_in`**
+//!     ([`GPIO_MATRIX_OUT`], [`GPIO_MATRIX_IN`]) — Milestone 3 Task D11.
+//!     Inside `app_main`, `spi_bus_initialize()` ->
+//!     `spicommon_bus_initialize_io()` (`components/esp_driver_spi/src/
+//!     gpspi/spi_common.c:650-705`, v5.5.3) routes SPI2 (FSPI) onto the
+//!     badge's display pads with `esp_rom_gpio_connect_out_signal()`/
+//!     `esp_rom_gpio_connect_in_signal()`, which `esp32c3.rom.api.ld`
+//!     aliases to these two ROM functions (`esp32c3.rom.ld`: `gpio_matrix_in
+//!     = 0x400005a0; gpio_matrix_out = 0x400005a4;`). The first call (the
+//!     571,713th step from a cold boot, caller RA `0x420e_e7b8`) is line
+//!     653's `esp_rom_gpio_connect_out_signal(mosi_io_num = 10,
+//!     FSPID_OUT_IDX = 65, false, false)`; with it stubbed, line 657's
+//!     `esp_rom_gpio_connect_in_signal(10, FSPID_IN_IDX = 65, false)`
+//!     (`gpio_matrix_in`, step 571,725, RA `0x420e_e7da`) was the next
+//!     fault. Both are atomic, `void` and touch only GPIO registers. Their
+//!     bodies, disassembled from the rev3 ROM ELF (each `0x4000_05xx` slot
+//!     is a `j` to the body):
+//!     - `gpio_matrix_out(gpio, signal_idx, out_inv, oen_inv)` (body
+//!       `0x4005_1ab8`): returns at once if `gpio > 25`; otherwise stores
+//!       `signal_idx | (out_inv ? 0x100 : 0) | (oen_inv ? 0x400 : 0)` to
+//!       `0x6000_4554 + 4 * gpio` (`GPIO_FUNCn_OUT_SEL_CFG_REG`; bit 8
+//!       `OUT_INV_SEL`, bit 10 `OEN_INV_SEL`, `OEN_SEL` left 0), then
+//!       `1 << gpio` to `0x6000_4024` (`GPIO_ENABLE_W1TS_REG`). This is a
+//!       [`RomStubEffect::BusRegisterWrites`] pair: the first write's
+//!       `index_limit` of 26 is the ROM's own guard, and the effect's
+//!       all-or-nothing bound skips the `W1TS` store with it, as the ROM
+//!       does.
+//!     - `gpio_matrix_in(gpio, signal_idx, inv)` (body `0x4005_1a94`):
+//!       stores `gpio | (inv ? 0x20 : 0) | (gpio != 0x3a ? 0x40 : 0)` to
+//!       `0x6000_4154 + 4 * signal_idx` (`GPIO_FUNCn_IN_SEL_CFG_REG`; bit 5
+//!       `IN_INV_SEL`, bit 6 `SIG_IN_SEL` = "through the matrix"). The ROM
+//!       neither masks `gpio` to `IN_SEL`'s 5 bits nor bounds `signal_idx`;
+//!       the stub mirrors the former (the value is stored as computed) but
+//!       bounds the latter at the 128 `IN_SEL_CFG` registers, dropping and
+//!       counting a wild index like entry 11's indexed intc calls.
+//!
+//!     The values come from argument registers through
+//!     [`BusRegisterOp::StoreComposed`] (a register plus per-flag bits) and
+//!     [`BusRegisterOp::StoreBit`], and land in
+//!     `crate::peripherals::gpio`'s new `FUNCn_OUT_SEL_CFG`/
+//!     `FUNCn_IN_SEL_CFG` storage (store-only so far; see that module's doc).
+//!     The rest of the `gpio_*` ROM group (`gpio_pad_select_gpio`,
+//!     `gpio_pad_*`, `gpio_output_set`, ...) is not observed, so it stays
+//!     unstubbed.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -757,8 +802,22 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task 4** (interrupt matrix + SYSTEM software interrupts): still 92
-//! stubs. `intr_matrix_set` and `esprv_intc_int_set_priority` now bound
+//! **As of Task D11**: 94 stubs (Task 4's 92 plus `gpio_matrix_out` and
+//! `gpio_matrix_in`, entry 22). `app_main`'s SPI bus setup routes SPI2 onto
+//! its pads through the GPIO matrix, and boot runs on with no exception and
+//! no panic. It then spins on a peripheral, not a ROM call:
+//! `spi_hal_init()` (`components/hal/spi_hal.c`) ends with
+//! `spi_ll_apply_config()` (`hal/esp32c3/include/hal/spi_ll.h:264-267`),
+//! which sets SPI2's `SPI_UPDATE` (`SPI_CMD_REG` bit 23) and polls it until
+//! the hardware clears it. The SPI2 model stores that bit inertly, so from
+//! step 584,618 the CPU spins on `0x420f_d6fc..=0x420f_d702` (plan Task 9:
+//! "UPDATE self-clear"). `main_task: Calling app_main()` is still the newest
+//! console line. See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear`.
+//! The Task 4 paragraph below is kept as history.
+//!
+//! **As of Task 4** (history; interrupt matrix + SYSTEM software
+//! interrupts): still 92 stubs. `intr_matrix_set` and `esprv_intc_int_set_priority` now bound
 //! their guest index (`BusRegisterWrite::index_limit`: 64 MAP registers, 32
 //! lines), so a wild index is dropped and counted
 //! (`Cpu::rom_stub_index_drops`) instead of landing on a neighbouring
@@ -872,12 +931,16 @@ use crate::cpu::encode::{
     S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, Int32UnaryOp, Int64Op, RomStub, RomStubTable, WordSource,
-    WordStore, REG_A0, REG_A1, REG_A2,
+    BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, RegCond, RomStub,
+    RomStubTable, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::image::ImageHeader;
-use crate::mem::soc::{INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
+use crate::mem::soc::{GPIO_RANGE, INTERRUPT_CORE0_RANGE, USB_SERIAL_JTAG_RANGE};
+use crate::peripherals::gpio::{
+    ENABLE_W1TS_REG, FUNC0_IN_SEL_CFG_REG, FUNC0_OUT_SEL_CFG_REG, IN_SEL_CFG_COUNT,
+    OUT_SEL_CFG_COUNT,
+};
 use crate::peripherals::intc::{
     CPU_INT_ENABLE_REG, CPU_INT_PRI_BASE_REG, CPU_INT_THRESH_REG, CPU_INT_TYPE_REG, LINE_COUNT,
     MAP_SOURCE_COUNT,
@@ -987,6 +1050,74 @@ pub const ESPRV_INTC_INT_SET_THRESHOLD: u32 = 0x4000_05e4;
 /// `intc::LINE_COUNT`; an out-of-range one is dropped, never written past
 /// the array.
 pub const ESPRV_INTC_INT_SET_PRIORITY: u32 = 0x4000_05e0;
+
+/// ROM `gpio_matrix_in(gpio, signal_idx, inv)` (`esp32c3.rom.ld`:
+/// `gpio_matrix_in = 0x400005a0;`), aliased as
+/// `esp_rom_gpio_connect_in_signal` by `esp32c3.rom.api.ld`. See the module
+/// doc, entry 22.
+pub const GPIO_MATRIX_IN: u32 = 0x4000_05a0;
+
+/// `gpio_matrix_in`'s flag bits in `GPIO_FUNCn_IN_SEL_CFG_REG` (`gpio_reg.h`),
+/// per the ROM body (module doc, entry 22): `inv` (`a2`, tested with `beqz`)
+/// sets `GPIO_FUNC0_IN_INV_SEL` (bit 5), and every `gpio` except `0x3a` sets
+/// `GPIO_SIG0_IN_SEL` (bit 6, "route through the matrix").
+const GPIO_MATRIX_IN_FLAGS: &[CondBits] = &[
+    CondBits {
+        reg: REG_A2,
+        cond: RegCond::NonZero,
+        bits: 1 << 5,
+    },
+    CondBits {
+        reg: REG_A0,
+        cond: RegCond::NotEqual(0x3a),
+        bits: 1 << 6,
+    },
+];
+
+/// ROM `gpio_matrix_out(gpio, signal_idx, out_inv, oen_inv)`
+/// (`esp32c3.rom.ld`: `gpio_matrix_out = 0x400005a4;`), aliased as
+/// `esp_rom_gpio_connect_out_signal` by `esp32c3.rom.api.ld`. See the module
+/// doc, entry 22.
+pub const GPIO_MATRIX_OUT: u32 = 0x4000_05a4;
+
+/// `gpio_matrix_out`'s two flag bits in `GPIO_FUNCn_OUT_SEL_CFG_REG`
+/// (`gpio_reg.h`): `out_inv` (`a2`) sets `GPIO_FUNC0_OUT_INV_SEL` (bit 8),
+/// `oen_inv` (`a3`) sets `GPIO_FUNC0_OEN_INV_SEL` (bit 10). The ROM tests
+/// each with `beqz`, so any nonzero value counts.
+const GPIO_MATRIX_OUT_FLAGS: &[CondBits] = &[
+    CondBits {
+        reg: REG_A2,
+        cond: RegCond::NonZero,
+        bits: 1 << 8,
+    },
+    CondBits {
+        reg: REG_A3,
+        cond: RegCond::NonZero,
+        bits: 1 << 10,
+    },
+];
+
+/// `gpio_matrix_out`'s two stores, in the ROM body's order (module doc,
+/// entry 22): the pad's `GPIO_FUNCn_OUT_SEL_CFG_REG`, then its bit in
+/// `GPIO_ENABLE_W1TS_REG`. The first write's `index_limit` is the ROM's own
+/// `gpio > 25` early return, which skips both.
+const GPIO_MATRIX_OUT_WRITES: &[BusRegisterWrite] = &[
+    BusRegisterWrite {
+        base: GPIO_RANGE.start + FUNC0_OUT_SEL_CFG_REG,
+        index_reg: Some(REG_A0), // gpio
+        index_limit: Some(OUT_SEL_CFG_COUNT),
+        op: BusRegisterOp::StoreComposed {
+            value_reg: REG_A1, // signal_idx
+            flags: GPIO_MATRIX_OUT_FLAGS,
+        },
+    },
+    BusRegisterWrite {
+        base: GPIO_RANGE.start + ENABLE_W1TS_REG,
+        index_reg: None,
+        index_limit: None,
+        op: BusRegisterOp::StoreBit { bit_reg: REG_A0 }, // 1 << gpio
+    },
+];
 
 /// `ets_get_cpu_frequency`'s fixed ROM address (`esp32c3.rom.ld`).
 pub const ETS_GET_CPU_FREQUENCY: u32 = 0x4000_0584;
@@ -1578,6 +1709,27 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         ),
     ),
     (
+        GPIO_MATRIX_IN,
+        RomStub::bus_register_write(
+            "gpio_matrix_in",
+            BusRegisterWrite {
+                base: GPIO_RANGE.start + FUNC0_IN_SEL_CFG_REG,
+                index_reg: Some(REG_A1), // signal_idx
+                // The ROM has no bound; 128 keeps a wild signal inside the
+                // FUNCn_IN_SEL_CFG array (module doc, entry 22).
+                index_limit: Some(IN_SEL_CFG_COUNT),
+                op: BusRegisterOp::StoreComposed {
+                    value_reg: REG_A0, // gpio
+                    flags: GPIO_MATRIX_IN_FLAGS,
+                },
+            },
+        ),
+    ),
+    (
+        GPIO_MATRIX_OUT,
+        RomStub::bus_register_writes("gpio_matrix_out", GPIO_MATRIX_OUT_WRITES),
+    ),
+    (
         ETS_GET_CPU_FREQUENCY,
         RomStub::returning("ets_get_cpu_frequency", CPU_FREQ_MHZ),
     ),
@@ -2146,6 +2298,128 @@ mod tests {
         // A neighbouring priority register must be untouched.
         assert_eq!(
             bus.read32(INTERRUPT_CORE0_RANGE.start + CPU_INT_PRI_BASE_REG + 24 * 4),
+            0
+        );
+    }
+
+    // ---- Milestone 3 Task D11: ROM GPIO-matrix routing ----
+
+    use crate::mem::soc::GPIO_RANGE;
+    use crate::peripherals::gpio::{
+        ENABLE_REG, FUNC0_IN_SEL_CFG_REG, FUNC0_OUT_SEL_CFG_REG, FUNC_OUT_SEL_CFG_RESET,
+        IN_SEL_CFG_COUNT, OUT_SEL_CFG_COUNT,
+    };
+
+    #[test]
+    fn gpio_matrix_out_routes_the_signal_and_enables_the_pad_output() {
+        // The observed boot call: spicommon_bus_initialize_io's
+        // esp_rom_gpio_connect_out_signal(mosi_io_num = 10, FSPID_OUT_IDX =
+        // 0x41, false, false).
+        let stub = esp32c3_rom_stubs()
+            .lookup(GPIO_MATRIX_OUT)
+            .expect("registered");
+        assert_eq!(stub.name, "gpio_matrix_out");
+        let (cpu, mut bus) = run_stub_call(
+            GPIO_MATRIX_OUT,
+            &[(REG_A0, 10), (REG_A1, 0x41), (REG_A2, 0), (REG_A3, 0)],
+        );
+        assert_eq!(
+            bus.read32(GPIO_RANGE.start + FUNC0_OUT_SEL_CFG_REG + 10 * 4),
+            0x41
+        );
+        assert_eq!(bus.read32(GPIO_RANGE.start + ENABLE_REG), 1 << 10);
+        // Neighbouring pins keep their reset routing.
+        assert_eq!(bus.gpio.func_out_sel_cfg(9), Some(FUNC_OUT_SEL_CFG_RESET));
+        assert_eq!(bus.gpio.func_out_sel_cfg(11), Some(FUNC_OUT_SEL_CFG_RESET));
+        assert_eq!(cpu.regs.read(REG_A0), 10, "void: a0 untouched");
+    }
+
+    #[test]
+    fn gpio_matrix_out_sets_the_inversion_bits_for_nonzero_flags() {
+        // out_inv -> bit 8 (GPIO_FUNC0_OUT_INV_SEL), oen_inv -> bit 10
+        // (GPIO_FUNC0_OEN_INV_SEL); the ROM tests each for nonzero.
+        let (_cpu, bus) = run_stub_call(
+            GPIO_MATRIX_OUT,
+            &[(REG_A0, 3), (REG_A1, 0x41), (REG_A2, 1), (REG_A3, 5)],
+        );
+        assert_eq!(bus.gpio.func_out_sel_cfg(3), Some(0x41 | 0x100 | 0x400));
+        let (_cpu, bus) = run_stub_call(
+            GPIO_MATRIX_OUT,
+            &[(REG_A0, 3), (REG_A1, 0x41), (REG_A2, 0), (REG_A3, 1)],
+        );
+        assert_eq!(bus.gpio.func_out_sel_cfg(3), Some(0x41 | 0x400));
+    }
+
+    #[test]
+    fn gpio_matrix_out_ignores_a_gpio_past_the_last_pad_like_the_rom() {
+        // The ROM body's `li a5,25; bltu a5,a0,ret` guard: gpio 26 writes
+        // nothing at all -- no OUT_SEL_CFG word, no ENABLE bit.
+        let (cpu, mut bus) = run_stub_call(
+            GPIO_MATRIX_OUT,
+            &[(REG_A0, OUT_SEL_CFG_COUNT), (REG_A1, 0x41)],
+        );
+        assert_eq!(bus.read32(GPIO_RANGE.start + ENABLE_REG), 0);
+        assert_eq!(
+            bus.read32(GPIO_RANGE.start + FUNC0_OUT_SEL_CFG_REG + OUT_SEL_CFG_COUNT * 4),
+            0
+        );
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        // The last real pad still works.
+        let (cpu, bus) = run_stub_call(
+            GPIO_MATRIX_OUT,
+            &[(REG_A0, OUT_SEL_CFG_COUNT - 1), (REG_A1, 0x41)],
+        );
+        assert_eq!(bus.gpio.func_out_sel_cfg(OUT_SEL_CFG_COUNT - 1), Some(0x41));
+        assert_eq!(cpu.rom_stub_index_drops(), 0);
+    }
+
+    #[test]
+    fn gpio_matrix_in_routes_the_pad_to_the_peripheral_input_through_the_matrix() {
+        // The observed boot call: spicommon_bus_initialize_io's
+        // esp_rom_gpio_connect_in_signal(mosi_io_num = 10, FSPID_IN_IDX =
+        // 0x41, false): GPIO_FUNC65_IN_SEL_CFG_REG = 10 | SIG_IN_SEL (0x40).
+        let stub = esp32c3_rom_stubs()
+            .lookup(GPIO_MATRIX_IN)
+            .expect("registered");
+        assert_eq!(stub.name, "gpio_matrix_in");
+        let (cpu, mut bus) =
+            run_stub_call(GPIO_MATRIX_IN, &[(REG_A0, 10), (REG_A1, 0x41), (REG_A2, 0)]);
+        assert_eq!(
+            bus.read32(GPIO_RANGE.start + FUNC0_IN_SEL_CFG_REG + 0x41 * 4),
+            0x40 | 10
+        );
+        assert_eq!(bus.gpio.func_in_sel_cfg(0x40), Some(0));
+        assert_eq!(bus.gpio.func_in_sel_cfg(0x42), Some(0));
+        // No output-enable side effect, unlike gpio_matrix_out.
+        assert_eq!(bus.read32(GPIO_RANGE.start + ENABLE_REG), 0);
+        assert_eq!(cpu.regs.read(REG_A0), 10, "void: a0 untouched");
+    }
+
+    #[test]
+    fn gpio_matrix_in_sets_inv_for_a_nonzero_flag_and_skips_sig_in_sel_for_0x3a() {
+        // inv -> GPIO_FUNC0_IN_INV_SEL (bit 5), tested with beqz.
+        let (_cpu, bus) = run_stub_call(GPIO_MATRIX_IN, &[(REG_A0, 7), (REG_A1, 3), (REG_A2, 2)]);
+        assert_eq!(bus.gpio.func_in_sel_cfg(3), Some(0x40 | 0x20 | 7));
+        // The ROM body leaves SIG_IN_SEL (bit 6) clear only for gpio ==
+        // 0x3a, stored as given (the ROM does not mask gpio to IN_SEL's 5
+        // bits).
+        let (_cpu, bus) =
+            run_stub_call(GPIO_MATRIX_IN, &[(REG_A0, 0x3a), (REG_A1, 3), (REG_A2, 0)]);
+        assert_eq!(bus.gpio.func_in_sel_cfg(3), Some(0x3a));
+    }
+
+    #[test]
+    fn gpio_matrix_in_drops_a_signal_past_the_last_in_sel_cfg_register() {
+        // The ROM has no bound on signal_idx; signal 128 would land on
+        // GPIO_FUNC0_OUT_SEL_CFG_REG's neighbourhood (0x354). Dropped and
+        // counted instead, like the intc stubs' wild indices.
+        let (cpu, mut bus) = run_stub_call(
+            GPIO_MATRIX_IN,
+            &[(REG_A0, 10), (REG_A1, IN_SEL_CFG_COUNT), (REG_A2, 0)],
+        );
+        assert_eq!(cpu.rom_stub_index_drops(), 1);
+        assert_eq!(
+            bus.read32(GPIO_RANGE.start + FUNC0_IN_SEL_CFG_REG + IN_SEL_CFG_COUNT * 4),
             0
         );
     }

@@ -56,9 +56,9 @@
 //!    functions whose *actual* work matters, the real thing: a real
 //!    register-only computation for [`RomStubEffect::Int64`], or a real
 //!    effect through the bus for [`RomStubEffect::Memset`],
-//!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`] and
-//!    [`RomStubEffect::StoreWords`] (plus the read-only libc effects
-//!    `Strlen`/`Memcmp`/`Strncmp`/`DivT`).
+//!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
+//!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.
@@ -204,6 +204,18 @@ pub enum RomStubEffect {
     /// (from `crate::mem::soc`/`crate::peripherals::intc` constants), per
     /// this module's chip-agnostic/chip-specific split.
     BusRegisterWrite(BusRegisterWrite),
+    /// Several [`BusRegisterWrite`]s run in order as one atomic ROM call
+    /// (Milestone 3 Task D11: `gpio_matrix_out` stores the pad's
+    /// `GPIO_FUNCn_OUT_SEL_CFG_REG`, then sets its `GPIO_ENABLE_W1TS_REG`
+    /// bit). **All-or-nothing on index bounds**: every indexed write's index
+    /// is checked against its `index_limit` before any write happens, and if
+    /// one is out of range the whole call is dropped -- no bus access at all,
+    /// one count in `Cpu::rom_stub_index_drops`. That mirrors a ROM body
+    /// whose early-return guard skips all of its stores, and means an
+    /// unindexed later write (the W1TS store, whose bit comes from the same
+    /// guarded register) is never half-applied. Never touches `a0`, like
+    /// [`RomStubEffect::BusRegisterWrite`].
+    BusRegisterWrites(&'static [BusRegisterWrite]),
     /// ROM libc's `char *itoa(int value, char *str, int base)`: writes the
     /// NUL-terminated string [`compute_itoa`] computes for `value = a0`/
     /// `base = a2` starting at `str = a1`, through the bus, then sets `a0`
@@ -362,10 +374,10 @@ pub struct BusRegisterWrite {
     pub op: BusRegisterOp,
 }
 
-/// The three register-write shapes [`BusRegisterWrite`] supports, chosen
-/// per-call to match that ROM function's actual argument meaning (see
-/// `crate::rom`'s citations for which shape each of the five
-/// interrupt-controller ROM calls uses).
+/// The register-write shapes [`BusRegisterWrite`] supports, chosen per-call
+/// to match that ROM function's actual argument meaning (see `crate::rom`'s
+/// citations for which shape each interrupt-controller and GPIO-matrix ROM
+/// call uses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusRegisterOp {
     /// Overwrite the whole word with `a[value_reg]` — used when the ROM
@@ -385,6 +397,53 @@ pub enum BusRegisterOp {
     /// architecturally meaningful states are `INTR_TYPE_LEVEL = 0` and
     /// `INTR_TYPE_EDGE = 1`).
     SetOrClearBit { bit_reg: u8, cond_reg: u8 },
+    /// Overwrite the whole word with `a[value_reg]` OR-ed with each
+    /// [`CondBits`] entry's `bits` whose condition holds -- used when the
+    /// ROM function assembles a register's new value from one argument plus
+    /// per-flag bits (`gpio_matrix_out`'s `signal_idx` plus `out_inv` ->
+    /// bit 8 and `oen_inv` -> bit 10; `gpio_matrix_in`'s `gpio` plus `inv`
+    /// -> bit 5). An outright store, not a read-modify-write, like
+    /// [`BusRegisterOp::Store`].
+    StoreComposed {
+        value_reg: u8,
+        flags: &'static [CondBits],
+    },
+    /// Overwrite the whole word with `1 << a[bit_reg]` -- the shape of a
+    /// write-1-to-set/-clear register store, where the other bits written as
+    /// 0 mean "leave alone" (`gpio_matrix_out`'s `GPIO_ENABLE_W1TS_REG`
+    /// store). Not a read-modify-write. The bit index is masked to 5 bits,
+    /// same as [`BusRegisterOp::SetOrClearBit`].
+    StoreBit { bit_reg: u8 },
+}
+
+/// One conditional OR-in for [`BusRegisterOp::StoreComposed`]: if
+/// `a[reg]` satisfies `cond`, `bits` is OR-ed into the stored word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CondBits {
+    pub reg: u8,
+    pub cond: RegCond,
+    pub bits: u32,
+}
+
+/// The test a [`CondBits`] applies to its register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegCond {
+    /// `a[reg] != 0` -- a C `bool` argument tested the way RV32 code tests
+    /// it (`beqz`), so any nonzero value counts as `true`.
+    NonZero,
+    /// `a[reg] != value` -- a comparison against a fixed constant
+    /// (`gpio_matrix_in`'s `gpio != 0x3a`).
+    NotEqual(u32),
+}
+
+impl RegCond {
+    /// Whether a register holding `value` satisfies this condition.
+    pub fn holds(self, value: u32) -> bool {
+        match self {
+            RegCond::NonZero => value != 0,
+            RegCond::NotEqual(constant) => value != constant,
+        }
+    }
 }
 
 /// The libgcc 64-bit integer helpers this project emulates.
@@ -1119,6 +1178,18 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::BusRegisterWrite(write),
+        }
+    }
+
+    /// A real high-level-emulated sequence of peripheral-register writes —
+    /// see [`RomStubEffect::BusRegisterWrites`].
+    pub const fn bus_register_writes(
+        name: &'static str,
+        writes: &'static [BusRegisterWrite],
+    ) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::BusRegisterWrites(writes),
         }
     }
 }

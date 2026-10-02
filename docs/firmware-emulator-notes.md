@@ -306,6 +306,16 @@ happened to write values those registers already held) and left the fifth
 unstubbed entirely; see "Known limitations" item 1 below for the fix and
 citations.
 
+Task D11 adds two more register-writing stubs, ROM `gpio_matrix_out` and
+`gpio_matrix_in`, which program the GPIO matrix's
+`GPIO_FUNCn_OUT_SEL_CFG_REG`/`GPIO_ENABLE_W1TS_REG` and
+`GPIO_FUNCn_IN_SEL_CFG_REG` in `emulator-core/src/peripherals/gpio.rs`.
+They use two new `BusRegisterOp` shapes, `StoreComposed` (a register plus
+conditional flag bits) and `StoreBit` (`1 << reg`, for a write-1-to-set
+register), and `gpio_matrix_out`'s two stores run as one
+`RomStubEffect::BusRegisterWrites` sequence, which drops the whole call if
+any index is out of range, as the ROM's own `gpio > 25` guard does.
+
 Result: real-firmware boot went from faulting ~20 instructions in to
 running past the mask-ROM wall entirely and into the app image's own
 runtime/logging code — see "Known limitations" below for exactly where it
@@ -953,19 +963,45 @@ predicted these blockers would surface once TIMG unblocks further boot:
    (step ~536,400) and `I (0) main_task: Calling app_main()` (step
    ~555,650), both also in the real badge's boot log.
 
-   **The current stall is a ROM call inside `app_main`.** On the 571,713th
-   step the firmware calls the unstubbed ROM `gpio_matrix_out`
-   (`0x4000_05a4`, `esp32c3.rom.ld`) with `a0` = 10 and `a1` = `0x41`
-   (GPIO10 and an output-signal index), and the fetch faults. The panic
-   handler prints "Guru Meditation Error" (step ~573,200) and
-   "Rebooting..." (step ~811,450). Its reboot attempt then faults on the
-   still-unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 812,080)
-   and loops ("Panic handler entered multiple times"). Nothing is drawn.
-   Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call`.
-   Backing `gpio_matrix_out` is next. The FreeRTOS tick (item 2) and
-   `wfi` (item 4) have not been needed yet, but the idle task will need
-   them.
+   **Task 4's stall** (history) was a ROM call inside `app_main`: the
+   unstubbed ROM `gpio_matrix_out` (`0x4000_05a4`, `esp32c3.rom.ld`), with
+   `a0` = 10 and `a1` = `0x41`, faulted on the 571,713th step; the panic
+   handler printed "Guru Meditation Error" and "Rebooting...", and its
+   reboot faulted on the unstubbed ROM `software_reset_cpu`.
+
+   **Task D11 (ROM GPIO-matrix routing).** The caller is ESP-IDF's
+   `spicommon_bus_initialize_io()` (`components/esp_driver_spi/src/gpspi/
+   spi_common.c:650-705`), routing SPI2 onto the display pads with
+   `esp_rom_gpio_connect_out_signal()`/`esp_rom_gpio_connect_in_signal()`,
+   aliased by `esp32c3.rom.api.ld` to ROM `gpio_matrix_out`/
+   `gpio_matrix_in`. Both are now real stubs that do what their ROM
+   bodies (disassembled from the rev3 ROM ELF) do, through the bus:
+   `gpio_matrix_out` stores `signal | out_inv<<8 | oen_inv<<10` to
+   `GPIO_FUNCn_OUT_SEL_CFG_REG` and sets the pad's `GPIO_ENABLE_W1TS_REG`
+   bit, skipping both for `gpio > 25`; `gpio_matrix_in` stores
+   `gpio | inv<<5 | SIG_IN_SEL` to `GPIO_FUNCn_IN_SEL_CFG_REG` (see
+   `emulator-core/src/rom.rs`'s module doc, entry 22). The GPIO model
+   stores both register arrays (store-only; nothing consults the routing
+   yet). The firmware routes MOSI (`FSPID`, 65) to GPIO10, SCLK
+   (`FSPICLK`, 63) to GPIO1, and `FSPIWP`/`FSPIHD` (67/66) to GPIO0.
+   (GPIO0 is the pin the SPI/ST7789 model reads as D/C. That fits a bus
+   config that leaves `quadwp_io_num`/`quadhd_io_num` at 0 instead of -1,
+   but this is an inference from the observed calls, not confirmed.)
+
+   **The current stall is SPI2, not a ROM call.** `spi_bus_initialize()`
+   -> `spi_master_init_driver()` (`spi_master.c:341`) -> `spi_hal_init()`
+   (`components/hal/spi_hal.c:13-28`, `0x420f_d64c` in factory.bin) ends
+   with `spi_ll_apply_config()` (`hal/esp32c3/include/hal/spi_ll.h:264-267`):
+   `hw->cmd.update = 1; while (hw->cmd.update);`. The SPI2 model keeps
+   `SPI_UPDATE` (`SPI_CMD_REG` bit 23, `soc/spi_reg.h`) as inert storage,
+   so from step 584,618 on the CPU spins forever on the poll loop at
+   `0x420f_d6fc..=0x420f_d702` (item 3 below; plan Task 9). There is no
+   exception and no panic, and `I (0) main_task: Calling app_main()` is
+   still the newest console line. Nothing is drawn. Pinned in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear`.
+   The FreeRTOS tick (item 2) and `wfi` (item 4) have not been needed yet,
+   but the idle task will need them.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -989,6 +1025,8 @@ predicted these blockers would surface once TIMG unblocks further boot:
    configuration would spin forever. Real completion detection also uses a
    different flag (`dma_int_raw.trans_done`) than what's modeled, and pixel
    transfers over 64 bytes use GDMA, which is entirely unmodeled.
+   **Boot now reaches this** (Task D11): `spi_hal_init()`'s
+   `spi_ll_apply_config()` spin is the current stall (item 1).
 4. **WFI decodes as `Illegal`** rather than as a real wait-for-interrupt —
    the FreeRTOS idle task's `wfi` would trap once boot reaches it.
 5. Two flagged guesses worth re-examining once boot progresses further:

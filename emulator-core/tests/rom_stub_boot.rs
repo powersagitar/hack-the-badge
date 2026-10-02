@@ -301,29 +301,53 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// `I (0) main_task: Started on CPU0` (step ~536,400) and
 /// `I (0) main_task: Calling app_main()` (step ~555,650).
 ///
-/// **The new stall** is a real fault inside `app_main`: on the 571,713th
-/// step it calls the unstubbed ROM `gpio_matrix_out` (`0x4000_05a4`,
-/// `esp32c3.rom.ld`; `a0 = 10`, `a1 = 0x41`, i.e. routing a peripheral
-/// output signal to GPIO10). The panic handler prints "Guru Meditation
-/// Error" (step ~573,200) and "Rebooting..." (step ~811,450), and its reboot
-/// attempt faults on the still-unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`) on step 812,080, which loops through "Panic handler
-/// entered multiple times". The panic output is not progress.
+/// **Task 4's stall** (history): a real fault inside `app_main`. On the
+/// 571,713th step it called the then-unstubbed ROM `gpio_matrix_out`
+/// (`0x4000_05a4`, `esp32c3.rom.ld`; `a0 = 10`, `a1 = 0x41`), the panic
+/// handler printed "Guru Meditation Error" and "Rebooting...", and its reboot
+/// faulted on the unstubbed ROM `software_reset_cpu` (`0x4000_0094`).
 ///
-/// This test is **deliberately expected to break** once `gpio_matrix_out`
-/// is backed; whoever makes that fix should re-point it at the next stall.
+/// **What changed in Task D11**: ROM `gpio_matrix_out` and `gpio_matrix_in`
+/// are real stubs that write the GPIO matrix's `GPIO_FUNCn_OUT_SEL_CFG_REG`/
+/// `GPIO_ENABLE_W1TS_REG` and `GPIO_FUNCn_IN_SEL_CFG_REG` through the bus
+/// (`emulator-core/src/rom.rs`'s module doc, entry 22). The caller is
+/// ESP-IDF's `spicommon_bus_initialize_io()` (`components/esp_driver_spi/
+/// src/gpspi/spi_common.c:650-705`), routing SPI2 (FSPI) onto the display
+/// pads: MOSI (`FSPID`, 65) on GPIO10, SCLK (`FSPICLK`, 63) on GPIO1, and
+/// `FSPIWP`/`FSPIHD` (67/66) on GPIO0. Boot runs with **no exception** past
+/// both calls, and `I (0) main_task: Calling app_main()` stays the newest
+/// console line.
+///
+/// **The new stall** is not a ROM call and not a fault: a spin on SPI2.
+/// `spi_bus_initialize()` -> `spi_master_init_driver()` (`spi_master.c:341`)
+/// -> `spi_hal_init()` (`components/hal/spi_hal.c:13-28`, at `0x420f_d64c`
+/// in factory.bin) ends with `spi_ll_apply_config()`
+/// (`components/hal/esp32c3/include/hal/spi_ll.h:264-267`): `hw->cmd.update
+/// = 1; while (hw->cmd.update);`. It sets `SPI_UPDATE` (`SPI_CMD_REG` bit
+/// 23, `soc/spi_reg.h`) on SPI2 (`0x6002_4000`), and the SPI2 model stores
+/// that bit inertly instead of self-clearing it, so from step 584,618 on the
+/// CPU spins forever on the four-instruction poll loop
+/// `0x420f_d6fc..=0x420f_d702`. That is plan Task 9 ("SPI2 register
+/// fidelity -- UPDATE self-clear").
+///
+/// This test is **deliberately expected to break** once `SPI_UPDATE`
+/// self-clears; whoever makes that fix should re-point it at the next stall.
 #[test]
-fn boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call() {
+fn boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
     const OLD_SPIN_PC: u32 = 0x4200_0cd2;
-    const GPIO_MATRIX_OUT: u32 = 0x4000_05a4;
-    const SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
+    const SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
+    // gpio_sig_map.h signal numbers and gpio_reg.h field bits.
+    const FSPICLK_OUT_IDX: u32 = 63;
+    const FSPID_OUT_IDX: u32 = 65;
+    const FSPID_IN_IDX: u32 = 65;
+    const SIG_IN_SEL: u32 = 1 << 6;
 
     let image = read_factory_bin();
     let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
 
     // Phase 1: fault-free up to and including vPortYield's write of the
-    // cross-core software-interrupt register, which now lands in the modeled
+    // cross-core software-interrupt register, which lands in the modeled
     // SYSTEM peripheral (not the unmapped catch-all) and asserts the source.
     let summary = rt.run(528_777);
     assert_eq!(
@@ -349,16 +373,39 @@ fn boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call()
     assert_eq!(summary.traps, 1);
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004, "FROM_CPU_0's routed line");
 
-    // Phase 3: the scheduler runs the first task and app_main starts; up to
-    // the step before the fault there is no exception, only interrupts, and
-    // the old scheduler-start spin is gone.
-    let summary = rt.run(571_712 - 528_778);
+    // Phase 3: main_task runs app_main, which routes SPI2 through the GPIO
+    // matrix via the two ROM stubs and enters spi_hal_init's UPDATE poll
+    // after step 584,618 -- with no exception on the way (only interrupts).
+    let summary = rt.run(584_618 - 528_778);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(rt.pc(), *SPI_UPDATE_POLL.start());
+    let gpio = &rt.bus().gpio;
+    assert_eq!(gpio.func_out_sel_cfg(10), Some(FSPID_OUT_IDX), "MOSI");
+    assert_eq!(gpio.func_out_sel_cfg(1), Some(FSPICLK_OUT_IDX), "SCLK");
+    assert_eq!(
+        gpio.func_in_sel_cfg(FSPID_IN_IDX),
+        Some(SIG_IN_SEL | 10),
+        "FSPID input from GPIO10, through the matrix"
+    );
+    assert_eq!(rt.cpu().rom_stub_index_drops(), 0);
+    assert_ne!(
+        rt.bus().spi.read_byte(2) & 0x80,
+        0,
+        "SPI_UPDATE (SPI_CMD_REG bit 23) set and never cleared"
+    );
+
+    // Phase 4: the spin. Hundreds of thousands of steps later the CPU is
+    // still in the same four-instruction poll, with no exception, no panic,
+    // and no new console line.
+    let console_before = rt.console_output();
+    let summary = rt.run(400_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert!(SPI_UPDATE_POLL.contains(&rt.pc()), "pc=0x{:08x}", rt.pc());
     assert_ne!(rt.pc(), OLD_SPIN_PC);
     let console = rt.console_output();
-    assert!(
-        console.contains("I (0) main_task: Started on CPU0"),
-        "console:\n{console}"
+    assert_eq!(
+        console, console_before,
+        "no new console output while spinning"
     );
     assert!(
         console.contains("I (0) main_task: Calling app_main()"),
@@ -368,26 +415,6 @@ fn boot_currently_faults_in_app_main_on_the_unstubbed_gpio_matrix_out_rom_call()
         !console.contains("Guru Meditation Error"),
         "console:\n{console}"
     );
-
-    // Phase 4: the next step faults fetching the unstubbed ROM gpio_matrix_out.
-    let summary = rt.run(1);
-    assert_eq!(summary.traps, 1);
-    assert_eq!(
-        rt.cpu().csr.mcause,
-        exception_code::INSTRUCTION_ACCESS_FAULT
-    );
-    assert_eq!(summary.last_instruction_fault, Some(GPIO_MATRIX_OUT));
-
-    // Phase 5: the panic path, then the reboot attempt's software_reset_cpu
-    // fault (panic output, not progress).
-    let summary = rt.run(812_080 - 571_713);
-    assert_eq!(summary.last_instruction_fault, Some(SOFTWARE_RESET_CPU));
-    let console = rt.console_output();
-    assert!(
-        console.contains("Guru Meditation Error"),
-        "console:\n{console}"
-    );
-    assert!(console.contains("Rebooting..."), "console:\n{console}");
 
     // Nothing has been drawn: the display is never initialized.
     assert!(rt.framebuffer().iter().all(|px| *px == 0));

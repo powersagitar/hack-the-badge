@@ -41,6 +41,18 @@
 //!   input state — see [`Gpio::pin_in_level`] for the per-pin rules (pin 7
 //!   is driven by [`Hc165`], pin 9 by [`Gpio::set_start_pressed`], every
 //!   other pin by a generic external-input bit that defaults to `0`).
+//! - `GPIO_FUNCn_OUT_SEL_CFG_REG` (`0x554 + 4n`, `n` = 0..=25), the GPIO
+//!   matrix's per-pad output routing (Milestone 3 Task D11). Fields, per
+//!   v5.5.3 `gpio_reg.h`: `OUT_SEL` `[7:0]` (default `8'h80`), `OUT_INV_SEL`
+//!   `[8]`, `OEN_SEL` `[9]`, `OEN_INV_SEL` `[10]`; the reserved upper bits
+//!   are masked off. Signal numbers are `gpio_sig_map.h`'s (`FSPID_OUT_IDX`
+//!   = 65, `SIG_GPIO_OUT_IDX` = 128, the reset value: "drive this pad from
+//!   `GPIO_OUT_REG`"). Written by ROM `gpio_matrix_out`'s stub
+//!   (`crate::rom`, through the bus) as ESP-IDF's SPI driver routes SPI2
+//!   onto the display pads. **Storage only**: nothing consults the routing
+//!   yet, so a pad routed to a peripheral still reads back `GPIO_OUT_REG`'s
+//!   bit in `GPIO_IN_REG`, and the SPI2/ST7789 model is still driven by its
+//!   own registers rather than by which pads carry its signals.
 //!
 //! Every other `GPIO_*_REG` this module doesn't name (pull-up/down config,
 //! strapping, interrupt-status, IO-MUX-adjacent registers, etc. — none of
@@ -139,6 +151,34 @@ pub const ENABLE_REG: u32 = 0x20;
 pub const ENABLE_W1TS_REG: u32 = 0x24;
 pub const ENABLE_W1TC_REG: u32 = 0x28;
 pub const IN_REG: u32 = 0x3C;
+/// `GPIO_FUNC0_IN_SEL_CFG_REG` (`gpio_reg.h`: `DR_REG_GPIO_BASE + 0x154`):
+/// the first of the per-peripheral-input-signal GPIO-matrix routing
+/// registers, one word per signal, through `GPIO_FUNC127_IN_SEL_CFG_REG`
+/// (`+ 0x350`).
+pub const FUNC0_IN_SEL_CFG_REG: u32 = 0x154;
+/// How many `GPIO_FUNCn_IN_SEL_CFG_REG` registers exist (`FUNC0`..=`FUNC127`,
+/// one per input signal).
+pub const IN_SEL_CFG_COUNT: u32 = 128;
+/// `GPIO_FUNCn_IN_SEL_CFG_REG`'s documented fields: `IN_SEL` `[4:0]`,
+/// `IN_INV_SEL` `[5]`, `SIG_IN_SEL` `[6]`, all defaulting to 0. The rest of
+/// the word is reserved and reads 0.
+const FUNC_IN_SEL_CFG_MASK: u32 = 0x7F;
+/// `GPIO_FUNC0_OUT_SEL_CFG_REG` (`gpio_reg.h`: `DR_REG_GPIO_BASE + 0x554`):
+/// the first of the per-pad GPIO-matrix output-routing registers, one word
+/// per pad, through `GPIO_FUNC25_OUT_SEL_CFG_REG` (`+ 0x5B8`).
+pub const FUNC0_OUT_SEL_CFG_REG: u32 = 0x554;
+/// How many `GPIO_FUNCn_OUT_SEL_CFG_REG` registers exist (`FUNC0`..=`FUNC25`,
+/// one per pad).
+pub const OUT_SEL_CFG_COUNT: u32 = 26;
+/// `GPIO_FUNCn_OUT_SEL_CFG_REG`'s reset value: `GPIO_FUNCn_OUT_SEL`
+/// (`[7:0]`) defaults to `8'h80` (= `SIG_GPIO_OUT_IDX`, 128, in
+/// `gpio_sig_map.h`: the pad is driven by `GPIO_OUT_REG`, not a
+/// peripheral), every other field to 0.
+pub const FUNC_OUT_SEL_CFG_RESET: u32 = 0x80;
+/// `GPIO_FUNCn_OUT_SEL_CFG_REG`'s documented fields: `OUT_SEL` `[7:0]`,
+/// `OUT_INV_SEL` `[8]`, `OEN_SEL` `[9]`, `OEN_INV_SEL` `[10]`. The rest of
+/// the word is reserved and reads 0.
+const FUNC_OUT_SEL_CFG_MASK: u32 = 0x7FF;
 
 /// Pin bit positions this peripheral gives special external-device
 /// behavior to; see the module doc's pin map.
@@ -263,6 +303,12 @@ pub struct Gpio {
     /// consulted for pins 7/9/20/21, which have their own special-cased
     /// rules.
     external_in: u32,
+    /// `GPIO_FUNCn_OUT_SEL_CFG_REG`, one per pad (see the module doc's
+    /// "GPIO matrix output routing"). Stored only; nothing consults it yet.
+    func_out_sel_cfg: [u32; OUT_SEL_CFG_COUNT as usize],
+    /// `GPIO_FUNCn_IN_SEL_CFG_REG`, one per input signal (same section).
+    /// Stored only.
+    func_in_sel_cfg: [u32; IN_SEL_CFG_COUNT as usize],
     pub hc165: Hc165,
 }
 
@@ -273,6 +319,8 @@ impl Default for Gpio {
             enable: 0,
             start_pressed: false,
             external_in: 0,
+            func_out_sel_cfg: [FUNC_OUT_SEL_CFG_RESET; OUT_SEL_CFG_COUNT as usize],
+            func_in_sel_cfg: [0; IN_SEL_CFG_COUNT as usize],
             hc165: Hc165::new(),
         }
     }
@@ -291,6 +339,33 @@ impl Gpio {
     /// same rule every pin follows).
     pub fn set_start_pressed(&mut self, pressed: bool) {
         self.start_pressed = pressed;
+    }
+
+    /// Pad `pin`'s `GPIO_FUNCn_OUT_SEL_CFG_REG` value, or `None` if `pin`
+    /// has no such register (`pin >= `[`OUT_SEL_CFG_COUNT`]).
+    pub fn func_out_sel_cfg(&self, pin: u32) -> Option<u32> {
+        self.func_out_sel_cfg.get(pin as usize).copied()
+    }
+
+    /// Input signal `signal`'s `GPIO_FUNCn_IN_SEL_CFG_REG` value, or `None`
+    /// if there is no such register (`signal >= `[`IN_SEL_CFG_COUNT`]).
+    pub fn func_in_sel_cfg(&self, signal: u32) -> Option<u32> {
+        self.func_in_sel_cfg.get(signal as usize).copied()
+    }
+
+    /// The stored GPIO-matrix routing word (`GPIO_FUNCn_IN_SEL_CFG_REG` or
+    /// `GPIO_FUNCn_OUT_SEL_CFG_REG`) at `word_offset`, with that register's
+    /// writable-field mask, if `word_offset` is one of them.
+    fn matrix_cfg_mut(&mut self, word_offset: u32) -> Option<(&mut u32, u32)> {
+        fn slot(word_offset: u32, first: u32, count: u32) -> Option<usize> {
+            let idx = word_offset.checked_sub(first)? / 4;
+            (idx < count).then_some(idx as usize)
+        }
+        if let Some(i) = slot(word_offset, FUNC0_IN_SEL_CFG_REG, IN_SEL_CFG_COUNT) {
+            return Some((&mut self.func_in_sel_cfg[i], FUNC_IN_SEL_CFG_MASK));
+        }
+        let i = slot(word_offset, FUNC0_OUT_SEL_CFG_REG, OUT_SEL_CFG_COUNT)?;
+        Some((&mut self.func_out_sel_cfg[i], FUNC_OUT_SEL_CFG_MASK))
     }
 
     fn pin_bit(pin: u32) -> u32 {
@@ -358,10 +433,13 @@ impl Gpio {
             OUT_REG => self.out,
             ENABLE_REG => self.enable,
             IN_REG => self.in_word(),
-            // W1TS/W1TC are write-only on real hardware; reads of them fall
-            // through to the generic 0 default below, same as everything
-            // else this module doesn't name.
-            _ => 0,
+            // GPIO_FUNCn_IN/OUT_SEL_CFG_REG read back their stored word. W1TS/
+            // W1TC are write-only on real hardware; reads of them fall
+            // through to the generic 0 default, same as everything else
+            // this module doesn't name.
+            _ => self
+                .matrix_cfg_mut(word_offset)
+                .map_or(0, |(word, _)| *word),
         };
         word.to_le_bytes()[idx]
     }
@@ -405,7 +483,13 @@ impl Gpio {
             // systimer's own catch-all philosophy so firmware probing
             // unrelated GPIO registers (pull-up/down, strapping, IO-MUX,
             // interrupt status, etc.) doesn't panic.
-            _ => {}
+            _ => {
+                // GPIO_FUNCn_IN/OUT_SEL_CFG_REG: stored, reserved bits masked.
+                if let Some((word, mask)) = self.matrix_cfg_mut(word_offset) {
+                    set_byte(word, idx, val);
+                    *word &= mask;
+                }
+            }
         }
     }
 }
@@ -712,5 +796,59 @@ mod tests {
                 "extra clocks past the 8th bit keep presenting the last bit"
             );
         }
+    }
+
+    // ---- GPIO matrix output routing (Milestone 3 Task D11) ----
+
+    #[test]
+    fn func_out_sel_cfg_resets_to_the_simple_gpio_output_signal() {
+        let mut g = Gpio::new();
+        for pin in 0..OUT_SEL_CFG_COUNT {
+            assert_eq!(
+                read_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * pin),
+                FUNC_OUT_SEL_CFG_RESET,
+                "pin {pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn func_out_sel_cfg_stores_the_documented_fields_per_pin() {
+        let mut g = Gpio::new();
+        // spicommon_bus_initialize_io: GPIO10 <- FSPID_OUT_IDX (65 = 0x41).
+        write_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * 10, 0x41);
+        assert_eq!(read_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * 10), 0x41);
+        assert_eq!(g.func_out_sel_cfg(10), Some(0x41));
+        // Neighbours keep their reset value.
+        assert_eq!(g.func_out_sel_cfg(9), Some(FUNC_OUT_SEL_CFG_RESET));
+        assert_eq!(g.func_out_sel_cfg(11), Some(FUNC_OUT_SEL_CFG_RESET));
+        // Bits above OEN_INV_SEL (bit 10) are reserved: masked off.
+        write_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * 25, 0xFFFF_FFFF);
+        assert_eq!(g.func_out_sel_cfg(25), Some(0x7FF));
+        // One past FUNC25 is not a FUNCn_OUT_SEL_CFG register.
+        assert_eq!(g.func_out_sel_cfg(26), None);
+        write_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * 26, 0x41);
+        assert_eq!(read_word(&mut g, FUNC0_OUT_SEL_CFG_REG + 4 * 26), 0);
+    }
+
+    #[test]
+    fn func_in_sel_cfg_stores_the_documented_fields_per_signal() {
+        let mut g = Gpio::new();
+        for signal in [0, 65, IN_SEL_CFG_COUNT - 1] {
+            assert_eq!(g.func_in_sel_cfg(signal), Some(0), "reset value 0");
+        }
+        // spicommon_bus_initialize_io: FSPID_IN_IDX (65) <- GPIO10, through
+        // the matrix (SIG_IN_SEL, bit 6).
+        write_word(&mut g, FUNC0_IN_SEL_CFG_REG + 4 * 65, 0x40 | 10);
+        assert_eq!(read_word(&mut g, FUNC0_IN_SEL_CFG_REG + 4 * 65), 0x4A);
+        assert_eq!(g.func_in_sel_cfg(64), Some(0));
+        assert_eq!(g.func_in_sel_cfg(66), Some(0));
+        // Bits above SIG_IN_SEL (bit 6) are reserved: masked off.
+        write_word(&mut g, FUNC0_IN_SEL_CFG_REG + 4 * 127, 0xFFFF_FFFF);
+        assert_eq!(g.func_in_sel_cfg(127), Some(0x7F));
+        // FUNC127 is the last; the next word is GPIO_FUNC0_OUT_SEL_CFG_REG's
+        // neighbourhood, not another IN_SEL_CFG.
+        assert_eq!(g.func_in_sel_cfg(IN_SEL_CFG_COUNT), None);
+        assert_eq!(FUNC0_IN_SEL_CFG_REG + 4 * IN_SEL_CFG_COUNT, 0x354);
     }
 }
