@@ -296,6 +296,19 @@
 //! appears (`main_task: Calling app_main()` is still the newest), so, as in
 //! Tasks D2 and D10, the rung is a no-fault one:
 //! [`boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site`].
+//!
+//! **Task 9 status**: SPI2's `SPI_UPDATE` reads back 0 at once and
+//! transactions signal `SPI_TRANS_DONE_INT_RAW`, so the `spi_hal_init()`
+//! poll exits on its first check and boot prints a new console line from
+//! the SPI clock setup, `W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value,
+//! assume 40MHz` (an emulator artifact: the real badge's log has no such
+//! line). It then faults on the 602,868th step on the unstubbed ROM
+//! `__bswapsi2` (`0x4000_0788`), called from `spi_ll_set_command()`, and
+//! the panic handler runs (see `tests/rom_stub_boot.rs`'s pinned stall).
+//! The D11 rung's budget drops from 1,500,000 to 602,000 steps (still well
+//! past its own old fault, step 571,713), and the new rung is a
+//! hot-PC-escape one:
+//! [`boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -431,15 +444,18 @@ fn boot_reaches_main_task_calling_app_main() {
 /// Milestone 3 Task D11's no-new-console-line fallback rung (see the module
 /// doc's "Task D11 status"). Before it, `app_main` faulted on the unstubbed
 /// ROM `gpio_matrix_out` on step 571,713 and the panic handler ran. Both
-/// GPIO-matrix ROM calls are now real stubs, so a run well past that step
-/// -- 1,500,000 steps, past where the old panic printed "Rebooting..."
-/// (~811,450) -- must show **no exception** (interrupts are fine: the
-/// FreeRTOS yield is one) and no panic text, and still have
-/// `main_task: Calling app_main()` as the newest good line.
+/// GPIO-matrix ROM calls are now real stubs, so a run past that step must
+/// show **no exception** (interrupts are fine: the FreeRTOS yield is one)
+/// and no panic text, and still have `main_task: Calling app_main()`.
+/// Task D11 ran it to 1,500,000 steps (past where the old panic printed
+/// "Rebooting...", ~811,450), because boot then spun without faulting;
+/// Task 9 ended that spin and boot now faults on step 602,868 (ROM
+/// `__bswapsi2`, see `tests/rom_stub_boot.rs`), so the budget is now
+/// 602,000 steps: still well past the old fault step.
 #[test]
 fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_500_000);
+    let summary = rt.run(602_000);
     assert_eq!(
         summary.last_instruction_fault,
         None,
@@ -824,4 +840,45 @@ fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
     );
     assert!(console.contains("I (0) spi_flash: flash io: dio"));
     assert!(!console.contains("Detected size"), "console:\n{console}");
+}
+
+/// `spi_ll_apply_config()`'s `while (hw->cmd.update);` poll in
+/// `spi_hal_init()` (Task D11's stall: every address hit tens of thousands
+/// of times from step 584,618 on).
+const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
+
+/// Milestone 3 Task 9's rung (see the module doc's "Task 9 status"). With
+/// SPI2's `SPI_UPDATE` reading back 0 at once, the `spi_hal_init()` poll is
+/// no longer a spin: over a trace window from just before the poll (step
+/// 584,000) to just before the new fault (602,000), each poll address is
+/// hit far fewer than [`SPIN_THRESHOLD`] times, no exception is taken, and
+/// boot prints the next console line, the SPI clock setup's (emulator-only)
+/// `clk_hal` XTAL warning.
+#[test]
+fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    rt.run(584_000);
+    let mut hist: HashMap<u32, u64> = HashMap::new();
+    let summary = rt.run_traced(602_000 - 584_000, &mut hist);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    let max_hits = PRE_TASK_9_SPI_UPDATE_POLL
+        .clone()
+        .filter_map(|pc| hist.get(&pc).copied())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        (1..SPIN_THRESHOLD).contains(&max_hits),
+        "the poll must run but not spin: max single-PC hits = {max_hits}; pc=0x{:08x}",
+        rt.pc()
+    );
+    assert!(!PRE_TASK_9_SPI_UPDATE_POLL.contains(&rt.pc()));
+    let console = rt.console_output();
+    assert!(
+        console.contains("W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz"),
+        "console:\n{console}"
+    );
+    assert!(
+        !console.contains("Guru Meditation Error"),
+        "console:\n{console}"
+    );
 }

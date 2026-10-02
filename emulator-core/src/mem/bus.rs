@@ -47,7 +47,7 @@
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
 //!    (`CPU_INT_EIP_STATUS_REG`) needs the live asserted interrupt sources
-//!    ([`FirmwareBus::pending_sources`]: SYSTIMER and SYSTEM) to answer a
+//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM and SPI2) to answer a
 //!    read, which is exactly the cross-peripheral access the ruling
 //!    anticipated: [`FirmwareBus::read_byte`] reads the concrete fields
 //!    directly, no trait object involved.
@@ -64,7 +64,9 @@
 //!    the "no trait-object dispatch" ruling anticipated:
 //!    [`FirmwareBus::write_byte`] reads `self.gpio.pin_level(0)` directly
 //!    and hands it to [`crate::peripherals::spi::Spi::process_transaction`],
-//!    no trait object involved.
+//!    no trait object involved. SPI2 also contributes its
+//!    `TRANS_DONE` interrupt level to [`FirmwareBus::pending_sources`]
+//!    (Milestone 3 Task 9).
 //! 8. **USB-Serial-JTAG** ([`crate::mem::soc::USB_SERIAL_JTAG_RANGE`]):
 //!    routed to [`FirmwareBus::usb_serial_jtag`], same ruling — see
 //!    `crate::peripherals::usb_serial_jtag`. TX-byte writes also need a
@@ -546,14 +548,15 @@ impl FirmwareBus {
     /// levels (bit `n` = source number `n`, `crate::mem::soc::SRC_*`). A
     /// pure recomputation from live peripheral state -- nothing latched --
     /// so a source de-asserts the moment its peripheral clears it. Sources
-    /// so far: SYSTIMER target0 and the SYSTEM `FROM_CPU_0..3` software
-    /// interrupts.
+    /// so far: SYSTIMER target0, the SYSTEM `FROM_CPU_0..3` software
+    /// interrupts, and SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9).
     pub fn pending_sources(&self) -> u64 {
         let mut p = 0u64;
         if self.systimer.target0_pending() {
             p |= 1u64 << SRC_SYSTIMER_TARGET0;
         }
         p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
+        p |= self.spi.pending_sources();
         p
     }
 

@@ -802,7 +802,18 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D11**: 94 stubs (Task 4's 92 plus `gpio_matrix_out` and
+//! **As of Task 9** (SPI2 register fidelity, no stub changes): still 94
+//! stubs. With SPI2's `SPI_UPDATE` self-clearing, the `spi_hal_init()` poll
+//! below exits at once, and boot faults on the 602,868th step on a missing
+//! stub: the libgcc ROM helper `__bswapsi2` (`0x4000_0788`,
+//! `esp32c3.rom.libgcc.ld`), called from `spi_ll_set_command()`
+//! (`spi_ll.h:1018-1030`; `HAL_SWAP32` = `__builtin_bswap32`) while the
+//! first SPI2 transaction is set up. The panic handler's reboot then faults
+//! on `software_reset_cpu`. See `tests/rom_stub_boot.rs`'s
+//! `boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command`.
+//! The Task D11 paragraph below is kept as history.
+//!
+//! **As of Task D11** (history): 94 stubs (Task 4's 92 plus `gpio_matrix_out` and
 //! `gpio_matrix_in`, entry 22). `app_main`'s SPI bus setup routes SPI2 onto
 //! its pads through the GPIO matrix, and boot runs on with no exception and
 //! no panic. It then spins on a peripheral, not a ROM call:
@@ -812,9 +823,8 @@
 //! the hardware clears it. The SPI2 model stores that bit inertly, so from
 //! step 584,618 the CPU spins on `0x420f_d6fc..=0x420f_d702` (plan Task 9:
 //! "UPDATE self-clear"). `main_task: Calling app_main()` is still the newest
-//! console line. See `tests/rom_stub_boot.rs`'s
-//! `boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear`.
-//! The Task 4 paragraph below is kept as history.
+//! console line. (That pinned-stall test was re-pointed by Task 9.) The
+//! Task 4 paragraph below is kept as history.
 //!
 //! **As of Task 4** (history; interrupt matrix + SYSTEM software
 //! interrupts): still 92 stubs. `intr_matrix_set` and `esprv_intc_int_set_priority` now bound

@@ -53,11 +53,14 @@ ESP32-C3 device), in two complementary modes:
    prints `main_task: Started on CPU0` and `main_task: Calling app_main()`.
    Inside `app_main`, ROM `gpio_matrix_out`/`gpio_matrix_in` are real stubs
    that program the GPIO matrix (Milestone 3 Task D11), so the SPI bus
-   setup routes SPI2 onto the display pads. Boot then spins, with no
-   exception and no panic, in `spi_hal_init()`'s poll on SPI2's
-   `SPI_UPDATE` bit (step 584,618 on), which the SPI2 model does not
-   self-clear yet. Nothing is drawn yet, well before reaching any built-in
-   app. The current blocker is that SPI2 bit (a known, documented gap —
+   setup routes SPI2 onto the display pads. SPI2's `SPI_UPDATE` then
+   self-clears and transactions raise `SPI_TRANS_DONE` (Milestone 3 Task
+   9), so `spi_hal_init()` completes. Boot then faults (step 602,868) on
+   the unstubbed libgcc ROM helper `__bswapsi2`, called from
+   `spi_ll_set_command()` while the first SPI2 transaction is set up, and
+   the panic handler reboot-loops. Nothing is drawn yet, well before
+   reaching any built-in app. The current blocker is that ROM call (a
+   known, documented gap —
    see `docs/firmware-emulator-notes.md`'s "Known limitations" section
    before assuming a built-in app is reachable in this mode).
 
@@ -211,7 +214,9 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       SYSTEM is unmapped), GPIO (including the GPIO
                       matrix's FUNCn_IN/OUT_SEL_CFG routing registers,
                       stored but not yet consulted, Task D11) + an emulated
-                      74HC165 button shift register, and SPI2/GPSPI2 + an ST7789
+                      74HC165 button shift register, and SPI2/GPSPI2 (UPDATE
+                      self-clear, TRANS_DONE interrupt, Task 9; no DMA
+                      yet) + an ST7789
                       command/pixel-stream interpreter that reconstructs a
                       framebuffer. Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came

@@ -318,25 +318,49 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// both calls, and `I (0) main_task: Calling app_main()` stays the newest
 /// console line.
 ///
-/// **The new stall** is not a ROM call and not a fault: a spin on SPI2.
-/// `spi_bus_initialize()` -> `spi_master_init_driver()` (`spi_master.c:341`)
-/// -> `spi_hal_init()` (`components/hal/spi_hal.c:13-28`, at `0x420f_d64c`
-/// in factory.bin) ends with `spi_ll_apply_config()`
+/// **Task D11's stall** (history): not a ROM call and not a fault, a spin on
+/// SPI2. `spi_bus_initialize()` -> `spi_master_init_driver()`
+/// (`spi_master.c:341`) -> `spi_hal_init()` (`components/hal/spi_hal.c:13-28`,
+/// at `0x420f_d64c` in factory.bin) ends with `spi_ll_apply_config()`
 /// (`components/hal/esp32c3/include/hal/spi_ll.h:264-267`): `hw->cmd.update
 /// = 1; while (hw->cmd.update);`. It sets `SPI_UPDATE` (`SPI_CMD_REG` bit
-/// 23, `soc/spi_reg.h`) on SPI2 (`0x6002_4000`), and the SPI2 model stores
-/// that bit inertly instead of self-clearing it, so from step 584,618 on the
-/// CPU spins forever on the four-instruction poll loop
-/// `0x420f_d6fc..=0x420f_d702`. That is plan Task 9 ("SPI2 register
-/// fidelity -- UPDATE self-clear").
+/// 23, `soc/spi_reg.h`) on SPI2 (`0x6002_4000`), and the SPI2 model stored
+/// that bit inertly, so from step 584,618 on the CPU spun forever on the
+/// four-instruction poll loop `0x420f_d6fc..=0x420f_d702`.
 ///
-/// This test is **deliberately expected to break** once `SPI_UPDATE`
-/// self-clears; whoever makes that fix should re-point it at the next stall.
+/// **What changed in Task 9**: SPI2's `SPI_UPDATE` is a `WT` pulse that
+/// reads back 0 at once, `SPI_USR` clears and `SPI_TRANS_DONE_INT_RAW` sets
+/// when a transaction completes, and `TRANS_DONE` (RAW & ENA) drives
+/// `ETS_SPI2_INTR_SOURCE` (`emulator_core::peripherals::spi`'s module doc).
+/// So `spi_ll_apply_config()`'s poll exits on its first check, and boot
+/// prints a new (emulator-only) line from the SPI clock setup,
+/// `W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz`.
+///
+/// **The new stall** is a ROM call again. On the 602,868th step boot
+/// fetches from `0x4000_0788`, the unstubbed libgcc ROM helper `__bswapsi2`
+/// (`esp32c3.rom.libgcc.ld`), called (RA `0x4039_45fa`) from
+/// `spi_ll_set_command()` (`spi_ll.h:1018-1030`, at `0x4039_45c0`): its
+/// MSB-first branch computes `HAL_SPI_SWAP_DATA_TX(cmd, cmdlen)`, a
+/// `HAL_SWAP32` = `__builtin_bswap32` (`hal/misc.h:15`), which RV32IMC
+/// without Zbb compiles to that libcall. This is the per-transaction setup
+/// (`spi_hal_setup_trans()`) of the first SPI2 transaction: no SPI2
+/// transaction has run yet (`SPI_DMA_INT_RAW` is still 0) and nothing has
+/// been drawn. The panic handler then prints "Guru Meditation Error" and
+/// its reboot faults on the unstubbed ROM `software_reset_cpu`
+/// (`0x4000_0094`), as in earlier stalls.
+///
+/// This test is **deliberately expected to break** once `__bswapsi2` is
+/// stubbed; whoever makes that fix should re-point it at the next stall.
 #[test]
-fn boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear() {
+fn boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
     const OLD_SPIN_PC: u32 = 0x4200_0cd2;
     const SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
+    const ROM_BSWAPSI2: u32 = 0x4000_0788;
+    const SPI_LL_SET_COMMAND_RA: u32 = 0x4039_45fa;
+    const ROM_SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
+    // soc/spi_reg.h: SPI_DMA_INT_RAW_REG (+0x3C).
+    const SPI_DMA_INT_RAW_OFFSET: u32 = 0x3C;
     // gpio_sig_map.h signal numbers and gpio_reg.h field bits.
     const FSPICLK_OUT_IDX: u32 = 63;
     const FSPID_OUT_IDX: u32 = 65;
@@ -374,7 +398,7 @@ fn boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear(
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004, "FROM_CPU_0's routed line");
 
     // Phase 3: main_task runs app_main, which routes SPI2 through the GPIO
-    // matrix via the two ROM stubs and enters spi_hal_init's UPDATE poll
+    // matrix via the two ROM stubs and reaches spi_hal_init's UPDATE poll
     // after step 584,618 -- with no exception on the way (only interrupts).
     let summary = rt.run(584_618 - 528_778);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
@@ -388,36 +412,63 @@ fn boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear(
         "FSPID input from GPIO10, through the matrix"
     );
     assert_eq!(rt.cpu().rom_stub_index_drops(), 0);
-    assert_ne!(
+    assert_eq!(
         rt.bus().spi.read_byte(2) & 0x80,
         0,
-        "SPI_UPDATE (SPI_CMD_REG bit 23) set and never cleared"
+        "SPI_UPDATE (SPI_CMD_REG bit 23) already reads back 0"
     );
 
-    // Phase 4: the spin. Hundreds of thousands of steps later the CPU is
-    // still in the same four-instruction poll, with no exception, no panic,
-    // and no new console line.
-    let console_before = rt.console_output();
-    let summary = rt.run(400_000);
+    // Phase 4: the poll exits at once and boot runs, fault-free, up to the
+    // call into ROM __bswapsi2.
+    let summary = rt.run(602_867 - 584_618);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
-    assert!(SPI_UPDATE_POLL.contains(&rt.pc()), "pc=0x{:08x}", rt.pc());
+    assert_eq!(rt.pc(), ROM_BSWAPSI2);
+    assert_eq!(rt.cpu().regs.read(1), SPI_LL_SET_COMMAND_RA, "ra");
+    assert!(!SPI_UPDATE_POLL.contains(&rt.pc()));
     assert_ne!(rt.pc(), OLD_SPIN_PC);
     let console = rt.console_output();
-    assert_eq!(
-        console, console_before,
-        "no new console output while spinning"
-    );
     assert!(
         console.contains("I (0) main_task: Calling app_main()"),
+        "console:\n{console}"
+    );
+    assert!(
+        console.contains("W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz"),
         "console:\n{console}"
     );
     assert!(
         !console.contains("Guru Meditation Error"),
         "console:\n{console}"
     );
-
-    // Nothing has been drawn: the display is never initialized.
+    // No SPI2 transaction has completed yet, and nothing has been drawn.
+    assert_eq!(rt.bus().spi.read_byte(SPI_DMA_INT_RAW_OFFSET + 1), 0);
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
+
+    // Phase 5: the 602,868th step faults on the unstubbed ROM fetch.
+    let summary = rt.run(1);
+    assert_eq!(
+        summary.last_instruction_fault,
+        Some(ROM_BSWAPSI2),
+        "{summary:?}"
+    );
+    assert_eq!(
+        rt.cpu().csr.mcause,
+        exception_code::INSTRUCTION_ACCESS_FAULT
+    );
+    assert_eq!(rt.cpu().csr.mepc, ROM_BSWAPSI2);
+
+    // Phase 6: the panic handler reports it, then its reboot faults on the
+    // unstubbed ROM software_reset_cpu.
+    let summary = rt.run(900_000);
+    assert_eq!(
+        summary.last_instruction_fault,
+        Some(ROM_SOFTWARE_RESET_CPU),
+        "{summary:?}"
+    );
+    let console = rt.console_output();
+    assert!(
+        console.contains("Guru Meditation Error"),
+        "console:\n{console}"
+    );
 }
 
 /// Task D10, item B: the shortcut boot seeds the ROM's SPI-flash legacy data

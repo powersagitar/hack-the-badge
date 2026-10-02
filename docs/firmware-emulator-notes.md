@@ -988,18 +988,36 @@ predicted these blockers would surface once TIMG unblocks further boot:
    config that leaves `quadwp_io_num`/`quadhd_io_num` at 0 instead of -1,
    but this is an inference from the observed calls, not confirmed.)
 
-   **The current stall is SPI2, not a ROM call.** `spi_bus_initialize()`
-   -> `spi_master_init_driver()` (`spi_master.c:341`) -> `spi_hal_init()`
-   (`components/hal/spi_hal.c:13-28`, `0x420f_d64c` in factory.bin) ends
-   with `spi_ll_apply_config()` (`hal/esp32c3/include/hal/spi_ll.h:264-267`):
-   `hw->cmd.update = 1; while (hw->cmd.update);`. The SPI2 model keeps
-   `SPI_UPDATE` (`SPI_CMD_REG` bit 23, `soc/spi_reg.h`) as inert storage,
-   so from step 584,618 on the CPU spins forever on the poll loop at
-   `0x420f_d6fc..=0x420f_d702` (item 3 below; plan Task 9). There is no
-   exception and no panic, and `I (0) main_task: Calling app_main()` is
-   still the newest console line. Nothing is drawn. Pinned in
-   `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_spins_in_spi_hal_init_on_the_unmodeled_spi2_update_self_clear`.
+   **Task D11's stall** (history) was SPI2, not a ROM call.
+   `spi_bus_initialize()` -> `spi_master_init_driver()` (`spi_master.c:341`)
+   -> `spi_hal_init()` (`components/hal/spi_hal.c:13-28`, `0x420f_d64c` in
+   factory.bin) ends with `spi_ll_apply_config()`
+   (`hal/esp32c3/include/hal/spi_ll.h:264-267`): `hw->cmd.update = 1;
+   while (hw->cmd.update);`. The SPI2 model kept `SPI_UPDATE` (`SPI_CMD_REG`
+   bit 23, `soc/spi_reg.h`) as inert storage, so from step 584,618 on the
+   CPU spun forever on the poll loop at `0x420f_d6fc..=0x420f_d702`.
+
+   **Task 9 (SPI2 register fidelity).** `SPI_UPDATE` now reads back 0 at
+   once, and transaction completion is signalled the way `spi_ll.h` reads
+   it (item 3). The poll exits on its first check, and boot prints
+   `W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz` from the
+   SPI clock setup. That line is an emulator artifact (the real badge's
+   log has no such line: the RTC store register holding the XTAL frequency
+   is unmodeled); the fallback, 40 MHz, matches the real badge.
+
+   **The current stall is a ROM call again.** On the 602,868th step boot
+   fetches from `0x4000_0788`, the unstubbed libgcc ROM helper
+   `__bswapsi2` (`esp32c3.rom.libgcc.ld`), called (RA `0x4039_45fa`) from
+   `spi_ll_set_command()` (`spi_ll.h:1018-1030`, `0x4039_45c0` in
+   factory.bin, disassembled). Its MSB-first branch writes
+   `HAL_SPI_SWAP_DATA_TX(cmd, cmdlen)` to `SPI_USER2_REG`'s command value;
+   that macro is `HAL_SWAP32` = `__builtin_bswap32` (`hal/misc.h:15`), a
+   libcall on RV32IMC without Zbb. This is `spi_hal_setup_trans()` for the
+   first SPI2 transaction: no transaction has run yet and nothing is drawn.
+   The panic handler then prints "Guru Meditation Error", and its reboot
+   faults on the unstubbed ROM `software_reset_cpu` (`0x4000_0094`). Pinned
+   in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command`.
    The FreeRTOS tick (item 2) and `wfi` (item 4) have not been needed yet,
    but the idle task will need them.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
@@ -1018,15 +1036,19 @@ predicted these blockers would surface once TIMG unblocks further boot:
    `xPortStartScheduler()` sets the interrupt threshold (step ~528,500),
    writes to `SYSTIMER_UNIT1_LOAD_HI_REG`/`_LO_REG`/`SYSTIMER_UNIT1_LOAD_REG`
    (`+0x14`/`+0x18`/`+0x60`, `soc/systimer_reg.h`) went to the unmapped log.
-3. **SPI2 can't be driven by ESP-IDF's `spi_master` driver as-is.** Real
-   `spi_ll_apply_config` sets `SPI_CMD_REG`'s `UPDATE` bit and spins on it
-   clearing — `emulator-core/src/peripherals/spi.rs` currently stores it as
-   plain read/write storage with no self-clear, so the first real SPI
-   configuration would spin forever. Real completion detection also uses a
-   different flag (`dma_int_raw.trans_done`) than what's modeled, and pixel
-   transfers over 64 bytes use GDMA, which is entirely unmodeled.
-   **Boot now reaches this** (Task D11): `spi_hal_init()`'s
-   `spi_ll_apply_config()` spin is the current stall (item 1).
+3. **SPI2 has no DMA transmit path yet.** Task 9 made SPI2's registers
+   match what `spi_ll.h` expects (`emulator-core/src/peripherals/spi.rs`'s
+   module doc): `SPI_UPDATE` (`WT`) reads back 0 at once
+   (`spi_ll_apply_config`); `SPI_USR` (`R/W/SC`) clears and
+   `SPI_TRANS_DONE_INT_RAW` (`SPI_DMA_INT_RAW_REG` bit 12) sets when a
+   transaction completes, which is what `spi_ll_usr_is_done` reads;
+   `SPI_DMA_INT_ENA`/`_CLR`/`_ST` behave per their access types, and
+   `TRANS_DONE` RAW & ENA drives `ETS_SPI2_INTR_SOURCE` (19) as a level.
+   `SPI_DMA_CONF_REG`'s `SPI_DMA_TX_ENA` (`spi_ll_dma_tx_enable`) is stored
+   and exposed, but nothing consumes it yet: every transaction still sends
+   the `SPI_W0..W15` buffer (at most 64 bytes), so a DMA transaction would
+   currently feed the ST7789 model whatever the `W` registers hold. Pixel
+   transfers over 64 bytes use GDMA, which is unmodeled (plan Task 10).
 4. **WFI decodes as `Illegal`** rather than as a real wait-for-interrupt —
    the FreeRTOS idle task's `wfi` would trap once boot reaches it.
 5. Two flagged guesses worth re-examining once boot progresses further:
@@ -1076,16 +1098,17 @@ predicted these blockers would surface once TIMG unblocks further boot:
    once, the CPU core takes the *lowest-numbered* line, not the
    highest-priority one. `CPU_INT_TYPE_REG` (edge vs. level) and
    `CPU_INT_CLEAR_REG` are plain storage: every source wired so far
-   (SYSTIMER target0, SYSTEM FROM_CPU) is level-type, and the SYSTIMER's
-   own latched `INT_RAW` stands in for its edge behavior. Neither has
+   (SYSTIMER target0, SYSTEM FROM_CPU, SPI2 TRANS_DONE) is level-type,
+   and the SYSTIMER's own latched `INT_RAW` stands in for its edge behavior. Neither has
    mattered in the observed boot. `FirmwareBus::pending_sources()` only
-   includes SYSTIMER target0 and SYSTEM FROM_CPU0..3 so far.
+   includes SYSTIMER target0, SYSTEM FROM_CPU0..3 and SPI2 (Task 9) so far.
 
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
 fixed it. Items 2 to 7 and 9 are not correctness bugs *today* — they're dormant
 because boot doesn't reach the code paths that would exercise them (item 2
-is about to be reached; see item 1's current stall). They're
+is about to be reached, and item 3 with the first SPI2 transaction; see
+item 1's current stall). They're
 recorded here so Milestone 3 starts from a known list instead of
 rediscovering each one by stepping through a debugger again.
 

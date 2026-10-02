@@ -202,3 +202,73 @@ fn gpio_dc_to_spi_trigger_to_st7789_to_framebuffer_end_to_end() {
     assert_eq!(fb[SCREEN_WIDTH], 0x001F, "(0,1) blue");
     assert_eq!(fb[SCREEN_WIDTH + 1], 0xFFFF, "(1,1) white");
 }
+
+// ---- Task 9: SPI2 register fidelity through FirmwareBus ----
+
+const SPI_DMA_INT_ENA_REG: u32 = SPI_BASE + 0x34;
+const SPI_DMA_INT_CLR_REG: u32 = SPI_BASE + 0x38;
+const SPI_DMA_INT_RAW_REG: u32 = SPI_BASE + 0x3C;
+const SPI_DMA_INT_ST_REG: u32 = SPI_BASE + 0x40;
+const SPI_UPDATE_BIT: u32 = 1 << 23;
+const SPI_TRANS_DONE: u32 = 1 << 12;
+const INTC_BASE: u32 = 0x600C_2000;
+const SPI2_LINE: u32 = 7;
+
+/// `spi_ll_apply_config` then `spi_ll_user_start` + `spi_ll_usr_is_done`,
+/// as whole-word `write32`s (four ascending byte writes each): `UPDATE`
+/// reads back 0, the transaction runs exactly once, `TRANS_DONE` raw is
+/// set, and -- with the source routed and enabled -- SPI2 asserts its
+/// interrupt line until `SPI_DMA_INT_CLR_REG` clears it.
+#[test]
+fn spi2_update_self_clears_and_trans_done_drives_the_spi2_interrupt_source() {
+    use emulator_core::mem::soc::SRC_SPI2;
+    use emulator_core::mem::Bus;
+
+    let mut bus = build_bus(&build_program());
+
+    // Route ETS_SPI2_INTR_SOURCE (19, MAP reg 0x4C) to SPI2_LINE, enable it
+    // at priority 1 (threshold defaults to 0).
+    bus.write32(INTC_BASE + 4 * SRC_SPI2, SPI2_LINE);
+    bus.write32(INTC_BASE + 0x104, 1 << SPI2_LINE);
+    bus.write32(INTC_BASE + 0x114 + 4 * SPI2_LINE, 1);
+
+    bus.write32(SPI_CMD_REG, SPI_UPDATE_BIT);
+    assert_eq!(
+        bus.read32(SPI_CMD_REG),
+        0,
+        "spi_ll_apply_config's poll must exit"
+    );
+
+    bus.write32(SPI_DMA_INT_ENA_REG, SPI_TRANS_DONE);
+    // CASET as a 1-byte command transaction (D/C = GPIO0, low by default).
+    bus.write32(SPI_W0_REG, CMD_CASET as u32);
+    bus.write32(SPI_MS_DLEN_REG, 7);
+    assert_eq!(bus.pending_sources() & (1u64 << SRC_SPI2), 0);
+    bus.write32(SPI_CMD_REG, SPI_UPDATE_BIT | SPI_USR_BIT);
+
+    assert_eq!(
+        bus.read32(SPI_CMD_REG),
+        0,
+        "USR cleared on completion, UPDATE never sticks"
+    );
+    assert_eq!(bus.read32(SPI_DMA_INT_RAW_REG), SPI_TRANS_DONE);
+    assert_eq!(bus.read32(SPI_DMA_INT_ST_REG), SPI_TRANS_DONE);
+    assert_eq!(bus.pending_sources(), 1u64 << SRC_SPI2);
+    assert_eq!(bus.asserted_lines(), 1 << SPI2_LINE);
+
+    // One command byte reached the ST7789 exactly once: a following data
+    // transaction is parsed as CASET parameters.
+    bus.write32(GPIO_ENABLE_REG, DC_BIT);
+    bus.write32(GPIO_OUT_REG, DC_BIT);
+    bus.write32(SPI_W0_REG, 0x0700_0300); // xs=3, xe=7 (big-endian pairs)
+    bus.write32(SPI_MS_DLEN_REG, 31);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    assert_eq!(bus.spi.st7789.window().0, 3);
+    assert_eq!(bus.spi.st7789.window().1, 7);
+
+    // ISR: clear TRANS_DONE -> the level drops.
+    bus.write32(SPI_DMA_INT_CLR_REG, SPI_TRANS_DONE);
+    assert_eq!(bus.read32(SPI_DMA_INT_RAW_REG), 0);
+    assert_eq!(bus.pending_sources(), 0);
+    assert_eq!(bus.asserted_lines(), 0);
+}
