@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod cpu;
+pub mod md5;
 pub mod mem;
 pub mod peripherals;
 pub mod rom;

@@ -192,11 +192,11 @@ pub const PARTITIONS: [PartitionEntry; 4] = [
 ];
 
 /// MD5 digest of the 128 bytes the four [`PARTITIONS`] entries serialize
-/// to. A constant rather than computed at run time, since this crate has no
-/// runtime MD5 implementation: it was computed with Python's `hashlib.md5`
-/// over [`EmulatedFlash::from_app_image`]'s own serialized entries. A unit
-/// test recomputes it from [`PARTITIONS`] with a test-only MD5, so editing a
-/// partition without updating it fails; it is also checked against the real
+/// to. A constant rather than computed at run time (it was computed with
+/// Python's `hashlib.md5` over [`EmulatedFlash::from_app_image`]'s own
+/// serialized entries). A unit test recomputes it from [`PARTITIONS`] with
+/// the crate's shared MD5 ([`crate::md5`]), so editing a partition without
+/// updating it fails; it is also checked against the real
 /// chip's table by `tests/flash_partition_table.rs` (gated on
 /// `BADGE_FULL_DUMP`). The firmware also re-verifies it itself
 /// when it loads the table.
@@ -585,79 +585,6 @@ mod tests {
         }
     }
 
-    /// `ESP_PARTITION_MAGIC_MD5` (`0xEBEB`) entry right after the last
-    /// partition: magic, 14 bytes of `0xFF`, then the 16-byte MD5 at
-    /// `ESP_PARTITION_MD5_OFFSET` (16), then blank (`0xFF`) to the end of
-    /// `ESP_PARTITION_TABLE_MAX_LEN` (0xC00).
-    /// A small test-only MD5 (RFC 1321), so the committed
-    /// [`PARTITION_TABLE_MD5`] constant can be recomputed from the committed
-    /// [`PARTITIONS`] without a new dependency. Not used outside tests.
-    fn md5(msg: &[u8]) -> [u8; 16] {
-        // Per-round shift amounts and K[i] = floor(|sin(i + 1)| * 2^32).
-        const S: [u32; 64] = [
-            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
-            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-        ];
-        let k: Vec<u32> = (0..64)
-            .map(|i| ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32)
-            .collect();
-
-        let mut data = msg.to_vec();
-        data.push(0x80);
-        while data.len() % 64 != 56 {
-            data.push(0);
-        }
-        data.extend_from_slice(&((msg.len() as u64) * 8).to_le_bytes());
-
-        let mut h: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
-        for chunk in data.chunks(64) {
-            let m: Vec<u32> = chunk
-                .chunks(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect();
-            let [mut a, mut b, mut c, mut d] = h;
-            for i in 0..64 {
-                let (f, g) = match i / 16 {
-                    0 => ((b & c) | (!b & d), i),
-                    1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                    2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                    _ => (c ^ (b | !d), (7 * i) % 16),
-                };
-                let rotated = a
-                    .wrapping_add(f)
-                    .wrapping_add(k[i])
-                    .wrapping_add(m[g])
-                    .rotate_left(S[i]);
-                a = d;
-                d = c;
-                c = b;
-                b = b.wrapping_add(rotated);
-            }
-            for (hi, v) in h.iter_mut().zip([a, b, c, d]) {
-                *hi = hi.wrapping_add(v);
-            }
-        }
-        let mut out = [0u8; 16];
-        for (i, word) in h.iter().enumerate() {
-            out[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        out
-    }
-
-    #[test]
-    fn test_md5_matches_rfc_1321_vectors() {
-        let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        assert_eq!(hex(md5(b"")), "d41d8cd98f00b204e9800998ecf8427e");
-        assert_eq!(hex(md5(b"abc")), "900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(
-            hex(md5(
-                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
-            )),
-            "57edf4a22be3c955ac49da2e2107b67a"
-        );
-    }
-
     /// Guards [`PARTITION_TABLE_MD5`] against going stale: it must equal the
     /// MD5 of the bytes the [`PARTITIONS`] entries serialize to (what
     /// ESP-IDF's `esp_partition` checks when `CONFIG_PARTITION_TABLE_MD5` is
@@ -669,9 +596,13 @@ mod tests {
         let entries: Vec<u8> = (0..PARTITIONS.len() as u32 * 32)
             .map(|k| f.read(PARTITION_TABLE_OFFSET + k))
             .collect();
-        assert_eq!(md5(&entries), PARTITION_TABLE_MD5);
+        assert_eq!(crate::md5::md5(&entries), PARTITION_TABLE_MD5);
     }
 
+    /// `ESP_PARTITION_MAGIC_MD5` (`0xEBEB`) entry right after the last
+    /// partition: magic, 14 bytes of `0xFF`, then the 16-byte MD5 at
+    /// `ESP_PARTITION_MD5_OFFSET` (16), then blank (`0xFF`) to the end of
+    /// `ESP_PARTITION_TABLE_MAX_LEN` (0xC00).
     #[test]
     fn partition_table_ends_with_the_md5_entry_then_blank() {
         let f = EmulatedFlash::from_app_image(&[]);

@@ -1265,8 +1265,9 @@ to any file. `emulator-core/tests/flash_partition_table.rs` checks the
 synthesized table byte-for-byte against the real chip's, but only when
 `BADGE_FULL_DUMP` points at the local dump; without it the test skips.
 A committed unit test (Task D10) also recomputes the MD5 constant from the
-committed entries with a small test-only MD5, so editing a partition
-without updating the digest fails.
+committed entries, so editing a partition without updating the digest
+fails. It uses `emulator-core/src/md5.rs`, the crate's one MD5 (it was a
+test-only copy inside `flash.rs` before).
 
 The firmware learns the chip's size and ID not from the chip but from the
 ROM's SPI-flash legacy data (`g_rom_flashchip`), which the shortcut boot
