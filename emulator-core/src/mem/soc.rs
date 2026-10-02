@@ -204,6 +204,12 @@ pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_9000;
 /// commands through; see `crate::peripherals::flash::Spimem1`.
 pub const SPIMEM1_RANGE: Range<u32> = 0x6000_2000..0x6000_3000;
 
+/// GDMA registers (`DR_REG_GDMA_BASE = 0x6003_F000`, confirmed via ESP-IDF
+/// v5.5.3's `components/soc/esp32c3/register/soc/reg_base.h`). One 4 KiB
+/// page: `gdma_reg.h`'s highest register, `GDMA_OUT_PERI_SEL_CH2_REG`, is
+/// at `+0x280`. See `crate::peripherals::gdma`.
+pub const GDMA_RANGE: Range<u32> = 0x6003_F000..0x6004_0000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +331,28 @@ mod tests {
         assert!(!RTC_RANGE.contains(&RTC_CNTL_RANGE.start));
         assert!(!RTC_CNTL_RANGE.contains(&RTC_RANGE.start));
         assert!(!is_xip_addr(RTC_CNTL_RANGE.start));
+    }
+
+    #[test]
+    fn gdma_range_is_disjoint_from_every_other_peripheral_range_and_xip_iram() {
+        assert!(GDMA_RANGE.contains(&0x6003_F000));
+        assert!(GDMA_RANGE.contains(&(0x6003_F000 + 0x280))); // OUT_PERI_SEL_CH2
+        assert!(!GDMA_RANGE.contains(&0x6004_0000)); // exclusive end
+        for other in [
+            SYSTIMER_RANGE,
+            INTERRUPT_CORE0_RANGE,
+            SYSTEM_RANGE,
+            GPIO_RANGE,
+            SPI2_RANGE,
+            USB_SERIAL_JTAG_RANGE,
+            TIMG0_RANGE,
+            TIMG1_RANGE,
+            RTC_CNTL_RANGE,
+            SPIMEM1_RANGE,
+        ] {
+            assert!(!GDMA_RANGE.contains(&other.start));
+            assert!(!other.contains(&GDMA_RANGE.start));
+        }
+        assert!(!is_xip_addr(GDMA_RANGE.start));
     }
 }

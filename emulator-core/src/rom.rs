@@ -858,6 +858,11 @@
 //! `tests/rom_stub_boot.rs`'s
 //! `boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init`.
 //!
+//! **As of Task 10** (GDMA, no stub changes): still 95 stubs, and the same
+//! `MD5Init` fault on the same step. The frames LVGL flushes now reach the
+//! ST7789 model through GDMA, so the framebuffer holds the boot splash by
+//! then.
+//!
 //! **As of Task D12** (history): 95 stubs (Task 9's 94 plus `__bswapsi2`, entry 23),
 //! and `RTC_XTAL_FREQ_REG` is seeded as the skipped bootloader leaves it
 //! (entry 23), so no "invalid RTC_XTAL_FREQ_REG" warning prints and the

@@ -272,3 +272,328 @@ fn spi2_update_self_clears_and_trans_done_drives_the_spi2_interrupt_source() {
     assert_eq!(bus.pending_sources(), 0);
     assert_eq!(bus.asserted_lines(), 0);
 }
+
+// ---- Task 10: GDMA out-link feeding SPI2 DMA transmit ----
+//
+// Register offsets from ESP-IDF v5.5.3
+// `components/soc/esp32c3/register/soc/gdma_reg.h` (DR_REG_GDMA_BASE =
+// 0x6003_F000, `soc/reg_base.h`); descriptor layout from
+// `components/hal/include/hal/dma_types.h`; the chunking of a transmit
+// buffer into descriptors from `esp_driver_spi/src/gpspi/spi_common.c`'s
+// `spicommon_dma_desc_setup_link` (4092-byte chunks, the last one carries
+// `suc_eof` and a NULL `next`); the per-transaction register sequence from
+// `spi_master.c`'s `s_spi_dma_prepare_data` + `spi_new_trans`.
+
+const GDMA_BASE: u32 = 0x6003_F000;
+const GDMA_CH_STRIDE: u32 = 0xC0;
+const GDMA_INT_RAW_CH0: u32 = GDMA_BASE;
+const GDMA_INT_ENA_CH0: u32 = GDMA_BASE + 0x08;
+const GDMA_OUT_CONF0_CH0: u32 = GDMA_BASE + 0xD0;
+const GDMA_OUT_LINK_CH0: u32 = GDMA_BASE + 0xE0;
+const GDMA_OUT_EOF_DES_ADDR_CH0: u32 = GDMA_BASE + 0xE8;
+const GDMA_OUT_EOF_BFR_DES_ADDR_CH0: u32 = GDMA_BASE + 0xEC;
+const GDMA_OUT_PERI_SEL_CH0: u32 = GDMA_BASE + 0x100;
+const GDMA_OUT_RST: u32 = 1 << 0;
+const GDMA_OUT_AUTO_WRBACK: u32 = 1 << 2;
+const GDMA_OUTLINK_ADDR_MASK: u32 = 0x000F_FFFF;
+const GDMA_OUTLINK_START: u32 = 1 << 21;
+const GDMA_OUT_DONE: u32 = 1 << 3;
+const GDMA_OUT_EOF: u32 = 1 << 4;
+const GDMA_OUT_TOTAL_EOF: u32 = 1 << 8;
+const SPI_DMA_CONF_REG: u32 = SPI_BASE + 0x30;
+const SPI_DMA_TX_ENA: u32 = 1 << 28;
+const DESC_OWNER_DMA: u32 = 1 << 31;
+const DESC_SUC_EOF: u32 = 1 << 30;
+
+/// DRAM scratch for descriptors and buffers (inside `SOC_DRAM_LOW..HIGH`).
+const DRAM_SCRATCH: u32 = 0x3FC9_0000;
+const DESC_AREA: u32 = DRAM_SCRATCH;
+const BUF_AREA: u32 = DRAM_SCRATCH + 0x1000;
+
+fn put_desc(bus: &mut FirmwareBus, at: u32, buf: u32, len: u32, eof: bool, next: u32) {
+    use emulator_core::mem::Bus;
+    let w0 =
+        (len & 0xFFF) | ((len & 0xFFF) << 12) | if eof { DESC_SUC_EOF } else { 0 } | DESC_OWNER_DMA;
+    bus.write32(at, w0);
+    bus.write32(at + 4, buf);
+    bus.write32(at + 8, next);
+}
+
+/// `spicommon_dma_desc_setup_link` for a transmit buffer at `buf` of
+/// `len` bytes, chunked at `chunk` bytes; returns the descriptor addresses.
+fn setup_link(bus: &mut FirmwareBus, buf: u32, len: u32, chunk: u32) -> Vec<u32> {
+    let n = len.div_ceil(chunk);
+    let descs: Vec<u32> = (0..n).map(|i| DESC_AREA + 12 * i).collect();
+    for (i, &d) in descs.iter().enumerate() {
+        let start = i as u32 * chunk;
+        let this = chunk.min(len - start);
+        let last = i + 1 == descs.len();
+        let next = if last { 0 } else { descs[i + 1] };
+        put_desc(bus, d, buf + start, this, last, next);
+    }
+    descs
+}
+
+fn bus_with_dram() -> FirmwareBus {
+    let mut bus = build_bus(&build_program());
+    bus.add_scratch_ram(DRAM_SCRATCH, 0x10000);
+    bus
+}
+
+/// The one-time `gdma_connect` of TX channel `ch` to SPI2 (peripheral id 0,
+/// `soc/gdma_channel.h`), via `gdma_ll_tx_connect_to_periph`.
+fn connect_spi2(bus: &mut FirmwareBus, ch: u32) {
+    use emulator_core::mem::Bus;
+    bus.write32(GDMA_OUT_PERI_SEL_CH0 + ch * GDMA_CH_STRIDE, 0);
+}
+
+/// One SPI2 DMA transmit, in `spi_new_trans`'s order: descriptors, GDMA
+/// reset + SPI DMA prepare + `gdma_start` (set address, then START as a
+/// separate read-modify-write), MS_DLEN, D/C on GPIO0, then `SPI_USR`.
+/// Every register write is a whole-word `write32` (4 ascending bytes).
+fn dma_transaction(
+    bus: &mut FirmwareBus,
+    ch: u32,
+    dc_high: bool,
+    payload: &[u8],
+    chunk: u32,
+) -> Vec<u32> {
+    use emulator_core::mem::Bus;
+    for (i, &b) in payload.iter().enumerate() {
+        bus.write8(BUF_AREA + i as u32, b);
+    }
+    let descs = setup_link(bus, BUF_AREA, payload.len() as u32, chunk);
+    let conf0 = GDMA_OUT_CONF0_CH0 + ch * GDMA_CH_STRIDE;
+    let link = GDMA_OUT_LINK_CH0 + ch * GDMA_CH_STRIDE;
+    // gdma_ll_tx_reset_channel
+    let c = bus.read32(conf0);
+    bus.write32(conf0, c | GDMA_OUT_RST);
+    bus.write32(conf0, c & !GDMA_OUT_RST);
+    // spi_hal_hw_prepare_tx -> spi_ll_dma_tx_enable
+    let d = bus.read32(SPI_DMA_CONF_REG);
+    bus.write32(SPI_DMA_CONF_REG, d | SPI_DMA_TX_ENA);
+    // gdma_ll_tx_set_desc_addr, gdma_ll_tx_start
+    let l = bus.read32(link);
+    bus.write32(
+        link,
+        (l & !GDMA_OUTLINK_ADDR_MASK) | (descs[0] & GDMA_OUTLINK_ADDR_MASK),
+    );
+    let l = bus.read32(link);
+    bus.write32(link, l | GDMA_OUTLINK_START);
+    bus.write32(SPI_MS_DLEN_REG, payload.len() as u32 * 8 - 1);
+    bus.write32(GPIO_ENABLE_REG, DC_BIT);
+    bus.write32(GPIO_OUT_REG, if dc_high { DC_BIT } else { 0 });
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    descs
+}
+
+fn set_window(bus: &mut FirmwareBus, ch: u32, xs: u16, xe: u16, ys: u16, ye: u16) {
+    dma_transaction(bus, ch, false, &[CMD_CASET], 4092);
+    let [a, b] = xs.to_be_bytes();
+    let [c, d] = xe.to_be_bytes();
+    dma_transaction(bus, ch, true, &[a, b, c, d], 4092);
+    dma_transaction(bus, ch, false, &[CMD_RASET], 4092);
+    let [a, b] = ys.to_be_bytes();
+    let [c, d] = ye.to_be_bytes();
+    dma_transaction(bus, ch, true, &[a, b, c, d], 4092);
+    dma_transaction(bus, ch, false, &[CMD_RAMWR], 4092);
+}
+
+fn pixel_payload(n: usize, seed: u16) -> (Vec<u16>, Vec<u8>) {
+    let px: Vec<u16> = (0..n as u16)
+        .map(|i| i.wrapping_mul(31).wrapping_add(seed))
+        .collect();
+    let bytes = px.iter().flat_map(|p| p.to_be_bytes()).collect();
+    (px, bytes)
+}
+
+/// The plan's 200-byte test: a 2-descriptor chain (more than the 64-byte W
+/// buffer holds), ch0 -> SPI2, auto-writeback on.
+#[test]
+fn gdma_two_descriptor_chain_feeds_a_200_byte_ramwr_through_spi2() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    let c = bus.read32(GDMA_OUT_CONF0_CH0);
+    bus.write32(GDMA_OUT_CONF0_CH0, c | GDMA_OUT_AUTO_WRBACK);
+    set_window(&mut bus, 0, 0, 9, 0, 9);
+
+    let (px, bytes) = pixel_payload(100, 0x1234);
+    // 120 + 80 bytes: two descriptors.
+    let descs = dma_transaction(&mut bus, 0, true, &bytes, 120);
+    assert_eq!(descs.len(), 2);
+
+    let fb = bus.spi.framebuffer();
+    for (i, &p) in px.iter().enumerate() {
+        let (x, y) = (i % 10, i / 10);
+        assert_eq!(fb[y * SCREEN_WIDTH + x], p, "pixel {i} at ({x},{y})");
+    }
+    for &d in &descs {
+        assert_eq!(bus.read32(d) & DESC_OWNER_DMA, 0, "owner cleared at {d:#x}");
+    }
+    let raw = bus.read32(GDMA_INT_RAW_CH0);
+    assert_ne!(raw & GDMA_OUT_EOF, 0);
+    assert_ne!(raw & GDMA_OUT_DONE, 0);
+    assert_ne!(raw & GDMA_OUT_TOTAL_EOF, 0);
+    assert_eq!(bus.read32(GDMA_OUT_EOF_DES_ADDR_CH0), descs[1]);
+    assert_eq!(bus.read32(GDMA_OUT_EOF_BFR_DES_ADDR_CH0), descs[0]);
+    assert_eq!(
+        bus.read32(SPI_DMA_INT_RAW_REG) & SPI_TRANS_DONE,
+        SPI_TRANS_DONE
+    );
+    assert_eq!(bus.read32(SPI_CMD_REG) & SPI_USR_BIT, 0);
+    // GDMA's interrupt is not enabled by the SPI driver: no DMA source.
+    assert_eq!(bus.pending_sources(), 0);
+}
+
+/// Addendum point 1: the firmware's real transfers are 12,800 bytes (20
+/// panel lines), more than one descriptor's 4095-byte maximum, so the chain
+/// has 4 descriptors (3 x 4092 + 524). Channel 1, to prove the channel
+/// comes from OUT_PERI_SEL, not a hardcoded 0.
+#[test]
+fn gdma_chain_longer_than_one_descriptor_streams_a_12800_byte_frame_slice() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 1);
+    set_window(&mut bus, 1, 0, 319, 40, 59);
+
+    let (px, bytes) = pixel_payload(320 * 20, 7);
+    assert_eq!(bytes.len(), 12_800);
+    let descs = dma_transaction(&mut bus, 1, true, &bytes, 4092);
+    assert_eq!(descs.len(), 4);
+
+    let fb = bus.spi.framebuffer();
+    for (i, &p) in px.iter().enumerate() {
+        let (x, y) = (i % 320, 40 + i / 320);
+        assert_eq!(fb[y * SCREEN_WIDTH + x], p, "pixel {i} at ({x},{y})");
+    }
+    assert_eq!(
+        fb[39 * SCREEN_WIDTH + 319],
+        0,
+        "row above the window untouched"
+    );
+    assert_eq!(fb[60 * SCREEN_WIDTH], 0, "row below the window untouched");
+    let raw1 = bus.read32(GDMA_INT_RAW_CH0 + 0x10);
+    assert_ne!(raw1 & GDMA_OUT_TOTAL_EOF, 0);
+    assert_eq!(bus.read32(GDMA_INT_RAW_CH0), 0, "channel 0 untouched");
+    assert_eq!(
+        bus.read32(GDMA_OUT_EOF_DES_ADDR_CH0 + GDMA_CH_STRIDE),
+        descs[3]
+    );
+    // OUT_AUTO_WRBACK is off (the SPI driver never applies a GDMA
+    // strategy), so the owner bits stay as software left them.
+    for &d in &descs {
+        assert_ne!(bus.read32(d) & DESC_OWNER_DMA, 0);
+    }
+}
+
+/// Raising GDMA OUT_TOTAL_EOF with its enable set asserts
+/// `ETS_DMA_CH0_INTR_SOURCE` (44) as a level.
+#[test]
+fn gdma_out_total_eof_with_enable_asserts_the_dma_ch0_source() {
+    use emulator_core::mem::soc::SRC_DMA_CH0;
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    bus.write32(GDMA_INT_ENA_CH0, GDMA_OUT_TOTAL_EOF);
+    dma_transaction(&mut bus, 0, false, &[0x00], 4092);
+    assert_eq!(bus.pending_sources(), 1u64 << SRC_DMA_CH0);
+    bus.write32(GDMA_BASE + 0x0C, GDMA_OUT_TOTAL_EOF); // INT_CLR_CH0
+    assert_eq!(bus.pending_sources(), 0);
+}
+
+/// With `SPI_DMA_TX_ENA` clear the W0..W15 path still runs, even with a
+/// started GDMA channel connected to SPI2.
+#[test]
+fn spi2_without_dma_tx_ena_keeps_the_w_buffer_path() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    put_desc(&mut bus, DESC_AREA, BUF_AREA, 1, true, 0);
+    bus.write8(BUF_AREA, CMD_RASET);
+    bus.write32(
+        GDMA_OUT_LINK_CH0,
+        GDMA_OUTLINK_START | (DESC_AREA & GDMA_OUTLINK_ADDR_MASK),
+    );
+    bus.write32(SPI_W0_REG, CMD_CASET as u32);
+    bus.write32(SPI_MS_DLEN_REG, 7);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT); // D/C low: command CASET
+    bus.write32(GPIO_ENABLE_REG, DC_BIT);
+    bus.write32(GPIO_OUT_REG, DC_BIT);
+    bus.write32(SPI_W0_REG, 0x0500_0200); // xs=2, xe=5
+    bus.write32(SPI_MS_DLEN_REG, 31);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    assert_eq!(bus.spi.st7789.window().0, 2);
+    assert_eq!(bus.spi.st7789.window().1, 5);
+    assert_eq!(bus.read32(GDMA_INT_RAW_CH0), 0, "GDMA never pulled");
+}
+
+/// An SPI transaction shorter than the link stops mid-descriptor; the next
+/// transaction (no GDMA restart) continues from that byte, and only then is
+/// the descriptor done.
+#[test]
+fn gdma_resumes_mid_descriptor_across_spi_transactions() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    set_window(&mut bus, 0, 0, 3, 0, 0);
+    let (px, bytes) = pixel_payload(4, 0x0101);
+    for (i, &b) in bytes.iter().enumerate() {
+        bus.write8(BUF_AREA + 0x100 + i as u32, b);
+    }
+    put_desc(&mut bus, DESC_AREA + 0x40, BUF_AREA + 0x100, 8, true, 0);
+    bus.write32(GDMA_OUT_CONF0_CH0, GDMA_OUT_RST);
+    bus.write32(GDMA_OUT_CONF0_CH0, 0);
+    bus.write32(GDMA_INT_RAW_CH0, 0xFFFF_FFFF); // WTC: clear everything
+    bus.write32(
+        GDMA_OUT_LINK_CH0,
+        GDMA_OUTLINK_START | ((DESC_AREA + 0x40) & GDMA_OUTLINK_ADDR_MASK),
+    );
+    bus.write32(GPIO_OUT_REG, DC_BIT);
+    bus.write32(SPI_MS_DLEN_REG, 5 * 8 - 1); // 5 of the 8 bytes
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    let fb = bus.spi.framebuffer();
+    assert_eq!(&fb[..2], &px[..2]);
+    assert_eq!(fb[2], 0, "third pixel only half sent");
+    assert_eq!(bus.read32(GDMA_INT_RAW_CH0), 0, "descriptor not done yet");
+
+    bus.write32(SPI_MS_DLEN_REG, 3 * 8 - 1); // the remaining 3
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    assert_eq!(&bus.spi.framebuffer()[..4], &px[..]);
+    let raw = bus.read32(GDMA_INT_RAW_CH0);
+    assert_eq!(raw, GDMA_OUT_DONE | GDMA_OUT_EOF | GDMA_OUT_TOTAL_EOF);
+    assert_ne!(
+        bus.read32(GDMA_OUT_LINK_CH0) & (1 << 23),
+        0,
+        "parked at end of link"
+    );
+}
+
+/// With `OUT_CHECK_OWNER` set, a CPU-owned descriptor is an
+/// `OUT_DSCR_ERR` and sends nothing; the SPI transaction still completes.
+#[test]
+fn gdma_owner_check_rejects_a_cpu_owned_descriptor() {
+    use emulator_core::mem::Bus;
+    const GDMA_OUT_CONF1_CH0: u32 = GDMA_BASE + 0xD4;
+    const GDMA_OUT_CHECK_OWNER: u32 = 1 << 12;
+    const GDMA_OUT_DSCR_ERR: u32 = 1 << 6;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    bus.write32(GDMA_OUT_CONF1_CH0, GDMA_OUT_CHECK_OWNER);
+    put_desc(&mut bus, DESC_AREA, BUF_AREA, 1, true, 0);
+    let w0 = bus.read32(DESC_AREA);
+    bus.write32(DESC_AREA, w0 & !DESC_OWNER_DMA);
+    bus.write8(BUF_AREA, CMD_CASET);
+    bus.write32(SPI_DMA_CONF_REG, SPI_DMA_TX_ENA);
+    bus.write32(
+        GDMA_OUT_LINK_CH0,
+        GDMA_OUTLINK_START | (DESC_AREA & GDMA_OUTLINK_ADDR_MASK),
+    );
+    bus.write32(SPI_MS_DLEN_REG, 7);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    assert_eq!(bus.read32(GDMA_INT_RAW_CH0), GDMA_OUT_DSCR_ERR);
+    assert_eq!(
+        bus.read32(SPI_DMA_INT_RAW_REG) & SPI_TRANS_DONE,
+        SPI_TRANS_DONE
+    );
+}

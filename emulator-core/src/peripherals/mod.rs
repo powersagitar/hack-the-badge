@@ -34,6 +34,12 @@
 //!   framebuffer from what real firmware writes to drive the badge's LCD.
 //!   Needs a live cross-peripheral read of `gpio`'s GPIO0 level (the D/C
 //!   line) at transaction-trigger time — see `spi`'s module doc.
+//! - [`gdma`]: [`gdma::Gdma`], the GDMA controller's three channels
+//!   (Milestone 3 Task 10): interrupt registers driving
+//!   `SRC_DMA_CH0..2`, the TX out-link FSM, and plain-storage RX
+//!   registers. With `SPI_DMA_TX_ENA` set, an SPI2 transaction's bytes come
+//!   from the TX channel connected to SPI2; the descriptor walk reads RAM,
+//!   so it lives in `FirmwareBus::gdma_pull`.
 //! - [`console`]: [`console::Console`], a capped byte sink every "firmware
 //!   printed something" path (USB-Serial-JTAG TX, UART0 TX, ROM putc stubs)
 //!   feeds into — diagnostic output, not emulated device state.
@@ -60,6 +66,7 @@
 
 pub mod console;
 pub mod flash;
+pub mod gdma;
 pub mod gpio;
 pub mod intc;
 pub mod rtc_cntl;

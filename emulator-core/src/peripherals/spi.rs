@@ -81,9 +81,14 @@
 //!   three `WT` FIFO-reset pulses (`SPI_DMA_AFIFO_RST`/`SPI_BUF_AFIFO_RST`/
 //!   `SPI_RX_AFIFO_RST`, bits 31/30/29), which there is no FIFO state for
 //!   and which read 0. `SPI_DMA_TX_ENA` (bit 28, `spi_ll_dma_tx_enable`,
-//!   `spi_ll.h:403-406`) is exposed as [`Spi::dma_tx_enabled`] but nothing
-//!   consumes it yet: every transaction still sends the `W` buffer. The
-//!   GDMA transmit path is plan Task 10.
+//!   `spi_ll.h:403-406`) is exposed as [`Spi::dma_tx_enabled`]. While it is
+//!   set and a GDMA TX channel is connected to SPI2, a transaction's bytes
+//!   come from that channel's descriptor link instead of the `W` buffer
+//!   (Milestone 3 Task 10; see "Transaction trigger flow" below and
+//!   `crate::peripherals::gdma`). On a DMA-enabled bus, ESP-IDF's
+//!   `spi_master` sends *every* transaction this way, commands included:
+//!   `spi_master.c`'s `spi_new_trans` calls `s_spi_dma_prepare_data`
+//!   whenever `bus_attr->dma_enabled`.
 //! - `SPI_DMA_INT_ENA_REG`/`_CLR_REG`/`_RAW_REG`/`_ST_REG`
 //!   (`+0x34`/`+0x38`/`+0x3C`/`+0x40`), the transaction-done interrupt.
 //!   Only `SPI_TRANS_DONE_INT_*` (bit 12 of each) is ever set by the model:
@@ -124,8 +129,19 @@
 //! not a stale snapshot) and calls [`Spi::process_transaction`] with the
 //! D/C phase that read implies; [`Spi::process_transaction`] ends by
 //! calling [`Spi::finish_transaction`] (clears `SPI_USR`, sets
-//! `SPI_TRANS_DONE_INT_RAW`). See `mem::bus`'s module doc for exactly
-//! where in the read/write dispatch order this sits.
+//! `SPI_TRANS_DONE_INT_RAW`). If [`Spi::dma_tx_enabled`] and a GDMA TX
+//! channel is connected to SPI2, the caller instead pulls
+//! [`Spi::tx_byte_len`] bytes from that channel (`FirmwareBus::gdma_pull`)
+//! and hands them to [`Spi::handle_dma_bytes`], which feeds the same
+//! interpreter and also ends with [`Spi::finish_transaction`]. See
+//! `mem::bus`'s module doc for exactly where in the read/write dispatch
+//! order this sits.
+//!
+//! **Caller contract**: `SPI_USR` stays set from the triggering byte write
+//! until [`Spi::process_transaction`] or [`Spi::handle_dma_bytes`] runs, so
+//! the caller must call exactly one of them synchronously, before any other
+//! bus access. That is what makes a transaction look atomically complete to
+//! firmware. Both `debug_assert!` that a trigger is pending.
 //!
 //! ## ST7789 command/data interpreter ([`St7789`])
 //!
@@ -453,7 +469,9 @@ impl Spi {
     /// [`crate::peripherals::gpio::Gpio`], and reading the D/C line (GPIO0)
     /// is `FirmwareBus`'s job (see the module doc's "Transaction trigger
     /// flow" section). On a `true` return, the caller must read GPIO0's
-    /// live level and call [`Spi::process_transaction`].
+    /// live level and call [`Spi::process_transaction`] (or, on the DMA
+    /// path, [`Spi::handle_dma_bytes`]) before any other bus access: the
+    /// module doc's caller contract.
     pub fn write_byte(&mut self, offset: u32, val: u8) -> bool {
         let word_offset = offset & !0b11;
         let idx = offset & 0b11;
@@ -552,6 +570,7 @@ impl Spi {
     /// the moment of the trigger, as read by the caller (`FirmwareBus`) —
     /// see the module doc.
     pub fn process_transaction(&mut self, dc_low: bool) {
+        self.debug_assert_triggered();
         let byte_count = self.tx_byte_len().min(MAX_TRANSACTION_BYTES);
 
         let mut bytes = Vec::with_capacity(byte_count);
@@ -563,6 +582,28 @@ impl Spi {
 
         self.st7789.handle_transaction(dc_low, &bytes);
         self.finish_transaction();
+    }
+
+    /// The DMA counterpart of [`Spi::process_transaction`]: `bytes` are what
+    /// the connected GDMA TX channel delivered for this transaction (the
+    /// caller, `FirmwareBus`, walked its descriptor link). Feeds them to
+    /// [`St7789::handle_transaction`], then [`Spi::finish_transaction`]. If
+    /// the link ran short of [`Spi::tx_byte_len`], only what it delivered is
+    /// sent and the transaction still completes: a synchronous model has no
+    /// "wait for the FIFO" state to stall in.
+    pub fn handle_dma_bytes(&mut self, dc_low: bool, bytes: &[u8]) {
+        self.debug_assert_triggered();
+        self.st7789.handle_transaction(dc_low, bytes);
+        self.finish_transaction();
+    }
+
+    /// The module doc's caller contract: transaction processing only ever
+    /// follows a `SPI_USR` trigger.
+    fn debug_assert_triggered(&self) {
+        debug_assert!(
+            self.cmd & CMD_USR != 0,
+            "SPI transaction processed without a pending SPI_USR trigger"
+        );
     }
 }
 
@@ -924,6 +965,7 @@ mod tests {
         write_word(&mut s, MS_DLEN_REG, 31); // 4 bytes
 
         s.st7789.handle_transaction(true, &[CMD_CASET]);
+        assert!(write_word(&mut s, CMD_REG, CMD_USR));
         s.process_transaction(false);
 
         assert_eq!(s.st7789.window().0, 0);

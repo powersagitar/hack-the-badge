@@ -65,11 +65,13 @@ ESP32-C3 device), in two complementary modes:
    modeled it) straight to its next alarm (Milestone 3 Task 6), so the
    FreeRTOS IDLE task sleeps until the tick wakes it and FreeRTOS keeps
    scheduling: `app_main` renders with LVGL and flushes frames over SPI2
-   with DMA, but GDMA is not modeled yet, so nothing is drawn. Boot then
-   faults (step 5,555,258) on the unstubbed ROM `MD5Init`, called by
-   `load_partitions()`, and the panic handler reboot-loops, well before
-   reaching any built-in app. The current blockers are that ROM call and
-   GDMA (known, documented gaps — see `docs/firmware-emulator-notes.md`'s
+   with DMA. GDMA's TX out-link is modeled and feeds SPI2 (Milestone 3
+   Task 10), so those frames reach the ST7789 model and the framebuffer
+   shows the firmware's boot splash. Boot then faults (step 5,555,258) on
+   the unstubbed ROM `MD5Init`, called by `load_partitions()`, and the
+   panic handler reboot-loops, well before reaching any built-in app. The
+   current blocker is that ROM call (a known, documented gap — see
+   `docs/firmware-emulator-notes.md`'s
    "Known limitations" section before assuming a built-in app is reachable
    in this mode).
 
@@ -230,11 +232,13 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       (including the GPIO matrix's FUNCn_IN/OUT_SEL_CFG
                       routing registers, stored but not yet consulted,
                       Task D11) + an emulated
-                      74HC165 button shift register, and SPI2/GPSPI2 (UPDATE
-                      self-clear, TRANS_DONE interrupt, Task 9; no DMA
-                      yet) + an ST7789
+                      74HC165 button shift register, SPI2/GPSPI2 (UPDATE
+                      self-clear, TRANS_DONE interrupt, Task 9) + an ST7789
                       command/pixel-stream interpreter that reconstructs a
-                      framebuffer. Each module's doc comment cites the
+                      framebuffer, and GDMA (gdma.rs, Task 10: the TX
+                      out-link that feeds SPI2 when SPI_DMA_TX_ENA is set;
+                      the descriptor walk reads RAM, so it is
+                      FirmwareBus::gdma_pull). Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
                       from.
   src/peripherals/flash.rs

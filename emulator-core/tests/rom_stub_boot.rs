@@ -405,9 +405,19 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// SPI2 raises 72 `TRANS_DONE` interrupts (then routed to CPU line 8), for
 /// transfers alternating 1 byte and 12,800 bytes (20 rows of 320 RGB565
 /// pixels), all with `SPI_DMA_TX_ENA` set: LVGL is
-/// flushing frames to the ST7789, but through GDMA, which is not modeled
-/// yet (plan Task 10), so the framebuffer stays blank. No new console
-/// line prints.
+/// flushing frames to the ST7789 through GDMA. No new console line prints.
+///
+/// **What changed in Task 10**: GDMA's TX out-link is modeled and feeds
+/// SPI2 whenever `SPI_DMA_TX_ENA` is set, so those transfers now reach the
+/// ST7789 interpreter (before, every one sent the stale `W0..W15` buffer).
+/// Measured with `boot-probe`: 234 SPI2 transactions by the stall, all on
+/// GDMA channel 0, every one delivered in full (the panel init commands
+/// with their parameters, then 36 pixel transfers of 12,800 bytes, three
+/// full 320x240 frames of 12 bands each). The framebuffer is blank through
+/// step 1,128,604 and non-blank from step 1,128,605; by the stall it holds
+/// the firmware's boot splash, 2,340 distinct RGB565 values. Nothing else
+/// moved: the timeline is step-for-step the same (the DMA path costs no
+/// guest instructions), and the stall below is unchanged.
 ///
 /// **The new stall** is a ROM call again: on the 5,555,258th step the CPU
 /// fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
@@ -578,7 +588,7 @@ fn boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init() 
     assert_eq!(rt.bus().systimer.elapsed_ticks() - elapsed_before, jump);
 
     // Phase 9: no exception up to the MD5Init call. LVGL flushes frames
-    // over SPI2 with DMA, which is not modeled, so nothing is drawn; no new
+    // over SPI2 through GDMA channel 0 (Task 10), so they are drawn; no new
     // console line and no panic.
     let summary = rt.run(5_555_257 - 596_610);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
@@ -594,7 +604,19 @@ fn boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init() 
         rt.bus().systimer.counter(1)
     );
     assert!(rt.bus().spi.dma_tx_enabled(), "SPI2 transfers use DMA");
-    assert!(rt.framebuffer().iter().all(|px| *px == 0));
+    assert_eq!(rt.bus().gdma.channel_for_spi2(), Some(0), "via GDMA ch0");
+    assert_ne!(
+        rt.bus().gdma.out_link_state(0).last_desc,
+        0,
+        "GDMA ch0 has sent descriptors"
+    );
+    let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
+    // Measured 2,340; a margin below that, far above a fill or a band.
+    assert!(
+        distinct.len() >= 2_000,
+        "framebuffer holds a drawn frame: {} distinct colors",
+        distinct.len()
+    );
     let console = rt.console_output();
     assert!(
         console

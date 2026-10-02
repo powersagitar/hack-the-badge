@@ -47,7 +47,7 @@
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
 //!    (`CPU_INT_EIP_STATUS_REG`) needs the live asserted interrupt sources
-//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM and SPI2) to answer a
+//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM, SPI2 and GDMA) to answer a
 //!    read, which is exactly the cross-peripheral access the ruling
 //!    anticipated: [`FirmwareBus::read_byte`] reads the concrete fields
 //!    directly, no trait object involved.
@@ -66,7 +66,12 @@
 //!    and hands it to [`crate::peripherals::spi::Spi::process_transaction`],
 //!    no trait object involved. SPI2 also contributes its
 //!    `TRANS_DONE` interrupt level to [`FirmwareBus::pending_sources`]
-//!    (Milestone 3 Task 9).
+//!    (Milestone 3 Task 9). If `SPI_DMA_TX_ENA` is set and a GDMA TX
+//!    channel is connected to SPI2, the triggering write instead pulls the
+//!    transaction's bytes from that channel's descriptor link in RAM
+//!    ([`FirmwareBus::gdma_pull`]) and hands them to
+//!    [`crate::peripherals::spi::Spi::handle_dma_bytes`] (Milestone 3 Task
+//!    10): a three-way direct field access (spi, gdma, RAM), same ruling.
 //! 8. **USB-Serial-JTAG** ([`crate::mem::soc::USB_SERIAL_JTAG_RANGE`]):
 //!    routed to [`FirmwareBus::usb_serial_jtag`], same ruling — see
 //!    `crate::peripherals::usb_serial_jtag`. TX-byte writes also need a
@@ -108,7 +113,14 @@
 //!    mapping, so a flash write through SPIMEM1 is not visible through XIP
 //!    (no observed code path needs that yet; the flash MMU sub-unit would
 //!    unify them).
-//! 13. **Catch-all**: any address covered by none of the above (every
+//! 13. **GDMA** ([`crate::mem::soc::GDMA_RANGE`]): routed to
+//!    [`FirmwareBus::gdma`], same ruling — see `crate::peripherals::gdma`.
+//!    Register offsets [`crate::peripherals::gdma::Gdma::handles`] does not
+//!    name (reserved gaps, the unmodeled `OUT_DSCR*` pre-fetch registers)
+//!    are still logged into [`FirmwareBus::unmapped_log`]. GDMA contributes
+//!    its channels' `INT_RAW & INT_ENA` levels to
+//!    [`FirmwareBus::pending_sources`].
+//! 14. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -133,6 +145,7 @@ use std::sync::Arc;
 
 use crate::peripherals::console::Console;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1};
+use crate::peripherals::gdma::{self, Gdma};
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::rtc_cntl::RtcCntl;
@@ -144,9 +157,9 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE, SPI2_RANGE,
-    SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE,
-    USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, GDMA_RANGE, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE,
+    SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE,
+    TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -304,6 +317,10 @@ pub struct FirmwareBus {
     /// includes the ST7789 command/pixel-stream interpreter and
     /// reconstructed framebuffer.
     pub spi: Spi,
+    /// The GDMA controller (`crate::peripherals::gdma`), same ruling -- its
+    /// TX out-link feeds SPI2 when `SPI_DMA_TX_ENA` is set (see
+    /// [`FirmwareBus::gdma_pull`]).
+    pub gdma: Gdma,
     /// The USB-Serial-JTAG peripheral (`crate::peripherals::usb_serial_jtag`),
     /// same ruling — the badge's actual console transport.
     pub usb_serial_jtag: UsbSerialJtag,
@@ -533,6 +550,7 @@ impl FirmwareBus {
             system: System::new(),
             gpio: Gpio::new(),
             spi: Spi::new(),
+            gdma: Gdma::new(),
             usb_serial_jtag: UsbSerialJtag::new(),
             timg0: Timg::new(),
             timg1: Timg::new(),
@@ -549,11 +567,13 @@ impl FirmwareBus {
     /// pure recomputation from live peripheral state -- nothing latched --
     /// so a source de-asserts the moment its peripheral clears it. Sources
     /// so far: SYSTIMER targets 0..2 (`SRC_SYSTIMER_TARGET0..2`, Task 5), the
-    /// SYSTEM `FROM_CPU_0..3` software interrupts, and SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9).
+    /// SYSTEM `FROM_CPU_0..3` software interrupts, SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9), and
+    /// GDMA channels 0..2 (`SRC_DMA_CH0..2`, `INT_RAW & INT_ENA`, Task 10).
     pub fn pending_sources(&self) -> u64 {
         let mut p = self.systimer.pending_sources();
         p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
         p |= self.spi.pending_sources();
+        p |= self.gdma.pending_sources();
         p
     }
 
@@ -741,6 +761,13 @@ impl FirmwareBus {
             }
             return self.spimem1.read_byte(offset);
         }
+        if GDMA_RANGE.contains(&addr) {
+            let offset = addr - GDMA_RANGE.start;
+            if !Gdma::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.gdma.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -800,7 +827,16 @@ impl FirmwareBus {
                 // INTERRUPT_CORE0 tier above already uses for its own
                 // cross-peripheral read.
                 let dc_low = !self.gpio.pin_level(0);
-                self.spi.process_transaction(dc_low);
+                // DMA transmit (Task 10): with SPI_DMA_TX_ENA set and a
+                // GDMA TX channel connected to SPI2, the bytes come from
+                // that channel's descriptor link, not W0..W15.
+                match self.gdma.channel_for_spi2() {
+                    Some(ch) if self.spi.dma_tx_enabled() => {
+                        let bytes = self.gdma_pull(ch, self.spi.tx_byte_len());
+                        self.spi.handle_dma_bytes(dc_low, &bytes);
+                    }
+                    _ => self.spi.process_transaction(dc_low),
+                }
             }
             return;
         }
@@ -848,7 +884,95 @@ impl FirmwareBus {
             self.spimem1.write_byte(offset, val, &mut self.flash_chip);
             return;
         }
+        if GDMA_RANGE.contains(&addr) {
+            let offset = addr - GDMA_RANGE.start;
+            if !Gdma::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.gdma.write_byte(offset, val);
+            return;
+        }
         self.record_unmapped(addr, true);
+    }
+
+    /// Walks GDMA TX channel `ch`'s out-link from its current descriptor and
+    /// returns up to `max_len` bytes of transmit data: the bus-level half of
+    /// `crate::peripherals::gdma` (the walk reads RAM, which only the bus
+    /// can). Descriptor layout is `dma_descriptor_t` (ESP-IDF v5.5.3
+    /// `components/hal/include/hal/dma_types.h`): word 0 `length[23:12]`,
+    /// `suc_eof` bit 30, `owner` bit 31; word 1 the buffer; word 2 `next`
+    /// (`0` ends the link). Per descriptor:
+    /// - If `OUT_CHECK_OWNER` is set and `owner` is 0 (CPU), raise
+    ///   `OUT_DSCR_ERR` and stop the channel ("owner error",
+    ///   `gdma_reg.h`'s `OUT_DSCR_ERR` doc).
+    /// - Send `length` bytes of the buffer, resuming at the channel's
+    ///   offset if an earlier transaction ended mid-descriptor. If
+    ///   `max_len` runs out first, stop there and remember the offset.
+    /// - A descriptor fully sent: if `OUT_AUTO_WRBACK` is set, clear its
+    ///   `owner` bit in RAM (`gdma_reg.h`: "automatic outlink-writeback
+    ///   when all the data in TX buffer has been transmitted"); raise
+    ///   `OUT_DONE`; if it has `suc_eof`, raise `OUT_EOF` and
+    ///   `OUT_TOTAL_EOF` and latch `OUT_EOF_DES_ADDR` (this descriptor) and
+    ///   `OUT_EOF_BFR_DES_ADDR` (the last one the channel sent before it, 0
+    ///   if none since `OUT_RST`; the driver resets before every transfer). Follow `next`; at `0` the channel goes
+    ///   idle (`PARK`).
+    ///
+    /// A `RESTART` since the last pull first re-reads the `next` field of
+    /// the last descriptor sent, if the link had ended there. The walk is
+    /// bounded (at most `max_len + 1` descriptors), so a cyclic link of
+    /// empty descriptors cannot hang the host.
+    pub fn gdma_pull(&mut self, ch: usize, max_len: usize) -> Vec<u8> {
+        let mut st = self.gdma.out_link_state(ch);
+        let check_owner = self.gdma.out_check_owner(ch);
+        let wrback = self.gdma.out_auto_wrback(ch);
+        let mut out = Vec::with_capacity(max_len);
+        let mut raised = 0u32;
+        if st.restart_pending {
+            st.restart_pending = false;
+            if st.cursor == 0 && st.last_desc != 0 {
+                st.cursor = self.read32(st.last_desc.wrapping_add(8));
+            }
+        }
+        let mut walked = 0usize;
+        while st.active && st.cursor != 0 && out.len() < max_len && walked <= max_len {
+            walked += 1;
+            let desc = st.cursor;
+            let w0 = self.read32(desc);
+            if check_owner && w0 & gdma::DESC_OWNER == 0 {
+                raised |= gdma::OUT_DSCR_ERR;
+                st.active = false;
+                break;
+            }
+            let buf = self.read32(desc.wrapping_add(4));
+            let next = self.read32(desc.wrapping_add(8));
+            let length = (w0 >> 12) & 0xFFF;
+            let remaining = length.saturating_sub(st.offset) as usize;
+            let take = remaining.min(max_len - out.len());
+            for i in 0..take as u32 {
+                out.push(self.read_byte(buf.wrapping_add(st.offset + i)));
+            }
+            st.offset += take as u32;
+            if st.offset < length {
+                break; // the SPI transaction ended mid-descriptor
+            }
+            if wrback {
+                self.write32(desc, w0 & !gdma::DESC_OWNER);
+            }
+            raised |= gdma::OUT_DONE;
+            if w0 & gdma::DESC_SUC_EOF != 0 {
+                raised |= gdma::OUT_EOF | gdma::OUT_TOTAL_EOF;
+                self.gdma.record_out_eof(ch, desc, st.last_desc);
+            }
+            st.last_desc = desc;
+            st.cursor = next;
+            st.offset = 0;
+            if next == 0 {
+                st.active = false;
+            }
+        }
+        self.gdma.set_out_link_state(ch, st);
+        self.gdma.raise_out(ch, raised);
+        out
     }
 
     /// `true` if `addr` falls inside an XIP, RAM-copied or ROM-code region — i.e. is

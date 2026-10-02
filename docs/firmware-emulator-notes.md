@@ -1073,10 +1073,35 @@ predicted these blockers would surface once TIMG unblocks further boot:
    ST7789 over SPI2. SPI2 raises 72 `TRANS_DONE` interrupts (then routed to
    CPU line 8), for transfers alternating 1 byte and 12,800 bytes (20 rows
    of 320 RGB565 pixels), all with `SPI_DMA_TX_ENA` set. Those pixels come
-   from GDMA, which is not modeled (item 3, plan Task 10), so the
-   framebuffer stays blank. By the next fault 42 FreeRTOS ticks have fired,
-   12 of them reached by fast-forward (1,827,031 ticks ahead of the step
-   count in all). No new console line prints.
+   from GDMA, which was not modeled until Task 10 (item 3), so the
+   framebuffer stayed blank. By the next fault 42 FreeRTOS ticks have
+   fired, 12 of them reached by fast-forward (1,827,031 ticks ahead of the
+   step count in all). No new console line prints.
+
+   **Task 10 (GDMA out-link feeding SPI2).** GDMA's TX out-link is modeled
+   (item 3), and every SPI2 transaction with `SPI_DMA_TX_ENA` set now takes
+   its bytes from the GDMA channel connected to SPI2. On a DMA-enabled bus
+   that is *every* transaction (`spi_master.c`'s `spi_new_trans`), so
+   before Task 10 the panel-init commands and their parameters were also
+   being read from the stale `W0..W15` buffer, not just the pixels.
+   Measured with `boot-probe` (a temporary trace, not committed): by the
+   stall, 234 SPI2 transactions, all on GDMA channel 0, each delivered in
+   full: the ST7789 init sequence (`DISPOFF`, `SLPOUT`, `MADCTL`, `COLMOD
+   0x55`, `INVON`, ...), then `CASET`/`RASET`/`RAMWR` plus a 12,800-byte
+   band (4 descriptors: 3 x 4,092 + 524, per `spicommon_dma_desc_setup_link`)
+   36 times, i.e. three full 320x240 frames of 12 bands each. The D/C line
+   (GPIO0's output level) was right for every one: the D11 GPIO-matrix
+   routing of GPIO0 as SPI2 `FSPIWP`/`FSPIHD` did not matter: the emulator
+   reads GPIO0 from `GPIO_OUT`/`GPIO_ENABLE` regardless of routing, and
+   `esp_lcd_new_panel_io_spi()` itself calls `gpio_func_sel(dc,
+   PIN_FUNC_GPIO)` and `gpio_output_enable(dc)` (`esp_lcd/spi/
+   esp_lcd_panel_io_spi.c`), then drives the level from its `pre_cb`. The
+   framebuffer is blank through step 1,128,604 and non-blank from step
+   1,128,605 (a light-grey band first, then a black clear); by the stall it
+   holds the firmware's boot splash, 2,340 distinct RGB565 values, laid
+   out correctly in the unrotated 320x240 orientation. The timeline is
+   unchanged step for step (the DMA path costs no guest instructions), so
+   the stall below is the same.
 
    **The current stall is ROM `MD5Init`.** On the 5,555,258th step the CPU
    fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
@@ -1113,7 +1138,7 @@ predicted these blockers would surface once TIMG unblocks further boot:
    `SysTimer::elapsed_ticks()` (monotonic) rather than a unit counter that
    firmware can stop or reload. Tick rate is still the 1-tick-per-step
    placeholder (real: 16 MHz), so a 10 ms FreeRTOS tick is 160,000 steps.
-3. **SPI2 has no DMA transmit path yet.** Task 9 made SPI2's registers
+3. **SPI2 DMA transmit: resolved (Milestone 3 Task 10).** Task 9 made SPI2's registers
    match what `spi_ll.h` expects (`emulator-core/src/peripherals/spi.rs`'s
    module doc): `SPI_UPDATE` (`WT`) reads back 0 at once
    (`spi_ll_apply_config`); `SPI_USR` (`R/W/SC`) clears and
@@ -1121,11 +1146,26 @@ predicted these blockers would surface once TIMG unblocks further boot:
    transaction completes, which is what `spi_ll_usr_is_done` reads;
    `SPI_DMA_INT_ENA`/`_CLR`/`_ST` behave per their access types, and
    `TRANS_DONE` RAW & ENA drives `ETS_SPI2_INTR_SOURCE` (19) as a level.
-   `SPI_DMA_CONF_REG`'s `SPI_DMA_TX_ENA` (`spi_ll_dma_tx_enable`) is stored
-   and exposed, but nothing consumes it yet: every transaction still sends
-   the `SPI_W0..W15` buffer (at most 64 bytes), so a DMA transaction would
-   currently feed the ST7789 model whatever the `W` registers hold. Pixel
-   transfers over 64 bytes use GDMA, which is unmodeled (plan Task 10).
+   Until Task 10, `SPI_DMA_TX_ENA` was stored but unused, so every
+   transaction sent the `SPI_W0..W15` buffer. Task 10 added
+   `emulator-core/src/peripherals/gdma.rs` (register layout from v5.5.3
+   `soc/gdma_reg.h`; the plan's offsets were not the ESP32-C3's, see that
+   module doc's correction table): three channels' interrupt registers
+   (`RAW`/`ST`/`ENA`/`CLR`, driving `ETS_DMA_CH0..2_INTR_SOURCE` as
+   levels), the TX out-link (`OUT_LINK` `START`/`STOP`/`RESTART` firing on
+   the byte that carries them, `OUT_RST`, `OUT_PERI_SEL`, EOF descriptor
+   addresses) and plain-storage RX registers. When `SPI_USR` fires with
+   `SPI_DMA_TX_ENA` set and a TX channel's `OUT_PERI_SEL` is SPI2 (0),
+   `FirmwareBus::gdma_pull` walks that channel's `dma_descriptor_t` link in
+   RAM for `SPI_MS_DATA_BITLEN` bytes, raising `OUT_DONE` per descriptor
+   and `OUT_EOF`/`OUT_TOTAL_EOF` at `suc_eof`, and clearing owner bits only
+   if `OUT_AUTO_WRBACK` is set. The SPI driver waits on SPI2's own
+   `TRANS_DONE` (the `spi_intr` ISR for queued transfers,
+   `spi_device_polling_end`'s `spi_hal_usr_is_done` poll for polling ones,
+   `spi_master.c`), never on a GDMA interrupt, so completion needed no new
+   signalling. Not modeled: the RX in-link walk, CPU FIFO push/pop, the
+   `OUT_DSCR*` pre-fetch registers (read 0, logged), and timing (a
+   transfer is instant at `SPI_USR`).
 4. **WFI: resolved (Milestone 3 Task 6).** `wfi` used to decode as
    `Illegal`, and the FreeRTOS idle task's `wfi` trapped on step 596,609
    (Task D12's stall). It is now a real wait-for-interrupt with SYSTIMER
@@ -1186,8 +1226,8 @@ predicted these blockers would surface once TIMG unblocks further boot:
    (SYSTIMER targets 0..2, SYSTEM FROM_CPU, SPI2 TRANS_DONE) is level-type,
    and the SYSTIMER's own latched `INT_RAW` stands in for its edge behavior. Neither has
    mattered in the observed boot. `FirmwareBus::pending_sources()` only
-   includes SYSTIMER targets 0..2 (Task 5), SYSTEM FROM_CPU0..3 and SPI2
-   (Task 9) so far. Since Task 6, a line whose 4-bit priority is 0 is
+   includes SYSTIMER targets 0..2 (Task 5), SYSTEM FROM_CPU0..3, SPI2
+   (Task 9) and GDMA channels 0..2 (Task 10) so far. Since Task 6, a line whose 4-bit priority is 0 is
    disabled (never asserted to the core, whatever the threshold; ESP32-C3
    TRM v1.4 section 1.5.2, and ESP-IDF's `esprv_int_set_priority` takes
    levels 1 to 7). Espressif's QEMU model admits a priority-0 line under
@@ -1195,9 +1235,9 @@ predicted these blockers would surface once TIMG unblocks further boot:
 
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
-fixed it. Items 2 and 4 are resolved (Tasks 5 and 6). Item 3 is now
-exercised: since Task 6, boot reaches LVGL's frame flushes over SPI2
-with DMA, and the missing GDMA path is why nothing is drawn. Items 5 to 7 and 9 are not
+fixed it. Items 2, 3 and 4 are resolved (Tasks 5, 10 and 6): boot now
+draws the firmware's boot splash into the framebuffer before the
+`MD5Init` stall. Items 5 to 7 and 9 are not
 correctness bugs *today*; they're dormant because boot doesn't reach the
 code paths that would exercise them. They're
 recorded here so Milestone 3 starts from a known list instead of

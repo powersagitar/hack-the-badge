@@ -341,6 +341,18 @@
 //! budgets (each is still short of the new fault); the new rung is a
 //! no-fault one that proves the idle fast-forward happened:
 //! [`boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`].
+//!
+//! **Task 10 status**: GDMA's TX out-link is modeled and feeds SPI2's DMA
+//! transmit, so the frames LVGL flushes now reach the ST7789 interpreter.
+//! The framebuffer is blank through step 1,128,604 and non-blank from step
+//! 1,128,605; by the stall it holds the firmware's boot splash (2,340
+//! distinct RGB565 values, three full frames sent). The timeline is
+//! unchanged step for step, so the next exception is still ROM `MD5Init`
+//! on step 5,555,258 (see `tests/rom_stub_boot.rs`). No new console line
+//! prints. The Task 6 rung keeps its 5,550,000-step budget (widened from
+//! 5,555,000 for a margin to that fault), and the new rung is a framebuffer
+//! one:
+//! [`boot_draws_frames_through_gdma_before_the_md5init_stall`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1037,6 +1049,40 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
         console.contains("I (0) main_task: Calling app_main()"),
         "console:\n{console}"
     );
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
+}
+
+/// Milestone 3 Task 10's framebuffer rung (see the module doc's "Task 10
+/// status"). Before it, every SPI2 transfer ran with `SPI_DMA_TX_ENA` set
+/// but GDMA was unmodeled, so the framebuffer stayed blank all the way to
+/// the `MD5Init` fault. Now:
+/// - at step 1,100,000 it is still blank (first pixels land on step
+///   1,128,605: a margin, not a pin);
+/// - by step 5,550,000 (short of the fault on step 5,555,258) it holds a
+///   drawn frame, at least 2,000 distinct colors (measured 2,340; a solid
+///   fill or a single band would be 1 or 2), sent through GDMA channel 0,
+///   with no exception and no panic text.
+#[test]
+fn boot_draws_frames_through_gdma_before_the_md5init_stall() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    rt.run(1_100_000);
+    assert!(
+        rt.framebuffer().iter().all(|px| *px == 0),
+        "nothing drawn yet at step 1,100,000"
+    );
+    let summary = rt.run(5_550_000 - 1_100_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
+    assert!(
+        distinct.len() >= 2_000,
+        "only {} distinct colors in the framebuffer",
+        distinct.len()
+    );
+    assert_eq!(rt.bus().gdma.channel_for_spi2(), Some(0));
+    assert_ne!(rt.bus().gdma.out_link_state(0).last_desc, 0);
+    let console = rt.console_output();
     for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
         assert!(!console.contains(panic_text), "console:\n{console}");
     }
