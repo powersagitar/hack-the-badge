@@ -378,31 +378,65 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// enabled; `ETS_SPI2_INTR_SOURCE` is routed to line 6, which is not yet
 /// enabled), and nothing is drawn.
 ///
-/// **The new stall** is not a ROM call and not a peripheral: on the
-/// 596,609th step the CPU takes an `ILLEGAL_INSTRUCTION` exception on a
+/// **Task D12's stall** (history): not a ROM call and not a peripheral: on
+/// the 596,609th step the CPU took an `ILLEGAL_INSTRUCTION` exception on a
 /// `wfi` (`0x1050_0073`, also `mtval`) at `0x4038_b8bc`. That is
 /// `esp_cpu_wait_for_intr()` (`components/esp_hw_support/cpu.c:52-64`,
 /// `rv_utils_wait_for_intr()`), called from `esp_vApplicationIdleHook()`
 /// (`components/esp_system/freertos_hooks.c:41-58`) in FreeRTOS's IDLE task
-/// (its TCB name `IDLE` is on the panic dump's stack): `app_main`'s task has
-/// blocked, and the idle task waits for the next interrupt. The core does
-/// not implement `wfi` yet (plan Task 6). The panic handler then prints
-/// "Guru Meditation Error" (~598,088) and its reboot faults on the unstubbed
-/// ROM `software_reset_cpu` (`0x4000_0094`, step 836,487), as in earlier
-/// stalls.
+/// (its TCB name `IDLE` is on the panic dump's stack): `app_main`'s task had
+/// blocked, and the idle task waited for the next interrupt. The core did
+/// not implement `wfi`; the panic handler printed "Guru Meditation Error"
+/// and its reboot faulted on the unstubbed ROM `software_reset_cpu`.
 ///
-/// This test is **deliberately expected to break** once `wfi` is
-/// implemented; whoever makes that fix should re-point it at the next stall.
+/// **What changed in Task 6**: `wfi` is a real instruction. It retires and
+/// parks the core until an interrupt line is pending
+/// (`emulator_core::cpu::Cpu::is_waiting`), and while the core waits with
+/// nothing asserted, `emulator_core::boot::step_with_interrupts` jumps the
+/// SYSTIMER straight to its next alarm. So the idle `wfi` on step 596,609
+/// retires, and step 596,610 fast-forwards SYSTIMER by 91,439 ticks to the
+/// FreeRTOS tick (alarm 0 on counter 1, routed to CPU line 5 at priority 1)
+/// and takes it (`mcause = 0x8000_0005`). FreeRTOS then runs normally:
+/// over the next ~25,000 steps the idle task waits and is woken 11 more
+/// times (each jump 154,855..=158,163 ticks), then `app_main`'s work keeps
+/// the CPU busy (LVGL rendering, at the hot fill/`memcpy`/`memset` loops)
+/// and the tick keeps firing at the ordinary rate: 42 FreeRTOS ticks in all
+/// by the next fault, 12 of them reached by fast-forward. Along the way
+/// SPI2 raises 72 `TRANS_DONE` interrupts (then routed to CPU line 8), for
+/// transfers alternating 1 byte and 12,800 bytes (20 rows of 320 RGB565
+/// pixels), all with `SPI_DMA_TX_ENA` set: LVGL is
+/// flushing frames to the ST7789, but through GDMA, which is not modeled
+/// yet (plan Task 10), so the framebuffer stays blank. No new console
+/// line prints.
+///
+/// **The new stall** is a ROM call again: on the 5,555,258th step the CPU
+/// fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
+/// (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and takes an
+/// `INSTRUCTION_ACCESS_FAULT` (RA `0x420f_a6ea`). The caller is ESP-IDF's
+/// `load_partitions()` (`components/esp_partition/partition.c:107-125`,
+/// at `0x420f_a6ce` in factory.bin), whose first act is
+/// `esp_rom_md5_init(&context)` before it reads the partition table. The
+/// panic handler prints "Guru Meditation Error" and its reboot faults on
+/// the unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 5,795,474),
+/// as in earlier stalls.
+///
+/// This test is **deliberately expected to break** once `MD5Init` is
+/// stubbed; whoever makes that fix should re-point it at the next stall.
 #[test]
-fn boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi() {
+fn boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
     const OLD_SPIN_PC: u32 = 0x4200_0cd2;
     const SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
     const ROM_BSWAPSI2: u32 = 0x4000_0788;
     const SPI_LL_SET_COMMAND_RA: u32 = 0x4039_45fa;
     const ESP_CPU_WAIT_FOR_INTR_WFI: u32 = 0x4038_b8bc;
-    const WFI: u32 = 0x1050_0073;
     const ROM_SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
+    // esp32c3.rom.ld: MD5Init = 0x40000614.
+    const ROM_MD5_INIT: u32 = 0x4000_0614;
+    // load_partitions()'s esp_rom_md5_init() call returns here.
+    const LOAD_PARTITIONS_MD5INIT_RA: u32 = 0x420f_a6ea;
+    // vSystimerSetup's alarm 0 period (TARGET0_CONF.period = 160,000).
+    const FREERTOS_TICK_PERIOD: u64 = 160_000;
     // soc/spi_reg.h: SPI_DMA_INT_ENA_REG (+0x34), SPI_DMA_INT_RAW_REG
     // (+0x3C); SPI_TRANS_DONE_INT_* is bit 12 (byte 1, bit 4).
     const SPI_DMA_INT_ENA_OFFSET: u32 = 0x34;
@@ -518,17 +552,71 @@ fn boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi() {
     );
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
 
-    // Phase 7: the 596,609th step: wfi is not implemented, so it traps as
-    // an illegal instruction.
+    // Phase 7: the 596,609th step: the idle task's wfi retires and parks
+    // the core (no trap; it used to be an ILLEGAL_INSTRUCTION here).
+    assert!(!rt.cpu().is_waiting());
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 0, "{summary:?}");
+    assert!(rt.cpu().is_waiting(), "wfi parks the core");
+    assert_eq!(rt.pc(), ESP_CPU_WAIT_FOR_INTR_WFI + 4);
+
+    // Phase 8: the 596,610th step fast-forwards SYSTIMER straight to the
+    // FreeRTOS tick (alarm 0, routed to CPU line 5) and takes it, with mepc
+    // the instruction after the wfi.
+    let jump = rt
+        .bus()
+        .systimer
+        .ticks_until_next_alarm()
+        .expect("the FreeRTOS tick is armed");
+    assert_eq!(jump, 91_439, "ticks to the next alarm");
+    let elapsed_before = rt.bus().systimer.elapsed_ticks();
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "{summary:?}");
-    assert_eq!(rt.cpu().csr.mcause, exception_code::ILLEGAL_INSTRUCTION);
-    assert_eq!(rt.cpu().csr.mepc, ESP_CPU_WAIT_FOR_INTR_WFI);
-    assert_eq!(rt.cpu().csr.mtval, WFI);
+    assert!(!rt.cpu().is_waiting());
+    assert_eq!(rt.cpu().csr.mcause, 0x8000_0005, "the tick's routed line");
+    assert_eq!(rt.cpu().csr.mepc, ESP_CPU_WAIT_FOR_INTR_WFI + 4);
+    assert_eq!(rt.bus().systimer.elapsed_ticks() - elapsed_before, jump);
 
-    // Phase 8: the panic handler reports it, then its reboot faults on the
+    // Phase 9: no exception up to the MD5Init call. LVGL flushes frames
+    // over SPI2 with DMA, which is not modeled, so nothing is drawn; no new
+    // console line and no panic.
+    let summary = rt.run(5_555_257 - 596_610);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    assert!(
+        rt.bus().systimer.counter(1) >= 42 * FREERTOS_TICK_PERIOD,
+        "42 FreeRTOS tick periods have elapsed on counter 1: {}",
+        rt.bus().systimer.counter(1)
+    );
+    assert!(rt.bus().spi.dma_tx_enabled(), "SPI2 transfers use DMA");
+    assert!(rt.framebuffer().iter().all(|px| *px == 0));
+    let console = rt.console_output();
+    assert!(
+        console
+            .trim_end()
+            .ends_with("I (0) main_task: Calling app_main()"),
+        "console:\n{console}"
+    );
+
+    // Phase 10: the 5,555,258th step fetches from the unstubbed ROM MD5Init,
+    // called by load_partitions().
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 1, "{summary:?}");
+    assert_eq!(summary.last_instruction_fault, Some(ROM_MD5_INIT));
+    assert_eq!(
+        rt.cpu().csr.mcause,
+        exception_code::INSTRUCTION_ACCESS_FAULT
+    );
+    assert_eq!(rt.cpu().regs.read(1), LOAD_PARTITIONS_MD5INIT_RA, "ra");
+
+    // Phase 11: the panic handler reports it, then its reboot faults on the
     // unstubbed ROM software_reset_cpu.
-    let summary = rt.run(900_000);
+    let summary = rt.run(300_000);
     assert_eq!(
         summary.last_instruction_fault,
         Some(ROM_SOFTWARE_RESET_CPU),

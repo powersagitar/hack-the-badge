@@ -327,6 +327,20 @@
 //! the XTAL-warning ratchet
 //! [`boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid`]. The Task 9
 //! rung no longer asserts the `clk_hal` line.
+//!
+//! **Task 6 status**: `wfi` is a real instruction, and while the core waits
+//! with nothing asserted the driving loop fast-forwards SYSTIMER to its next
+//! alarm. The idle task's `wfi` on step 596,609 now retires, the FreeRTOS
+//! tick wakes it on the next step, and FreeRTOS runs on: 42 ticks (12 of
+//! them reached by fast-forward) while `app_main` renders with LVGL and
+//! flushes frames over SPI2 with DMA (GDMA is not modeled, so nothing is
+//! drawn). No new console line prints. The next exception is on step
+//! 5,555,258: `load_partitions()` calls the unstubbed ROM `MD5Init`
+//! (`0x4000_0614`), and the panic handler runs (see
+//! `tests/rom_stub_boot.rs`'s pinned stall). The rungs above keep their
+//! budgets (each is still short of the new fault); the new rung is a
+//! no-fault one that proves the idle fast-forward happened:
+//! [`boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -427,8 +441,9 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// longer prints its (emulator-only) `rtc_clk` XTAL warnings, so the whole
 /// timeline is 629 steps earlier here: the yield request is on step
 /// 528,148 and taken on step 528,149. The fault-free run still ends at step
-/// 571,712 (the old gpio_matrix_out step); the next exception is now the
-/// idle task's `wfi` on step 596,609.
+/// 571,712 (the old gpio_matrix_out step); the next exception was then the
+/// idle task's `wfi` on step 596,609 (Task 6 made `wfi` real; the next
+/// exception is now ROM `MD5Init` on step 5,555,258).
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -479,6 +494,10 @@ fn boot_reaches_main_task_calling_app_main() {
 /// call and made the timeline earlier; the next exception is the idle
 /// task's `wfi` on step 596,609 (see `tests/rom_stub_boot.rs`), so the
 /// budget is now 596,000 steps: still ~24,000 steps past the old fault.
+/// (Task 6 made `wfi` real; the next exception is now ROM `MD5Init` on step
+/// 5,555,258, covered by
+/// [`boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`],
+/// so this rung keeps its budget.)
 #[test]
 fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -892,7 +911,8 @@ const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=
 /// rung now checks only the poll escape. The window moves with the earlier
 /// timeline: the poll is first reached on step 583,989 (was 584,618), and
 /// the next exception is the idle task's `wfi` on step 596,609, so the
-/// window is steps 583,000..596,000 (was 584,000..602,000).
+/// window is steps 583,000..596,000 (was 584,000..602,000). (Task 6: that
+/// `wfi` no longer faults; the window is unchanged.)
 #[test]
 fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -926,7 +946,8 @@ const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
 /// Milestone 3 Task D12's no-fault rung (see the module doc's "Task D12
 /// status"). Before it, `spi_ll_set_command()` faulted on the unstubbed
 /// ROM `__bswapsi2` (Task 9's stall). Now that call is a real stub: over a
-/// run to the step before the next exception (596,608), the ROM address is
+/// run to the step before the then-next exception (the idle `wfi`, 596,609;
+/// no longer an exception since Task 6), the ROM address is
 /// entered exactly once (on step 593,018), execution comes back to its
 /// caller, and no exception is taken (the last trap is an interrupt).
 #[test]
@@ -971,4 +992,50 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
         !console.contains("invalid RTC_XTAL_FREQ_REG"),
         "console:\n{console}"
     );
+}
+
+/// Milestone 3 Task 6's no-fault rung (see the module doc's "Task 6
+/// status"). Before it, the FreeRTOS idle task's `wfi` on step 596,609 was
+/// an illegal instruction and the panic handler ran. Now it waits, and the
+/// driving loop jumps SYSTIMER to the next alarm while it does. Over a run
+/// to just short of the next exception (step 5,555,258, ROM `MD5Init`):
+/// - no exception is taken (the last trap is an interrupt) and no panic
+///   text prints;
+/// - SYSTIMER time ran **ahead** of the step count, which only the idle
+///   fast-forward can do: measured 1,827,031 extra ticks over 12 waits
+///   (asserted `>= 1_500_000`, about 9.4 tick periods, so at least ~10 of
+///   the waits must have jumped most of a period);
+/// - counter 1, the FreeRTOS tick's counter, is past 40 tick periods of
+///   160,000 (measured: 42 periods, 6,853,983 ticks), so the scheduler kept
+///   ticking long after the first wake.
+#[test]
+fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(5_555_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt, not an exception; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    let systimer = &rt.bus().systimer;
+    let ahead = systimer.elapsed_ticks() - rt.total_steps();
+    assert!(
+        ahead >= 1_500_000,
+        "idle fast-forward added only {ahead} ticks"
+    );
+    assert!(
+        systimer.counter(1) >= 40 * 160_000,
+        "counter 1 = {}",
+        systimer.counter(1)
+    );
+    let console = rt.console_output();
+    assert!(
+        console.contains("I (0) main_task: Calling app_main()"),
+        "console:\n{console}"
+    );
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
 }

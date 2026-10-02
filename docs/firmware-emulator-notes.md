@@ -448,7 +448,9 @@ predicted these blockers would surface once TIMG unblocks further boot:
    write latches synchronously): a write setting `TIME_UPDATE` (bit 31)
    latches a 48-bit snapshot derived from the emulator's own elapsed step
    count (SYSTIMER's live `unit0_counter`, the same "notion of elapsed
-   time" SYSTIMER itself uses), scaled by `RC_SLOW_HZ / XTAL_HZ` (reused
+   time" SYSTIMER itself uses; *superseded in Task 5*: the RTC timer now
+   reads SYSTIMER's monotonic `elapsed_ticks()`, which firmware cannot stop
+   or reload, see item 2), scaled by `RC_SLOW_HZ / XTAL_HZ` (reused
    from `crate::peripherals::timg`, not duplicated). This unblocked the
    pre-Task-D1 stall (confirmed via a throwaway experiment: the specific
    scaling ratio doesn't matter — even a 1:1 ratio reaches the exact same
@@ -1039,24 +1041,60 @@ predicted these blockers would surface once TIMG unblocks further boot:
    transaction (`TRANS_DONE` raw and enabled; the SPI2 source is routed to
    CPU line 6, which is not enabled yet), and `app_main`'s task blocks.
 
-   **The current stall is `wfi` (item 4).** On the 596,609th step the
-   FreeRTOS IDLE task's `esp_cpu_wait_for_intr()`
+   **Task D12's stall** (history) was `wfi` (item 4). On the 596,609th
+   step the FreeRTOS IDLE task's `esp_cpu_wait_for_intr()`
    (`components/esp_hw_support/cpu.c:52-64`, called from
    `esp_vApplicationIdleHook()`, `components/esp_system/freertos_hooks.c`)
-   executes `wfi` (`0x1050_0073`) at `0x4038_b8bc`, which the core decodes
-   as illegal, so it takes an `ILLEGAL_INSTRUCTION` exception. The panic
-   handler prints "Guru Meditation Error", and its reboot faults on the
-   unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 836,487).
-   Nothing is drawn. `main_task: Calling app_main()` is still the newest
-   console line. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi`.
-   Once `wfi` waits (plan Task 6), the FreeRTOS tick is what wakes the
-   blocked task. Task 5 modeled it (item 2, resolved): by the `wfi`,
-   `vSystimerSetup` has run, so alarm 0 is armed in period mode on counter
-   1 with a 160,000-tick period (10 ms at 16 MHz, `CONFIG_FREERTOS_HZ`
-   100), `INT_ENA` has bits 0 and 2 set, and the first tick is 91,440
-   ticks away (= steps, at 1 tick per step). esp_timer's alarm 2 is not
-   enabled in `CONF` yet.
+   executed `wfi` (`0x1050_0073`) at `0x4038_b8bc`, which the core decoded
+   as illegal, so it took an `ILLEGAL_INSTRUCTION` exception and the panic
+   handler reboot-looped. By then `vSystimerSetup` had armed alarm 0 in
+   period mode on counter 1 with a 160,000-tick period (10 ms at 16 MHz,
+   `CONFIG_FREERTOS_HZ` 100), with `INT_ENA` bits 0 and 2 set.
+
+   **Task 6 (WFI with SYSTIMER fast-forward).** `wfi` is now a real
+   instruction (item 4). It retires and parks the core until an interrupt
+   line is pending (`Cpu::is_waiting`); waking ignores `mstatus.MIE`
+   (privileged spec 3.3.3), then the interrupt is taken if `MIE` is set,
+   else execution resumes after the `wfi`. While the core waits with no
+   line asserted, `boot::step_with_interrupts` advances SYSTIMER by
+   `ticks_until_next_alarm().unwrap_or(0).max(TICKS_PER_STEP)` instead of
+   one tick, then samples the lines again, so the alarm that ends the wait
+   is taken in the same step. Every waiting step is still exactly one step
+   of `FirmwareRuntime::run`'s budget, so a `wfi` that never wakes cannot
+   hang the host. A priority-0 interrupt line is now disabled whatever the
+   threshold (item 9), so it can't wake a `wfi` either.
+
+   On the real boot the idle `wfi` on step 596,609 retires, and step
+   596,610 jumps SYSTIMER 91,439 ticks to the FreeRTOS tick (routed to CPU
+   line 5 at priority 1) and takes it. The idle task waits and is woken 11
+   more times in the next ~25,000 steps (each jump 154,855 to 158,163
+   ticks), then `app_main`'s work keeps the CPU busy: LVGL renders (the hot
+   PCs are fill, `memcpy` and `memset` loops) and flushes frames to the
+   ST7789 over SPI2. SPI2 raises 72 `TRANS_DONE` interrupts (then routed to
+   CPU line 8), for transfers alternating 1 byte and 12,800 bytes (20 rows
+   of 320 RGB565 pixels), all with `SPI_DMA_TX_ENA` set. Those pixels come
+   from GDMA, which is not modeled (item 3, plan Task 10), so the
+   framebuffer stays blank. By the next fault 42 FreeRTOS ticks have fired,
+   12 of them reached by fast-forward (1,827,031 ticks ahead of the step
+   count in all). No new console line prints.
+
+   **The current stall is ROM `MD5Init`.** On the 5,555,258th step the CPU
+   fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
+   (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and takes an
+   `INSTRUCTION_ACCESS_FAULT` (RA `0x420f_a6ea`). The caller is ESP-IDF's
+   `load_partitions()` (`components/esp_partition/partition.c:107-125`,
+   `0x420f_a6ce` in factory.bin), which starts with
+   `esp_rom_md5_init(&context)` before it maps and reads the partition
+   table (`MD5Update`/`MD5Final` at `0x4000_0618`/`0x4000_061c` follow, per
+   `CONFIG_PARTITION_TABLE_MD5`). The panic handler prints "Guru Meditation
+   Error", and its reboot faults on the unstubbed ROM `software_reset_cpu`
+   (`0x4000_0094`, step 5,795,474). `main_task: Calling app_main()` is
+   still the newest console line. Pinned in
+   `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init`.
+   This is a ROM-stub (Task D) fix; after it, `load_partitions()` maps the
+   partition table through `spi_flash_mmap()`, so item 7 is worth checking
+   next.
 2. **SYSTIMER: resolved (Milestone 3 Task 5).** Milestone 2 modeled only
    unit 0/target 0, with a `COMP0_LOAD` rule that contradicted the real
    HAL order. `emulator-core/src/peripherals/systimer.rs` now models both
@@ -1068,7 +1106,7 @@ predicted these blockers would surface once TIMG unblocks further boot:
    esp_timer's `systimer_hal_set_alarm_target` (alarm 2 on counter 0,
    oneshot, `MISS_COMPENSATE`). Each target drives its own source
    (`SRC_SYSTIMER_TARGET0..2`, 37..39) as a level. `advance_by(ticks)` and
-   `ticks_until_next_alarm()` are there for WFI fast-forward (plan Task 6);
+   `ticks_until_next_alarm()` drive WFI fast-forward (Task 6, item 4);
    a jump across several periods fires once and re-arms to the next future
    period. Every modeled offset is in `SysTimer::handles`, so the rest
    (only `DATE`) is logged as unmapped; the RTC timer now reads
@@ -1088,9 +1126,12 @@ predicted these blockers would surface once TIMG unblocks further boot:
    the `SPI_W0..W15` buffer (at most 64 bytes), so a DMA transaction would
    currently feed the ST7789 model whatever the `W` registers hold. Pixel
    transfers over 64 bytes use GDMA, which is unmodeled (plan Task 10).
-4. **WFI decodes as `Illegal`** rather than as a real wait-for-interrupt.
-   Boot reaches it as of Task D12: the FreeRTOS idle task's `wfi` traps on
-   step 596,609, which is the current stall (item 1).
+4. **WFI: resolved (Milestone 3 Task 6).** `wfi` used to decode as
+   `Illegal`, and the FreeRTOS idle task's `wfi` trapped on step 596,609
+   (Task D12's stall). It is now a real wait-for-interrupt with SYSTIMER
+   fast-forward while idle (item 1's "Task 6" paragraph): the idle task
+   sleeps until the FreeRTOS tick, which costs one step instead of up to
+   160,000.
 5. Two flagged guesses worth re-examining once boot progresses further:
    `rom_i2c_readReg*` stubbed to return 0 (currently steers boot down an
    "assume 40MHz" crystal-frequency fallback that happens to match the
@@ -1142,18 +1183,23 @@ predicted these blockers would surface once TIMG unblocks further boot:
    ties to the lowest line number (ESP32-C3 TRM v1.4 section 1.5.2;
    `cpu::select_interrupt_line`). `CPU_INT_TYPE_REG` (edge vs. level) and
    `CPU_INT_CLEAR_REG` are plain storage: every source wired so far
-   (SYSTIMER target0, SYSTEM FROM_CPU, SPI2 TRANS_DONE) is level-type,
+   (SYSTIMER targets 0..2, SYSTEM FROM_CPU, SPI2 TRANS_DONE) is level-type,
    and the SYSTIMER's own latched `INT_RAW` stands in for its edge behavior. Neither has
    mattered in the observed boot. `FirmwareBus::pending_sources()` only
    includes SYSTIMER targets 0..2 (Task 5), SYSTEM FROM_CPU0..3 and SPI2
-   (Task 9) so far.
+   (Task 9) so far. Since Task 6, a line whose 4-bit priority is 0 is
+   disabled (never asserted to the core, whatever the threshold; ESP32-C3
+   TRM v1.4 section 1.5.2, and ESP-IDF's `esprv_int_set_priority` takes
+   levels 1 to 7). Espressif's QEMU model admits a priority-0 line under
+   threshold 0; this emulator follows the TRM.
 
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
-fixed it. Item 2 is resolved (Task 5). Items 3 to 7 and 9 are not
-correctness bugs *today* — they're dormant because boot doesn't reach the
-code paths that would exercise them (item 3 is reached with the first
-SPI2 transaction; see item 1's current stall). They're
+fixed it. Items 2 and 4 are resolved (Tasks 5 and 6). Item 3 is now
+exercised: since Task 6, boot reaches LVGL's frame flushes over SPI2
+with DMA, and the missing GDMA path is why nothing is drawn. Items 5 to 7 and 9 are not
+correctness bugs *today*; they're dormant because boot doesn't reach the
+code paths that would exercise them. They're
 recorded here so Milestone 3 starts from a known list instead of
 rediscovering each one by stepping through a debugger again.
 

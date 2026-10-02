@@ -844,7 +844,21 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D12**: 95 stubs (Task 9's 94 plus `__bswapsi2`, entry 23),
+//! **As of Task 6** (CPU and interrupt changes, no stub changes): still 95
+//! stubs. `wfi` is now a real wait-for-interrupt with SYSTIMER fast-forward
+//! while idle, so the idle task's `wfi` (step 596,609) retires and the
+//! FreeRTOS tick wakes it on the next step. Boot then runs, with no
+//! exception, through 42 FreeRTOS ticks while `app_main` renders with LVGL
+//! and flushes over SPI2 with DMA (GDMA is unmodeled, so nothing is drawn),
+//! until a missing stub again: on the 5,555,258th step
+//! `load_partitions()` (`components/esp_partition/partition.c:107-125`)
+//! calls ROM `MD5Init` (`0x4000_0614`, `esp32c3.rom.ld`; RA
+//! `0x420f_a6ea`) through `esp_rom_md5_init()`. The panic handler's reboot
+//! then faults on `software_reset_cpu` (step 5,795,474). See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init`.
+//!
+//! **As of Task D12** (history): 95 stubs (Task 9's 94 plus `__bswapsi2`, entry 23),
 //! and `RTC_XTAL_FREQ_REG` is seeded as the skipped bootloader leaves it
 //! (entry 23), so no "invalid RTC_XTAL_FREQ_REG" warning prints and the
 //! timeline is ~629 steps earlier by the first yield. `spi_ll_set_command()`'s
@@ -857,8 +871,9 @@
 //! `ILLEGAL_INSTRUCTION` exception. The panic handler's reboot then faults on
 //! `software_reset_cpu` (step 836,487). Nothing is drawn. See
 //! `tests/rom_stub_boot.rs`'s
-//! `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi`. The
-//! Task 9 paragraph below is kept as history.
+//! `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi` (since
+//! renamed and re-pointed by Task 6, above). The Task 9 paragraph below is
+//! kept as history.
 //!
 //! **As of Task 9** (history; SPI2 register fidelity, no stub changes): still 94
 //! stubs. With SPI2's `SPI_UPDATE` self-clearing, the `spi_hal_init()` poll

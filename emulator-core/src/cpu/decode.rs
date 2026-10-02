@@ -61,6 +61,9 @@ pub enum Instruction {
     Ecall,
     Ebreak,
     Mret,
+    /// `WFI` (wait for interrupt): retires like a no-op, then parks the core
+    /// until an interrupt is pending. See `Cpu::is_waiting`.
+    Wfi,
     Csr {
         rd: u8,
         csr: u16,
@@ -327,11 +330,13 @@ pub fn decode_32(word: u32) -> Instruction {
 
 fn decode_system(word: u32, rd: u8, rs1: u8, funct3: u8, funct7: u8, rs2: u8) -> Instruction {
     if funct3 == 0 {
-        // funct7/rs2 select ECALL/EBREAK/MRET among the funct3==0 SYSTEM ops.
+        // funct7/rs2 select ECALL/EBREAK/MRET/WFI among the funct3==0 SYSTEM ops.
         return match (funct7, rs2, rd, rs1) {
             (0b0000000, 0b00000, 0, 0) => Instruction::Ecall,
             (0b0000000, 0b00001, 0, 0) => Instruction::Ebreak,
             (0b0011000, 0b00010, 0, 0) => Instruction::Mret,
+            // WFI (privileged spec 3.3.3): funct7=0001000, rs2=00101, rd=rs1=0.
+            (0b0001000, 0b00101, 0, 0) => Instruction::Wfi,
             _ => Instruction::Illegal(word),
         };
     }
@@ -854,6 +859,21 @@ mod tests {
         assert_eq!(
             decode_32(0b0011000_00010_00000_000_00000_1110011),
             Instruction::Mret
+        );
+    }
+
+    #[test]
+    fn decodes_wfi_and_rejects_near_miss_encodings() {
+        // WFI: funct7=0001000, rs2=00101, rs1=0, funct3=0, rd=0, SYSTEM.
+        assert_eq!(decode_32(0x1050_0073), Instruction::Wfi);
+        // Same funct7/rs2 with a non-zero rd or rs1 is reserved: illegal.
+        assert_eq!(
+            decode_32(0x1050_0073 | (1 << 7)),
+            Instruction::Illegal(0x1050_0073 | (1 << 7))
+        );
+        assert_eq!(
+            decode_32(0x1050_0073 | (1 << 15)),
+            Instruction::Illegal(0x1050_0073 | (1 << 15))
         );
     }
 

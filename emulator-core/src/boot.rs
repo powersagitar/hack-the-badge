@@ -29,6 +29,7 @@ use crate::cpu::Cpu;
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::{parse_image, ImageParseError};
 use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, RTC_RANGE};
+use crate::peripherals::systimer::TICKS_PER_STEP;
 
 /// Parses `image` (expected to be the raw bytes of an ESP-IDF app image,
 /// e.g. `frontend/public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
@@ -237,15 +238,49 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 /// section 1.5.2; [`crate::cpu::select_interrupt_line`]), so the
 /// interrupt controller's priorities are handed to the core whenever more
 /// than one line is pending (the only case they matter).
+///
+/// ## Idle fast-forward (`WFI`, Milestone 3 Task 6)
+///
+/// If the core is parked by `WFI` ([`Cpu::is_waiting`]) and no line is
+/// asserted, nothing can happen until some peripheral raises one, and the
+/// only modeled peripheral whose state changes with time alone is the
+/// SYSTIMER. So instead of the usual one-step tick *after* the step, the
+/// SYSTIMER is advanced *before* it by
+/// `ticks_until_next_alarm().unwrap_or(0).max(TICKS_PER_STEP)` ticks --
+/// straight to the next alarm that could raise an interrupt, or one
+/// ordinary step's worth if none is armed -- and the lines are sampled
+/// again, so an alarm reached by the jump wakes the core (and, with `MIE`
+/// set, is taken) in this same step. With FreeRTOS's tick (alarm 0, period
+/// 160,000 ticks on the real boot) an idle tick costs one step instead of
+/// 160,000.
+///
+/// Either way this is one call, one `Cpu::step` and one step of a caller's
+/// budget, with no loop inside: a `WFI` that never wakes (nothing armed, or
+/// an alarm whose line is disabled or masked) just costs one step per call,
+/// so `crate::runtime::FirmwareRuntime::run(budget)` always returns after
+/// `budget` steps.
 pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu::StepInfo {
-    let lines = bus.asserted_lines();
+    let mut lines = bus.asserted_lines();
+    let fast_forward = cpu.is_waiting() && lines == 0;
+    if fast_forward {
+        let ticks = bus
+            .systimer
+            .ticks_until_next_alarm()
+            .unwrap_or(0)
+            .max(TICKS_PER_STEP);
+        bus.systimer.advance_by(ticks);
+        lines = bus.asserted_lines();
+    }
     cpu.set_pending_interrupts(lines);
     if lines & lines.wrapping_sub(1) != 0 {
         // Several lines asserted: the core arbitrates by priority.
         cpu.set_interrupt_priorities(bus.intc.line_priorities());
     }
     let info = cpu.step(bus);
-    bus.tick_peripherals();
+    if !fast_forward {
+        // (The fast-forward above already advanced this step's time.)
+        bus.tick_peripherals();
+    }
     info
 }
 

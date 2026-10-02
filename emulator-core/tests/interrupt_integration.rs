@@ -478,3 +478,100 @@ fn equal_priority_ties_go_to_the_lowest_line() {
     assert_eq!(two_pending_lines(9, 2, 3, 2), 3);
     assert_eq!(two_pending_lines(2, 2, 7, 2), 2);
 }
+
+// ---- Milestone 3 Task 6: WFI with SYSTIMER fast-forward while idle ----
+
+const WFI: u32 = 0x1050_0073;
+/// Direct-mode `mtvec` (low bits 0) inside the program's own NOP padding,
+/// so the trap lands on fetchable code.
+const HANDLER: u32 = PROGRAM_LOAD_ADDR + 0x80;
+const LONG_PERIOD: u32 = 1_000_000;
+
+/// `wfi` followed by NOPs, with SYSTIMER target0 armed (period mode,
+/// `LONG_PERIOD` ticks, on unit 0, which works out of reset) and routed to
+/// `TARGET_LINE` at priority `pri` -- all programmed through the bus the way
+/// firmware stores would land.
+fn wfi_setup(pri: u32) -> (Cpu, FirmwareBus) {
+    use emulator_core::mem::Bus;
+    let mut prog = vec![WFI];
+    prog.extend(std::iter::repeat_n(addi(0, 0, 0), 63));
+    let mut bus = build_bus(&prog);
+    let mut cpu = Cpu::new();
+    cpu.regs.pc = PROGRAM_LOAD_ADDR;
+    cpu.csr.mtvec = HANDLER;
+
+    bus.write32(INTC_BASE + 0x094, TARGET_LINE);
+    bus.write32(INTC_BASE + 0x104, 1 << TARGET_LINE);
+    bus.write32(INTC_BASE + 0x114 + 4 * TARGET_LINE, pri);
+    bus.write32(SYSTIMER_BASE + 0x34, (1 << 30) | LONG_PERIOD);
+    bus.write32(SYSTIMER_BASE + 0x50, 1); // COMP0_LOAD: load_base = 0
+    let conf = bus.read32(SYSTIMER_BASE);
+    bus.write32(SYSTIMER_BASE, conf | (1 << 24));
+    bus.write32(SYSTIMER_BASE + 0x64, 1);
+    (cpu, bus)
+}
+
+/// The FreeRTOS idle loop's shape: `wfi` with the tick armed far in the
+/// future. The driving loop must jump the SYSTIMER straight to the alarm
+/// instead of spending a million steps at one tick each.
+#[test]
+fn wfi_fast_forwards_systimer_to_the_next_alarm_and_takes_it() {
+    let (mut cpu, mut bus) = wfi_setup(1);
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+
+    let mut taken_at = None;
+    for i in 0..3 {
+        if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
+            taken_at = Some(i);
+            break;
+        }
+    }
+    let taken_at = taken_at.expect("the alarm must wake the WFI within 3 steps");
+    assert_eq!(
+        taken_at, 1,
+        "step 0 is the WFI, step 1 fast-forwards and traps"
+    );
+    assert!(!cpu.is_waiting());
+    assert_eq!(cpu.csr.mcause, 0x8000_0000 | TARGET_LINE);
+    assert_eq!(cpu.regs.pc, HANDLER);
+    assert_eq!(cpu.csr.mepc, PROGRAM_LOAD_ADDR + 4, "mepc: after the WFI");
+    // One tick after the WFI step, then a jump of exactly the remainder.
+    assert_eq!(bus.systimer.counter(0), u64::from(LONG_PERIOD));
+}
+
+/// Waking ignores `MIE` (privileged spec 3.3.3): with `MIE` clear the
+/// fast-forwarded alarm ends the wait, no trap is taken, and execution
+/// resumes after the WFI.
+#[test]
+fn wfi_with_mie_clear_wakes_on_the_alarm_without_trapping() {
+    let (mut cpu, mut bus) = wfi_setup(1);
+    for _ in 0..3 {
+        assert!(!step_with_interrupts(&mut cpu, &mut bus).trap_taken);
+    }
+    assert!(!cpu.is_waiting());
+    assert!(cpu.regs.pc > PROGRAM_LOAD_ADDR + 4, "resumed past the WFI");
+    assert!(bus.systimer.counter(0) >= u64::from(LONG_PERIOD));
+}
+
+/// A priority-0 line is disabled (ESP32-C3 TRM, `peripherals::intc`'s
+/// module doc), so its asserted source must neither wake the WFI nor be
+/// taken: the CPU keeps waiting, one budget step at a time.
+#[test]
+fn wfi_does_not_wake_on_a_priority_zero_line() {
+    let (mut cpu, mut bus) = wfi_setup(0);
+    cpu.csr.mstatus |= mstatus_bits::MIE;
+    for i in 0..20 {
+        assert!(
+            !step_with_interrupts(&mut cpu, &mut bus).trap_taken,
+            "taken at {i}"
+        );
+    }
+    assert!(cpu.is_waiting(), "a priority-0 line must not wake WFI");
+    assert_eq!(cpu.regs.pc, PROGRAM_LOAD_ADDR + 4);
+    assert_ne!(
+        bus.systimer.pending_sources() & (1 << 37),
+        0,
+        "the alarm itself did fire (the source is asserted)"
+    );
+    assert_eq!(bus.asserted_lines(), 0);
+}

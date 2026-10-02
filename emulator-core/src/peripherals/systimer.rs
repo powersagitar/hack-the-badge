@@ -115,7 +115,9 @@
 use crate::mem::soc::SRC_SYSTIMER_TARGET0;
 
 /// Ticks each working counter advances per [`SysTimer::advance`] call, i.e.
-/// per `Cpu::step()` in the driving loop (`crate::boot::step_with_interrupts`).
+/// per `Cpu::step()` in the driving loop (`crate::boot::step_with_interrupts`),
+/// except on a step spent waiting in `WFI`, where the loop jumps straight to
+/// the next alarm ([`SysTimer::ticks_until_next_alarm`], Milestone 3 Task 6).
 /// See the module doc's "Tick rate" section.
 pub const TICKS_PER_STEP: u64 = 1;
 

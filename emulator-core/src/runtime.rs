@@ -51,7 +51,8 @@ pub const NUM_RAW_BUTTON_SLOTS: usize = 1 + crate::peripherals::gpio::HC165_SLOT
 pub struct RunSummary {
     /// How many `step()` calls this run made (equal to the requested budget;
     /// this runtime has no halt state — even a firmware stuck in a trap loop
-    /// keeps consuming steps).
+    /// keeps consuming steps, and so does a core parked in `WFI`: each
+    /// waiting step counts once, see [`FirmwareRuntime::run`]).
     pub steps: u32,
     /// How many of those steps took a trap instead of completing an
     /// instruction.
@@ -118,6 +119,12 @@ impl FirmwareRuntime {
     /// interrupts along the way (via
     /// [`crate::boot::step_with_interrupts`] — the correct one-poll-per-step
     /// cadence, see its doc).
+    ///
+    /// A core parked by `WFI` (`Cpu::is_waiting`) still costs one step of
+    /// `budget` per step, fast-forward or not, so this always returns after
+    /// exactly `budget` steps even if the firmware waits forever (Milestone
+    /// 3 Task 6; pinned by
+    /// `tests::run_returns_after_budget_even_if_wfi_never_wakes`).
     pub fn run(&mut self, budget: u32) -> RunSummary {
         self.run_impl(budget, None)
     }
@@ -248,6 +255,41 @@ mod tests {
         buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
         buf.extend_from_slice(&code);
         buf
+    }
+
+    /// Same shape as [`synthetic_image`], but the code is `wfi; j .` and
+    /// nothing (no SYSTIMER alarm, no interrupt line) is ever armed, so the
+    /// WFI never wakes.
+    fn wfi_image() -> Vec<u8> {
+        let mut buf = vec![0u8; 24];
+        buf[0] = 0xE9;
+        buf[1] = 1;
+        buf[4..8].copy_from_slice(&0x4200_0000u32.to_le_bytes());
+        buf.extend_from_slice(&0x4200_0000u32.to_le_bytes());
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x1050_0073u32.to_le_bytes()); // wfi
+        code.extend_from_slice(&0x0000_006fu32.to_le_bytes()); // j .
+        buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&code);
+        buf
+    }
+
+    /// Review focus 4: a WFI that never wakes must not hang the host. Each
+    /// waiting step is one step of the budget, fast-forward or not.
+    #[test]
+    fn run_returns_after_budget_even_if_wfi_never_wakes() {
+        let mut rt = FirmwareRuntime::from_image(&wfi_image()).unwrap();
+        let s = rt.run(1000);
+        assert_eq!(s.steps, 1000);
+        assert_eq!(s.traps, 0);
+        assert!(rt.cpu().is_waiting());
+        assert_eq!(rt.pc(), 0x4200_0004, "parked after the wfi");
+        assert_eq!(rt.total_steps(), 1000);
+        // Nothing armed: time still passes at the ordinary one-step rate.
+        assert_eq!(
+            rt.bus().systimer.elapsed_ticks(),
+            1000 * crate::peripherals::systimer::TICKS_PER_STEP
+        );
     }
 
     #[test]

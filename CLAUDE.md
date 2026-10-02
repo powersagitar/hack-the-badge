@@ -59,15 +59,19 @@ ESP32-C3 device), in two complementary modes:
    (called from `spi_ll_set_command()`) is then a real stub, and the
    shortcut boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader leaves
    it, so the emulator-only "invalid RTC_XTAL_FREQ_REG" warnings are gone
-   (Milestone 3 Task D12). One SPI2 transaction completes, `app_main`'s
-   task blocks, and the FreeRTOS IDLE task's `wfi` then traps as an
-   illegal instruction (step 596,609), because the core does not implement
-   `wfi` yet (by then the FreeRTOS tick, SYSTIMER alarm 0 on counter 1, is
-   armed — Milestone 3 Task 5 modeled the full SYSTIMER); the panic
-   handler reboot-loops. Nothing is drawn yet, well before reaching any
-   built-in app. The current blocker is `wfi` (a known, documented gap —
-   see `docs/firmware-emulator-notes.md`'s "Known limitations" section
-   before assuming a built-in app is reachable in this mode).
+   (Milestone 3 Task D12). One SPI2 transaction completes and `app_main`'s
+   task blocks. `wfi` is a real wait-for-interrupt, and while the core
+   waits the driving loop fast-forwards the SYSTIMER (Milestone 3 Task 5
+   modeled it) straight to its next alarm (Milestone 3 Task 6), so the
+   FreeRTOS IDLE task sleeps until the tick wakes it and FreeRTOS keeps
+   scheduling: `app_main` renders with LVGL and flushes frames over SPI2
+   with DMA, but GDMA is not modeled yet, so nothing is drawn. Boot then
+   faults (step 5,555,258) on the unstubbed ROM `MD5Init`, called by
+   `load_partitions()`, and the panic handler reboot-loops, well before
+   reaching any built-in app. The current blockers are that ROM call and
+   GDMA (known, documented gaps — see `docs/firmware-emulator-notes.md`'s
+   "Known limitations" section before assuming a built-in app is reachable
+   in this mode).
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -163,9 +167,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       natively; the primary iteration loop for this half of
                       the codebase.
   src/cpu/            Generic RV32IMC decode/execute core (registers, CSRs,
-                      M-mode trap entry/mret). Deliberately knows nothing
-                      about ESP32-C3 specifics — see cpu/mod.rs's module
-                      doc. cpu/rom_stubs.rs is the chip-agnostic *mechanism*
+                      M-mode trap entry/mret, WFI wait state). Deliberately
+                      knows nothing about ESP32-C3 specifics — see
+                      cpu/mod.rs's module doc. cpu/rom_stubs.rs is the
+                      chip-agnostic *mechanism*
                       for intercepting fetches to fixed ROM addresses and
                       running a stub's effect in place of the real
                       instruction — a return value, a real memcpy/memset,
@@ -215,9 +220,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       for fast-forward, Task 5) + the ESP32-C3 interrupt
                       matrix (not a standard PLIC: 64 source MAP registers
                       onto 32 CPU lines, gated by enable and priority >=
-                      threshold, delivered as levels sampled every step by
-                      boot::step_with_interrupts; the core takes the
-                      highest-priority pending line, ties to the lowest),
+                      threshold, priority 0 = disabled, delivered as levels
+                      sampled every step by boot::step_with_interrupts; the
+                      core takes the highest-priority pending line, ties to
+                      the lowest; while the core waits in WFI that loop
+                      fast-forwards SYSTIMER to its next alarm, Task 6),
                       SYSTEM's FROM_CPU software-interrupt registers
                       (system.rs; the rest of SYSTEM is unmapped), GPIO
                       (including the GPIO matrix's FUNCn_IN/OUT_SEL_CFG

@@ -1,10 +1,10 @@
 //! ESP32-C3 peripheral models wired into `crate::mem::bus::FirmwareBus`.
 //!
-//! Task 3 scope: just enough of the interrupt matrix + SYSTIMER for
-//! FreeRTOS's periodic tick interrupt (`ETS_SYSTIMER_TARGET0_INTR_SOURCE`,
-//! per ESP-IDF v5.5.3's `components/freertos/port_systick.c`) to actually
-//! reach the CPU core once something later unblocks the mask-ROM boundary.
-//! See each submodule's doc comment for register-layout citations and the
+//! Interrupt sources are levels recomputed every step
+//! (`FirmwareBus::pending_sources`) and delivered by
+//! `crate::boot::step_with_interrupts`, which also fast-forwards
+//! [`systimer`] while the core waits in `WFI` (Milestone 3 Task 6). See
+//! each submodule's doc comment for register-layout citations and the
 //! judgment calls their exact behavior required.
 //!
 //! - [`systimer`]: [`systimer::SysTimer`], two 52-bit counters and three
@@ -13,7 +13,8 @@
 //! - [`intc`]: [`intc::InterruptController`], the ESP32-C3's non-PLIC
 //!   interrupt matrix (`INTERRUPT_CORE0`) — per-source MAP registers routing
 //!   into 32 CPU interrupt lines, gated by `CPU_INT_ENABLE_REG` and by
-//!   priority vs. `CPU_INT_THRESH_REG` (Milestone 3 Task 4).
+//!   priority vs. `CPU_INT_THRESH_REG` (Milestone 3 Task 4); a priority-0
+//!   line is disabled (Task 6).
 //! - [`system`]: [`system::System`], the SYSTEM peripheral's four
 //!   `FROM_CPU` software-interrupt registers (Milestone 3 Task 4) — the
 //!   level sources FreeRTOS's `vPortYield` raises to request a context
@@ -21,7 +22,8 @@
 //! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
 //!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
 //!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
-//!   from `systimer`'s live counter scaled to the RTC slow clock. Also
+//!   from `systimer`'s monotonic `elapsed_ticks()` scaled to the RTC slow
+//!   clock. Also
 //!   `STORE4_REG` (`RTC_XTAL_FREQ_REG`), plain storage the shortcut boot
 //!   seeds as the bootloader would (Task D12).
 //! - [`gpio`]: [`gpio::Gpio`], the GPIO peripheral plus an emulated 74HC165

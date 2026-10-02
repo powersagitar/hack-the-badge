@@ -4,9 +4,10 @@
 //! This module deliberately knows nothing about ESP32-C3 peripherals, the
 //! memory map, or the interrupt matrix — it only implements the RISC-V
 //! architectural behavior (base I, M, C extensions, Zicsr, and the M-mode
-//! subset of the privileged spec needed for traps). The ESP32-C3 interrupt
-//! matrix drives it from outside through [`Cpu::set_pending_interrupts`]
-//! (`crate::boot::step_with_interrupts`, level delivery);
+//! subset of the privileged spec needed for traps, plus `WFI`). The
+//! ESP32-C3 interrupt matrix drives it from outside through
+//! [`Cpu::set_pending_interrupts`] (`crate::boot::step_with_interrupts`,
+//! level delivery);
 //! [`Cpu::raise_interrupt`] is the one-shot variant unit tests use.
 
 mod decode;
@@ -90,7 +91,16 @@ pub struct Cpu {
     /// interrupt controller's `CPU_INT_PRI_n` values here whenever more
     /// than one line is pending ([`Cpu::set_interrupt_priorities`]); the core itself knows nothing
     /// about where priorities come from.
+    ///
+    /// **May be stale.** `crate::boot::step_with_interrupts` refreshes it
+    /// only on steps where more than one line is pending (the only case
+    /// arbitration consults it), so after single-line steps it can still
+    /// hold the controller's priorities as of the last multi-line step.
+    /// Never read it as "the current `CPU_INT_PRI_n` values".
     interrupt_priorities: [u8; 32],
+    /// `true` between a retired `WFI` and the next step that sees a pending
+    /// interrupt -- see [`Cpu::is_waiting`].
+    waiting: bool,
     /// How many indexed [`rom_stubs::RomStubEffect::BusRegisterWrite`] stub
     /// calls were dropped because the guest's index register was out of
     /// range (see `BusRegisterWrite::index_limit`). The "log" for those
@@ -134,6 +144,7 @@ impl Default for Cpu {
             csr: Csrs::new(),
             pending_interrupts: 0,
             interrupt_priorities: [0; 32],
+            waiting: false,
             rom_stub_index_drops: 0,
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
@@ -244,12 +255,38 @@ impl Cpu {
     /// Replaces the per-line priority table used to pick among several
     /// pending lines (see [`select_interrupt_line`]). Masking by priority vs.
     /// threshold is the interrupt controller's job, not this table's.
+    /// `true` while the core is parked by a `WFI` (RISC-V privileged spec
+    /// v1.12, section 3.3.3, "Wait for Interrupt"): the `WFI` itself has
+    /// retired (`pc` is past it), and each [`Cpu::step`] executes nothing --
+    /// it returns `StepInfo { trap_taken: false, instr_len: 0, .. }` with
+    /// `pc` unchanged -- until [`Cpu::pending_interrupts`] is non-zero.
+    ///
+    /// Waking ignores `mstatus.MIE`, as the spec requires ("WFI is also
+    /// required to resume execution for locally enabled interrupts pending
+    /// at any privilege level, regardless of the global interrupt enable at
+    /// each privilege level"); "locally enabled" is the interrupt matrix's
+    /// enable/priority/threshold gating, already applied to the pending set
+    /// the driving loop hands in. The waking step then proceeds as an
+    /// ordinary step: it takes the interrupt if `MIE` is set (`mepc` = the
+    /// instruction after the `WFI`), else executes that instruction.
+    ///
+    /// Waiting never ends on its own, so a caller stepping a core that
+    /// waits forever must bound its own loop; `crate::runtime::FirmwareRuntime::run`
+    /// counts every waiting step against its budget, and
+    /// `crate::boot::step_with_interrupts` fast-forwards the SYSTIMER while
+    /// the core waits.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting
+    }
+
     pub fn set_interrupt_priorities(&mut self, priorities: [u8; 32]) {
         self.interrupt_priorities = priorities;
     }
 
     /// Executes exactly one instruction: fetch, decode, execute, and advance
-    /// `pc` — or, if an interrupt is pending (via [`Cpu::raise_interrupt`])
+    /// `pc` — unless parked by `WFI` with nothing pending, when it executes
+    /// nothing (see [`Cpu::is_waiting`]) — or, if an interrupt is pending
+    /// (via [`Cpu::raise_interrupt`])
     /// *and* `mstatus.MIE` is set, or the instruction just decoded raises a
     /// synchronous exception, takes that trap instead (saving
     /// `mepc`/`mcause`, updating `mstatus`, and jumping to `mtvec`).
@@ -265,6 +302,20 @@ impl Cpu {
     /// re-asserts and the trap fires again, so the ISR body never runs.
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepInfo {
         let pc_before = self.regs.pc;
+
+        // Parked by WFI (see `is_waiting`): nothing executes until some
+        // line is pending; then fall through to an ordinary step.
+        if self.waiting {
+            if self.pending_interrupts == 0 {
+                return StepInfo {
+                    trap_taken: false,
+                    instr_len: 0,
+                    pc_before,
+                    rom_stub: None,
+                };
+            }
+            self.waiting = false;
+        }
 
         if self.pending_interrupts != 0 && self.csr.mstatus & mstatus_bits::MIE != 0 {
             let line = select_interrupt_line(self.pending_interrupts, &self.interrupt_priorities);
@@ -1448,6 +1499,62 @@ mod tests {
         let info = cpu.step(&mut bus);
         assert!(info.trap_taken);
         assert_eq!(cpu.csr.mcause, 0x8000_0000 | 5);
+    }
+
+    const WFI: u32 = 0x1050_0073;
+
+    #[test]
+    fn wfi_waits_until_an_interrupt_is_pending_then_traps_if_mie() {
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::with_program(&[WFI, addi(0, 0, 0)]);
+        cpu.csr.mtvec = 0x8000_0000;
+        cpu.csr.mstatus |= mstatus_bits::MIE;
+        let info = cpu.step(&mut bus); // executes WFI
+        assert!(!info.trap_taken);
+        assert_eq!(info.instr_len, 4);
+        assert!(cpu.is_waiting());
+        let pc = cpu.regs.pc;
+        assert_eq!(pc, 4, "WFI itself retires; pc is past it");
+        for _ in 0..5 {
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.instr_len, 0, "nothing executes while waiting");
+            assert_eq!(info.rom_stub, None);
+        }
+        assert_eq!(cpu.regs.pc, pc, "no progress while waiting");
+        assert!(cpu.is_waiting());
+        cpu.set_pending_interrupts(1 << 3);
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken && !cpu.is_waiting());
+        assert_eq!(cpu.csr.mcause, 0x8000_0000 | 3);
+        assert_eq!(cpu.csr.mepc, 4, "mepc is the instruction after WFI");
+    }
+
+    #[test]
+    fn wfi_with_mie_clear_resumes_after_wfi_without_trapping() {
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::with_program(&[WFI, addi(5, 0, 7)]);
+        cpu.step(&mut bus);
+        assert!(cpu.is_waiting());
+        cpu.set_pending_interrupts(1 << 3);
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken && !cpu.is_waiting());
+        // The wake-up step goes on to execute the instruction after WFI.
+        assert_eq!(cpu.regs.read(5), 7);
+        assert_eq!(cpu.regs.pc, 8);
+    }
+
+    #[test]
+    fn wfi_with_an_interrupt_already_pending_but_mie_clear_does_not_stall() {
+        // Privileged spec 3.3.3: WFI wakes on a pending interrupt whatever
+        // MIE says, so with one already pending the very next step resumes.
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::with_program(&[WFI, addi(5, 0, 7)]);
+        cpu.set_pending_interrupts(1 << 3);
+        cpu.step(&mut bus);
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken && !cpu.is_waiting());
+        assert_eq!(cpu.regs.read(5), 7);
     }
 
     #[test]

@@ -85,7 +85,9 @@
 //! already tracks as its monotonic `elapsed_ticks()` (advanced by exactly
 //! [`crate::peripherals::systimer::TICKS_PER_STEP`] -- documented there as 1
 //! tick per `Cpu::step()`, a placeholder since `Cpu::step()` has no
-//! cycle-accurate timing model). Rather than add a second, redundant
+//! cycle-accurate timing model -- except that a step spent waiting in `WFI`
+//! may jump it ahead to the next SYSTIMER alarm, Milestone 3 Task 6; RTC
+//! time follows that jump, as real time would). Rather than add a second, redundant
 //! step-counting field here, [`RtcCntl::write_byte`] takes that live
 //! SYSTIMER tick count as a parameter at the moment of the trigger --
 //! `crate::mem::bus::FirmwareBus` passes `self.systimer.elapsed_ticks()` directly

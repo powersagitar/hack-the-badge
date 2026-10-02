@@ -38,8 +38,9 @@
 //! [`InterruptController::poll`] returns the mask of CPU lines that are
 //! (a) routed-to by at least one *asserted* source, (b) enabled in
 //! `CPU_INT_ENABLE_REG`, and (c) whose `CPU_INT_PRI_<n>_REG` priority is
-//! **greater than or equal to** `CPU_INT_THRESH_REG` -- i.e. only
-//! priorities *strictly less than* the threshold are masked. Sources, all
+//! non-zero (priority 0 is "disabled", below) and **greater than or equal
+//! to** `CPU_INT_THRESH_REG` -- i.e. only priorities *strictly less than*
+//! the threshold are masked. Sources, all
 //! ESP-IDF v5.5.3:
 //! - `components/riscv/include/esp_private/interrupt_intc.h`: "On the
 //!   legacy INTC, all interrupt priority levels strictly less than the
@@ -63,9 +64,24 @@
 //! Both fields are 4 bits wide (`interrupt_core0_reg.h`: `CPU_INT_THRESH`
 //! bitpos `[3:0]`, `CPU_PRI_<n>_MAP` bitpos `[3:0]`), so the comparison
 //! masks to 4 bits. Reset values are 0 for every priority *and* for the
-//! threshold (`default: 4'b0`), so after reset `0 >= 0` lets any routed,
-//! enabled line through, as in QEMU's model; the enable register (reset 0)
-//! is what keeps a fresh controller quiet. ESP-IDF programs each allocated
+//! threshold (`default: 4'b0`).
+//!
+//! **Priority 0 means "disabled"** (Milestone 3 Task 6): a line whose
+//! 4-bit priority is 0 is never asserted to the core, whatever the
+//! threshold -- not even under the reset threshold of 0, where `0 >= 0`
+//! alone would admit it. Sources: ESP32-C3 TRM v1.4 section 1.5.2 (interrupt
+//! controller: priority levels 1..15 are usable, and a line at priority 0
+//! is disabled); ESP-IDF v5.5.3 `components/riscv/include/riscv/interrupt.h`
+//! documents `esprv_int_set_priority`'s priority as "Interrupt priority
+//! level, 1 to 7" (0 is never a valid allocated level), and every ESP-IDF
+//! allocation programs the line's priority (`esp_cpu_intr_set_priority` ->
+//! `esprv_intc_int_set_priority`, `components/esp_hw_support/cpu.c`) before
+//! enabling it. This **diverges from Espressif's QEMU model**, whose
+//! `esp32c3_intmatrix_line_should_assert` only rejects line 0 and admits a
+//! priority-0 line under threshold 0; we follow the TRM. It matters for
+//! `WFI`: a routed, enabled source on a never-prioritized line must not wake
+//! the core. The enable register (reset 0) and the 0 reset priorities both
+//! keep a fresh controller quiet. ESP-IDF programs each allocated
 //! line's priority (`esp_cpu_intr_set_priority` ->
 //! `esprv_intc_int_set_priority`, `components/esp_hw_support/cpu.c`)
 //! before enabling it. The FreeRTOS port's critical sections raise
@@ -199,9 +215,10 @@ impl InterruptController {
     }
 
     /// The set of CPU lines currently asserted *to the CPU*: routed pending,
-    /// enabled in `CPU_INT_ENABLE_REG`, and with priority greater than or
-    /// equal to `CPU_INT_THRESH_REG` (only priorities strictly below the
-    /// threshold are masked). See the module doc.
+    /// enabled in `CPU_INT_ENABLE_REG`, with a non-zero priority (priority 0
+    /// is "disabled"), and with priority greater than or equal to
+    /// `CPU_INT_THRESH_REG` (only priorities strictly below the threshold are
+    /// masked). See the module doc.
     pub fn poll(&self, pending_sources: u64) -> u32 {
         if pending_sources == 0 {
             return 0; // the common case, every step: skip the scans
@@ -210,9 +227,9 @@ impl InterruptController {
         let thresh = self.cpu_int_thresh & PRIO_MASK;
         let mut out = 0u32;
         for line in 0..LINE_COUNT {
-            if candidates & (1 << line) != 0
-                && (self.cpu_int_pri[line as usize] & PRIO_MASK) >= thresh
-            {
+            let pri = self.cpu_int_pri[line as usize] & PRIO_MASK;
+            // Priority 0 = line disabled (module doc), whatever `thresh` is.
+            if candidates & (1 << line) != 0 && pri != 0 && pri >= thresh {
                 out |= 1 << line;
             }
         }
@@ -407,11 +424,36 @@ mod tests {
         assert_eq!(ic.poll(1u64 << 50), 0);
     }
 
+    /// Priority 0 means "disabled" (module doc): a routed, enabled line at
+    /// the reset priority never asserts, whatever the threshold, until its
+    /// priority is programmed.
     #[test]
-    fn reset_priority_and_threshold_admit_an_enabled_routed_line() {
-        // Reset PRI = THRESH = 0 => `0 >= 0`; ENABLE (reset 0) is the gate.
+    fn priority_zero_line_never_asserts_at_any_threshold() {
         let mut ic = InterruptController::new();
         write_word(&mut ic, 37 * 4, 7);
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
+        for thresh in [0, 1, 7, 15] {
+            write_word(&mut ic, CPU_INT_THRESH_REG, thresh);
+            assert_eq!(ic.poll(1u64 << 37), 0, "pri 0 fired at thresh {thresh}");
+        }
+        assert_eq!(
+            ic.eip_status(1u64 << 37),
+            1 << 7,
+            "still visible as pending"
+        );
+        write_word(&mut ic, CPU_INT_THRESH_REG, 0);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 7 * 4, 1);
+        assert_eq!(ic.poll(1u64 << 37), 1 << 7, "pri 1 >= thresh 0 fires");
+        // Only the low 4 bits count: 0x10 is priority 0 again.
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 7 * 4, 0x10);
+        assert_eq!(ic.poll(1u64 << 37), 0);
+    }
+
+    #[test]
+    fn enable_is_still_a_gate_for_a_prioritized_line() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 37 * 4, 7);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 7 * 4, 1);
         assert_eq!(ic.poll(1u64 << 37), 0, "not enabled");
         write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 7);
         assert_eq!(ic.poll(1u64 << 37), 1 << 7);

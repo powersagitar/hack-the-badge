@@ -567,7 +567,9 @@ impl FirmwareBus {
     }
 
     /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
-    /// ticks. Call exactly once per `Cpu::step()` — see
+    /// ticks. Call exactly once per `Cpu::step()` (except a step spent
+    /// waiting in `WFI`, which advances SYSTIMER by its own fast-forward
+    /// instead) — see
     /// `crate::boot::step_with_interrupts`, which samples
     /// [`FirmwareBus::asserted_lines`] itself at the start of the next step,
     /// so this returns nothing.
@@ -824,8 +826,9 @@ impl FirmwareBus {
                 self.record_unmapped(addr, true);
             }
             // Cross-peripheral read: the RTC timer's "elapsed time" source
-            // is systimer's own live counter (no free-running clock of its
-            // own to model) -- both fields are concrete on `self`, so this
+            // is systimer's monotonic `elapsed_ticks()` (no free-running
+            // clock of its own to model; not a unit counter, which firmware
+            // can stop or reload) -- both fields are concrete on `self`, so this
             // is just direct field access, the same pattern the
             // INTERRUPT_CORE0/SPI2 tiers above already use. See
             // `crate::peripherals::rtc_cntl`'s module doc.

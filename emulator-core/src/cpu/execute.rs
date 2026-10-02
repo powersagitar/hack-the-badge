@@ -132,6 +132,14 @@ pub(super) fn execute<B: Bus>(
         Instruction::Mret => {
             cpu.exec_mret();
         }
+        Instruction::Wfi => {
+            // Retires (pc advances), then the core parks until an interrupt
+            // is pending -- see `Cpu::is_waiting`. `mepc` for the waking
+            // interrupt is therefore the instruction after the WFI, as the
+            // privileged spec (3.3.3) requires.
+            cpu.waiting = true;
+            cpu.regs.pc = fallthrough;
+        }
         Instruction::Csr { rd, csr, src, kind } => {
             let old = cpu.csr.read(csr);
             let operand = match src {
