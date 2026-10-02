@@ -12,74 +12,24 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestone 2): the badge's *built-in* apps (Snake,
+2. **Real-firmware mode** (Milestones 2–3): the badge's *built-in* apps (Snake,
    Dice, etc.) are native RISC-V machine code baked into one monolithic
    ESP-IDF app image — not extractable as Lua files (confirmed by
    flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   Real-firmware boot currently runs past the mask-ROM wall, past
-   `cpu_start`'s own app-image-header check (Milestone 3 Task D5 made the
-   emulator's flash-cache XIP mapping page-granular, like the real 2nd-stage
-   bootloader's, which exposes the header bytes `cpu_start` actually reads —
-   see `docs/firmware-emulator-notes.md`'s "Known limitations" entry 1 for
-   the full story), and into a full early-boot log: `cpu_start: Pro cpu
-   start user code`, `cpu_start: cpu freq: ...`, and a generic
-   `app_init`/`efuse_init` build-metadata block, all visible on the emulated
-   console since ROM `ets_printf` is HLE-stubbed as a real C-printf
-   formatter (Milestone 3 Task 7). ROM libc `qsort` then runs as real
-   guest-executed code (Milestone 3 Task D6). The ROM layout table behind
-   `ets_rom_layout_p` (ROM *data* at `0x3ff1_fffc`) is backed with values
-   read from Espressif's published ESP32-C3 ROM ELF (Milestone 3 Task D7),
-   so its caller `s_prepare_reserved_regions()` passes its overlap check and
-   boot prints `heap_init: Initializing. RAM available for dynamic
-   allocation:`, then all four `heap_init: At ...` region lines once the
-   libgcc ROM helpers `__clzsi2`/`__ffssi2` are backed (Milestone 3 Task
-   D8). ROM `esp_rom_newlib_init_common_mutexes` and the ROM libc calls
-   `strlen`/`memcmp`/`strncmp`/`div` are then real stubs (Milestone 3 Task
-   D9), and boot runs on to ESP-IDF's flash-chip detection. The SPI1 flash
-   controller and a synthetic 4 MiB flash chip are modeled (Milestone 3
-   Task 8), so the JEDEC ID read succeeds and boot prints `spi_flash:
-   detected chip: generic` and the `sleep_gpio:` lines. ROM `memchr`/
-   `memmove`, `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get`
-   and `esprv_intc_int_set_threshold` are then real stubs too, and the
-   ROM's writable SPI-flash legacy data is seeded at boot (Milestone 3 Task
-   D10), so boot runs with zero traps into FreeRTOS's scheduler start.
-   The SYSTEM cross-core software interrupt (`SYSTEM_CPU_INTR_FROM_CPU_0_REG`)
-   and a source-indexed, priority/threshold-gated interrupt matrix are then
-   modeled (Milestone 3 Task 4), so `vPortYield()`'s first context-switch
-   request is taken as an interrupt, FreeRTOS runs its first task, and boot
-   prints `main_task: Started on CPU0` and `main_task: Calling app_main()`.
-   Inside `app_main`, ROM `gpio_matrix_out`/`gpio_matrix_in` are real stubs
-   that program the GPIO matrix (Milestone 3 Task D11), so the SPI bus
-   setup routes SPI2 onto the display pads. SPI2's `SPI_UPDATE` then
-   self-clears and transactions raise `SPI_TRANS_DONE` (Milestone 3 Task
-   9), so `spi_hal_init()` completes. The libgcc ROM helper `__bswapsi2`
-   (called from `spi_ll_set_command()`) is then a real stub, and the
-   shortcut boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader leaves
-   it, so the emulator-only "invalid RTC_XTAL_FREQ_REG" warnings are gone
-   (Milestone 3 Task D12). One SPI2 transaction completes and `app_main`'s
-   task blocks. `wfi` is a real wait-for-interrupt, and while the core
-   waits the driving loop fast-forwards the SYSTIMER (Milestone 3 Task 5
-   modeled it) straight to its next alarm (Milestone 3 Task 6), so the
-   FreeRTOS IDLE task sleeps until the tick wakes it and FreeRTOS keeps
-   scheduling: `app_main` renders with LVGL and flushes frames over SPI2
-   with DMA. GDMA's TX out-link is modeled and feeds SPI2 (Milestone 3
-   Task 10), so those frames reach the ST7789 model and the framebuffer
-   shows the firmware's boot splash. ROM `MD5Init`/`MD5Update`/`MD5Final`
-   are real stubs over the guest's MD5 context (Milestone 3 Task D13), so
-   `load_partitions()`'s `MD5Init` call (step 5,555,258) returns and boot
-   takes no exception after it. But the partition table it then reads
-   through `spi_flash_mmap()` comes back as zeros, because the flash MMU
-   table is not modeled (the firmware's MMU entry write is dropped), so
-   partition loading fails with `ESP_ERR_NOT_FOUND`. The firmware keeps
-   scheduling with the splash on screen, unchanged, but prints nothing new
-   and never reaches a built-in app. The current blocker is that flash MMU
-   (plan Task 8, sub-unit 3; a known, documented gap — see
-   `docs/firmware-emulator-notes.md`'s
-   "Known limitations" section before assuming a built-in app is reachable
-   in this mode).
+   **Current state (end of Milestone 3):** boot runs through the ESP-IDF
+   startup log, FreeRTOS and `app_main`, and draws the firmware's **boot
+   splash** to the emulated ST7789 framebuffer (final from step 5,535,126;
+   pinned by `boots_to_first_real_frame` in
+   `emulator-core/tests/boot_progress.rs`). It then stalls without a
+   fault: `load_partitions()` reads the partition table through the flash
+   MMU, which is not modeled, gets zeros, and never reaches the app
+   launcher or any built-in app. The flash MMU is the next blocker
+   (Milestone 4). Read `docs/firmware-emulator-notes.md`'s "Known
+   limitations" (current state, open limitations, and the stall-by-stall
+   history) before assuming a built-in app is reachable in this mode.
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -122,6 +72,25 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   generated glue + `.wasm` binary) from `emulator-wasm/`. **Must be re-run after any
   change under `emulator-core/`/`emulator-wasm/`**, before `bun run dev`,
   `bun run build`, or `bun test` — nothing else regenerates it automatically.
+- `cargo test -p emulator-core --release --test boot_progress` — the
+  real-firmware boot ratchet: each test boots `factory.bin` and asserts a
+  console line, a no-fault point, or a framebuffer state (the finish line
+  is `boots_to_first_real_frame`). It also passes in a debug build, but the
+  multi-million-step boots are much faster with `--release`. When boot
+  moves, update the rung whose budget it affects and the module doc's
+  per-task status.
+- `cargo run -p emulator-core --release --example boot-probe -- [--steps N] [--window W] [--dump-frame PATH]`
+  — the "why is boot stuck" diagnostic: console output, run summary, hot
+  PCs, unmapped accesses, framebuffer diversity; `--dump-frame` writes a
+  PNG under `local/` (relative paths are confined there).
+
+Local-only data (`local/`, gitignored): the full flash dump, the real
+serial boot log and the esptool venv (`local/.venv/bin/python`; use it for
+any Python, never the system `python3`). Never commit anything from
+`local/`, and never quote the boot log's identity lines in code, tests,
+docs or commits. Committed tests depend only on `factory.bin`; code that
+needs the full dump reads `BADGE_FULL_DUMP` and skips when it is unset. See
+the notes' "Data-handling note".
 
 ## Architecture
 
@@ -248,7 +217,15 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       framebuffer, and GDMA (gdma.rs, Task 10: the TX
                       out-link that feeds SPI2 when SPI_DMA_TX_ENA is set;
                       the descriptor walk reads RAM, so it is
-                      FirmwareBus::gdma_pull). Each module's doc comment cites the
+                      FirmwareBus::gdma_pull), TIMG0/TIMG1 (timg.rs: RTC
+                      slow-clock calibration, inert watchdog storage) and
+                      RTC_CNTL (rtc_cntl.rs: the RTC timer and the
+                      RTC_XTAL_FREQ_REG store). console.rs is the capped
+                      byte sink every "firmware printed" path feeds
+                      (USB-Serial-JTAG TX via usb_serial_jtag.rs, the
+                      badge's real console; UART0 TX; ROM putc stubs).
+                      The flash MMU is not modeled (the current stall).
+                      Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
                       from.
   src/peripherals/flash.rs

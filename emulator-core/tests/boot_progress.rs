@@ -366,6 +366,16 @@
 //! moved). The new rung is a no-fault one a few thousand steps past the old
 //! fault:
 //! [`boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site`].
+//!
+//! **Task 11 status (Milestone 3 finish line)**: nothing in the emulator
+//! changes; the boot splash Task 10 first drew is pinned. The framebuffer
+//! is first non-blank on step 1,128,605 (2 colors, not the finished
+//! splash), keeps changing (33 changes at 1,000-step sampling; whether
+//! from partial flushes or an animation was not traced), and is final
+//! from step 5,535,126 on (2,340 colors, unchanged to step 10,000,000).
+//! The flash MMU stall after `MD5Init` (see the D13 status) is the next
+//! blocker, Milestone 4. The new rung pins that stable frame by hash:
+//! [`boots_to_first_real_frame`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1128,6 +1138,103 @@ fn boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site() {
     assert!(
         distinct.len() >= 2_000,
         "only {} distinct colors in the framebuffer",
+        distinct.len()
+    );
+    let console = rt.console_output();
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
+}
+
+/// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2
+/// little-endian bytes, in framebuffer order.
+fn framebuffer_fnv1a(fb: &[u16]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for px in fb {
+        for b in px.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Milestone 3's finish line (Task 11, see the module doc's "Task 11
+/// status"): the real firmware boots to its first stable ST7789 frame, the
+/// boot splash, and the frame is pinned by hash.
+///
+/// **Which frame is pinned.** The first non-blank framebuffer (step
+/// 1,128,605, 2 distinct colors) is not the finished splash: the
+/// framebuffer changes 33 times (at 1,000-step sampling) before it
+/// settles. This test pins the first *stable* frame instead: the one the
+/// framebuffer holds from step 5,535,126 on (2,340 distinct colors),
+/// unchanged at every 1,000-step sample to step 10,000,000. The loop
+/// samples every 250,000 steps and stops once the hash has held for
+/// 1,000,000 steps (it stops at step 6,750,000), so the pinned hash is
+/// that stable frame, not whichever intermediate frame a sample happens to
+/// land on.
+/// `MAX` is the observed stable step × 2, rounded up (11,100,000); it is
+/// only reached if the frame never stabilizes.
+///
+/// **Orientation.** The hash is of *our* framebuffer, in the ST7789 model's
+/// default row/column order. MADCTL's row/column exchange (the firmware
+/// sends 0x20, then 0x60) is not modeled; the splash matches the physical
+/// badge only because the firmware's address window fits that default
+/// order (see the notes' "Known limitations"). Modeling MADCTL may change
+/// this hash without the image being wrong.
+///
+/// Runtime (measured): about 0.5 s with `--release`, about 6.5 s in a debug
+/// build.
+/// On failure, inspect the frame with
+/// `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
+/// (writes under the gitignored `local/`).
+#[test]
+fn boots_to_first_real_frame() {
+    const MAX: u64 = 11_100_000;
+    const CHUNK: u32 = 250_000;
+    const STABLE_FOR: u64 = 1_000_000;
+    const PINNED: u64 = 0x5599_c270_ab04_29fa;
+
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut first_non_blank: Option<u64> = None;
+    let mut hash = framebuffer_fnv1a(rt.framebuffer());
+    let mut hash_since = rt.total_steps();
+    let mut stable = false;
+    while rt.total_steps() < MAX {
+        let summary = rt.run(CHUNK);
+        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+        let fb = rt.framebuffer();
+        if first_non_blank.is_none() && fb.iter().any(|px| *px != fb[0]) {
+            first_non_blank = Some(rt.total_steps());
+        }
+        let h = framebuffer_fnv1a(fb);
+        if h != hash {
+            hash = h;
+            hash_since = rt.total_steps();
+        } else if first_non_blank.is_some() && rt.total_steps() - hash_since >= STABLE_FOR {
+            stable = true;
+            break;
+        }
+    }
+
+    let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "no frame within {MAX} steps; pc=0x{:08x}\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(
+        stable,
+        "frame never held for {STABLE_FOR} steps within {MAX} (first non-blank at \
+         {first_non_blank:?}, last change at {hash_since}); pc=0x{:08x}",
+        rt.pc()
+    );
+    assert_eq!(
+        hash,
+        PINNED,
+        "first stable frame changed ({} distinct colors, stable since step {hash_since}) — \
+         inspect with boot-probe --dump-frame",
         distinct.len()
     );
     let console = rt.console_output();

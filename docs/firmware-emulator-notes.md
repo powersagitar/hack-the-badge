@@ -391,6 +391,103 @@ at the actual device.
 
 ## Known limitations / where boot currently stalls
 
+### Current state (end of Milestone 3)
+
+Real-firmware boot reaches its **first real ST7789 frame**: the firmware's
+boot splash ("Hack the North × SOLANA" and the FW version line; no
+personal data). From a cold shortcut boot of `factory.bin`:
+
+- The framebuffer is blank through step 1,128,604. It is first non-blank
+  on step 1,128,605 (2 distinct RGB565 values, not yet the finished
+  splash).
+- It changes 33 times (sampled every 1,000 steps) and is final from step
+  5,535,126 on: 2,340 distinct values, unchanged at every 1,000-step sample
+  to step 10,000,000.
+- `emulator-core/tests/boot_progress.rs`'s `boots_to_first_real_frame`
+  pins that stable frame by an FNV-1a hash of the framebuffer
+  (`0x5599c270ab0429fa`). It samples every 250,000 steps and stops once
+  the hash has held for 1,000,000 steps (at step 6,750,000). It takes
+  about 0.5 s with `--release` and about 6.5 s in a debug build.
+- To look at the frame:
+  `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
+  writes a PNG under the gitignored `local/`.
+
+After the frame, boot takes no instruction-access fault and prints no
+panic text (checked to step 10,000,000; history item 1 checked for no
+exception at all to step 7,600,000), but it never reaches the app launcher or a built-in app. Once the splash is
+drawn, `load_partitions()` reads the partition table through a
+`spi_flash_mmap` window, the flash MMU behind it is not modeled, the
+table reads as zeros, and partition loading fails with
+`ESP_ERR_NOT_FOUND` (history item 1's "Task D13" paragraphs have the
+details). The firmware keeps scheduling with the splash on screen.
+
+**Resolved in Milestone 3** (details in the history below):
+
+- TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
+- The ROM HLE stub table, grown task by task (Tasks D2 to D13 and 7): libc
+  and libgcc helpers, `ets_printf` as a real formatter, the interrupt-matrix
+  and GPIO-matrix ROM calls, ROM MD5, and ROM data/`.data` the shortcut
+  boot seeds (layout table, SPI-flash legacy data, `RTC_XTAL_FREQ_REG`).
+- Page-granular XIP mapping (Task D5).
+- The SPI1 flash controller and a synthetic 4 MiB flash chip (Task 8; see
+  "Emulated flash chip" below).
+- The interrupt matrix with priority/threshold and the SYSTEM FROM_CPU
+  software interrupts (Task 4); SYSTIMER (Task 5, item 2); WFI with
+  SYSTIMER fast-forward (Task 6, item 4).
+- SPI2 `SPI_UPDATE`/`TRANS_DONE` (Task 9) and the GDMA TX out-link feeding
+  SPI2 (Task 10, item 3), which is what puts pixels on screen.
+
+**Open limitations (Milestone 4 candidates)**, the first one being the
+current blocker:
+
+1. **Flash MMU (plan Task 8, sub-unit 3): the next blocker.** The bus has
+   no MMU table: the firmware's entry writes (`DR_REG_MMU_TABLE`,
+   `0x600c_5000`) are dropped and reads through a `spi_flash_mmap` window
+   return 0. The fix is an MMU table model that the DROM/IROM read path
+   consults, backed by the emulated flash chip. Milestone 3 deliberately
+   stopped short of it: the spec builds flash/partition support only if
+   boot reaches it before the first frame, and the first frame comes
+   first.
+2. **Console output after the scheduler starts is missing.**
+   `load_partitions()`'s `ESP_LOGE` runs (`esp_log_write`), but no byte
+   reaches the emulated console. Every console line so far was printed
+   before or just after the scheduler started. How later log output
+   leaves the chip (newlib stdout through the VFS, and whether it waits on
+   a USB-Serial-JTAG interrupt the emulator does not raise) is not traced.
+   Until it is, a missing console line is not proof the firmware did not
+   log it.
+3. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
+   and then `0x60` (row/column exchange, then also column-address
+   mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
+   hardcodes the unrotated 320x240 order. The splash comes out right only
+   because the firmware's address window fits that default order. So
+   `boots_to_first_real_frame`'s pinned hash is of *this* framebuffer
+   orientation; modeling `MADCTL` may change the hash without the image
+   being wrong.
+4. **The frame has not yet been compared with the physical badge's first
+   screen** by eye (pending, outside the test suite).
+5. The dormant items from the history below: flagged ROM-stub guesses
+   (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
+   "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6),
+   the bootloader's extra DROM page (item 7) and simplified edge
+   interrupts (item 9).
+
+### Ground truth from the physical badge
+
+Read from the real badge's serial boot log and partition table (neither is
+committed; see the "Data-handling note"). None of these facts is personal
+data:
+
+- ESP32-C3, chip revision v0.4; 40 MHz crystal; CPU at 80 MHz (the
+  emulator's `CPU_FREQ_MHZ` stub returns 160, a flagged guess left alone
+  because nothing has stalled on it).
+- 4 MiB flash, JEDEC ID `0x46 0x40 0x16`.
+- Console: USB-Serial-JTAG.
+- Partition table: `nvs` 0x9000/0x4000, `phy_init` 0xd000/0x1000,
+  `factory` 0x10000/0x2a0000, `storage` 0x2b0000/0x140000.
+
+### History: the stall-by-stall log (Milestones 2 and 3)
+
 As of the Milestone 2 merge, real-firmware boot runs 2,000,000+ instructions
 with zero traps, then stalls inside `rtc_clk_cal()`, polling an unmodeled
 `TIMG_RTCCALICFG_REG` (TIMERGROUP0, the `RTC_CALI_RDY` bit) — before
@@ -401,7 +498,8 @@ physical-hardware visual cross-check) was always out of scope for Milestone
 2.
 
 **Milestone 3 candidate work**, in the order a whole-branch code review
-predicted these blockers would surface once TIMG unblocks further boot:
+predicted these blockers would surface once TIMG unblocks further boot
+(item 1 grew into the step-by-step record of every Milestone 3 stall):
 
 1. ~~**Model `TIMG_RTCCALICFG_REG`**~~ — **Resolved in Milestone 3, Task 3**
    (`emulator-core/src/peripherals/timg.rs`). `RTCCALICFG_REG`/
@@ -1168,6 +1266,12 @@ predicted these blockers would surface once TIMG unblocks further boot:
    USB-Serial-JTAG interrupt the emulator does not raise) is not yet
    checked. Until it is, a missing console line is not proof the firmware
    did not log it.
+
+   **Task 11 (Milestone 3 finish line).** No emulator change. The
+   splash is final from step 5,535,126 on, and
+   `boots_to_first_real_frame` pins it by hash (see "Current state" at
+   the top of this section). The flash MMU above is the next blocker,
+   left for Milestone 4.
 2. **SYSTIMER: resolved (Milestone 3 Task 5).** Milestone 2 modeled only
    unit 0/target 0, with a `COMP0_LOAD` rule that contradicted the real
    HAL order. `emulator-core/src/peripherals/systimer.rs` now models both
@@ -1289,9 +1393,10 @@ fixed it. Items 2, 3 and 4 are resolved (Tasks 5, 10 and 6): boot now
 draws the firmware's boot splash into the framebuffer, and it stays on
 screen through the flash-MMU stall (item 1). Items 5 to 7 and 9 are not
 correctness bugs *today*; they're dormant because boot doesn't reach the
-code paths that would exercise them. They're
-recorded here so Milestone 3 starts from a known list instead of
-rediscovering each one by stepping through a debugger again.
+code paths that would exercise them. They were recorded so Milestone 3
+started from a known list instead of rediscovering each one by stepping
+through a debugger, and they carry over to Milestone 4 in "Open
+limitations" at the top of this section.
 
 ## Emulated flash chip: what it contains
 
@@ -1342,3 +1447,16 @@ repository** — only `factory.bin` (the app partition alone, confirmed clean
 of personal data) belongs here. If a full dump is ever genuinely needed for
 future bootloader/OTA work, it must have the `nvs` (0x9000–0xD000) and
 `storage` (0x2b0000–0x3f0000) partition ranges zeroed/redacted first.
+
+**Local-only artifacts (`local/`).** The full dump, the real serial boot
+log, the esptool Python venv (`local/.venv/`) and any frames dumped with
+`boot-probe --dump-frame` live in the repo-root `local/` directory, which
+is gitignored (as is `*flash*dump*.bin`). Never commit them, and never
+quote the boot log's identity lines anywhere committed (code, tests, docs
+or commit messages). Committed tests depend only on `factory.bin`. Code
+that needs the full dump reads its path from the `BADGE_FULL_DUMP` env var
+and skips when it is unset (`emulator-core/tests/flash_partition_table.rs`,
+and `boot-probe`, which prints only the dump's partition table). Only two
+kinds of thing come from the boot log: generic ESP-IDF log lines (the
+`boot_progress` tests' needles) and the facts in "Ground truth from the
+physical badge" above.
