@@ -67,10 +67,16 @@ ESP32-C3 device), in two complementary modes:
    scheduling: `app_main` renders with LVGL and flushes frames over SPI2
    with DMA. GDMA's TX out-link is modeled and feeds SPI2 (Milestone 3
    Task 10), so those frames reach the ST7789 model and the framebuffer
-   shows the firmware's boot splash. Boot then faults (step 5,555,258) on
-   the unstubbed ROM `MD5Init`, called by `load_partitions()`, and the
-   panic handler reboot-loops, well before reaching any built-in app. The
-   current blocker is that ROM call (a known, documented gap — see
+   shows the firmware's boot splash. ROM `MD5Init`/`MD5Update`/`MD5Final`
+   are real stubs over the guest's MD5 context (Milestone 3 Task D13), so
+   `load_partitions()`'s `MD5Init` call (step 5,555,258) returns and boot
+   takes no exception after it. But the partition table it then reads
+   through `spi_flash_mmap()` comes back as zeros, because the flash MMU
+   table is not modeled (the firmware's MMU entry write is dropped), so
+   partition loading fails with `ESP_ERR_NOT_FOUND`. The firmware keeps
+   scheduling with the splash on screen, unchanged, but prints nothing new
+   and never reaches a built-in app. The current blocker is that flash MMU
+   (plan Task 8, sub-unit 3; a known, documented gap — see
    `docs/firmware-emulator-notes.md`'s
    "Known limitations" section before assuming a built-in app is reachable
    in this mode).
@@ -185,6 +191,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       back into firmware (qsort's comparator) are real
                       RV32 code instead; cpu/encode.rs is the const-fn
                       RV32IM encoder those code blobs are assembled with.
+  src/md5.rs          Chip-agnostic MD5 in Colin Plumb's context shape
+                      (the ROM's md5_context_t layout), shared by the ROM
+                      MD5 stubs (RomStubEffect::Md5, Task D13) and
+                      peripherals/flash.rs's partition-table MD5 check.
   src/mem/            mem/mod.rs defines the Bus trait the CPU core is
                       generic over. mem/bus.rs's FirmwareBus is the real
                       ESP32-C3 memory map: an ordered sequence of named

@@ -823,7 +823,40 @@
 //!       The warnings were the first callers of `ets_get_cpu_frequency`/
 //!       `ets_printf`, so dropping them moves the whole timeline earlier
 //!       (296 steps at `qsort`'s return, 629 at the first yield).
-
+//!
+//! 24. **ROM MD5: `MD5Init`, `MD5Update`, `MD5Final`** ([`MD5_INIT`],
+//!     [`MD5_UPDATE`], [`MD5_FINAL`]) — Milestone 3 Task D13. Addresses
+//!     from `esp32c3.rom.ld` (`MD5Init = 0x40000614; MD5Update =
+//!     0x40000618; MD5Final = 0x4000061c;`, next to `md5_vector` and the
+//!     `hmac_md5*` pair, which are not stubbed); `esp32c3.rom.api.ld`
+//!     aliases them as `esp_rom_md5_init`/`_update`/`_final`. No other
+//!     `esp32c3.rom*.ld` file (including
+//!     `esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`) names an MD5
+//!     symbol. The context type is `md5_context_t` from
+//!     `components/esp_rom/include/esp_rom_md5.h` (v5.5.3): for every
+//!     target but the ESP32-C2 it is `struct MD5Context { uint32_t buf[4];
+//!     uint32_t bits[2]; uint8_t in[64]; }`, 88 bytes, and the header
+//!     declares `esp_rom_md5_final(uint8_t *digest, md5_context_t
+//!     *context)`, digest first. The ROM ELF (`esp32c3_rev3_rom.elf`) shows
+//!     each address is a `j` trampoline to Colin Plumb's public-domain MD5
+//!     (`MD5Init` `0x400369d8`, `MD5Update` `0x40036a0a`, `MD5Final`
+//!     `0x40036ad2`, `MD5Transform` `0x400360d0`): `MD5Init` stores the RFC
+//!     1321 IV and zeroes `bits` only; `MD5Update` adds `len << 3` to
+//!     `bits[0]` with a carry and `len >> 29` to `bits[1]`, then buffers in
+//!     `in`; `MD5Final` pads, copies the digest out, and ends with
+//!     `memset(ctx, 0, 0x58)`, the whole context. These are real effects
+//!     ([`crate::cpu::rom_stubs::RomStubEffect::Md5`] over
+//!     [`crate::md5::Md5Context`]), keeping all state in the guest's
+//!     context, because the caller compares the digest. The caller is
+//!     `load_partitions()` (`components/esp_partition/partition.c:107-250`,
+//!     with `CONFIG_PARTITION_TABLE_MD5`): `MD5Init` on step 5,555,258
+//!     (`a0 = 0x3fcb_fd30`, the stack context; RA `0x420f_a6ea`), then
+//!     again on step 5,583,744 (`a0 = 0x3fcb_fd40`) when the first load
+//!     fails. `MD5Update`/`MD5Final` are not reached on the boot yet (see
+//!     "Where this gets boot to"); they are stubbed with `MD5Init` because
+//!     the three are always called together, and a unit test drives
+//!     `load_partitions()`'s call pattern through all three over the
+//!     synthesized partition table and gets its stored digest.
 //!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
@@ -844,7 +877,23 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task 6** (CPU and interrupt changes, no stub changes): still 95
+//! **As of Task D13**: 98 stubs (Task D12's 95 plus `MD5Init`,
+//! `MD5Update` and `MD5Final`, entry 24). The `MD5Init` call on step
+//! 5,555,258 returns, and boot then takes **no exception** (checked to step
+//! 7,600,000). It stalls on the flash MMU instead, which is not a ROM call:
+//! `load_partitions()`'s `spi_flash_mmap()` returns `ESP_OK` with a window
+//! at `0x3c27_0000` after writing MMU table entry 39 (`0x600c_509c`), which
+//! the bus does not model, so the table reads (`0x3c27_8000`) return 0.
+//! The function finds no `0x50AA` entry and no MD5 entry and returns
+//! `ESP_ERR_NOT_FOUND` before ever calling `MD5Update`; the next partition
+//! lookup retries it (step 5,583,744) with the same result. The firmware
+//! keeps scheduling, but prints no new console line and draws nothing new:
+//! the boot splash stays in the framebuffer, unchanged. See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`.
+//! The Task 6 paragraph below is kept as history.
+//!
+//! **As of Task 6** (history; CPU and interrupt changes, no stub changes): still 95
 //! stubs. `wfi` is now a real wait-for-interrupt with SYSTIMER fast-forward
 //! while idle, so the idle task's `wfi` (step 596,609) retires and the
 //! FreeRTOS tick wakes it on the next step. Boot then runs, with no
@@ -858,7 +907,7 @@
 //! `tests/rom_stub_boot.rs`'s
 //! `boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init`.
 //!
-//! **As of Task 10** (GDMA, no stub changes): still 95 stubs, and the same
+//! **As of Task 10** (history; GDMA, no stub changes): still 95 stubs, and the same
 //! `MD5Init` fault on the same step. The frames LVGL flushes now reach the
 //! ST7789 model through GDMA, so the framebuffer holds the boot splash by
 //! then.
@@ -1019,7 +1068,7 @@ use crate::cpu::encode::{
     S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, RegCond, RomStub,
+    BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, RomStub,
     RomStubTable, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
@@ -1327,6 +1376,23 @@ pub const MEMCHR: u32 = 0x4000_03c8;
 /// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Memmove`]); module doc
 /// entry 18.
 pub const MEMMOVE: u32 = 0x4000_035c;
+
+/// ROM `MD5Init`'s fixed address (`esp32c3.rom.ld`: `MD5Init =
+/// 0x40000614;`; `esp32c3.rom.api.ld`: `PROVIDE ( esp_rom_md5_init =
+/// MD5Init );`). The ROM ELF shows a `j 0x400369d8 <MD5Init>` trampoline.
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Md5`]); module doc
+/// entry 24.
+pub const MD5_INIT: u32 = 0x4000_0614;
+
+/// ROM `MD5Update`'s fixed address (`esp32c3.rom.ld`: `MD5Update =
+/// 0x40000618;`; aliased by `esp_rom_md5_update` in `esp32c3.rom.api.ld`;
+/// trampoline to `0x40036a0a <MD5Update>`). Real HLE; module doc entry 24.
+pub const MD5_UPDATE: u32 = 0x4000_0618;
+
+/// ROM `MD5Final`'s fixed address (`esp32c3.rom.ld`: `MD5Final =
+/// 0x4000061c;`; aliased by `esp_rom_md5_final` in `esp32c3.rom.api.ld`;
+/// trampoline to `0x40036ad2 <MD5Final>`). Real HLE; module doc entry 24.
+pub const MD5_FINAL: u32 = 0x4000_061c;
 
 /// ROM libc `qsort`'s fixed address (`esp32c3.rom.libc.ld`: `qsort =
 /// 0x40000434;`, between `ldiv = 0x40000430;` in the same script and
@@ -1859,6 +1925,9 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (MEMCHR, RomStub::memchr("memchr")),
     (MEMMOVE, RomStub::memmove("memmove")),
     (DIV, RomStub::div_t("div")),
+    (MD5_INIT, RomStub::md5("MD5Init", Md5Op::Init)),
+    (MD5_UPDATE, RomStub::md5("MD5Update", Md5Op::Update)),
+    (MD5_FINAL, RomStub::md5("MD5Final", Md5Op::Final)),
     (
         ESP_ROM_NEWLIB_INIT_COMMON_MUTEXES,
         RomStub::store_words(
@@ -2942,6 +3011,206 @@ mod tests {
         fill(&mut bus);
         call(&mut cpu, &mut bus, buf, buf + 4, 0);
         assert_eq!(read(&mut bus), b"abcdefgh");
+    }
+
+    /// Guest addresses for the ROM MD5 tests: an 88-byte `md5_context_t`, a
+    /// message buffer and a 16-byte digest buffer, all in DRAM scratch.
+    const MD5_CTX: u32 = 0x3fc9_1000;
+    const MD5_MSG: u32 = 0x3fc9_1100;
+    const MD5_DIGEST: u32 = 0x3fc9_1300;
+    const MD5_RA: u32 = 0x4200_2000;
+
+    fn md5_bus() -> FirmwareBus {
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(MD5_CTX, 0x400);
+        bus
+    }
+
+    /// One stubbed ROM call: `pc = addr` with the given argument registers.
+    /// Checks it ran as a stub, returned to `ra`, and left `a0` alone (all
+    /// three ROM MD5 functions are `void`).
+    fn md5_call(cpu: &mut Cpu, bus: &mut FirmwareBus, addr: u32, args: &[u32]) {
+        for (i, v) in args.iter().enumerate() {
+            cpu.regs.write(REG_A0 + i as u8, *v);
+        }
+        cpu.regs.write(REG_RA, MD5_RA);
+        cpu.regs.pc = addr;
+        let info = cpu.step(bus);
+        assert!(!info.trap_taken, "0x{addr:08x} trapped");
+        assert_eq!(info.rom_stub, Some(addr));
+        assert_eq!(cpu.regs.pc, MD5_RA);
+        assert_eq!(cpu.regs.read(REG_A0), args[0], "void: a0 untouched");
+    }
+
+    /// `MD5Init(ctx)`, one `MD5Update(ctx, msg + at, n)` per chunk, then
+    /// `MD5Final(digest, ctx)`, all through the stubs; returns the digest.
+    fn md5_via_rom(cpu: &mut Cpu, bus: &mut FirmwareBus, msg: &[u8], chunks: &[usize]) -> String {
+        for (i, b) in msg.iter().enumerate() {
+            bus.write8(MD5_MSG + i as u32, *b);
+        }
+        md5_call(cpu, bus, MD5_INIT, &[MD5_CTX]);
+        let mut at = 0u32;
+        for n in chunks {
+            md5_call(cpu, bus, MD5_UPDATE, &[MD5_CTX, MD5_MSG + at, *n as u32]);
+            at += *n as u32;
+        }
+        assert_eq!(at as usize, msg.len(), "chunks cover the message");
+        md5_call(cpu, bus, MD5_FINAL, &[MD5_DIGEST, MD5_CTX]);
+        (0..16)
+            .map(|i| format!("{:02x}", bus.read8(MD5_DIGEST + i)))
+            .collect()
+    }
+
+    #[test]
+    fn rom_md5_stubs_are_registered_at_the_linker_script_addresses() {
+        let table = esp32c3_rom_stubs();
+        for (addr, name, op) in [
+            (0x4000_0614, "MD5Init", Md5Op::Init),
+            (0x4000_0618, "MD5Update", Md5Op::Update),
+            (0x4000_061c, "MD5Final", Md5Op::Final),
+        ] {
+            let stub = table.lookup(addr).expect("registered");
+            assert_eq!(stub.name, name);
+            assert_eq!(stub.effect, RomStubEffect::Md5(op));
+        }
+        assert_eq!(
+            (MD5_INIT, MD5_UPDATE, MD5_FINAL),
+            (0x4000_0614, 0x4000_0618, 0x4000_061c)
+        );
+    }
+
+    #[test]
+    fn rom_md5_stubs_give_the_rfc_1321_digests() {
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = md5_bus();
+        for (msg, want) in [
+            (&b""[..], "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ] {
+            let got = md5_via_rom(&mut cpu, &mut bus, msg, &[msg.len()]);
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(msg));
+        }
+    }
+
+    #[test]
+    fn rom_md5_update_split_at_odd_sizes_keeps_the_partial_block_in_guest_memory() {
+        // 1 + 63 + 65 + 7 = 136 bytes: a 1-byte partial block, topped up to
+        // exactly one block, then a block plus one byte, then 7 more. Only
+        // the guest context carries the buffered bytes between calls.
+        let msg: Vec<u8> = (0..136u32).map(|i| (i * 31 + 7) as u8).collect();
+        let want: String = crate::md5::md5(&msg)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        for chunks in [
+            &[1usize, 63, 65, 7][..],
+            &[136],
+            &[0, 55, 1, 8, 72],
+            &[64, 64, 8],
+        ] {
+            let mut cpu = Cpu::new();
+            cpu.set_rom_stubs(esp32c3_rom_stubs());
+            let mut bus = md5_bus();
+            assert_eq!(
+                md5_via_rom(&mut cpu, &mut bus, &msg, chunks),
+                want,
+                "{chunks:?}"
+            );
+        }
+        // Mid-stream, the guest context holds the bit count and the tail:
+        // after 1 + 63 + 65 bytes, bits = 129 * 8 and in[0] = msg[128].
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = md5_bus();
+        for (i, b) in msg.iter().enumerate() {
+            bus.write8(MD5_MSG + i as u32, *b);
+        }
+        md5_call(&mut cpu, &mut bus, MD5_INIT, &[MD5_CTX]);
+        let mut at = 0;
+        for n in [1u32, 63, 65] {
+            md5_call(&mut cpu, &mut bus, MD5_UPDATE, &[MD5_CTX, MD5_MSG + at, n]);
+            at += n;
+        }
+        assert_eq!(bus.read32(MD5_CTX + 16), 129 * 8, "bits[0]");
+        assert_eq!(bus.read32(MD5_CTX + 20), 0, "bits[1]");
+        assert_eq!(bus.read8(MD5_CTX + 24), msg[128], "in[0]");
+    }
+
+    #[test]
+    fn rom_md5_init_leaves_in_alone_and_final_zeroes_the_whole_context() {
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = md5_bus();
+        for i in 0..0x60 {
+            bus.write8(MD5_CTX + i, 0xA5);
+        }
+        md5_call(&mut cpu, &mut bus, MD5_INIT, &[MD5_CTX]);
+        assert_eq!(bus.read32(MD5_CTX), 0x6745_2301);
+        assert_eq!(bus.read32(MD5_CTX + 12), 0x1032_5476);
+        assert_eq!(bus.read32(MD5_CTX + 16), 0, "bits[0]");
+        assert_eq!(bus.read32(MD5_CTX + 20), 0, "bits[1]");
+        assert!(
+            (24..88).all(|i| bus.read8(MD5_CTX + i) == 0xA5),
+            "in[] untouched"
+        );
+
+        bus.write8(MD5_MSG, b'a');
+        md5_call(&mut cpu, &mut bus, MD5_UPDATE, &[MD5_CTX, MD5_MSG, 1]);
+        md5_call(&mut cpu, &mut bus, MD5_FINAL, &[MD5_DIGEST, MD5_CTX]);
+        assert!(
+            (0..88).all(|i| bus.read8(MD5_CTX + i) == 0),
+            "all 88 bytes of the context zeroed"
+        );
+        assert_eq!(bus.read8(MD5_CTX + 88), 0xA5, "nothing past the context");
+        assert_eq!(bus.read8(MD5_DIGEST), 0x0c, "digest written to a0");
+    }
+
+    /// The check `load_partitions()` makes (`components/esp_partition/
+    /// partition.c:107-250`), driven through the stubs over the emulator's
+    /// own synthesized partition table: `esp_rom_md5_init`, one
+    /// `esp_rom_md5_update(&context, &entry, 32)` per `0x50AA` entry until
+    /// the `0xEBEB` MD5 entry, then `esp_rom_md5_final` and a compare with
+    /// the 16 bytes stored `ESP_PARTITION_MD5_OFFSET` into that entry. The
+    /// boot itself cannot run this yet (the table's `spi_flash_mmap` window
+    /// reads as zeros; see the module doc's entry 24), so this is the
+    /// stand-in.
+    #[test]
+    fn rom_md5_stubs_accept_the_synthesized_partition_tables_md5_entry() {
+        use crate::peripherals::flash::{EmulatedFlash, PARTITION_TABLE_OFFSET};
+        let flash = EmulatedFlash::from_app_image(&[]);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = md5_bus();
+        md5_call(&mut cpu, &mut bus, MD5_INIT, &[MD5_CTX]);
+        let mut entry_off = PARTITION_TABLE_OFFSET;
+        let mut entries = 0;
+        let stored = loop {
+            let magic = u16::from_le_bytes([flash.read(entry_off), flash.read(entry_off + 1)]);
+            if magic == 0xEBEB {
+                break (0..16)
+                    .map(|k| flash.read(entry_off + 16 + k))
+                    .collect::<Vec<u8>>();
+            }
+            assert_eq!(magic, 0x50AA, "entry at 0x{entry_off:x}");
+            // memcpy(&entry, p_entry, 32) into a stack copy, then update.
+            for k in 0..32 {
+                bus.write8(MD5_MSG + k, flash.read(entry_off + k));
+            }
+            md5_call(&mut cpu, &mut bus, MD5_UPDATE, &[MD5_CTX, MD5_MSG, 32]);
+            entries += 1;
+            entry_off += 32;
+        };
+        assert_eq!(entries, 4, "nvs, phy_init, factory, storage");
+        md5_call(&mut cpu, &mut bus, MD5_FINAL, &[MD5_DIGEST, MD5_CTX]);
+        let calc: Vec<u8> = (0..16).map(|k| bus.read8(MD5_DIGEST + k)).collect();
+        assert_eq!(calc, stored, "load_partitions() would accept the table");
     }
 
     #[test]

@@ -1103,23 +1103,71 @@ predicted these blockers would surface once TIMG unblocks further boot:
    unchanged step for step (the DMA path costs no guest instructions), so
    the stall below is the same.
 
-   **The current stall is ROM `MD5Init`.** On the 5,555,258th step the CPU
-   fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
-   (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and takes an
+   **Task 10's stall (history) was ROM `MD5Init`.** On the 5,555,258th
+   step the CPU fetched from `0x4000_0614`, the unstubbed ROM `MD5Init`
+   (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and took an
    `INSTRUCTION_ACCESS_FAULT` (RA `0x420f_a6ea`). The caller is ESP-IDF's
-   `load_partitions()` (`components/esp_partition/partition.c:107-125`,
+   `load_partitions()` (`components/esp_partition/partition.c:107-250`,
    `0x420f_a6ce` in factory.bin), which starts with
    `esp_rom_md5_init(&context)` before it maps and reads the partition
-   table (`MD5Update`/`MD5Final` at `0x4000_0618`/`0x4000_061c` follow, per
-   `CONFIG_PARTITION_TABLE_MD5`). The panic handler prints "Guru Meditation
-   Error", and its reboot faults on the unstubbed ROM `software_reset_cpu`
-   (`0x4000_0094`, step 5,795,474). `main_task: Calling app_main()` is
-   still the newest console line. Pinned in
+   table. The panic handler printed "Guru Meditation Error", and its
+   reboot faulted on the unstubbed ROM `software_reset_cpu` (step
+   5,795,474).
+
+   **Task D13 (ROM MD5).** `MD5Init`/`MD5Update`/`MD5Final`
+   (`0x4000_0614`/`0x4000_0618`/`0x4000_061c`, `esp32c3.rom.ld`; aliased
+   as `esp_rom_md5_*` by `esp32c3.rom.api.ld`) are real stubs over the
+   guest's `md5_context_t` (`emulator-core/src/rom.rs` entry 24). The ROM's
+   code is Colin Plumb's public-domain MD5 (checked against its
+   disassembly in Espressif's ROM ELF, including `MD5Final`'s closing
+   88-byte `memset`), and `emulator-core/src/md5.rs` mirrors it, so the
+   context bytes in guest memory end up as the ROM would leave them. The
+   same module now also recomputes the synthesized partition table's MD5
+   (it used to be a test-only copy in `flash.rs`), and a unit test drives
+   `load_partitions()`'s exact call pattern through the stubs over that
+   table and gets the stored digest. The stub count is 98.
+
+   **The current stall is the flash MMU (plan Task 8, sub-unit 3), and it
+   is not a fault.** The `MD5Init` call on step 5,555,258 returns. Then
+   `load_partitions()` calls `spi_flash_mmap(0, 0x1000,
+   SPI_FLASH_MMAP_DATA, ..)` (`0x420f_babc`), which returns `ESP_OK` with
+   a window at `0x3c27_0000`. To make it, the firmware wrote MMU table
+   entry 39 (`0x600c_509c`: `DR_REG_MMU_TABLE` `0x600c_5000` + 39 * 4;
+   virtual page 39 of the `0x3c00_0000` DROM aperture). The bus has no MMU
+   table, so that write is dropped (logged unmapped), and the reads of the
+   table at `p_start + 0x8000 = 0x3c27_8000` are unmapped and return 0.
+   The first entry's magic is then neither `0x50AA` nor `0xEBEB`, the loop
+   ends before any `esp_rom_md5_update`, and the function takes the "No
+   MD5 found in partition table" path and returns `ESP_ERR_NOT_FOUND`
+   (`0x105`; `pc` is on its epilogue, `0x420f_a878`, before step
+   5,566,584). `MD5Update`/`MD5Final` are never reached on the real boot
+   yet. The partition list is not cached on failure, so the next lookup
+   (through `ensure_partitions_loaded()`) calls it again: `MD5Init` on step
+   5,583,744, the same `0x105` before step 5,591,869. This is not item 7's
+   fixed top-of-aperture page: the window is an ordinary
+   `spi_flash_mmap` mapping, so the fix is an MMU table model that the
+   DROM/IROM read path consults.
+
+   After that the firmware keeps running with **no exception** (checked to
+   step 7,600,000): FreeRTOS ticks (CPU line 5), cross-core yields (line
+   4), an interrupt on line 3, and repeated CPU-frequency switches
+   (`ets_update_cpu_frequency`, `SYSTEM_CPU_PER_CONF_REG`/
+   `SYSTEM_SYSCLK_CONF_REG` writes, interrupt-threshold critical
+   sections). The CPU is busy, mostly in IRAM, and almost never waits in
+   `wfi`. No new console line prints, and nothing new is drawn: sampled
+   every 1,000 steps from step 5,555,000 to 7,600,000, the framebuffer is
+   unchanged, the boot splash with 2,340 distinct RGB565 values. Pinned in
    `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init`.
-   This is a ROM-stub (Task D) fix; after it, `load_partitions()` maps the
-   partition table through `spi_flash_mmap()`, so item 7 is worth checking
-   next.
+   `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`.
+
+   One loose end: `load_partitions()`'s `ESP_LOGE` does run
+   (`esp_log_write` from `0x420f_a826`, for about 2,700 steps), but no byte
+   reaches the console. Every console line so far was printed before or
+   just after the scheduler started; how log output leaves the chip after
+   `app_main` starts (the stdio/VFS path, and whether it waits on a
+   USB-Serial-JTAG interrupt the emulator does not raise) is not yet
+   checked. Until it is, a missing console line is not proof the firmware
+   did not log it.
 2. **SYSTIMER: resolved (Milestone 3 Task 5).** Milestone 2 modeled only
    unit 0/target 0, with a `COMP0_LOAD` rule that contradicted the real
    HAL order. `emulator-core/src/peripherals/systimer.rs` now models both
@@ -1201,7 +1249,9 @@ predicted these blockers would surface once TIMG unblocks further boot:
    blocker — but it's a plausible **candidate cause of a later
    partition-table/`esp_partition_find`-style stall**, worth checking first
    if boot gets past heap init and stalls again on an unmapped read inside
-   the DROM aperture near its top end.
+   the DROM aperture near its top end. (Task D13: the partition-table
+   stall that did come is a plain `spi_flash_mmap` window at `0x3c27_0000`,
+   not this page; see item 1.)
 
 8. **Resolved in Task D10: the ROM's SPI-flash legacy data was not
    initialized** (found in Task 8). The shortcut boot now seeds it (see
@@ -1236,8 +1286,8 @@ predicted these blockers would surface once TIMG unblocks further boot:
 Item 8 was a live divergence, not a dormant one: it printed a warning the
 real badge doesn't and sent real accesses to address 0, until Task D10
 fixed it. Items 2, 3 and 4 are resolved (Tasks 5, 10 and 6): boot now
-draws the firmware's boot splash into the framebuffer before the
-`MD5Init` stall. Items 5 to 7 and 9 are not
+draws the firmware's boot splash into the framebuffer, and it stays on
+screen through the flash-MMU stall (item 1). Items 5 to 7 and 9 are not
 correctness bugs *today*; they're dormant because boot doesn't reach the
 code paths that would exercise them. They're
 recorded here so Milestone 3 starts from a known list instead of
@@ -1266,8 +1316,9 @@ synthesized table byte-for-byte against the real chip's, but only when
 `BADGE_FULL_DUMP` points at the local dump; without it the test skips.
 A committed unit test (Task D10) also recomputes the MD5 constant from the
 committed entries, so editing a partition without updating the digest
-fails. It uses `emulator-core/src/md5.rs`, the crate's one MD5 (it was a
-test-only copy inside `flash.rs` before).
+fails. It uses `emulator-core/src/md5.rs`, the crate's one MD5 (shared
+with the ROM MD5 stubs since Task D13; it was a test-only copy inside
+`flash.rs` before).
 
 The firmware learns the chip's size and ID not from the chip but from the
 ROM's SPI-flash legacy data (`g_rom_flashchip`), which the shortcut boot

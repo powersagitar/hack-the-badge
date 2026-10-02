@@ -2,19 +2,24 @@
 //! implementation: a `struct MD5Context { uint32_t buf[4]; uint32_t bits[2];
 //! uint8_t in[64]; }` driven by `MD5Init`/`MD5Update`/`MD5Final`.
 //!
-//! Chip-agnostic. Today its one user is `crate::peripherals::flash`'s
-//! tests, which recompute the synthesized partition table's MD5 entry
-//! ([`md5`]). The context type is shaped for the ROM MD5 routines too:
-//! ESP-IDF v5.5.3's `components/esp_rom/include/esp_rom_md5.h` declares
-//! `md5_context_t`, for every target but the ESP32-C2, as exactly Plumb's
-//! struct: `uint32_t buf[4]; uint32_t bits[2]; uint8_t in[64];`, 88 bytes
-//! ([`CONTEXT_LEN`]), and [`Md5Context::from_bytes`]/
-//! [`Md5Context::to_bytes`] convert that memory image. The ESP32-C3 mask
-//! ROM's own `MD5Init`/`MD5Update`/`MD5Final` (`0x400369d8`/`0x40036a0a`/
-//! `0x40036ad2` in Espressif's `esp32c3_rev3_rom.elf`) are that code,
-//! compiled: the disassembly matches [`Md5Context::init`],
-//! [`Md5Context::update`] and [`Md5Context::finalize`] step for step,
-//! including which bytes of the context each one writes.
+//! Chip-agnostic. It has two users:
+//!
+//! - `crate::peripherals::flash`'s tests, which recompute the synthesized
+//!   partition table's MD5 entry ([`md5`]).
+//! - The ROM MD5 stubs (`crate::cpu::rom_stubs::RomStubEffect::Md5`), which
+//!   load a guest `md5_context_t` through the bus into an [`Md5Context`],
+//!   apply one call, and store it back. ESP-IDF v5.5.3's
+//!   `components/esp_rom/include/esp_rom_md5.h` declares that type, for
+//!   every target but the ESP32-C2, as exactly Plumb's struct: `uint32_t
+//!   buf[4]; uint32_t bits[2]; uint8_t in[64];`, 88 bytes
+//!   ([`CONTEXT_LEN`]). The ESP32-C3 mask ROM's own `MD5Init`/`MD5Update`/
+//!   `MD5Final` (`0x400369d8`/`0x40036a0a`/`0x40036ad2` in Espressif's
+//!   `esp32c3_rev3_rom.elf`) are that code, compiled: the disassembly
+//!   matches [`Md5Context::init`], [`Md5Context::update`] and
+//!   [`Md5Context::finalize`] step for step, including which bytes of the
+//!   context each one writes. So a stubbed call leaves guest memory as the
+//!   real ROM would, and a partial block buffered by one `MD5Update`
+//!   survives in guest memory for the next.
 //!
 //! On a little-endian host Plumb's `byteReverse` is a no-op, and the
 //! context's words are stored little-endian, as the RV32 guest stores them.

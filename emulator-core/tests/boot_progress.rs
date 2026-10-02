@@ -353,6 +353,19 @@
 //! 5,555,000 for a margin to that fault), and the new rung is a framebuffer
 //! one:
 //! [`boot_draws_frames_through_gdma_before_the_md5init_stall`].
+//!
+//! **Task D13 status**: ROM `MD5Init`/`MD5Update`/`MD5Final` are real
+//! stubs, so the `MD5Init` call on step 5,555,258 returns. Boot then takes
+//! no exception at all (checked to step 6,600,000; `tests/rom_stub_boot.rs`
+//! pins it), but makes no visible progress either: `load_partitions()`
+//! reads the partition table through a `spi_flash_mmap` window the flash
+//! MMU does not map (plan Task 8, sub-unit 3), sees zeros, and returns
+//! `ESP_ERR_NOT_FOUND` twice; no new console line prints and the
+//! framebuffer keeps the boot splash, unchanged. The older rungs keep their
+//! budgets (they were already short of 5,555,258, and nothing before it
+//! moved). The new rung is a no-fault one a few thousand steps past the old
+//! fault:
+//! [`boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -455,7 +468,8 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// 528,148 and taken on step 528,149. The fault-free run still ends at step
 /// 571,712 (the old gpio_matrix_out step); the next exception was then the
 /// idle task's `wfi` on step 596,609 (Task 6 made `wfi` real; the next
-/// exception is now ROM `MD5Init` on step 5,555,258).
+/// exception was then ROM `MD5Init` on step 5,555,258, which Task D13
+/// stubbed).
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
@@ -506,8 +520,8 @@ fn boot_reaches_main_task_calling_app_main() {
 /// call and made the timeline earlier; the next exception is the idle
 /// task's `wfi` on step 596,609 (see `tests/rom_stub_boot.rs`), so the
 /// budget is now 596,000 steps: still ~24,000 steps past the old fault.
-/// (Task 6 made `wfi` real; the next exception is now ROM `MD5Init` on step
-/// 5,555,258, covered by
+/// (Task 6 made `wfi` real; the next exception was then ROM `MD5Init` on
+/// step 5,555,258, stubbed by Task D13, covered by
 /// [`boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`],
 /// so this rung keeps its budget.)
 #[test]
@@ -1010,8 +1024,9 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 /// status"). Before it, the FreeRTOS idle task's `wfi` on step 596,609 was
 /// an illegal instruction and the panic handler ran. Now it waits, and the
 /// driving loop jumps SYSTIMER to the next alarm while it does. Over a run
-/// to short of the next exception (step 5,555,258, ROM `MD5Init`; the
-/// budget was 5,555,000 steps, now 5,550,000 for a wider margin):
+/// to short of what was then the next exception (step 5,555,258, ROM
+/// `MD5Init`, stubbed since Task D13; the budget was 5,555,000 steps, now
+/// 5,550,000 for a wider margin):
 /// - no exception is taken (the last trap is an interrupt) and no panic
 ///   text prints;
 /// - SYSTIMER time ran **ahead** of the step count, which only the idle
@@ -1057,7 +1072,7 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
 /// Milestone 3 Task 10's framebuffer rung (see the module doc's "Task 10
 /// status"). Before it, every SPI2 transfer ran with `SPI_DMA_TX_ENA` set
 /// but GDMA was unmodeled, so the framebuffer stayed blank all the way to
-/// the `MD5Init` fault. Now:
+/// the `MD5Init` fault (stubbed since Task D13; the name is kept). Now:
 /// - at step 1,100,000 it is still blank (first pixels land on step
 ///   1,128,605: a margin, not a pin);
 /// - by step 5,550,000 (short of the fault on step 5,555,258) it holds a
@@ -1082,6 +1097,39 @@ fn boot_draws_frames_through_gdma_before_the_md5init_stall() {
     );
     assert_eq!(rt.bus().gdma.channel_for_spi2(), Some(0));
     assert_ne!(rt.bus().gdma.out_link_state(0).last_desc, 0);
+    let console = rt.console_output();
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
+}
+
+/// Milestone 3 Task D13's no-fault rung (see the module doc's "Task D13
+/// status"). Before it, step 5,555,258 fetched from the unstubbed ROM
+/// `MD5Init` (`0x4000_0614`) and the panic handler ran. Now the stub
+/// returns, and through step 5,560,000 (4,742 steps past that fault, and
+/// past `spi_flash_mmap()`'s first MMU-table write) no exception is taken,
+/// no panic text prints, and the framebuffer still holds the splash. There
+/// is no new console line to ratchet on: the next one the firmware tries
+/// to print is `load_partitions()`'s "No MD5 found in partition table"
+/// error, which is not progress (and does not reach the console; see the
+/// notes).
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let summary = rt.run(5_560_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt, not an exception; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
+    assert!(
+        distinct.len() >= 2_000,
+        "only {} distinct colors in the framebuffer",
+        distinct.len()
+    );
     let console = rt.console_output();
     for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
         assert!(!console.contains(panic_text), "console:\n{console}");

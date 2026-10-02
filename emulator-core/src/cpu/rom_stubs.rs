@@ -58,7 +58,9 @@
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
-//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`).
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`,
+//!    and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.
@@ -100,6 +102,7 @@
 //! `INSTRUCTION_ACCESS_FAULT` on the next step, with `mtval` pointing at the
 //! bad address.
 
+use crate::mem::Bus;
 use std::collections::HashMap;
 
 /// `x1`/`ra` — the RV32 ABI return-address register a stub redirects `pc` to.
@@ -334,6 +337,86 @@ pub enum RomStubEffect {
     /// (Named `LoadStoreWords` before Task D10 added the register-value
     /// source.)
     StoreWords(&'static [WordStore]),
+    /// One of the three calls of an MD5 implementation whose context lives
+    /// in guest memory as Colin Plumb's public-domain `struct MD5Context {
+    /// uint32_t buf[4]; uint32_t bits[2]; uint8_t in[64]; }` (88 bytes),
+    /// the shape the ESP32-C3 mask ROM's `MD5Init`/`MD5Update`/`MD5Final`
+    /// use (Milestone 3 Task D13; `crate::rom` has the addresses and
+    /// citations). See [`Md5Op`] for each call's registers, and
+    /// [`apply_md5`] for how it runs: the whole context is loaded through
+    /// the bus into a [`crate::md5::Md5Context`], the call is applied, and
+    /// the bytes the real function writes are stored back. All state stays
+    /// in guest memory, so a partial block buffered by one `MD5Update` is
+    /// there for the next. All three are `void`: `a0` is left untouched.
+    /// Chip-agnostic: nothing here knows which chip's ROM this is.
+    Md5(Md5Op),
+}
+
+/// The three MD5 calls of [`RomStubEffect::Md5`], with Plumb's argument
+/// order (`esp_rom_md5.h` declares the same order for `esp_rom_md5_*`, which
+/// `esp32c3.rom.api.ld` aliases straight to these):
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Md5Op {
+    /// `void MD5Init(struct MD5Context *ctx)`, `ctx = a0`: writes the RFC
+    /// 1321 initial chaining value to `buf` and zeroes `bits`; `in` is not
+    /// touched (the first 24 bytes only).
+    Init,
+    /// `void MD5Update(struct MD5Context *ctx, const unsigned char *buf,
+    /// unsigned len)`, `ctx = a0`, `buf = a1`, `len = a2`: hashes `len`
+    /// bytes read through the bus. `len` is clamped to
+    /// [`MAX_STUB_MEMORY_BYTES`], like the libc stubs'.
+    Update,
+    /// `void MD5Final(unsigned char digest[16], struct MD5Context *ctx)`,
+    /// `digest = a0`, `ctx = a1` (digest first): pads, writes the 16-byte
+    /// digest, and zeroes all 88 bytes of the context.
+    Final,
+}
+
+/// Runs one [`RomStubEffect::Md5`] call against guest memory: `a0`..`a2`
+/// are the call's argument registers (see [`Md5Op`]).
+pub fn apply_md5<B: Bus>(op: Md5Op, a0: u32, a1: u32, a2: u32, bus: &mut B) {
+    use crate::md5::{Md5Context, CONTEXT_LEN, INIT_WRITE_LEN};
+    let ctx_addr = match op {
+        Md5Op::Init | Md5Op::Update => a0,
+        Md5Op::Final => a1,
+    };
+    let mut raw = [0u8; CONTEXT_LEN];
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = bus.read8(ctx_addr.wrapping_add(i as u32));
+    }
+    let mut ctx = Md5Context::from_bytes(&raw);
+    let written = match op {
+        Md5Op::Init => {
+            ctx.init();
+            INIT_WRITE_LEN
+        }
+        Md5Op::Update => {
+            // Feed the message a block at a time (MD5Update is split-
+            // invariant), so a large `len` needs no host-side copy of it.
+            let len = a2.min(MAX_STUB_MEMORY_BYTES);
+            let mut chunk = [0u8; crate::md5::BLOCK_LEN];
+            let mut done = 0u32;
+            while done < len {
+                let n = (len - done).min(chunk.len() as u32);
+                for (i, byte) in chunk[..n as usize].iter_mut().enumerate() {
+                    *byte = bus.read8(a1.wrapping_add(done).wrapping_add(i as u32));
+                }
+                ctx.update(&chunk[..n as usize]);
+                done += n;
+            }
+            CONTEXT_LEN
+        }
+        Md5Op::Final => {
+            let digest = ctx.finalize();
+            for (i, byte) in digest.iter().enumerate() {
+                bus.write8(a0.wrapping_add(i as u32), *byte);
+            }
+            CONTEXT_LEN
+        }
+    };
+    for (i, byte) in ctx.to_bytes()[..written].iter().enumerate() {
+        bus.write8(ctx_addr.wrapping_add(i as u32), *byte);
+    }
 }
 
 /// One `*dst = <word>` store for [`RomStubEffect::StoreWords`].
@@ -1142,6 +1225,15 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::DivT,
+        }
+    }
+
+    /// A real high-level-emulated MD5 call over a guest context — see
+    /// [`RomStubEffect::Md5`].
+    pub const fn md5(name: &'static str, op: Md5Op) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Md5(op),
         }
     }
 

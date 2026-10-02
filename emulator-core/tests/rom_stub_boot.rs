@@ -419,32 +419,69 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// moved: the timeline is step-for-step the same (the DMA path costs no
 /// guest instructions), and the stall below is unchanged.
 ///
-/// **The new stall** is a ROM call again: on the 5,555,258th step the CPU
-/// fetches from `0x4000_0614`, the unstubbed ROM `MD5Init`
-/// (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and takes an
+/// **Task 10's stall** (history) was a ROM call: on the 5,555,258th step
+/// the CPU fetched from `0x4000_0614`, the unstubbed ROM `MD5Init`
+/// (`esp32c3.rom.ld`: `MD5Init = 0x40000614`), and took an
 /// `INSTRUCTION_ACCESS_FAULT` (RA `0x420f_a6ea`). The caller is ESP-IDF's
-/// `load_partitions()` (`components/esp_partition/partition.c:107-125`,
-/// at `0x420f_a6ce` in factory.bin), whose first act is
+/// `load_partitions()` (`components/esp_partition/partition.c:107-250`, at
+/// `0x420f_a6ce` in factory.bin), whose first act is
 /// `esp_rom_md5_init(&context)` before it reads the partition table. The
-/// panic handler prints "Guru Meditation Error" and its reboot faults on
-/// the unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 5,795,474),
-/// as in earlier stalls.
+/// panic handler printed "Guru Meditation Error" and its reboot faulted on
+/// the unstubbed ROM `software_reset_cpu` (step 5,795,474).
 ///
-/// This test is **deliberately expected to break** once `MD5Init` is
-/// stubbed; whoever makes that fix should re-point it at the next stall.
+/// **What changed in Task D13**: ROM `MD5Init`/`MD5Update`/`MD5Final` are
+/// real stubs over a guest `md5_context_t` (`crate::rom`'s module doc,
+/// entry 24). Step 5,555,258 is now the `MD5Init` stub (context at
+/// `0x3fcb_fd30`), and it returns.
+///
+/// **The new stall** is the flash MMU (plan Task 8, sub-unit 3), and it
+/// is not a fault. `load_partitions()` calls `spi_flash_mmap(0, 0x1000,
+/// SPI_FLASH_MMAP_DATA, ..)` (`0x420f_babc`), which returns `ESP_OK` with
+/// the window at `0x3c27_0000`: it programs MMU table entry 39 by writing
+/// `0x600c_509c` (`DR_REG_MMU_TABLE` + 39 * 4), which the bus does not
+/// model and drops. Reads through the window (`p_start + 0x8000 =
+/// 0x3c27_8000`) are unmapped and return 0, so the first entry's magic is
+/// neither `0x50AA` nor `0xEBEB`, the loop ends before any
+/// `esp_rom_md5_update`, and the function takes the "No MD5 found in
+/// partition table" path and returns `ESP_ERR_NOT_FOUND` (`0x105`), with
+/// `pc` on its epilogue (`0x420f_a878`) before step 5,566,584.
+/// `MD5Update`/`MD5Final` are never reached. (`esp_log_write` runs for the
+/// `E` line, but no console byte appears; see the notes.) The partition
+/// list is not cached, so the next lookup calls `load_partitions()` again:
+/// `MD5Init` again on step 5,583,744 (context at `0x3fcb_fd40`), and the
+/// same `0x105` before step 5,591,869. After that the firmware keeps
+/// running with no exception: FreeRTOS ticks, cross-core yields and CPU
+/// frequency switches, but no new console line and no new frame. The
+/// framebuffer keeps the boot splash, unchanged, through step 6,600,000.
+///
+/// This test is **deliberately expected to break** once the flash MMU
+/// maps `spi_flash_mmap` windows; whoever makes that fix should re-point it.
 #[test]
-fn boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init() {
+fn boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
     const OLD_SPIN_PC: u32 = 0x4200_0cd2;
     const SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
     const ROM_BSWAPSI2: u32 = 0x4000_0788;
     const SPI_LL_SET_COMMAND_RA: u32 = 0x4039_45fa;
     const ESP_CPU_WAIT_FOR_INTR_WFI: u32 = 0x4038_b8bc;
-    const ROM_SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
     // esp32c3.rom.ld: MD5Init = 0x40000614.
     const ROM_MD5_INIT: u32 = 0x4000_0614;
+    // esp32c3.rom.ld: MD5Update = 0x40000618, MD5Final = 0x4000061c.
+    const ROM_MD5_UPDATE: u32 = 0x4000_0618;
+    const ROM_MD5_FINAL: u32 = 0x4000_061c;
     // load_partitions()'s esp_rom_md5_init() call returns here.
     const LOAD_PARTITIONS_MD5INIT_RA: u32 = 0x420f_a6ea;
+    // load_partitions()'s spi_flash_mmap() call returns here.
+    const LOAD_PARTITIONS_MMAP_RA: u32 = 0x420f_a6f8;
+    // load_partitions()'s epilogue (`mv a0, s4`), s4 = err.
+    const LOAD_PARTITIONS_EPILOGUE: u32 = 0x420f_a878;
+    // The mapped window's partition table (p_start + 0x8000), and the MMU
+    // table entry spi_flash_mmap() programs for it (DR_REG_MMU_TABLE
+    // 0x600c5000 + 39 * 4: virtual page 39 = 0x3c270000).
+    const MMAP_TABLE_VADDR: u32 = 0x3c27_8000;
+    const MMU_TABLE_ENTRY_39: u32 = 0x600c_509c;
+    // esp_err.h: ESP_ERR_NOT_FOUND.
+    const ESP_ERR_NOT_FOUND: u32 = 0x105;
     // vSystimerSetup's alarm 0 period (TARGET0_CONF.period = 160,000).
     const FREERTOS_TICK_PERIOD: u64 = 160_000;
     // soc/spi_reg.h: SPI_DMA_INT_ENA_REG (+0x34), SPI_DMA_INT_RAW_REG
@@ -625,30 +662,80 @@ fn boot_idles_through_freertos_ticks_then_faults_on_the_unstubbed_rom_md5init() 
         "console:\n{console}"
     );
 
-    // Phase 10: the 5,555,258th step fetches from the unstubbed ROM MD5Init,
-    // called by load_partitions().
-    let summary = rt.run(1);
-    assert_eq!(summary.traps, 1, "{summary:?}");
-    assert_eq!(summary.last_instruction_fault, Some(ROM_MD5_INIT));
-    assert_eq!(
-        rt.cpu().csr.mcause,
-        exception_code::INSTRUCTION_ACCESS_FAULT
-    );
-    assert_eq!(rt.cpu().regs.read(1), LOAD_PARTITIONS_MD5INIT_RA, "ra");
+    let splash = rt.framebuffer().to_vec();
 
-    // Phase 11: the panic handler reports it, then its reboot faults on the
-    // unstubbed ROM software_reset_cpu.
-    let summary = rt.run(300_000);
-    assert_eq!(
-        summary.last_instruction_fault,
-        Some(ROM_SOFTWARE_RESET_CPU),
-        "{summary:?}"
+    // Phase 10: the 5,555,258th step is the ROM MD5Init stub, called by
+    // load_partitions() with its stack md5_context_t; it returns.
+    assert_eq!(rt.pc(), ROM_MD5_INIT);
+    assert_eq!(rt.cpu().regs.read(10), 0x3fcb_fd30, "a0 = &context");
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 0, "{summary:?}");
+    assert_eq!(summary.rom_stub_calls, 1, "{summary:?}");
+    assert_eq!(rt.pc(), LOAD_PARTITIONS_MD5INIT_RA);
+
+    // Phase 11: spi_flash_mmap() returns ESP_OK, but the window reads as
+    // zeros, so the entry loop ends before any MD5Update and
+    // load_partitions() reaches its epilogue with ESP_ERR_NOT_FOUND
+    // before step 5,566,584. Stepped one at a time to watch pc.
+    let mut mmap_returned_ok = false;
+    for _ in 5_555_258..5_566_583 {
+        let pc = rt.pc();
+        assert!(pc != ROM_MD5_UPDATE && pc != ROM_MD5_FINAL, "pc 0x{pc:08x}");
+        if pc == LOAD_PARTITIONS_MMAP_RA {
+            assert_eq!(rt.cpu().regs.read(10), 0, "spi_flash_mmap: ESP_OK");
+            mmap_returned_ok = true;
+        }
+        let summary = rt.run(1);
+        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    }
+    assert!(mmap_returned_ok);
+    assert_eq!(rt.pc(), LOAD_PARTITIONS_EPILOGUE);
+    assert_eq!(rt.cpu().regs.read(20), ESP_ERR_NOT_FOUND, "s4 = err");
+    let log = rt.bus().unmapped_log();
+    assert!(
+        log.iter()
+            .any(|a| a.addr & !3 == MMU_TABLE_ENTRY_39 && a.is_write),
+        "the MMU table write is dropped"
     );
+    assert!(
+        log.iter()
+            .any(|a| a.addr == MMAP_TABLE_VADDR && !a.is_write),
+        "the table read through the window is unmapped"
+    );
+
+    // Phase 12: the next partition lookup calls load_partitions() again:
+    // MD5Init on step 5,583,744, the same failure before step 5,591,869.
+    let summary = rt.run(5_583_743 - 5_566_583);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(rt.pc(), ROM_MD5_INIT);
+    assert_eq!(rt.cpu().regs.read(1), LOAD_PARTITIONS_MD5INIT_RA, "ra");
+    assert_eq!(rt.cpu().regs.read(10), 0x3fcb_fd40, "a0 = &context");
+    let summary = rt.run(5_591_868 - 5_583_743);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(rt.pc(), LOAD_PARTITIONS_EPILOGUE);
+    assert_eq!(rt.cpu().regs.read(20), ESP_ERR_NOT_FOUND, "s4 = err");
+
+    // Phase 13: then no exception, no panic, no new console line, and the
+    // boot splash unchanged, through step 6,600,000.
+    let summary = rt.run(6_600_000 - 5_591_868);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    assert!(rt.framebuffer() == &splash[..], "the splash is unchanged");
     let console = rt.console_output();
     assert!(
-        console.contains("Guru Meditation Error"),
+        console
+            .trim_end()
+            .ends_with("I (0) main_task: Calling app_main()"),
         "console:\n{console}"
     );
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
 }
 
 /// Task D10, item B: the shortcut boot seeds the ROM's SPI-flash legacy data

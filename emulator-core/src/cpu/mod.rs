@@ -670,6 +670,16 @@ impl Cpu {
                 self.regs.write(rom_stubs::REG_A0, quot as u32);
                 self.regs.write(rom_stubs::REG_A1, rem as u32);
             }
+            RomStubEffect::Md5(op) => {
+                rom_stubs::apply_md5(
+                    op,
+                    self.regs.read(rom_stubs::REG_A0),
+                    self.regs.read(rom_stubs::REG_A1),
+                    self.regs.read(rom_stubs::REG_A2),
+                    bus,
+                );
+                // All three MD5 calls are `void`: `a0` is left untouched.
+            }
             RomStubEffect::Printf { sink_addr } => {
                 let fmt_addr = self.regs.read(rom_stubs::REG_A0);
                 let sp = self.regs.read(rom_stubs::REG_SP);

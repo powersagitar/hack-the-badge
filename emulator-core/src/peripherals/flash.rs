@@ -195,8 +195,8 @@ pub const PARTITIONS: [PartitionEntry; 4] = [
 /// to. A constant rather than computed at run time (it was computed with
 /// Python's `hashlib.md5` over [`EmulatedFlash::from_app_image`]'s own
 /// serialized entries). A unit test recomputes it from [`PARTITIONS`] with
-/// the crate's shared MD5 ([`crate::md5`]), so editing a partition without
-/// updating it fails; it is also checked against the real
+/// the crate's shared MD5 ([`crate::md5`], which the ROM MD5 stubs also
+/// use), so editing a partition without updating it fails; it is also checked against the real
 /// chip's table by `tests/flash_partition_table.rs` (gated on
 /// `BADGE_FULL_DUMP`). The firmware also re-verifies it itself
 /// when it loads the table.
