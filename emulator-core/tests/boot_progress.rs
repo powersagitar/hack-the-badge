@@ -309,6 +309,24 @@
 //! past its own old fault, step 571,713), and the new rung is a
 //! hot-PC-escape one:
 //! [`boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup`].
+//!
+//! **Task D12 status**: ROM `__bswapsi2` is a real stub, and the shortcut
+//! boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader would. Both
+//! (emulator-only) XTAL warnings are gone: the `clk_hal` one above and 17
+//! `rtc_clk` ones in early boot. Not printing those makes the timeline
+//! earlier (296 steps at `qsort`'s return, 629 at the first yield), so the
+//! step-exact rungs above carry "Task D12 update" notes. Boot then runs
+//! with no exception through the `__bswapsi2` call (step 593,018) and one
+//! SPI2 transaction, until the FreeRTOS IDLE task's `wfi` (in
+//! `esp_cpu_wait_for_intr()`) traps as an illegal instruction on step
+//! 596,609, because the core does not implement `wfi` yet (plan Task 6).
+//! The panic handler runs (see `tests/rom_stub_boot.rs`'s pinned stall). No
+//! new console line appears (`main_task: Calling app_main()` is still the
+//! newest), so the rung is a no-fault one:
+//! [`boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site`], plus
+//! the XTAL-warning ratchet
+//! [`boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid`]. The Task 9
+//! rung no longer asserts the `clk_hal` line.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -404,15 +422,22 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// 4 (the line the firmware routes `ETS_FROM_CPU_INTR0_SOURCE` to). And the
 /// scheduler-start spin at `0x4200_0cd2` is gone: up to the step before the
 /// next fault (571,712) no exception is taken.
+///
+/// **Task D12 update**: with `RTC_XTAL_FREQ_REG` seeded, early boot no
+/// longer prints its (emulator-only) `rtc_clk` XTAL warnings, so the whole
+/// timeline is 629 steps earlier here: the yield request is on step
+/// 528,148 and taken on step 528,149. The fault-free run still ends at step
+/// 571,712 (the old gpio_matrix_out step); the next exception is now the
+/// idle task's `wfi` on step 596,609.
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(528_777);
+    let summary = rt.run(528_148);
     assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "the yield must be taken on the next step");
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004);
-    let summary = rt.run(571_712 - 528_778);
+    let summary = rt.run(571_712 - 528_149);
     assert_eq!(
         summary.last_instruction_fault, None,
         "no exception through step 571,712 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
@@ -449,13 +474,15 @@ fn boot_reaches_main_task_calling_app_main() {
 /// and no panic text, and still have `main_task: Calling app_main()`.
 /// Task D11 ran it to 1,500,000 steps (past where the old panic printed
 /// "Rebooting...", ~811,450), because boot then spun without faulting;
-/// Task 9 ended that spin and boot now faults on step 602,868 (ROM
-/// `__bswapsi2`, see `tests/rom_stub_boot.rs`), so the budget is now
-/// 602,000 steps: still well past the old fault step.
+/// Task 9 ended that spin and boot then faulted on step 602,868 (ROM
+/// `__bswapsi2`), so the budget became 602,000 steps. Task D12 stubbed that
+/// call and made the timeline earlier; the next exception is the idle
+/// task's `wfi` on step 596,609 (see `tests/rom_stub_boot.rs`), so the
+/// budget is now 596,000 steps: still ~24,000 steps past the old fault.
 #[test]
 fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(602_000);
+    let summary = rt.run(596_000);
     assert_eq!(
         summary.last_instruction_fault,
         None,
@@ -660,13 +687,17 @@ fn boot_reaches_efuse_inits_chip_rev_line() {
 /// insertion sort does more work. The first trap after this point is now
 /// the `__clzsi2` fault on the 409,759th step (see the module doc's "Task
 /// D7 status").
+///
+/// **Task D12 update**: 408,740 steps. Seeding `RTC_XTAL_FREQ_REG` removed
+/// the early (emulator-only) `rtc_clk` XTAL warnings, so `qsort` returns
+/// 296 steps sooner.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(409_036);
+    let summary = rt.run(408_740);
     assert_eq!(
         summary.traps, 0,
-        "expected zero traps through ROM qsort's return (409,036 steps); got \
+        "expected zero traps through ROM qsort's return (408,740 steps); got \
          {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
@@ -806,11 +837,12 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
 /// `esprv_intc_int_set_threshold`, were stubbed in the same task. Boot now
 /// runs fault-free until FreeRTOS's first yield request (step 528,777;
 /// since Task 4 taken as an interrupt on the next step), so a run to step
-/// 528,776 must show **zero** traps.
+/// 528,776 must show **zero** traps. (Task D12: the yield request is now
+/// on step 528,148, so the run is to step 528,147.)
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(528_776);
+    let summary = rt.run(528_147);
     assert_eq!(
         summary.traps,
         0,
@@ -849,17 +881,24 @@ const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=
 
 /// Milestone 3 Task 9's rung (see the module doc's "Task 9 status"). With
 /// SPI2's `SPI_UPDATE` reading back 0 at once, the `spi_hal_init()` poll is
-/// no longer a spin: over a trace window from just before the poll (step
-/// 584,000) to just before the new fault (602,000), each poll address is
-/// hit far fewer than [`SPIN_THRESHOLD`] times, no exception is taken, and
-/// boot prints the next console line, the SPI clock setup's (emulator-only)
-/// `clk_hal` XTAL warning.
+/// no longer a spin: over a trace window from just before the poll to just
+/// before the next exception, each poll address is hit far fewer than
+/// [`SPIN_THRESHOLD`] times and no exception is taken.
+///
+/// **Task D12 update**: Task 9 also asserted the next console line, the
+/// SPI clock setup's (emulator-only) `clk_hal` XTAL warning. Task D12 seeds
+/// `RTC_XTAL_FREQ_REG`, so that line is gone (see
+/// [`boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid`]), and this
+/// rung now checks only the poll escape. The window moves with the earlier
+/// timeline: the poll is first reached on step 583,989 (was 584,618), and
+/// the next exception is the idle task's `wfi` on step 596,609, so the
+/// window is steps 583,000..596,000 (was 584,000..602,000).
 #[test]
 fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    rt.run(584_000);
+    rt.run(583_000);
     let mut hist: HashMap<u32, u64> = HashMap::new();
-    let summary = rt.run_traced(602_000 - 584_000, &mut hist);
+    let summary = rt.run_traced(596_000 - 583_000, &mut hist);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     let max_hits = PRE_TASK_9_SPI_UPDATE_POLL
         .clone()
@@ -874,11 +913,62 @@ fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
     assert!(!PRE_TASK_9_SPI_UPDATE_POLL.contains(&rt.pc()));
     let console = rt.console_output();
     assert!(
-        console.contains("W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz"),
+        !console.contains("Guru Meditation Error"),
+        "console:\n{console}"
+    );
+}
+
+/// ROM libgcc `__bswapsi2` (`esp32c3.rom.libgcc.ld`).
+const ROM_BSWAPSI2: u32 = 0x4000_0788;
+/// The return address of `spi_ll_set_command()`'s `__bswapsi2` call.
+const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
+
+/// Milestone 3 Task D12's no-fault rung (see the module doc's "Task D12
+/// status"). Before it, `spi_ll_set_command()` faulted on the unstubbed
+/// ROM `__bswapsi2` (Task 9's stall). Now that call is a real stub: over a
+/// run to the step before the next exception (596,608), the ROM address is
+/// entered exactly once (on step 593,018), execution comes back to its
+/// caller, and no exception is taken (the last trap is an interrupt).
+#[test]
+fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    rt.run(590_000);
+    let mut hist: HashMap<u32, u64> = HashMap::new();
+    let summary = rt.run_traced(596_608 - 590_000, &mut hist);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt, not an exception; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    assert_eq!(hist.get(&ROM_BSWAPSI2), Some(&1), "one __bswapsi2 call");
+    assert!(
+        hist.contains_key(&SPI_LL_SET_COMMAND_BSWAP_RA),
+        "the stub returned to spi_ll_set_command()"
+    );
+}
+
+/// Milestone 3 Task D12, part B's ratchet. Seeding `RTC_XTAL_FREQ_REG`
+/// (`RTC_CNTL_STORE4_REG`) with the value the skipped 2nd-stage bootloader
+/// stores (`emulator-core/src/rom.rs`'s module doc, entry 23) makes ESP-IDF's
+/// `clk_ll_xtal_load_freq_mhz()` find a valid 40 MHz. So neither of its
+/// "invalid RTC_XTAL_FREQ_REG value" warnings prints any more: not
+/// `rtc_clk_xtal_freq_get()`'s (`rtc_clk` tag, 17 times in early boot) and
+/// not `clk_hal_xtal_get_freq_mhz()`'s (`clk_hal` tag, from the SPI clock
+/// setup). The real badge's log has neither. Checked over a run to step
+/// 596,000, past `main_task: Calling app_main()` and the SPI2 setup.
+#[test]
+fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    rt.run(596_000);
+    let console = rt.console_output();
+    assert!(
+        console.contains("I (0) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     assert!(
-        !console.contains("Guru Meditation Error"),
+        !console.contains("invalid RTC_XTAL_FREQ_REG"),
         "console:\n{console}"
     );
 }

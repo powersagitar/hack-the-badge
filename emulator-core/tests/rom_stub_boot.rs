@@ -93,7 +93,18 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
     // first trap is now an `abort()`'s ILLEGAL_INSTRUCTION at step 442,141
     // (after `E (0) memspi: no response`; see the pinned-stall test below).
     // 350,000 stays clear by ~92,141 steps (~26%).
-    const STEP_BUDGET: usize = 350_000;
+    //
+    // Task D12 status: raised from 350,000 to 420,000. With
+    // `RTC_XTAL_FREQ_REG` seeded (`emulator_core::rom`'s module doc, entry
+    // 23), `rtc_clk_xtal_freq_get()` no longer logs its (emulator-only)
+    // "invalid" warning during early clock init. That warning was what
+    // reached `ets_get_cpu_frequency` (the log timestamp) and `ets_printf`
+    // first, at steps ~557/~576. Now both are first reached by the first
+    // real log line, at steps 400,695/400,714, so 350,000 no longer covers
+    // them. 420,000 does, by ~19,000 steps, and stays clear of boot's first
+    // trap (the FROM_CPU_0 yield interrupt at step 528,149) by ~108,000
+    // steps (~26%).
+    const STEP_BUDGET: usize = 420_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
     // per-address hit count -- together these say what the firmware asked the
@@ -216,7 +227,10 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 }
 
 /// This test **pins today's panic path, not boot progress past it**.
-/// **Renamed and re-pointed in Task 8** (from
+/// **Renamed and re-pointed in Task D12** (from
+/// `boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command`,
+/// Task 9's name; it was also renamed between Task 8 and Task 9). Earlier,
+/// **renamed and re-pointed in Task 8** (from
 /// `boot_currently_aborts_on_memspi_no_response_and_reaches_the_panic_handlers_reboot_message`,
 /// then briefly `boot_currently_faults_on_the_unstubbed_memchr_call_and_reaches_the_panic_handlers_reboot_message`),
 /// previously renamed and re-pointed in Task D7 (from
@@ -333,34 +347,67 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// when a transaction completes, and `TRANS_DONE` (RAW & ENA) drives
 /// `ETS_SPI2_INTR_SOURCE` (`emulator_core::peripherals::spi`'s module doc).
 /// So `spi_ll_apply_config()`'s poll exits on its first check, and boot
-/// prints a new (emulator-only) line from the SPI clock setup,
-/// `W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz`.
+/// printed a new (emulator-only) warning from the SPI clock setup, from
+/// `clk_hal_xtal_get_freq_mhz()` (`components/hal/esp32c3/clk_tree_hal.c`).
 ///
-/// **The new stall** is a ROM call again. On the 602,868th step boot
-/// fetches from `0x4000_0788`, the unstubbed libgcc ROM helper `__bswapsi2`
+/// **Task 9's stall** (history): on the 602,868th step boot fetched from
+/// `0x4000_0788`, the then-unstubbed libgcc ROM helper `__bswapsi2`
 /// (`esp32c3.rom.libgcc.ld`), called (RA `0x4039_45fa`) from
 /// `spi_ll_set_command()` (`spi_ll.h:1018-1030`, at `0x4039_45c0`): its
 /// MSB-first branch computes `HAL_SPI_SWAP_DATA_TX(cmd, cmdlen)`, a
 /// `HAL_SWAP32` = `__builtin_bswap32` (`hal/misc.h:15`), which RV32IMC
-/// without Zbb compiles to that libcall. This is the per-transaction setup
-/// (`spi_hal_setup_trans()`) of the first SPI2 transaction: no SPI2
-/// transaction has run yet (`SPI_DMA_INT_RAW` is still 0) and nothing has
-/// been drawn. The panic handler then prints "Guru Meditation Error" and
-/// its reboot faults on the unstubbed ROM `software_reset_cpu`
-/// (`0x4000_0094`), as in earlier stalls.
+/// without Zbb compiles to that libcall. The panic handler then printed
+/// "Guru Meditation Error" and its reboot faulted on `software_reset_cpu`.
 ///
-/// This test is **deliberately expected to break** once `__bswapsi2` is
-/// stubbed; whoever makes that fix should re-point it at the next stall.
+/// **What changed in Task D12**: `__bswapsi2` is a real HLE stub
+/// (`RomStubEffect::Int32Unary(Int32UnaryOp::Bswap)`), and the shortcut boot
+/// seeds `RTC_XTAL_FREQ_REG` (`RTC_CNTL_STORE4_REG`, `0x6000_80b8`) with
+/// `0x0028_0028`, the value the skipped 2nd-stage bootloader's
+/// `clk_ll_xtal_store_freq_mhz(40)` leaves there
+/// (`emulator-core/src/rom.rs`'s module doc, entry 23). Both XTAL warnings
+/// are gone: the SPI clock setup's `clk_hal` one and 17 earlier `rtc_clk`
+/// ones from `rtc_clk_xtal_freq_get()`, which the old pinned stall never
+/// asserted. Neither is in the real badge's log. Not printing them makes the
+/// whole timeline **earlier** (by 296 steps at ROM `qsort`'s return, by 629
+/// steps at the first yield): the step numbers in the history paragraphs
+/// above are as measured in their own tasks, not today's. Today's are: the
+/// yield request on step 528,148, taken on step 528,149; `main_task: Calling
+/// app_main()` at ~554,981; the `spi_hal_init()` poll at step 583,989; and
+/// the one `__bswapsi2` call on step 593,018 (`a0 = 0`, `cmd = 0`; RA
+/// `0x4039_45fa`). One SPI2 transaction then completes (`TRANS_DONE` raw and
+/// enabled; `ETS_SPI2_INTR_SOURCE` is routed to line 6, which is not yet
+/// enabled), and nothing is drawn.
+///
+/// **The new stall** is not a ROM call and not a peripheral: on the
+/// 596,609th step the CPU takes an `ILLEGAL_INSTRUCTION` exception on a
+/// `wfi` (`0x1050_0073`, also `mtval`) at `0x4038_b8bc`. That is
+/// `esp_cpu_wait_for_intr()` (`components/esp_hw_support/cpu.c:52-64`,
+/// `rv_utils_wait_for_intr()`), called from `esp_vApplicationIdleHook()`
+/// (`components/esp_system/freertos_hooks.c:41-58`) in FreeRTOS's IDLE task
+/// (its TCB name `IDLE` is on the panic dump's stack): `app_main`'s task has
+/// blocked, and the idle task waits for the next interrupt. The core does
+/// not implement `wfi` yet (plan Task 6). The panic handler then prints
+/// "Guru Meditation Error" (~598,088) and its reboot faults on the unstubbed
+/// ROM `software_reset_cpu` (`0x4000_0094`, step 836,487), as in earlier
+/// stalls.
+///
+/// This test is **deliberately expected to break** once `wfi` is
+/// implemented; whoever makes that fix should re-point it at the next stall.
 #[test]
-fn boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command() {
+fn boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
     const OLD_SPIN_PC: u32 = 0x4200_0cd2;
     const SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
     const ROM_BSWAPSI2: u32 = 0x4000_0788;
     const SPI_LL_SET_COMMAND_RA: u32 = 0x4039_45fa;
+    const ESP_CPU_WAIT_FOR_INTR_WFI: u32 = 0x4038_b8bc;
+    const WFI: u32 = 0x1050_0073;
     const ROM_SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
-    // soc/spi_reg.h: SPI_DMA_INT_RAW_REG (+0x3C).
+    // soc/spi_reg.h: SPI_DMA_INT_ENA_REG (+0x34), SPI_DMA_INT_RAW_REG
+    // (+0x3C); SPI_TRANS_DONE_INT_* is bit 12 (byte 1, bit 4).
+    const SPI_DMA_INT_ENA_OFFSET: u32 = 0x34;
     const SPI_DMA_INT_RAW_OFFSET: u32 = 0x3C;
+    const TRANS_DONE_BYTE1: u8 = 1 << 4;
     // gpio_sig_map.h signal numbers and gpio_reg.h field bits.
     const FSPICLK_OUT_IDX: u32 = 63;
     const FSPID_OUT_IDX: u32 = 65;
@@ -373,7 +420,7 @@ fn boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command() {
     // Phase 1: fault-free up to and including vPortYield's write of the
     // cross-core software-interrupt register, which lands in the modeled
     // SYSTEM peripheral (not the unmapped catch-all) and asserts the source.
-    let summary = rt.run(528_777);
+    let summary = rt.run(528_148);
     assert_eq!(
         summary.traps, 0,
         "expected a fault-free run; got {summary:?}"
@@ -399,8 +446,8 @@ fn boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command() {
 
     // Phase 3: main_task runs app_main, which routes SPI2 through the GPIO
     // matrix via the two ROM stubs and reaches spi_hal_init's UPDATE poll
-    // after step 584,618 -- with no exception on the way (only interrupts).
-    let summary = rt.run(584_618 - 528_778);
+    // after step 583,989 -- with no exception on the way (only interrupts).
+    let summary = rt.run(583_989 - 528_149);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(rt.pc(), *SPI_UPDATE_POLL.start());
     let gpio = &rt.bus().gpio;
@@ -419,44 +466,67 @@ fn boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command() {
     );
 
     // Phase 4: the poll exits at once and boot runs, fault-free, up to the
-    // call into ROM __bswapsi2.
-    let summary = rt.run(602_867 - 584_618);
+    // call into ROM __bswapsi2 from spi_ll_set_command() (cmd = 0).
+    let summary = rt.run(593_017 - 583_989);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(rt.pc(), ROM_BSWAPSI2);
     assert_eq!(rt.cpu().regs.read(1), SPI_LL_SET_COMMAND_RA, "ra");
+    assert_eq!(rt.cpu().regs.read(10), 0, "a0");
     assert!(!SPI_UPDATE_POLL.contains(&rt.pc()));
     assert_ne!(rt.pc(), OLD_SPIN_PC);
+
+    // Phase 5: the 593,018th step is the __bswapsi2 stub: it returns to
+    // spi_ll_set_command() with the byte-swapped a0 (0).
+    let summary = rt.run(1);
+    assert_eq!(summary.traps, 0, "{summary:?}");
+    assert_eq!(summary.rom_stub_calls, 1, "{summary:?}");
+    assert_eq!(rt.pc(), SPI_LL_SET_COMMAND_RA);
+    assert_eq!(rt.cpu().regs.read(10), 0);
+
+    // Phase 6: no exception up to the idle task's wfi. One SPI2 transaction
+    // has completed; nothing has been drawn; neither XTAL warning printed.
+    let summary = rt.run(596_608 - 593_018);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    assert_eq!(
+        rt.cpu().csr.mcause & 0x8000_0000,
+        0x8000_0000,
+        "the last trap taken was an interrupt; mcause=0x{:08x}",
+        rt.cpu().csr.mcause
+    );
+    assert_eq!(rt.pc(), ESP_CPU_WAIT_FOR_INTR_WFI);
     let console = rt.console_output();
     assert!(
         console.contains("I (0) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     assert!(
-        console.contains("W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz"),
+        !console.contains("invalid RTC_XTAL_FREQ_REG"),
         "console:\n{console}"
     );
     assert!(
         !console.contains("Guru Meditation Error"),
         "console:\n{console}"
     );
-    // No SPI2 transaction has completed yet, and nothing has been drawn.
-    assert_eq!(rt.bus().spi.read_byte(SPI_DMA_INT_RAW_OFFSET + 1), 0);
+    assert_ne!(
+        rt.bus().spi.read_byte(SPI_DMA_INT_RAW_OFFSET + 1) & TRANS_DONE_BYTE1,
+        0,
+        "one SPI2 transaction has completed"
+    );
+    assert_ne!(
+        rt.bus().spi.read_byte(SPI_DMA_INT_ENA_OFFSET + 1) & TRANS_DONE_BYTE1,
+        0
+    );
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
 
-    // Phase 5: the 602,868th step faults on the unstubbed ROM fetch.
+    // Phase 7: the 596,609th step: wfi is not implemented, so it traps as
+    // an illegal instruction.
     let summary = rt.run(1);
-    assert_eq!(
-        summary.last_instruction_fault,
-        Some(ROM_BSWAPSI2),
-        "{summary:?}"
-    );
-    assert_eq!(
-        rt.cpu().csr.mcause,
-        exception_code::INSTRUCTION_ACCESS_FAULT
-    );
-    assert_eq!(rt.cpu().csr.mepc, ROM_BSWAPSI2);
+    assert_eq!(summary.traps, 1, "{summary:?}");
+    assert_eq!(rt.cpu().csr.mcause, exception_code::ILLEGAL_INSTRUCTION);
+    assert_eq!(rt.cpu().csr.mepc, ESP_CPU_WAIT_FOR_INTR_WFI);
+    assert_eq!(rt.cpu().csr.mtval, WFI);
 
-    // Phase 6: the panic handler reports it, then its reboot faults on the
+    // Phase 8: the panic handler reports it, then its reboot faults on the
     // unstubbed ROM software_reset_cpu.
     let summary = rt.run(900_000);
     assert_eq!(

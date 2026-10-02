@@ -1,5 +1,8 @@
 //! ESP32-C3 RTC_CNTL RTC timer (`DR_REG_RTCCNTL_BASE = 0x6000_8000`).
 //!
+//! (Plus, since Task D12, the `STORE4` retention register; see "STORE4"
+//! below.)
+//!
 //! Task D1 scope: just the `RTC_CNTL_TIME_UPDATE_REG` /
 //! `RTC_CNTL_TIME_LOW0_REG` / `RTC_CNTL_TIME_HIGH0_REG` trio that
 //! `rtc_cntl_ll_get_rtc_time()` (and therefore `rtc_time_get()`) reads at
@@ -109,6 +112,25 @@
 //! latches taken with enough real steps between them are guaranteed to
 //! differ once enough steps have passed to move the quotient by at least 1
 //! (`XTAL_HZ / RC_SLOW_HZ` ~= 294 steps) -- see the module's tests.
+//!
+//! ## STORE4 (`RTC_XTAL_FREQ_REG`, Milestone 3 Task D12)
+//!
+//! `RTC_CNTL_STORE4_REG` (`+0xb8`, `soc/rtc_cntl_reg.h`) is a plain R/W
+//! retention register with reset value 0. ESP-IDF names it
+//! `RTC_XTAL_FREQ_REG` (`components/esp_rom/esp32c3/include/esp32c3/rom/rtc.h`).
+//! On real hardware the 2nd-stage bootloader stores the XTAL frequency in it:
+//! `bootloader_init()` -> `bootloader_clock_configure()`
+//! (`components/bootloader_support/src/bootloader_clock_init.c`) ->
+//! `rtc_clk_init()` (`components/esp_hw_support/port/esp32c3/rtc_clk_init.c`)
+//! -> `rtc_clk_xtal_freq_update()` (`rtc_clk.c`) ->
+//! `clk_ll_xtal_store_freq_mhz()` (`hal/esp32c3/include/hal/clk_tree_ll.h`).
+//! The app reads it back via `clk_ll_xtal_load_freq_mhz()`, which rejects 0.
+//! The shortcut boot skips the bootloader, so `crate::boot` seeds the value
+//! the bootloader would have stored (`crate::rom::RTC_XTAL_FREQ_REG`) by an
+//! ordinary bus write. This module needs no special behavior for it: the
+//! generic word storage below holds it. It is listed in [`RtcCntl::handles`]
+//! because it is now a deliberately modeled register, so its accesses are
+//! not logged as unmapped.
 
 use super::set_byte;
 use super::timg::{RC_SLOW_HZ, XTAL_HZ};
@@ -123,6 +145,13 @@ const REGS_WORDS: usize = (REGS_END / 4) as usize;
 pub const TIME_UPDATE_REG: u32 = 0x0c;
 pub const TIME_LOW0_REG: u32 = 0x10;
 pub const TIME_HIGH0_REG: u32 = 0x14;
+/// `RTC_CNTL_STORE4_REG` (`+0xb8`, `soc/rtc_cntl_reg.h`): a plain R/W
+/// retention register, which ESP-IDF names `RTC_XTAL_FREQ_REG`
+/// (`components/esp_rom/esp32c3/include/esp32c3/rom/rtc.h`). Its reset value
+/// is 0; the 2nd-stage bootloader stores the XTAL frequency in it, which the
+/// shortcut boot seeds instead (`crate::rom::RTC_XTAL_FREQ_REG`). See the
+/// module doc's "STORE4" section.
+pub const STORE4_REG: u32 = 0xb8;
 
 /// `RTC_CNTL_TIME_UPDATE`, bit 31 of `TIME_UPDATE_REG` -- byte index 3, bit
 /// 7 of that byte (`31 - 24 == 7`).
@@ -168,7 +197,8 @@ impl RtcCntl {
     }
 
     /// `true` iff `offset`'s word-aligned offset is one of the three
-    /// registers this module gives real latch behavior to. Used by
+    /// registers this module gives real latch behavior to, or `STORE4_REG`
+    /// (seeded at boot, Task D12; see the module doc). Used by
     /// `crate::mem::bus::FirmwareBus` to log an access to any other
     /// RTC_CNTL register as "unmapped" (even though it's still backed by
     /// real storage below, not a hard failure) -- see the module doc and
@@ -177,7 +207,7 @@ impl RtcCntl {
     pub fn handles(offset: u32) -> bool {
         matches!(
             offset & !0b11,
-            TIME_UPDATE_REG | TIME_LOW0_REG | TIME_HIGH0_REG
+            TIME_UPDATE_REG | TIME_LOW0_REG | TIME_HIGH0_REG | STORE4_REG
         )
     }
 
@@ -364,12 +394,22 @@ mod tests {
     }
 
     #[test]
-    fn handles_only_reports_the_three_named_registers() {
+    fn handles_only_reports_the_named_registers() {
         assert!(RtcCntl::handles(TIME_UPDATE_REG));
         assert!(RtcCntl::handles(TIME_UPDATE_REG + 2)); // any byte within the word
         assert!(RtcCntl::handles(TIME_LOW0_REG));
         assert!(RtcCntl::handles(TIME_HIGH0_REG));
+        assert!(RtcCntl::handles(STORE4_REG)); // RTC_XTAL_FREQ_REG (Task D12)
         assert!(!RtcCntl::handles(0x00)); // OPTIONS0_REG
         assert!(!RtcCntl::handles(0x18)); // STATE0_REG
+        assert!(!RtcCntl::handles(0xbc)); // STORE5_REG (RTC_APB_FREQ_REG): not seeded
+    }
+
+    #[test]
+    fn store4_is_plain_read_write_storage_with_a_zero_reset_value() {
+        let mut t = RtcCntl::new();
+        assert_eq!(r(&mut t, STORE4_REG), 0);
+        w(&mut t, STORE4_REG, 0x0028_0028, 0);
+        assert_eq!(r(&mut t, STORE4_REG), 0x0028_0028);
     }
 }

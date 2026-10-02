@@ -2244,6 +2244,35 @@ mod tests {
     }
 
     #[test]
+    fn bswapsi2_rom_stub_reverses_the_bytes_of_a0_and_returns_via_ra() {
+        use rom_stubs::Int32UnaryOp;
+        for (input, expected) in [
+            (0x1234_5678u32, 0x7856_3412u32),
+            (0, 0),
+            (0xffff_ffff, 0xffff_ffff),
+            (0x0000_00ff, 0xff00_0000),
+        ] {
+            let mut cpu = Cpu::new();
+            let mut table = RomStubTable::new();
+            table.insert(
+                ROM_STUB_ADDR,
+                RomStub::int32_unary("__bswapsi2", Int32UnaryOp::Bswap),
+            );
+            cpu.set_rom_stubs(table);
+            cpu.regs.write(10, input);
+            cpu.regs.write(11, 0x1234); // a1 must survive
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            let mut bus = rom_stub_test_bus();
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+            assert_eq!(cpu.regs.read(10), expected, "bswap({input:#x})");
+            assert_eq!(cpu.regs.read(11), 0x1234);
+            assert_eq!(cpu.regs.pc, 0x40, "pc == ra");
+        }
+    }
+
+    #[test]
     fn int64_rom_stub_reads_and_writes_the_rv32_register_pairs() {
         use rom_stubs::Int64Op;
         let mut cpu = Cpu::new();

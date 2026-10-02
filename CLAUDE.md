@@ -55,11 +55,15 @@ ESP32-C3 device), in two complementary modes:
    that program the GPIO matrix (Milestone 3 Task D11), so the SPI bus
    setup routes SPI2 onto the display pads. SPI2's `SPI_UPDATE` then
    self-clears and transactions raise `SPI_TRANS_DONE` (Milestone 3 Task
-   9), so `spi_hal_init()` completes. Boot then faults (step 602,868) on
-   the unstubbed libgcc ROM helper `__bswapsi2`, called from
-   `spi_ll_set_command()` while the first SPI2 transaction is set up, and
-   the panic handler reboot-loops. Nothing is drawn yet, well before
-   reaching any built-in app. The current blocker is that ROM call (a
+   9), so `spi_hal_init()` completes. The libgcc ROM helper `__bswapsi2`
+   (called from `spi_ll_set_command()`) is then a real stub, and the
+   shortcut boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader leaves
+   it, so the emulator-only "invalid RTC_XTAL_FREQ_REG" warnings are gone
+   (Milestone 3 Task D12). One SPI2 transaction completes, `app_main`'s
+   task blocks, and the FreeRTOS IDLE task's `wfi` then traps as an
+   illegal instruction (step 596,609), because the core does not implement
+   `wfi` yet; the panic handler reboot-loops. Nothing is drawn yet, well
+   before reaching any built-in app. The current blocker is `wfi` (a
    known, documented gap —
    see `docs/firmware-emulator-notes.md`'s "Known limitations" section
    before assuming a built-in app is reachable in this mode).
@@ -252,7 +256,8 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       layout table, values from Espressif's ROM ELF),
                       and the ROM's writable `.data` boot reads
                       (`esp32c3_rom_ram_initializers`: the SPI-flash legacy
-                      data, `chip_size` from the image header), all
+                      data, `chip_size` from the image header, plus the
+                      bootloader's `RTC_XTAL_FREQ_REG` store, Task D12), all
                       installed by boot.rs alongside the stub table. Addresses
                       sourced from ESP-IDF's own linker scripts, not
                       guessed — see docs/firmware-emulator-notes.md.
@@ -264,7 +269,9 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       in RAM for the app is re-created by a generic list
                       of boot-time (address, bytes) writes
                       (`apply_ram_initializers`, Task D10); the ESP32-C3
-                      data (the ROM's SPI-flash legacy data) lives in
+                      data (the ROM's SPI-flash legacy data, and the
+                      RTC_CNTL register the bootloader stores the XTAL
+                      frequency in, written through the bus) lives in
                       rom.rs.
   src/runtime.rs      FirmwareRuntime: the whole emulator as one owned,
                       driveable object. Buttons are addressed by raw slot

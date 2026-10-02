@@ -123,8 +123,10 @@ pub fn initial_stack_pointer() -> u32 {
 /// ROM's writable RAM state that the skipped mask-ROM reset and 2nd-stage
 /// bootloader would have left behind ([`apply_ram_initializers`] with
 /// [`crate::rom::esp32c3_rom_ram_initializers`] -- currently the SPI-flash
-/// legacy data, Milestone 3 Task D10; its `chip_size` comes from `image`'s
-/// own header). Stubs cover routines whose effect can be applied atomically,
+/// legacy data, Milestone 3 Task D10, whose `chip_size` comes from
+/// `image`'s own header, and the bootloader's `RTC_XTAL_FREQ_REG` store,
+/// Task D12, a peripheral register written through the bus). Stubs cover
+/// routines whose effect can be applied atomically,
 /// real guest code covers the ones that must call back into firmware, ROM
 /// data covers read-only tables the firmware reads, and RAM initializers
 /// cover ROM `.data` the firmware reads and writes (see [`crate::rom`]'s
@@ -186,6 +188,11 @@ pub struct RamInitializer {
 /// It differs from `FirmwareBus::map_rom_data` (Task D7): that maps
 /// *read-only* ROM data in the ROM's own address range, whereas these
 /// writes land in ordinary writable RAM that the firmware keeps updating.
+///
+/// Because every write goes through the bus, an entry may also target a
+/// peripheral register that the bus backs with plain storage, for state the
+/// skipped bootloader leaves in a register rather than RAM (Task D12:
+/// `RTC_XTAL_FREQ_REG`, in `crate::peripherals::rtc_cntl`).
 ///
 /// A write that lands outside backed RAM is dropped by the bus's never-panic
 /// catch-all (and logged as unmapped) like any other stray write.
@@ -407,6 +414,20 @@ mod tests {
         // The plain (ROM-less) boot models no ROM, so seeds nothing.
         let (_cpu, mut plain) = boot_from_factory_image(&image).expect("should boot");
         assert_eq!(plain.read32(0x3fcd_fff0), 0);
+    }
+
+    #[test]
+    fn rom_stub_boot_seeds_rtc_xtal_freq_reg_through_the_rtc_cntl_model() {
+        let code = [0x13, 0x00, 0x00, 0x00];
+        let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
+        // RTC_XTAL_FREQ_REG (RTC_CNTL_STORE4_REG) as the bootloader's
+        // clk_ll_xtal_store_freq_mhz(40) left it.
+        assert_eq!(bus.read32(0x6000_80b8), 0x0028_0028);
+
+        // The plain (ROM-less) boot stands in for no bootloader: reset value.
+        let (_cpu, mut plain) = boot_from_factory_image(&image).expect("should boot");
+        assert_eq!(plain.read32(0x6000_80b8), 0);
     }
 
     #[test]

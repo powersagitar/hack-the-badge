@@ -534,6 +534,12 @@ pub enum Int32UnaryOp {
     /// `int __ffssi2 (int a)`: one plus the index of the least significant
     /// 1-bit of `a`, or 0 if `a` is 0 (fully defined, unlike `Clz`).
     Ffs,
+    /// `int32_t __bswapsi2 (int32_t a)`: `a` with its four bytes reversed
+    /// (byte 0 <-> byte 3, byte 1 <-> byte 2). Fully defined for every input.
+    /// It is the libcall `__builtin_bswap32` lowers to on RV32IMC without
+    /// Zbb (ESP-IDF's `HAL_SWAP32`,
+    /// `components/hal/platform_port/include/hal/misc.h:15`).
+    Bswap,
 }
 
 impl Int32UnaryOp {
@@ -545,6 +551,7 @@ impl Int32UnaryOp {
                 0 => 0,
                 _ => a.trailing_zeros() + 1,
             },
+            Int32UnaryOp::Bswap => a.swap_bytes(),
         }
     }
 }

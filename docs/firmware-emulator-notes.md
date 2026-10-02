@@ -260,10 +260,25 @@ so a read-only `RomDataBlob` doesn't fit. Instead:
   `esp_app_format.h`), falling back to 2 MB as the bootloader's
   `update_flash_config()` does. `device_id` is the badge's JEDEC ID
   byte-swapped the way `bootloader_read_flash_id()` does it.
-- Nothing else is seeded. A temporary read-before-write trace of the whole
+- No other ROM `.data` is seeded. A temporary read-before-write trace of the whole
   ROM-reserved window, run to the current stall, found no other read of
   ROM `.data` (the only other read was all-zero `.bss`, which zeroed RAM
   already matches). Every value is cited in `rom.rs` entry 20.
+- **Task D12** added one entry that is a peripheral register, not RAM: the
+  2nd-stage bootloader's XTAL-frequency store. `RTC_XTAL_FREQ_REG` is
+  `RTC_CNTL_STORE4_REG` (`0x6000_80b8`; `esp_rom/esp32c3/include/esp32c3/
+  rom/rtc.h`, `soc/rtc_cntl_reg.h`). The bootloader's
+  `bootloader_clock_configure()` -> `rtc_clk_init()` ->
+  `rtc_clk_xtal_freq_update()` -> `clk_ll_xtal_store_freq_mhz(40)`
+  (`hal/esp32c3/include/hal/clk_tree_ll.h`) writes the MHz value into both
+  16-bit halves: `0x0028_0028`. `clk_ll_xtal_load_freq_mhz()` rejects the
+  reset value 0, so without the seed ESP-IDF logged an "invalid
+  RTC_XTAL_FREQ_REG value, assume 40MHz" warning 17 times in early boot
+  (`rtc_clk` tag) and once more from the SPI clock setup (`clk_hal` tag).
+  The real badge's log has none of them. The write goes through the bus
+  into the RTC_CNTL model's plain storage. Citations are in `rom.rs`
+  entry 23.
+
 
 This is split across two files on purpose:
 
@@ -999,27 +1014,44 @@ predicted these blockers would surface once TIMG unblocks further boot:
 
    **Task 9 (SPI2 register fidelity).** `SPI_UPDATE` now reads back 0 at
    once, and transaction completion is signalled the way `spi_ll.h` reads
-   it (item 3). The poll exits on its first check, and boot prints
-   `W (0) clk_hal: invalid RTC_XTAL_FREQ_REG value, assume 40MHz` from the
-   SPI clock setup. That line is an emulator artifact (the real badge's
-   log has no such line: the RTC store register holding the XTAL frequency
-   is unmodeled); the fallback, 40 MHz, matches the real badge.
+   it (item 3). The poll exits on its first check, and boot printed an
+   (emulator-only) `clk_hal` "invalid RTC_XTAL_FREQ_REG" warning from the
+   SPI clock setup; Task D12 removed it (below).
 
-   **The current stall is a ROM call again.** On the 602,868th step boot
-   fetches from `0x4000_0788`, the unstubbed libgcc ROM helper
-   `__bswapsi2` (`esp32c3.rom.libgcc.ld`), called (RA `0x4039_45fa`) from
-   `spi_ll_set_command()` (`spi_ll.h:1018-1030`, `0x4039_45c0` in
+   **Task 9's stall** (history) was a ROM call again. On the 602,868th
+   step boot fetched from `0x4000_0788`, the then-unstubbed libgcc ROM
+   helper `__bswapsi2` (`esp32c3.rom.libgcc.ld`), called (RA `0x4039_45fa`)
+   from `spi_ll_set_command()` (`spi_ll.h:1018-1030`, `0x4039_45c0` in
    factory.bin, disassembled). Its MSB-first branch writes
    `HAL_SPI_SWAP_DATA_TX(cmd, cmdlen)` to `SPI_USER2_REG`'s command value;
    that macro is `HAL_SWAP32` = `__builtin_bswap32` (`hal/misc.h:15`), a
-   libcall on RV32IMC without Zbb. This is `spi_hal_setup_trans()` for the
-   first SPI2 transaction: no transaction has run yet and nothing is drawn.
-   The panic handler then prints "Guru Meditation Error", and its reboot
-   faults on the unstubbed ROM `software_reset_cpu` (`0x4000_0094`). Pinned
-   in `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_currently_faults_on_the_unstubbed_rom_bswapsi2_in_spi_ll_set_command`.
-   The FreeRTOS tick (item 2) and `wfi` (item 4) have not been needed yet,
-   but the idle task will need them.
+   libcall on RV32IMC without Zbb.
+
+   **Task D12.** `__bswapsi2` is a real stub in the libgcc `Int32Unary`
+   family (`rom.rs` entry 23; observed once, step 593,018, `a0 = 0`). And
+   the shortcut boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader
+   leaves it ("ROM writable `.data`" above), so neither XTAL warning prints.
+   Those warnings were the first callers of `ets_get_cpu_frequency`/
+   `ets_printf`, so without them the whole timeline is earlier (296 steps
+   at ROM `qsort`'s return, 629 steps by the first yield, now taken on step
+   528,149). Step numbers in the history paragraphs above are as measured
+   in their own tasks. Boot then runs with no exception through one SPI2
+   transaction (`TRANS_DONE` raw and enabled; the SPI2 source is routed to
+   CPU line 6, which is not enabled yet), and `app_main`'s task blocks.
+
+   **The current stall is `wfi` (item 4).** On the 596,609th step the
+   FreeRTOS IDLE task's `esp_cpu_wait_for_intr()`
+   (`components/esp_hw_support/cpu.c:52-64`, called from
+   `esp_vApplicationIdleHook()`, `components/esp_system/freertos_hooks.c`)
+   executes `wfi` (`0x1050_0073`) at `0x4038_b8bc`, which the core decodes
+   as illegal, so it takes an `ILLEGAL_INSTRUCTION` exception. The panic
+   handler prints "Guru Meditation Error", and its reboot faults on the
+   unstubbed ROM `software_reset_cpu` (`0x4000_0094`, step 836,487).
+   Nothing is drawn. `main_task: Calling app_main()` is still the newest
+   console line. Pinned in `emulator-core/tests/rom_stub_boot.rs`'s
+   `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi`.
+   Once `wfi` waits (plan Task 6), the FreeRTOS tick (item 2) is the likely
+   next need, since that is what wakes a blocked task.
 2. **SYSTIMER doesn't match real ESP-IDF v5.5.3 driver behavior.**
    `emulator-core/src/peripherals/systimer.rs` only models unit 0/target 0
    with real behavior, but ESP-IDF's `vSystimerSetup`
@@ -1049,13 +1081,17 @@ predicted these blockers would surface once TIMG unblocks further boot:
    the `SPI_W0..W15` buffer (at most 64 bytes), so a DMA transaction would
    currently feed the ST7789 model whatever the `W` registers hold. Pixel
    transfers over 64 bytes use GDMA, which is unmodeled (plan Task 10).
-4. **WFI decodes as `Illegal`** rather than as a real wait-for-interrupt —
-   the FreeRTOS idle task's `wfi` would trap once boot reaches it.
+4. **WFI decodes as `Illegal`** rather than as a real wait-for-interrupt.
+   Boot reaches it as of Task D12: the FreeRTOS idle task's `wfi` traps on
+   step 596,609, which is the current stall (item 1).
 5. Two flagged guesses worth re-examining once boot progresses further:
    `rom_i2c_readReg*` stubbed to return 0 (currently steers boot down an
    "assume 40MHz" crystal-frequency fallback that happens to match the
    badge's real crystal — correct today, but a guess, not a verified
-   value); `Cache_Get_*` accessor family stubbed to 0 (never actually called
+   value. Task D12 note: the "invalid RTC_XTAL_FREQ_REG ... assume 40MHz"
+   warnings came from the unseeded `RTC_XTAL_FREQ_REG`, not from these
+   stubs, and are gone now that it is seeded); `Cache_Get_*` accessor
+   family stubbed to 0 (never actually called
    during the observed boot path — unverified whether that generalizes to a
    boot path that gets further).
 6. **`TICKS_PER_STEP = 1`** (the emulator's steps-to-real-cycles ratio) is

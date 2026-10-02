@@ -567,7 +567,8 @@
 //!     Task D7 stopped there.
 //!
 //! 16. **libgcc's unary 32-bit bit-count helpers** ([`LIBGCC_INT32_FAMILY`],
-//!     `esp32c3.rom.libgcc.ld`) — Milestone 3 Task D8's stall.
+//!     `esp32c3.rom.libgcc.ld`) — Milestone 3 Task D8's stall. (Task D12 adds
+//!     `__bswapsi2` to the same family; see entry 23.)
 //!     `__clzsi2` (`0x4000_079c`) is TLSF's `fls()` (`32 - clz(size)`,
 //!     observed `a0 = 0x2e6c`, result 18); `__ffssi2` (`0x4000_07d4`) is
 //!     `ffs()` (observed `a0 = 0x200`, result 10, caller `0x4039_5c08`).
@@ -783,6 +784,47 @@
 //!     `gpio_pad_*`, `gpio_output_set`, ...) is not observed, so it stays
 //!     unstubbed.
 //!
+//! 23. **libgcc `__bswapsi2`, and the bootloader's `RTC_XTAL_FREQ_REG`
+//!     store** — Milestone 3 Task D12.
+//!     - `__bswapsi2` (`0x4000_0788`, `esp32c3.rom.libgcc.ld`; GCC internals
+//!       "Integer library routines": `int32_t __bswapsi2 (int32_t a)`
+//!       returns `a` with its bytes reversed) joins entry 16's
+//!       [`LIBGCC_INT32_FAMILY`] as [`Int32UnaryOp::Bswap`]. Its caller is
+//!       `spi_ll_set_command()` (`hal/esp32c3/include/hal/spi_ll.h:1018-1030`,
+//!       RA `0x4039_45fa`): the MSB-first branch's `HAL_SPI_SWAP_DATA_TX` is
+//!       a `HAL_SWAP32` = `__builtin_bswap32` (`hal/misc.h`), a libcall on
+//!       RV32IMC without Zbb. Observed once, on step 593,018, with `a0 = 0`
+//!       (the first SPI2 transaction's command is 0). `__bswapdi2`
+//!       (`0x4000_0784`) is not observed, so it stays unstubbed.
+//!     - `RTC_XTAL_FREQ_REG` ([`RTC_XTAL_FREQ_REG`]) is `RTC_CNTL_STORE4_REG`
+//!       (`0x6000_8000 + 0xb8`; `components/esp_rom/esp32c3/include/
+//!       esp32c3/rom/rtc.h`, `soc/rtc_cntl_reg.h`). On real hardware the
+//!       2nd-stage bootloader writes it: `bootloader_init()`
+//!       (`bootloader_support/src/esp32c3/bootloader_esp32c3.c:154`) ->
+//!       `bootloader_clock_configure()` (`bootloader_clock_init.c:83`) ->
+//!       `rtc_clk_init(RTC_CLK_CONFIG_DEFAULT())` (`esp_hw_support/port/
+//!       esp32c3/rtc_clk_init.c:50-52`) -> `rtc_clk_xtal_freq_update()`
+//!       (`rtc_clk.c:368-371`) -> `clk_ll_xtal_store_freq_mhz(40)`
+//!       (`hal/esp32c3/include/hal/clk_tree_ll.h:626-635`). The encoding is
+//!       the MHz value in both 16-bit halves, with bit 0 of each half
+//!       (`RTC_DISABLE_ROM_LOG`) kept only if already set:
+//!       [`BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE`] = `0x0028_0028`.
+//!       `clk_ll_xtal_load_freq_mhz()` (same header, `:645-655`) accepts a
+//!       value iff the halves match and it is neither 0 nor all-ones. The
+//!       shortcut boot skipped the store, so the register read its reset
+//!       value 0, and both `rtc_clk_xtal_freq_get()` (`rtc_clk.c:358-364`,
+//!       17 times in early boot) and `clk_hal_xtal_get_freq_mhz()`
+//!       (`hal/esp32c3/clk_tree_hal.c:76-84`, from the SPI clock setup)
+//!       logged an "invalid RTC_XTAL_FREQ_REG value, assume 40MHz"
+//!       warning the real badge's log does not have. Seeded now through
+//!       entry 20's mechanism ([`esp32c3_rom_ram_initializers`], item 3):
+//!       the write goes through the bus into the RTC_CNTL model's plain
+//!       storage (`crate::peripherals::rtc_cntl`'s module doc, "STORE4").
+//!       The warnings were the first callers of `ets_get_cpu_frequency`/
+//!       `ets_printf`, so dropping them moves the whole timeline earlier
+//!       (296 steps at `qsort`'s return, 629 at the first yield).
+
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -802,7 +844,23 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task 9** (SPI2 register fidelity, no stub changes): still 94
+//! **As of Task D12**: 95 stubs (Task 9's 94 plus `__bswapsi2`, entry 23),
+//! and `RTC_XTAL_FREQ_REG` is seeded as the skipped bootloader leaves it
+//! (entry 23), so no "invalid RTC_XTAL_FREQ_REG" warning prints and the
+//! timeline is ~629 steps earlier by the first yield. `spi_ll_set_command()`'s
+//! `__bswapsi2` call (step 593,018) returns, one SPI2 transaction completes,
+//! and `app_main`'s task blocks. Then the stall is not a ROM call: the
+//! FreeRTOS IDLE task's `esp_cpu_wait_for_intr()`
+//! (`components/esp_hw_support/cpu.c:52-64`, from
+//! `esp_vApplicationIdleHook()`) executes `wfi` at `0x4038_b8bc`, which the
+//! core does not implement yet (plan Task 6), so step 596,609 takes an
+//! `ILLEGAL_INSTRUCTION` exception. The panic handler's reboot then faults on
+//! `software_reset_cpu` (step 836,487). Nothing is drawn. See
+//! `tests/rom_stub_boot.rs`'s
+//! `boot_currently_takes_an_illegal_instruction_on_the_idle_tasks_wfi`. The
+//! Task 9 paragraph below is kept as history.
+//!
+//! **As of Task 9** (history; SPI2 register fidelity, no stub changes): still 94
 //! stubs. With SPI2's `SPI_UPDATE` self-clearing, the `spi_hal_init()` poll
 //! below exits at once, and boot faults on the 602,868th step on a missing
 //! stub: the libgcc ROM helper `__bswapsi2` (`0x4000_0788`,
@@ -1551,6 +1609,24 @@ pub const BOOTLOADER_FLASH_DEVICE_ID: u32 = {
     ((id[0] as u32) << 16) | ((id[1] as u32) << 8) | id[2] as u32
 };
 
+/// `RTC_XTAL_FREQ_REG` = `RTC_CNTL_STORE4_REG`
+/// (`components/esp_rom/esp32c3/include/esp32c3/rom/rtc.h`;
+/// `DR_REG_RTCCNTL_BASE` `0x6000_8000` + `0xb8`, `soc/rtc_cntl_reg.h`).
+/// Module doc, entry 23.
+pub const RTC_XTAL_FREQ_REG: u32 =
+    crate::mem::soc::RTC_CNTL_RANGE.start + crate::peripherals::rtc_cntl::STORE4_REG;
+
+/// The value the 2nd-stage bootloader leaves in [`RTC_XTAL_FREQ_REG`]:
+/// `clk_ll_xtal_store_freq_mhz(40)` (`hal/esp32c3/include/hal/clk_tree_ll.h`)
+/// writes `(f & 0xffff) | ((f & 0xffff) << 16)`, both halves the MHz value,
+/// with bit 0 of each half (`RTC_DISABLE_ROM_LOG`) set only when the ROM log
+/// was already disabled, which it is not on this badge (the ROM prints its
+/// banner). `clk_ll_xtal_load_freq_mhz()` accepts it as 40 MHz. 40 is the
+/// only `CONFIG_XTAL_FREQ` the ESP32-C3 offers
+/// (`components/esp_hw_support/port/esp32c3/Kconfig.xtal`), passed via
+/// `RTC_CLK_CONFIG_DEFAULT()` (`soc/rtc.h`). Module doc, entry 23.
+pub const BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE: u32 = (40 << 16) | 40;
+
 /// The ROM writable-`.data` state the shortcut boot must seed, standing in
 /// for the two steps it skips (module doc, entry 20), in application order:
 ///
@@ -1572,6 +1648,12 @@ pub const BOOTLOADER_FLASH_DEVICE_ID: u32 = {
 ///    [`BOOTLOADER_DEFAULT_FLASH_SIZE`] as the bootloader does. (The real
 ///    bootloader reads its *own* image header; esptool writes the same
 ///    flash size into both, and on this badge both say 4 MB.)
+/// 3. The 2nd-stage bootloader's XTAL-frequency store (module doc, entry
+///    23): [`RTC_XTAL_FREQ_REG`] = [`BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE`].
+///    This one is a peripheral register, not RAM: the write goes through
+///    the bus into the RTC_CNTL model's plain register storage
+///    ([`crate::peripherals::rtc_cntl::STORE4_REG`]), which is where the
+///    real bootloader's `WRITE_PERI_REG` lands too.
 pub fn esp32c3_rom_ram_initializers(header: &ImageHeader) -> Vec<RamInitializer> {
     let chip_size = header
         .flash_size_bytes()
@@ -1599,6 +1681,11 @@ pub fn esp32c3_rom_ram_initializers(header: &ImageHeader) -> Vec<RamInitializer>
         RamInitializer {
             addr: ROM_DEFAULT_SPIFLASH_LEGACY_DATA,
             bytes: config_param.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        },
+        // 3. The bootloader's clk_ll_xtal_store_freq_mhz(40) effect.
+        RamInitializer {
+            addr: RTC_XTAL_FREQ_REG,
+            bytes: BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE.to_le_bytes().to_vec(),
         },
     ]
 }
@@ -1793,11 +1880,14 @@ const LIBGCC_INT64_FAMILY: &[(u32, &str, Int64Op)] = &[
     (0x4000_08bc, "__umoddi3", Int64Op::UMod),
 ];
 
-/// libgcc's unary 32-bit bit-counting helpers (`esp32c3.rom.libgcc.ld`), real
+/// libgcc's unary 32-bit helpers (`esp32c3.rom.libgcc.ld`), real
 /// implementations -- see [`Int32UnaryOp`]. `__clzsi2` is TLSF's `fls()` in
-/// the heap allocator (Task D8's stall); `__ffssi2` is the next observed call (a0 = 0x200); others such as `__ctzsi2` are left
-/// to fault loudly until something calls them.
+/// the heap allocator (Task D8's stall); `__ffssi2` is the next observed call (a0 = 0x200);
+/// `__bswapsi2` is `spi_ll_set_command()`'s `HAL_SWAP32` (Task D12, module
+/// doc entry 23). Others such as `__ctzsi2` are left to fault loudly until
+/// something calls them.
 const LIBGCC_INT32_FAMILY: &[(u32, &str, Int32UnaryOp)] = &[
+    (0x4000_0788, "__bswapsi2", Int32UnaryOp::Bswap),
     (0x4000_079c, "__clzsi2", Int32UnaryOp::Clz),
     (0x4000_07d4, "__ffssi2", Int32UnaryOp::Ffs),
 ];
@@ -2611,6 +2701,8 @@ mod tests {
             (0x3fcd_f5d0, 0x0000_0100), // page_size
             (0x3fcd_f5d4, 0x0000_ffff), // status_mask
             (0x3fcd_f5d8, 0),           // dummy_len_plus[3], sig_matrix (ROM .data)
+            // RTC_XTAL_FREQ_REG, as clk_ll_xtal_store_freq_mhz(40) left it (Task D12)
+            (0x6000_80b8, 0x0028_0028),
         ]
         .into_iter()
         .collect();
@@ -2633,19 +2725,56 @@ mod tests {
     #[test]
     fn rom_ram_initializers_seed_only_the_rom_data_boot_consumes() {
         // Guard against bulk-copying ROM .data: every byte seeded lies in
-        // either the legacy-data pointer word or the 28-byte struct.
+        // the legacy-data pointer word, the 28-byte struct, or (Task D12)
+        // the one RTC_XTAL_FREQ_REG word.
         for init in esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f)) {
             let end = init.addr + init.bytes.len() as u32;
             let in_ptr =
                 init.addr >= ROM_SPIFLASH_LEGACY_DATA && end <= ROM_SPIFLASH_LEGACY_DATA + 4;
             let in_struct = init.addr >= ROM_DEFAULT_SPIFLASH_LEGACY_DATA
                 && end <= ROM_DEFAULT_SPIFLASH_LEGACY_DATA + 28;
+            let in_xtal = init.addr == RTC_XTAL_FREQ_REG && init.bytes.len() == 4;
             assert!(
-                in_ptr || in_struct,
+                in_ptr || in_struct || in_xtal,
                 "unexpected seed at 0x{:08x}",
                 init.addr
             );
         }
+    }
+
+    #[test]
+    fn bswapsi2_is_a_real_int32_unary_stub_at_its_libgcc_ld_address() {
+        // esp32c3.rom.libgcc.ld: `__bswapsi2 = 0x40000788;`.
+        let table = esp32c3_rom_stubs();
+        let stub = table.lookup(0x4000_0788).expect("__bswapsi2 is stubbed");
+        assert_eq!(stub.name, "__bswapsi2");
+        assert_eq!(stub.effect, RomStubEffect::Int32Unary(Int32UnaryOp::Bswap));
+    }
+
+    /// `clk_ll_xtal_load_freq_mhz()` (`hal/esp32c3/include/hal/clk_tree_ll.h`),
+    /// transcribed: both 16-bit halves equal, not 0 and not all-ones, then
+    /// the low half minus `RTC_DISABLE_ROM_LOG`; otherwise 0 ("invalid").
+    fn clk_ll_xtal_load_freq_mhz(reg: u32) -> u32 {
+        const RTC_DISABLE_ROM_LOG: u32 = (1 << 0) | (1 << 16);
+        if (reg & 0xffff) == ((reg >> 16) & 0xffff) && reg != 0 && reg != u32::MAX {
+            reg & !RTC_DISABLE_ROM_LOG & 0xffff
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn rom_ram_initializers_seed_rtc_xtal_freq_reg_as_the_bootloader_stores_40mhz() {
+        assert_eq!(RTC_XTAL_FREQ_REG, 0x6000_80b8, "RTC_CNTL_STORE4_REG");
+        let words = net_words(&esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f)));
+        let reg = *words
+            .get(&RTC_XTAL_FREQ_REG)
+            .expect("RTC_XTAL_FREQ_REG is seeded");
+        // clk_ll_xtal_store_freq_mhz(40) with the ROM log enabled.
+        assert_eq!(reg, 0x0028_0028);
+        assert_eq!(clk_ll_xtal_load_freq_mhz(reg), 40, "a valid 40 MHz");
+        // The unseeded reset value is what clk_hal calls invalid.
+        assert_eq!(clk_ll_xtal_load_freq_mhz(0), 0);
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
 //!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
 //!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
-//!   from `systimer`'s live counter scaled to the RTC slow clock.
+//!   from `systimer`'s live counter scaled to the RTC slow clock. Also
+//!   `STORE4_REG` (`RTC_XTAL_FREQ_REG`), plain storage the shortcut boot
+//!   seeds as the bootloader would (Task D12).
 //! - [`gpio`]: [`gpio::Gpio`], the GPIO peripheral plus an emulated 74HC165
 //!   shift register (`gpio::Hc165`) the real badge uses to read 7 of its 8
 //!   buttons.
