@@ -891,6 +891,19 @@ fn push_padded(out: &mut Vec<u8>, text: &[u8], width: usize, left_align: bool, p
     }
 }
 
+/// [`push_padded`] for a numeric conversion: when zero-padding, a leading
+/// `-` goes before the zeros (`%05d` of -42 is `-0042`, as in C), not after.
+fn push_number(out: &mut Vec<u8>, text: &[u8], width: usize, left_align: bool, pad_byte: u8) {
+    match text.split_first() {
+        Some((&b'-', digits)) if pad_byte == b'0' => {
+            if push_capped(out, b'-') {
+                push_padded(out, digits, width.saturating_sub(1), left_align, pad_byte);
+            }
+        }
+        _ => push_padded(out, text, width, left_align, pad_byte),
+    }
+}
+
 /// Formats `fmt_addr`'s C format string (read through `host`) against the
 /// RV32 ILP32 varargs `host` resolves (`a1..a7`, then the stack -- see
 /// [`VarargCursor`]), mirroring the ESP32-C3 ROM's own `ets_printf`
@@ -911,10 +924,14 @@ fn push_padded(out: &mut Vec<u8>, text: &[u8], width: usize, left_align: bool, p
 /// `ets_sys.h` documents `ets_printf` itself as unable to print
 /// floating-point, "Can not print float point data format, or longlong
 /// data format", though this stub does support `ll` per the orchestrator
-/// ruling above) are emitted **verbatim** as `%` followed by the
-/// conversion character (e.g. `%f` prints the two characters `%f`) and
-/// consume **no** vararg -- printing a wrong/misaligned value from the
-/// wrong slot would be worse than printing the literal specifier.
+/// ruling above) are echoed as just `%` followed by the conversion
+/// character (e.g. `%f` prints the two characters `%f`; any flags, width,
+/// precision or length modifier between them are parsed and dropped, so
+/// `%-08.3lf` also prints `%f` -- not a fully verbatim echo) and consume
+/// **no** vararg -- printing a wrong/misaligned value from the wrong slot
+/// would be worse than printing the literal specifier. A lone `%` right
+/// before the terminator (possibly with flags/width) prints nothing and
+/// ends the string.
 ///
 /// A NULL (`0`) `%s` pointer prints `(null)`, matching glibc/newlib's own
 /// common convention for this ROM's non-standard printf (not documented in
@@ -922,8 +939,10 @@ fn push_padded(out: &mut Vec<u8>, text: &[u8], width: usize, left_align: bool, p
 /// practice for a `%s` implementation and clearly preferable to dereferencing
 /// a null pointer).
 ///
-/// Every byte read (format string, `%s` argument) and every byte written is
-/// capped at [`PRINTF_MAX_SCAN_BYTES`]/[`PRINTF_MAX_OUTPUT_BYTES`] so a
+/// Every scan loop (literal text, flags, width, precision, `%s` argument)
+/// is capped at [`PRINTF_MAX_SCAN_BYTES`] and every byte written at
+/// [`PRINTF_MAX_OUTPUT_BYTES`] (the fixed-length `.`/`l`/`ll`/conversion
+/// reads after a capped loop add at most four more bytes), so a
 /// garbage/unterminated pointer can't hang the caller.
 pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput {
     let mut out = Vec::new();
@@ -950,7 +969,7 @@ pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput
         // per this function's doc.
         let mut left_align = false;
         let mut zero_pad = false;
-        loop {
+        while (i as usize) < PRINTF_MAX_SCAN_BYTES {
             match host.read_byte(fmt_addr.wrapping_add(i)) {
                 b'-' => {
                     left_align = true;
@@ -1005,6 +1024,11 @@ pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput
 
         let conv = host.read_byte(fmt_addr.wrapping_add(i));
         i += 1;
+        if conv == 0 {
+            // A lone `%` (plus any flags/width) right before the terminator:
+            // stop here rather than emit the NUL and scan past the string.
+            break;
+        }
 
         let zero_pad_byte = if zero_pad && !left_align { b'0' } else { b' ' };
 
@@ -1031,7 +1055,7 @@ pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput
                     host.slot(slot) as i32 as i64
                 };
                 let text = value.to_string();
-                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+                push_number(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
             }
             b'u' => {
                 let value: u64 = if is_64 {
@@ -1042,7 +1066,7 @@ pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput
                     u64::from(host.slot(slot))
                 };
                 let text = value.to_string();
-                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+                push_number(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
             }
             b'x' | b'X' => {
                 let value: u64 = if is_64 {
@@ -1057,7 +1081,7 @@ pub fn compute_printf(fmt_addr: u32, host: &mut impl PrintfHost) -> PrintfOutput
                 } else {
                     format!("{value:x}")
                 };
-                push_padded(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
+                push_number(&mut out, text.as_bytes(), width, left_align, zero_pad_byte);
             }
             b'p' => {
                 let slot = cursor.take_u32_slot();
@@ -1704,6 +1728,67 @@ mod tests {
         // %d that follows must still read slot 1, not slot 2.
         let (text, _) = run_printf(b"%f%d", vec![111, 222]);
         assert_eq!(text, "%f111");
+    }
+
+    #[test]
+    fn printf_unsupported_specifier_drops_its_flags_and_width() {
+        // Only `%` and the conversion character are echoed; whatever sat
+        // between them is dropped (see this function's doc).
+        let (text, _) = run_printf(b"[%-08.3lf]", vec![]);
+        assert_eq!(text, "[%f]");
+    }
+
+    #[test]
+    fn printf_trailing_percent_stops_at_the_terminator() {
+        // A format string ending in a lone `%` must not emit `%` + NUL nor
+        // keep scanning the bytes past its own terminator.
+        let mut host = TestHost::new(vec![]);
+        host.write_cstr(FMT_ADDR, b"50%");
+        host.write_cstr(FMT_ADDR + 4, b"XYZ");
+        let result = compute_printf(FMT_ADDR, &mut host);
+        assert_eq!(result.bytes, b"50");
+        assert_eq!(result.chars_written, 2);
+    }
+
+    #[test]
+    fn printf_flag_scan_is_bounded_by_the_scan_cap() {
+        // A `%` followed by an endless run of `0` flags (e.g. a garbage
+        // pointer into a zero-filled-with-'0' buffer) must terminate.
+        struct EndlessZeros {
+            reads: usize,
+        }
+        impl PrintfHost for EndlessZeros {
+            fn read_byte(&mut self, addr: u32) -> u8 {
+                self.reads += 1;
+                assert!(
+                    self.reads <= 4 * PRINTF_MAX_SCAN_BYTES,
+                    "flag scan ran past the cap"
+                );
+                if addr == FMT_ADDR {
+                    b'%'
+                } else {
+                    b'0'
+                }
+            }
+            fn slot(&mut self, _slot: u32) -> u32 {
+                0
+            }
+        }
+        let mut host = EndlessZeros { reads: 0 };
+        let result = compute_printf(FMT_ADDR, &mut host);
+        assert!(result.bytes.len() <= PRINTF_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn printf_zero_padding_goes_after_the_sign() {
+        assert_eq!(run_printf(b"%05d", vec![(-42i32) as u32]).0, "-0042");
+        assert_eq!(run_printf(b"%05d", vec![42]).0, "00042");
+        assert_eq!(run_printf(b"%-5d|", vec![(-42i32) as u32]).0, "-42  |");
+        assert_eq!(run_printf(b"%03d", vec![(-1234i32) as u32]).0, "-1234");
+        assert_eq!(
+            run_printf(b"%06lld", vec![0, (-5i64) as u32, ((-5i64) >> 32) as u32]).0,
+            "-00005"
+        );
     }
 
     #[test]
