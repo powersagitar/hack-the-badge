@@ -104,6 +104,11 @@
 //!   and drives this module through [`Gdma::out_link_state`]/
 //!   [`Gdma::set_out_link_state`], [`Gdma::raise_out`] and
 //!   [`Gdma::record_out_eof`]. See that function for the descriptor rules.
+//!   The walk only reads/writes internal SRAM (`SOC_DRAM_LOW..HIGH`)
+//!   through a RAM-only accessor; a descriptor or buffer address anywhere
+//!   else raises `OUT_DSCR_ERR` (bit 6, "the second and third word error of
+//!   transmit descriptor", `gdma_reg.h`) and stops the channel, so a
+//!   malicious `next` aimed at MMIO cannot re-enter a peripheral.
 //! - **Everything is synchronous**: data moves at the instant SPI2's
 //!   `SPI_USR` fires, so the L1 FIFO is always drained: `OUTFIFO_STATUS`
 //!   reads `OUTFIFO_EMPTY` (bit 1) set and nothing else (the header's

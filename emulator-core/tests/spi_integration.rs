@@ -597,3 +597,85 @@ fn gdma_owner_check_rejects_a_cpu_owned_descriptor() {
         SPI_TRANS_DONE
     );
 }
+
+// ---- Final-review fix 1: the out-link walk only touches internal SRAM ----
+
+const GDMA_OUT_DSCR_ERR: u32 = 1 << 6;
+const GDMA_OUTLINK_PARK: u32 = 1 << 23;
+
+/// Regression (final whole-branch review, finding 1): a descriptor whose
+/// `next` points at SPI2's own `SPI_CMD_REG`, with `OUT_AUTO_WRBACK` on, used
+/// to write the descriptor's owner-cleared word 0 back into `SPI_CMD_REG`
+/// with `SPI_USR` still set, re-triggering SPI2 -> a nested `gdma_pull` from
+/// the same cursor -> unbounded recursion -> host stack overflow (a trap
+/// that kills the emulator in WASM). Built from bus-level register writes
+/// only. A descriptor address outside internal SRAM is now a descriptor
+/// error (`gdma_reg.h`: `OUT_DSCR_ERR` covers "the second and third word
+/// error of transmit descriptor"): the walk stops, the channel parks, and
+/// nothing outside SRAM is read or written by the DMA.
+#[test]
+fn gdma_next_pointing_at_spi2_cmd_is_a_descriptor_error_not_recursion() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    bus.write32(GDMA_OUT_CONF0_CH0, GDMA_OUT_AUTO_WRBACK);
+    for i in 0..4 {
+        bus.write8(BUF_AREA + i, 0xA0 + i as u8);
+    }
+    put_desc(&mut bus, DESC_AREA, BUF_AREA, 4, false, SPI_CMD_REG);
+    bus.write32(SPI_DMA_CONF_REG, SPI_DMA_TX_ENA);
+    bus.write32(
+        GDMA_OUT_LINK_CH0,
+        GDMA_OUTLINK_START | (DESC_AREA & GDMA_OUTLINK_ADDR_MASK),
+    );
+    bus.write32(SPI_MS_DLEN_REG, 64 * 8 - 1); // more than the first descriptor
+    bus.write32(GPIO_ENABLE_REG, DC_BIT);
+    bus.write32(GPIO_OUT_REG, DC_BIT);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+
+    let raw = bus.read32(GDMA_INT_RAW_CH0);
+    assert_ne!(raw & GDMA_OUT_DSCR_ERR, 0, "INT_RAW {raw:#x}");
+    assert_ne!(
+        raw & GDMA_OUT_DONE,
+        0,
+        "the SRAM descriptor itself was sent"
+    );
+    assert_ne!(
+        bus.read32(GDMA_OUT_LINK_CH0) & GDMA_OUTLINK_PARK,
+        0,
+        "channel stopped"
+    );
+    assert_eq!(
+        bus.read32(SPI_CMD_REG) & SPI_USR_BIT,
+        0,
+        "the DMA never wrote back into SPI_CMD_REG"
+    );
+}
+
+/// A descriptor whose buffer pointer (word 1) lies outside internal SRAM is
+/// likewise a descriptor error: no bytes are fetched from it.
+#[test]
+fn gdma_buffer_outside_sram_is_a_descriptor_error() {
+    use emulator_core::mem::Bus;
+    let mut bus = bus_with_dram();
+    connect_spi2(&mut bus, 0);
+    put_desc(&mut bus, DESC_AREA, GPIO_BASE, 4, true, 0);
+    bus.write32(SPI_DMA_CONF_REG, SPI_DMA_TX_ENA);
+    bus.write32(
+        GDMA_OUT_LINK_CH0,
+        GDMA_OUTLINK_START | (DESC_AREA & GDMA_OUTLINK_ADDR_MASK),
+    );
+    bus.write32(SPI_MS_DLEN_REG, 4 * 8 - 1);
+    bus.write32(SPI_CMD_REG, SPI_USR_BIT);
+    assert_eq!(bus.read32(GDMA_INT_RAW_CH0), GDMA_OUT_DSCR_ERR);
+    assert_ne!(bus.read32(GDMA_OUT_LINK_CH0) & GDMA_OUTLINK_PARK, 0);
+}
+
+/// `FirmwareBus::gdma_pull` is `pub`; a channel number past the three that
+/// exist returns nothing instead of panicking (never-panic bus invariant).
+#[test]
+fn gdma_pull_on_a_nonexistent_channel_returns_nothing() {
+    let mut bus = bus_with_dram();
+    assert!(bus.gdma_pull(3, 16).is_empty());
+    assert!(bus.gdma_pull(usize::MAX, 16).is_empty());
+}

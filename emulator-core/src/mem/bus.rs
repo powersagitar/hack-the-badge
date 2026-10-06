@@ -157,9 +157,9 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, GDMA_RANGE, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE, RTC_CNTL_RANGE,
-    SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE,
-    TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE,
+    RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE,
+    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -921,7 +921,30 @@ impl FirmwareBus {
     /// the last descriptor sent, if the link had ended there. The walk is
     /// bounded (at most `max_len + 1` descriptors), so a cyclic link of
     /// empty descriptors cannot hang the host.
+    ///
+    /// **The walk only touches internal SRAM** (`DRAM_RANGE`, `SOC_DRAM_LOW..
+    /// SOC_DRAM_HIGH`, and only where a RAM region actually backs it): a
+    /// descriptor (`desc..desc+12`) or a non-empty buffer (`buf..buf+length`)
+    /// anywhere else raises `OUT_DSCR_ERR` and stops the channel, sending
+    /// nothing from that descriptor. `gdma_reg.h` (v5.5.3) documents
+    /// `OUT_DSCR_ERR` (bit 6) as "detecting transmit descriptor error,
+    /// including owner error, the second and third word error of transmit
+    /// descriptor" -- word 2 is the buffer pointer, word 3 `next`. Exactly
+    /// which addresses the silicon rejects is not in the header; restricting
+    /// to the SRAM DMA-capable descriptors and buffers must live in
+    /// (`esp_ptr_dma_capable`) is this model's reconstruction. It is also
+    /// load-bearing for the never-panic invariant: descriptors and buffers
+    /// are read and written through a RAM-only accessor, never through full
+    /// bus dispatch, so a `next` aimed at an MMIO register (e.g. SPI2's own
+    /// `SPI_CMD_REG`, whose write-back would re-trigger `SPI_USR` and recurse
+    /// into this function) cannot reach a peripheral.
+    ///
+    /// `ch` outside `0..gdma::NUM_CHANNELS` returns an empty `Vec` (this is
+    /// `pub`; never panic).
     pub fn gdma_pull(&mut self, ch: usize, max_len: usize) -> Vec<u8> {
+        if ch >= gdma::NUM_CHANNELS {
+            return Vec::new();
+        }
         let mut st = self.gdma.out_link_state(ch);
         let check_owner = self.gdma.out_check_owner(ch);
         let wrback = self.gdma.out_auto_wrback(ch);
@@ -930,33 +953,52 @@ impl FirmwareBus {
         if st.restart_pending {
             st.restart_pending = false;
             if st.cursor == 0 && st.last_desc != 0 {
-                st.cursor = self.read32(st.last_desc.wrapping_add(8));
+                // `last_desc` was validated when it was sent.
+                st.cursor = self.dma_read32(st.last_desc.wrapping_add(8)).unwrap_or(0);
             }
         }
         let mut walked = 0usize;
         while st.active && st.cursor != 0 && out.len() < max_len && walked <= max_len {
             walked += 1;
             let desc = st.cursor;
-            let w0 = self.read32(desc);
+            let Some(_) = self.dma_sram_offset(desc, 12) else {
+                raised |= gdma::OUT_DSCR_ERR; // descriptor outside SRAM
+                st.active = false;
+                break;
+            };
+            let w0 = self.dma_read32(desc).unwrap_or(0);
             if check_owner && w0 & gdma::DESC_OWNER == 0 {
                 raised |= gdma::OUT_DSCR_ERR;
                 st.active = false;
                 break;
             }
-            let buf = self.read32(desc.wrapping_add(4));
-            let next = self.read32(desc.wrapping_add(8));
+            let buf = self.dma_read32(desc.wrapping_add(4)).unwrap_or(0);
+            let next = self.dma_read32(desc.wrapping_add(8)).unwrap_or(0);
             let length = (w0 >> 12) & 0xFFF;
+            let buf_loc = if length == 0 {
+                None
+            } else {
+                match self.dma_sram_offset(buf, length) {
+                    Some(loc) => Some(loc),
+                    None => {
+                        raised |= gdma::OUT_DSCR_ERR; // buffer outside SRAM
+                        st.active = false;
+                        break;
+                    }
+                }
+            };
             let remaining = length.saturating_sub(st.offset) as usize;
             let take = remaining.min(max_len - out.len());
-            for i in 0..take as u32 {
-                out.push(self.read_byte(buf.wrapping_add(st.offset + i)));
+            if let Some((r, off)) = buf_loc {
+                let start = off + st.offset as usize;
+                out.extend_from_slice(&self.ram_regions[r].data[start..start + take]);
             }
             st.offset += take as u32;
             if st.offset < length {
                 break; // the SPI transaction ended mid-descriptor
             }
             if wrback {
-                self.write32(desc, w0 & !gdma::DESC_OWNER);
+                self.dma_write32(desc, w0 & !gdma::DESC_OWNER);
             }
             raised |= gdma::OUT_DONE;
             if w0 & gdma::DESC_SUC_EOF != 0 {
@@ -973,6 +1015,41 @@ impl FirmwareBus {
         self.gdma.set_out_link_state(ch, st);
         self.gdma.raise_out(ch, raised);
         out
+    }
+
+    /// GDMA's view of memory (see [`FirmwareBus::gdma_pull`]): if
+    /// `addr..addr+len` lies inside internal SRAM (`DRAM_RANGE`) *and* inside
+    /// one backing RAM region, that region's index and the byte offset of
+    /// `addr` in it; otherwise `None`. Never dispatches to a peripheral. A
+    /// span straddling two adjacent RAM regions is rejected too (a
+    /// simplification; the real firmware's descriptors and buffers never
+    /// do -- `boots_to_first_real_frame` is unchanged).
+    fn dma_sram_offset(&self, addr: u32, len: u32) -> Option<(usize, usize)> {
+        let start = addr as u64;
+        let end = start + len as u64;
+        if start < DRAM_RANGE.start as u64 || end > DRAM_RANGE.end as u64 {
+            return None;
+        }
+        self.ram_regions.iter().enumerate().find_map(|(i, r)| {
+            let r_start = r.load_addr as u64;
+            let r_end = r_start + r.data.len() as u64;
+            (start >= r_start && end <= r_end).then(|| (i, (start - r_start) as usize))
+        })
+    }
+
+    /// RAM-only little-endian word read for the GDMA walk.
+    fn dma_read32(&self, addr: u32) -> Option<u32> {
+        let (r, off) = self.dma_sram_offset(addr, 4)?;
+        let d = &self.ram_regions[r].data[off..off + 4];
+        Some(u32::from_le_bytes([d[0], d[1], d[2], d[3]]))
+    }
+
+    /// RAM-only little-endian word write for the GDMA walk (dropped outside
+    /// SRAM; callers have already validated the address).
+    fn dma_write32(&mut self, addr: u32, val: u32) {
+        if let Some((r, off)) = self.dma_sram_offset(addr, 4) {
+            self.ram_regions[r].data[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        }
     }
 
     /// `true` if `addr` falls inside an XIP, RAM-copied or ROM-code region — i.e. is
