@@ -170,7 +170,7 @@ pub const USB_SERIAL_JTAG_RANGE: Range<u32> = 0x6004_3000..0x6004_4000;
 
 /// TIMG0 (timer group 0) peripheral registers
 /// (`DR_REG_TIMERGROUP0_BASE`, confirmed via ESP-IDF v5.5.3's
-/// `components/soc/esp32c3/include/soc/reg_base.h`). One full 4 KiB page,
+/// `components/soc/esp32c3/register/soc/reg_base.h`). One full 4 KiB page,
 /// same rationale as [`SYSTIMER_RANGE`]. This is the timer group
 /// `rtc_clk_cal_internal()` uses for RTC slow-clock calibration at boot
 /// (`TIMG_RTCCALICFG*_REG`) — see `crate::peripherals::timg` for what's

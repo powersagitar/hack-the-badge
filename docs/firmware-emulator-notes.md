@@ -85,19 +85,17 @@ internals.
 just `[load_addr, load_addr+len)` (`emulator-core/src/mem/bus.rs`'s
 `FirmwareBus::from_segments`/`xip_page_window`) — matching what the real
 2nd-stage bootloader's `set_cache_and_start_app()` +
-`mmu_hal_map_region()` actually expose (see the "Known limitations" entry
-below for the full citation chain and why it matters: `cpu_start`'s
+`mmu_hal_map_region()` actually expose (see history item 1's "Resolved
+in Milestone 3, Task D5" paragraph, under "History: the stall-by-stall
+log" below, for the full citation chain and why it matters: `cpu_start`'s
 app-image-header check reads bytes that live in exactly this leading
 per-segment page gap).
 
-**Not yet done:** cross-checking computed segment/entry addresses against a
-real-hardware serial boot log transcript (the real bootloader's own boot log
-prints over USB-Serial-JTAG before the app's console takes over — passively
-observable, no firmware modification needed). Judged lower priority since
-the header-byte ground truth above is stronger evidence for "does the parser
-read the header correctly" than a serial log would add on top — but it
-remains a cheap live-hardware check if boot ever behaves unexpectedly in a
-way only that comparison would explain.
+A real-hardware serial boot log has since been captured (kept local-only,
+never committed; see the "Data-handling note") and is the source of
+"Ground truth from the physical badge" below. The header-byte evidence
+above remains the primary check that the parser reads the header
+correctly.
 
 ## The mask-ROM problem, and how it's solved
 
@@ -318,8 +316,9 @@ all use `BusRegisterWrite` to perform a real read/write of
 `CPU_INT_PRI_<n>_REG`) — an earlier revision of this table left four of
 these five as `void` no-ops (safe only because the one boot run observed
 happened to write values those registers already held) and left the fifth
-unstubbed entirely; see "Known limitations" item 1 below for the fix and
-citations.
+unstubbed entirely; see history item 1 under "History: the stall-by-stall
+log" below (the paragraph that rewires all five interrupt-controller calls
+onto `BusRegisterWrite`) for the fix and citations.
 
 Task D11 adds two more register-writing stubs, ROM `gpio_matrix_out` and
 `gpio_matrix_in`, which program the GPIO matrix's
@@ -408,6 +407,8 @@ personal data). From a cold shortcut boot of `factory.bin`:
   (`0x5599c270ab0429fa`). It samples every 250,000 steps and stops once
   the hash has held for 1,000,000 steps (at step 6,750,000). It takes
   about 0.5 s with `--release` and about 6.5 s in a debug build.
+- 2026-10-06: the human partner compared this frame by eye with the
+  physical badge's first screen and confirmed they match.
 - To look at the frame:
   `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
   writes a PNG under the gitignored `local/`.
@@ -464,13 +465,20 @@ current blocker:
    `boots_to_first_real_frame`'s pinned hash is of *this* framebuffer
    orientation; modeling `MADCTL` may change the hash without the image
    being wrong.
-4. **The frame has not yet been compared with the physical badge's first
-   screen** by eye (pending, outside the test suite).
-5. The dormant items from the history below: flagged ROM-stub guesses
+4. The dormant items from the history below: flagged ROM-stub guesses
    (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
    "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6),
    the bootloader's extra DROM page (item 7) and simplified edge
    interrupts (item 9).
+5. **The eFuse block is not modeled**, so the emulated boot logs
+   `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
+   "Ground truth from the physical badge"). Nothing has stalled on it.
+6. **Every log timestamp reads `I (0)`** (likewise `W (0)`/`E (0)`). On
+   real hardware ESP-IDF's log timestamp is milliseconds since boot and
+   advances line by line. The likely cause (not traced) is that the early
+   timestamp comes from the CPU cycle counter, and the ESP32-C3's
+   performance-counter CSR is not modeled. Cosmetic; no test depends on
+   it.
 
 ### Ground truth from the physical badge
 

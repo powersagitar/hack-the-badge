@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { initSync, add } from "../src/cpu/wasm-pkg/emulator_wasm.js";
+import { initSync, add, FirmwareEmulator } from "../src/cpu/wasm-pkg/emulator_wasm.js";
 import { createFirmwareEmulator, initCpuWasmSync } from "../src/cpu/bridge";
 
 describe("emulator-wasm round trip", () => {
@@ -31,108 +31,8 @@ describe("emulator-wasm firmware-boot boundary", () => {
     try {
       const report = handle.run(500_000);
 
-      // Milestone 3 Task D1: this used to assert 0 traps. Modeling
-      // RTC_CNTL's RTC timer (emulator-core/src/peripherals/rtc_cntl.rs)
-      // let boot's rtc_cntl_ll_get_rtc_time()-based busy-wait actually
-      // terminate, so boot now runs past a spin loop that previously kept
-      // it fault-free forever, and hits a genuine ROM-call fault.
-      //
-      // Milestone 3 Task D2: ROM libc memcpy is now HLE-stubbed
-      // (emulator-core/src/cpu/rom_stubs.rs's RomStubEffect::Memcpy), which
-      // unblocked the Task-D1-era fault (at step 401,761) -- boot now runs
-      // further and hits a *different* unstubbed ROM call
-      // (ets_efuse_get_spiconfig, step 402,113), still well within this
-      // 500,000-step budget.
-      //
-      // Milestone 3 Task D3: ets_efuse_get_spiconfig and six more ROM
-      // calls it led to are now HLE-stubbed (emulator-core/src/rom.rs's
-      // module doc, entry 10), which unblocked the Task-D2-era fault --
-      // boot now runs further still and hits a *different* unstubbed ROM
-      // call (esprv_intc_int_enable, step 405,806), still well within this
-      // 500,000-step budget, so the trap count here stays 1.
-      //
-      // Milestone 3 Task D3 fix round 1: esprv_intc_int_enable and its four
-      // siblings now perform real InterruptController register writes
-      // (emulator-core/src/rom.rs's module doc, entry 11), which unblocked
-      // the Task-D3-era fault -- boot now runs further still and hits a
-      // *different* unstubbed ROM call (itoa, step 407,471).
-      //
-      // Milestone 3 Task D4: itoa, and the very next unstubbed ROM libc
-      // call it led to (strcat, step ~407,498), are now HLE-stubbed
-      // (emulator-core/src/rom.rs's module doc, entry 12). With both real,
-      // boot no longer stalls on an unmapped ROM-address fetch at all --
-      // it hits a *qualitatively different* fault: a real
-      // ILLEGAL_INSTRUCTION trap (step 407,549) at ESP-IDF's own
-      // panic_abort(), still well within this 500,000-step budget, so the
-      // trap count here stays 1 (the second fault -- the still-unstubbed
-      // software_reset_cpu the panic handler's own reboot attempt calls --
-      // isn't reached until step 645,410, past this budget).
-      //
-      // Task D4 fix round 1 (correction, not a code change): itoa/strcat
-      // are called from newlib's abort(), itself called because cpu_start
-      // (ESP-IDF's early startup) rejects this image's header and aborts --
-      // *not* from "normal boot progress" as originally (incorrectly)
-      // documented. This trap is panic_abort() reached via that
-      // pre-existing abort() call, not evidence of progress past the
-      // header check. See docs/firmware-emulator-notes.md for the full
-      // corrected story (superseded by Task D5 below).
-      //
-      // Milestone 3 Task D5: emulator-core/src/mem/bus.rs's
-      // FirmwareBus::from_segments now widens each XIP (DROM/IROM) segment
-      // to its containing 64 KiB flash-cache MMU page, matching what the
-      // real 2nd-stage bootloader's set_cache_and_start_app() +
-      // mmu_hal_map_region() actually expose. cpu_start's app-image-header
-      // check reads the header from exactly this newly-exposed leading page
-      // gap, so it now reads the real magic byte and passes for real --
-      // abort() is never called any more, and boot runs much further (a
-      // full app_init/efuse_init log block that never printed before) --
-      // before hitting a new, unrelated stall: an unstubbed ROM qsort call
-      // (0x4000_0434, step 408,481). That INSTRUCTION_ACCESS_FAULT is still
-      // well within this 500,000-step budget, so the trap count here stays
-      // 1 (the second fault -- the still-unstubbed software_reset_cpu the
-      // panic handler's own reboot attempt calls -- isn't reached until
-      // ~step 648,457, past this budget). See
-      // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_faults_on_the_unstubbed_qsort_call_and_reaches_the_panic_handlers_reboot_message
-      // (renamed in Task D6, below) and docs/firmware-emulator-notes.md for
-      // the full story.
-      //
-      // Milestone 3 Task D6: ROM qsort is now real guest-executed RV32 code
-      // mapped into the ROM address space (emulator-core/src/rom.rs's
-      // module doc, entry 14), so the step-408,481 fault is gone. Its
-      // caller, ESP-IDF's s_prepare_reserved_regions(), then finds that
-      // the sorted reserved-region list overlaps. Entry 0 comes from the
-      // unbacked ROM layout table (ets_rom_layout_p reads 0). The firmware
-      // logs the overlap and calls abort(), which reaches panic_abort()'s
-      // ILLEGAL_INSTRUCTION trap at step 409,071. That is still the only
-      // trap within this 500,000-step budget. The software_reset_cpu
-      // reboot-retry fault follows at step 647,238, past this budget. See
-      // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_aborts_on_the_unbacked_rom_layout_reserved_region_overlap_and_reaches_the_panic_handlers_reboot_message
-      // (renamed in Task D7, below).
-      //
-      // Milestone 3 Task D7: the ROM layout table (ets_rom_layout_p and the
-      // ets_rom_layout_t it points at) is now backed as read-only ROM data
-      // (emulator-core/src/rom.rs's module doc, entry 15), so the overlap
-      // check passes and that abort() is gone. Boot prints heap_init's first
-      // line, then faults on the unstubbed libgcc __clzsi2 (0x4000_079c) on
-      // the 409,759th step. That is still the only trap within this
-      // 500,000-step budget; the software_reset_cpu reboot-retry fault
-      // follows on the 650,332nd step, past it. See
-      // emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message.
-      //
-      // Tasks D8, D9 and 8 each moved that single fault later (the last one
-      // was the unstubbed ROM ets_apb_backup_init_lock_func on step
-      // 493,861), so it stayed the only trap in this budget.
-      //
-      // Milestone 3 Task D10: that ROM call and the next two
-      // (esp_coex_rom_version_get, esprv_intc_int_set_threshold) are
-      // stubbed and the ROM's SPI-flash legacy data is seeded, so boot now
-      // runs with zero traps into FreeRTOS's scheduler start, where it spins
-      // (the SYSTEM cross-core software interrupt vPortYield() relies on is
-      // unmodeled; see emulator-core/tests/rom_stub_boot.rs's
-      // boot_currently_spins_after_vtaskstartscheduler_returns_because_the_from_cpu_0_yield_interrupt_is_unmodeled).
+      // Boot takes zero traps within this budget (the full stall-by-stall
+      // history is in docs/firmware-emulator-notes.md).
       expect(report.traps).toBe(0);
 
       const fb = handle.framebuffer();
@@ -142,4 +42,43 @@ describe("emulator-wasm firmware-boot boundary", () => {
       handle.dispose();
     }
   });
+
+  // The WASM-path twin of emulator-core/tests/boot_progress.rs's
+  // boots_to_first_real_frame: same 250,000-step chunks to the same
+  // 6,750,000-step horizon, same FNV-1a hash over each pixel's
+  // little-endian bytes. Uses the raw wasm-bindgen class (not the bridge
+  // handle) because consoleOutput() is not part of the bridge surface.
+  test(
+    "boots factory.bin to the same first real frame as the native finish-line test",
+    () => {
+      const wasmBytes = readFileSync(
+        new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
+      );
+      initSync({ module: wasmBytes });
+      const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+      const emu = new FirmwareEmulator(new Uint8Array(image));
+      try {
+        for (let done = 0; done < 6_750_000; done += 250_000) {
+          const report = emu.run(250_000);
+          const fault = report.lastInstructionFault;
+          report.free();
+          expect(fault).toBeUndefined();
+        }
+        const fb = emu.framebuffer();
+        expect(new Set(fb).size).toBeGreaterThan(1);
+        let h = 0xcbf29ce484222325n;
+        for (const px of fb) {
+          for (const b of [px & 0xff, px >> 8]) {
+            h ^= BigInt(b);
+            h = (h * 0x100000001b3n) & 0xffffffffffffffffn;
+          }
+        }
+        expect(h).toBe(0x5599c270ab0429fan);
+        expect(emu.consoleOutput().length).toBeGreaterThan(0);
+      } finally {
+        emu.free();
+      }
+    },
+    30_000,
+  );
 });

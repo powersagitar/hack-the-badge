@@ -31,8 +31,10 @@
  * risk — see the Task 6 brief). `DEFAULT_CYCLES_PER_FRAME` is a documented
  * guess, not a measurement:
  *
- * - The real badge runs its CPU at 160 MHz. At 60 fps that's ~2.67M
- *   instructions of real time per frame — far more than is safe to spend
+ * - The real badge runs its CPU at 80 MHz (per its own boot log; the
+ *   emulator's ROM-stub `CPU_FREQ_MHZ` = 160 in `emulator-core/src/rom.rs`
+ *   is a separate, documented flagged guess). At 60 fps that's ~1.33M
+ *   instructions of real time per frame — more than is safe to spend
  *   synchronously inside one `requestAnimationFrame` callback.
  * - The prior session measured ~40M steps/s for `cargo test --release`
  *   (native, no WASM/JS-boundary overhead, no framebuffer copy/paint cost
@@ -41,7 +43,7 @@
  *   conversion `blitFramebuffer` does over all 76,800 pixels will all be
  *   slower than that native figure by an unmeasured but real amount.
  * - 500,000 steps/frame is chosen as a conservative fraction of a 16ms
- *   budget: enough to make visible progress every frame (roughly 1/5 of a
+ *   budget: enough to make visible progress every frame (roughly 3/8 of a
  *   real frame's worth of instructions, so boot/gameplay isn't rendered in
  *   slow motion relative to real time) while leaving comfortable headroom
  *   for the WASM call, the copy, and the paint even if the in-browser rate

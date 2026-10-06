@@ -10,7 +10,7 @@
 //! `components/soc/esp32c3/register/soc/timer_group_reg.h` (`DR_REG_TIMG_BASE(i)
 //! = REG_TIMG_BASE(i) = DR_REG_TIMERGROUP0_BASE + i*0x1000`, and
 //! `DR_REG_TIMERGROUP0_BASE == 0x6001_F000` per
-//! `components/soc/esp32c3/include/soc/reg_base.h` — i.e. TIMG0 and TIMG1
+//! `components/soc/esp32c3/register/soc/reg_base.h` — i.e. TIMG0 and TIMG1
 //! are two back-to-back 4 KiB register pages). The calibration algorithm
 //! itself (what a write to `RTC_CALI_START` actually computes) is modeled
 //! from `components/esp_hw_support/port/esp32c3/rtc_time.c`'s

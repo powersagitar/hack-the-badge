@@ -221,9 +221,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       slow-clock calibration, inert watchdog storage) and
                       RTC_CNTL (rtc_cntl.rs: the RTC timer and the
                       RTC_XTAL_FREQ_REG store). console.rs is the capped
-                      byte sink every "firmware printed" path feeds
-                      (USB-Serial-JTAG TX via usb_serial_jtag.rs, the
-                      badge's real console; UART0 TX; ROM putc stubs).
+                      byte sink for firmware output. Its one feed is the
+                      USB-Serial-JTAG EP1 TX FIFO (usb_serial_jtag.rs, the
+                      badge's real console), written both by firmware
+                      directly and by the ROM ets_printf HLE stub. UART0
+                      and the ROM putc functions are not modeled.
                       The flash MMU is not modeled (the current stall).
                       Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came

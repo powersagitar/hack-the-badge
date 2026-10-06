@@ -1,5 +1,8 @@
-//! Capped byte sink for everything the firmware prints (USB-Serial-JTAG TX
-//! FIFO, UART0 TX FIFO, ROM putc stubs). Diagnostic output, not device state:
+//! Capped byte sink for what the firmware prints. Its only feed is the
+//! USB-Serial-JTAG EP1 TX FIFO (`usb_serial_jtag.rs`), which both firmware
+//! code and the ROM `ets_printf` HLE stub (`cpu/rom_stubs.rs`, sink address
+//! `0x6004_3000`) write to; UART0 and the ROM putc functions are not
+//! modeled, so they feed nothing. Diagnostic output, not device state:
 //! capped so a firmware stuck in a print loop can't grow host memory
 //! without bound.
 use std::collections::VecDeque;
