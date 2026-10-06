@@ -30,6 +30,9 @@ ESP32-C3 device), in two complementary modes:
    (Milestone 4). Read `docs/firmware-emulator-notes.md`'s "Known
    limitations" (current state, open limitations, and the stall-by-stall
    history) before assuming a built-in app is reachable in this mode.
+   Milestone 3's design decisions (some override the plan text, e.g.
+   interrupt threshold `>=`) and the Milestone 4 backlog are in
+   `docs/milestone-3-decisions.md`.
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that

@@ -3,6 +3,13 @@
 Date: 2026-09-22
 Status: approved design (brainstorming), pending written-spec review
 
+> **Outcome (2026-10-06):** done. Real firmware boots to its first real
+> ST7789 frame (the boot splash), pinned by `boots_to_first_real_frame`.
+> The flash MMU was ruled out of scope and is Milestone 4's first
+> blocker. This spec is kept as a historical record; decisions that
+> departed from it and the Milestone 4 backlog are in
+> `docs/milestone-3-decisions.md`.
+
 ## Goal
 
 Boot the real dumped badge firmware (`frontend/public/firmware/factory.bin`)

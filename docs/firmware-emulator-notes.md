@@ -438,8 +438,13 @@ details). The firmware keeps scheduling with the splash on screen.
 - SPI2 `SPI_UPDATE`/`TRANS_DONE` (Task 9) and the GDMA TX out-link feeding
   SPI2 (Task 10, item 3), which is what puts pixels on screen.
 
+The design decisions behind these fixes (and where they override the
+plan text), plus the full Milestone 4 backlog, are in
+[`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
+
 **Open limitations (Milestone 4 candidates)**, the first one being the
-current blocker:
+current blocker (the backlog in `milestone-3-decisions.md` is the complete
+list):
 
 1. **Flash MMU (plan Task 8, sub-unit 3): the next blocker.** The bus has
    no MMU table: the firmware's entry writes (`DR_REG_MMU_TABLE`,
@@ -1319,7 +1324,11 @@ predicted these blockers would surface once TIMG unblocks further boot
    `FirmwareBus::gdma_pull` walks that channel's `dma_descriptor_t` link in
    RAM for `SPI_MS_DATA_BITLEN` bytes, raising `OUT_DONE` per descriptor
    and `OUT_EOF`/`OUT_TOTAL_EOF` at `suc_eof`, and clearing owner bits only
-   if `OUT_AUTO_WRBACK` is set. The SPI driver waits on SPI2's own
+   if `OUT_AUTO_WRBACK` is set. The walk reads and writes internal SRAM
+   only (`SOC_DRAM_LOW..HIGH`); a descriptor or buffer anywhere else
+   raises `OUT_DSCR_ERR` and stops the channel, so a bad `next` pointer
+   cannot re-enter a peripheral (final-review fix; the SRAM-only rule is a
+   reconstruction, see `milestone-3-decisions.md`). The SPI driver waits on SPI2's own
    `TRANS_DONE` (the `spi_intr` ISR for queued transfers,
    `spi_device_polling_end`'s `spi_hal_usr_is_done` poll for polling ones,
    `spi_master.c`), never on a GDMA interrupt, so completion needed no new
