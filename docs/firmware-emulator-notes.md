@@ -432,6 +432,13 @@ is gone; boot proceeds past `load_partitions()`'s read (ROM `strncpy` and
 new console line or frame yet (see the history entry at the end of the stall
 log).
 
+**Update (Milestone 4 Task 3):** partition loading succeeds: `load_partitions()`
+returns `ESP_OK` after 4 `MD5Update` calls and 1 `MD5Final`, pinned by
+`boot_progress.rs`'s
+`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`. The
+next stall is a poll of SPIMEM1's `CMD` register for `SPI_MEM_FLASH_WREN` to
+clear (see the "Milestone 4 Task 3" history entry).
+
 **Resolved in Milestone 3** (details in the history below):
 
 - TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
@@ -1445,13 +1452,52 @@ XIP.
   at the same 5,750,000-step sample as before, and every earlier boot-ladder
   rung still passes.
 - **Boot moves on.** `load_partitions()` now reads the real
-  synthesized table, so boot proceeds past the Milestone 3 stall. Just after `MD5Init` it called ROM `strncpy` (`0x4000_0368`), then `strcmp`
-  (`0x4000_036c`); both are now real HLE stubs (`RomStubEffect::Strncpy`/`Strcmp`).
+  synthesized table, so boot proceeds past the Milestone 3 stall. Just
+  after `MD5Init` it called ROM `strncpy` (`0x4000_0368`), then `strcmp`
+  (`0x4000_036c`); both are now real HLE stubs
+  (`RomStubEffect::Strncpy`/`Strcmp`).
   `boots_to_first_real_frame` passes again with hash `0x5599c270ab0429fa`
   unchanged, no fault through step 6.75M. The pinned-stall test in
   `rom_stub_boot.rs` was truncated to its Phases 1 to 10.
 - **Performance.** `boot-probe --steps 5750000` (release), median of three:
   0.40 s before, 0.39 s after; no translation cache was needed.
+
+### Milestone 4 Task 3: `load_partitions()` succeeds; the next stall
+
+The rung `load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`
+(`boot_progress.rs`) single-steps from the first `MD5Init` to
+`load_partitions()`'s epilogue (`0x420f_a878`): 4 `MD5Update` calls (one per
+partition entry), 1 `MD5Final`, `s4` = `ESP_OK`, no DBUS read through an
+invalid MMU entry, no fault. Its `MD5Update` count is 4, matching the table's
+four entries.
+
+Next stall, from `boot-probe --steps 12000000 --window 500000` (release):
+
+- **Fault:** none (303 traps, all interrupts; 8,136 ROM stub calls).
+- **Console:** unchanged, last line `I (0) main_task: Calling app_main()`.
+- **Framebuffer:** still the splash (2,340 distinct values).
+- **Hot PCs (last 500,000 steps):** `0x4039_3916`, `0x4039_3918`,
+  `0x4039_391a` (about 166,000 hits each, i.e. nearly all of the time the
+  CPU is not in the scheduler/idle path). Disassembly of the IRAM segment
+  (`0x4038_0000`) shows `c.lw a5,4(a0); c.lw a5,0(a5); c.bnez a5,-4`: a
+  loop that loads a register pointer from `a0+4` and re-reads it until it
+  reads 0. At step 11,000,000 `a0` = `0x3fca_6b48`, the pointer is
+  `0x6000_2000` (SPIMEM1 `SPI_MEM_CMD_REG`) and the value read is
+  `0x4000_0000`, i.e. `SPI_MEM_FLASH_WREN` (bit 30, self-clearing "SC" in
+  `soc/spi_mem_reg.h`). Return address `0x4039_3e42`. The SPIMEM1 model
+  stores the dedicated `SPI_MEM_FLASH_*` command bits but never fires or
+  clears them, so the poll never ends. The other hot PCs
+  (`0x4038_e4c2..0x4038_e4dc`, `0x4038_f930..`) are short and not identified (probably the tick/idle path).
+- **SPIMEM1:** 26 user transactions; recent unmodeled user commands:
+  `0xbb` (fifteen times, a dual-I/O read) then `0x05` (`RDSR`).
+- **Unmapped-access tail:** `0x600c_e000..0x600c_e03c` (the
+  ASSIST_DEBUG block, `DR_REG_ASSIST_DEBUG_BASE`): reads and writes of
+  `+0x000`, writes of `+0x038` and `+0x03c` (12 each), `+0x000` 20 each.
+- **Next task:** model SPIMEM1's dedicated `SPI_MEM_FLASH_*` command bits in
+  `CMD` (at least `WREN`, and the ones `esp_flash` issues next: `RDSR`,
+  `PP`, `SE`/`BE`, `READ`), with their self-clear and the effect on the
+  emulated flash chip; the `0xbb` reads and `RDSR` as user commands are
+  related. ASSIST_DEBUG accesses are probably a separate, benign later item.
 
 ## Emulated flash chip: what it contains
 

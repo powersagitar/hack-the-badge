@@ -62,7 +62,8 @@ real stub (`RomStubEffect::Strcmp`). With both in place
 `0x5599c270ab0429fa` unchanged and no fault through step 6.75M, as does its
 WASM twin; the pinned-stall test in `tests/rom_stub_boot.rs` was renamed and
 truncated to its Phases 1 to 10. Where boot goes after that (it still never
-reaches the launcher) is the next stall-loop task: boot-probe to step 10,000,000 shows no fault, the same console, the splash unchanged.
+reaches the launcher) is the next stall-loop task: boot-probe to step
+10,000,000 shows no fault, the same console, the splash unchanged.
 
 ## Milestone 5 backlog
 

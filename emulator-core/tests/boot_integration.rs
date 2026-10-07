@@ -117,8 +117,8 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
 ///
 /// `0x3c13_0000` is exactly `load_addr`'s containing 64 KiB flash-cache MMU
 /// page start (`0x3c13_0020 & !0xFFFF`), so this is the same page-granular
-/// XIP mapping rule `crate::mem::bus`'s `xip_regions_expose_the_full_
-/// containing_64kib_page_not_just_the_declared_segment` test pins directly:
+/// XIP mapping rule `crate::mem::bus`'s `leading_page_bytes_before_load_addr_read_from_the_chip`
+/// test pins directly:
 /// this test is that same rule's real-image regression check.
 #[test]
 fn real_factory_image_exposes_cpu_starts_header_bytes_at_the_page_aligned_drom_address() {

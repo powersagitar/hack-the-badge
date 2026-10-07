@@ -373,9 +373,17 @@
 //! splash), keeps changing (33 changes at 1,000-step sampling; whether
 //! from partial flushes or an animation was not traced), and is final
 //! from step 5,535,126 on (2,340 colors, unchanged to step 10,000,000).
-//! The flash MMU stall after `MD5Init` (see the D13 status) is the next
-//! blocker, Milestone 4. The new rung pins that stable frame by hash:
+//! The new rung pins that stable frame by hash:
 //! [`boots_to_first_real_frame`].
+//!
+//! **Milestone 4 Task 3 status**: the flash MMU stall named in the D13
+//! status is gone (Milestone 4 Tasks 1 and 2). `load_partitions()` now
+//! reads the synthesized partition table through its own `spi_flash_mmap`
+//! window, runs `MD5Update` 4 times and `MD5Final` once, and returns
+//! `ESP_OK`:
+//! [`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`].
+//! Boot then stalls in a 3-instruction poll of SPIMEM1's `CMD` register
+//! (the notes' "Milestone 4 Task 3" entry).
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1144,6 +1152,55 @@ fn boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site() {
     for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
         assert!(!console.contains(panic_text), "console:\n{console}");
     }
+}
+
+/// Milestone 4 Task 3: with the flash MMU modeled, `load_partitions()`
+/// reads the synthesized partition table through its own `spi_flash_mmap`
+/// window, feeds the entries to ROM `MD5Update`, checks the digest with
+/// `MD5Final`, and returns `ESP_OK` (M3 ended with `ESP_ERR_NOT_FOUND`
+/// here because the window read as zeros).
+#[test]
+fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
+    const ROM_MD5_INIT: u32 = 0x4000_0614;
+    const ROM_MD5_UPDATE: u32 = 0x4000_0618;
+    const ROM_MD5_FINAL: u32 = 0x4000_061c;
+    const LOAD_PARTITIONS_EPILOGUE: u32 = 0x420f_a878;
+    const ESP_OK: u32 = 0;
+
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
+    let summary = rt.run(5_000_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+
+    // Single-step to load_partitions()'s first MD5Init, then to its epilogue.
+    let mut reached_init = false;
+    let (mut updates, mut finals) = (0u32, 0u32);
+    let mut err = None;
+    for _ in 0..1_000_000 {
+        match rt.pc() {
+            ROM_MD5_INIT => reached_init = true,
+            ROM_MD5_UPDATE if reached_init => updates += 1,
+            ROM_MD5_FINAL if reached_init => finals += 1,
+            LOAD_PARTITIONS_EPILOGUE if reached_init => {
+                err = Some(rt.cpu().regs.read(20));
+                break;
+            }
+            _ => {}
+        }
+        let s = rt.run(1);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+    }
+    assert!(reached_init, "load_partitions() never called MD5Init");
+    assert_eq!(err, Some(ESP_OK), "s4 = err at the epilogue");
+    // One MD5Update per partition entry (4) is the expected shape; at least one is required.
+    assert!(updates >= 1, "MD5Update calls: {updates}");
+    assert_eq!(finals, 1, "MD5Final calls");
+    assert!(
+        !rt.bus()
+            .unmapped_log()
+            .iter()
+            .any(|a| (0x3c00_0000..0x3c80_0000).contains(&a.addr) && !a.is_write),
+        "no DBUS read went through an invalid MMU entry"
+    );
 }
 
 /// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2

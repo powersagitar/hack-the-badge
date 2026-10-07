@@ -197,9 +197,10 @@
 //!    zero/status return would silently corrupt whatever the copied bytes
 //!    were meant to become, which is worse than the loud fault it replaces.
 //!    The sibling functions in that same linker script (`memmove`, `memcmp`,
-//!    `strcpy`, `strncpy`, `strcmp`, `strncmp`; `strncpy` and `strcmp` were later stubbed for real, Milestone 4) were checked against a
+//!    `strcpy`, `strncpy`, `strcmp`, `strncmp`) were checked against a
 //!    post-fix boot-probe re-run and were **not** observed being called
-//!    within the tested budget — see `tests/rom_stub_boot.rs` and this
+//!    within the tested budget (`strncpy` and `strcmp` were later observed,
+//!    after Milestone 4's flash MMU, and stubbed for real) — see `tests/rom_stub_boot.rs` and this
 //!    task's report for the exact re-probe evidence — so, per this module's
 //!    own "only stub what's observed" rule, they remain unstubbed for now.
 //!
@@ -613,7 +614,9 @@
 //!       `div`/`rem`). Not stubbed until observed: `strcpy`,
 //!       `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
 //!       came in Task 8, entry 18; `strncpy`, `0x4000_0368`, [`STRNCPY`],
-//!       came in Milestone 4: newlib semantics, copy to NUL then NUL-pad to `n`).
+//!       and `strcmp`, `0x4000_036c`, [`STRCMP`], came in Milestone 4:
+//!       newlib semantics, `strncpy` copies to NUL then NUL-pads to `n`,
+//!       `strcmp` returns the unsigned-byte difference at the first mismatch).
 //!
 //!     With these, boot runs fault-free to step 442,140. The next stall is
 //!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
@@ -878,20 +881,24 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Task D13**: 98 stubs (Task D12's 95 plus `MD5Init`,
+//! **As of Milestone 4 Task 3**: 100 stubs (Task D13's 98 plus `strncpy` and
+//! `strcmp`, Milestone 4). With the flash MMU modeled (Milestone 4 Task 2),
+//! `load_partitions()` reads the synthesized partition table through its own
+//! `spi_flash_mmap` window and uses the ROM MD5 stubs (entry 24) end to
+//! end: `MD5Init`, one `MD5Update` per table entry (4 observed), `MD5Final`,
+//! a digest match, and `ESP_OK`. `tests/boot_progress.rs`'s
+//! `load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`
+//! pins it. Boot takes no exception (checked to step 12,000,000) and then
+//! stalls in a flash-controller poll, not a ROM call: see the notes'
+//! "Milestone 4 Task 3" history entry.
+//!
+//! **As of Task D13** (history): 98 stubs (Task D12's 95 plus `MD5Init`,
 //! `MD5Update` and `MD5Final`, entry 24). The `MD5Init` call on step
-//! 5,555,258 returns, and boot then takes **no exception** (checked to step
-//! 7,600,000). It stalls on the flash MMU instead, which is not a ROM call:
-//! `load_partitions()`'s `spi_flash_mmap()` returns `ESP_OK` with a window
-//! at `0x3c27_0000` after writing MMU table entry 39 (`0x600c_509c`), which
-//! the bus does not model, so the table reads (`0x3c27_8000`) return 0.
-//! The function finds no `0x50AA` entry and no MD5 entry and returns
-//! `ESP_ERR_NOT_FOUND` before ever calling `MD5Update`; the next partition
-//! lookup retries it (step 5,583,744) with the same result. The firmware
-//! keeps scheduling, but prints no new console line and draws nothing new:
-//! the boot splash stays in the framebuffer, unchanged. See
-//! `tests/rom_stub_boot.rs`'s
-//! `boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash` (renamed and truncated in Milestone 4 Task 2; was `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`).
+//! 5,555,258 returned, and boot then took no exception but stalled on the
+//! unmodeled flash MMU: `load_partitions()` read zeros through its
+//! `spi_flash_mmap` window and returned `ESP_ERR_NOT_FOUND` before ever
+//! calling `MD5Update`. Milestone 4 Task 2 modeled the MMU.
+//!
 //! The Task 6 paragraph below is kept as history.
 //!
 //! **As of Task 6** (history; CPU and interrupt changes, no stub changes): still 95
@@ -2237,13 +2244,11 @@ mod tests {
         // esp32c3.rom.libc.ld / esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld.
         let table = esp32c3_rom_stubs();
         // Task D9 gave strlen/memcmp/strncmp real effects (checked below).
-        for addr in [0x4000_0364u32 /* strcpy */] {
-            assert_eq!(
-                table.lookup(addr),
-                None,
-                "ROM libc address 0x{addr:08x} must not carry a generic stub"
-            );
-        }
+        assert_eq!(
+            table.lookup(0x4000_0364), // strcpy
+            None,
+            "ROM libc strcpy must not carry a generic stub"
+        );
         for (addr, effect) in [
             (STRLEN, RomStubEffect::Strlen),
             (MEMCMP, RomStubEffect::Memcmp),
@@ -3192,10 +3197,9 @@ mod tests {
     /// own synthesized partition table: `esp_rom_md5_init`, one
     /// `esp_rom_md5_update(&context, &entry, 32)` per `0x50AA` entry until
     /// the `0xEBEB` MD5 entry, then `esp_rom_md5_final` and a compare with
-    /// the 16 bytes stored `ESP_PARTITION_MD5_OFFSET` into that entry. The
-    /// boot itself cannot run this yet (the table's `spi_flash_mmap` window
-    /// reads as zeros; see the module doc's entry 24), so this is the
-    /// stand-in.
+    /// the 16 bytes stored `ESP_PARTITION_MD5_OFFSET` into that entry. This
+    /// is the unit test of the stubs; the end-to-end proof is boot_progress.rs's
+    /// `load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`.
     #[test]
     fn rom_md5_stubs_accept_the_synthesized_partition_tables_md5_entry() {
         use crate::peripherals::flash::{EmulatedFlash, PARTITION_TABLE_OFFSET};

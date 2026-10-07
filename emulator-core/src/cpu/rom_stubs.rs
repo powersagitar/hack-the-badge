@@ -58,8 +58,8 @@
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
-//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`, and the writing `Strncpy`,
-//!    and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`DivT`, the writing
+//!    `Strncpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.

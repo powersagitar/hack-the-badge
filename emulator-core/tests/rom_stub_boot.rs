@@ -430,8 +430,9 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// framebuffer holds the 2,340-colour boot splash), the console lines
 /// through `Calling app_main()`, and no exception before the `MD5Init`
 /// call. What happens *after* it (Milestone 3: the unmapped flash MMU made
-/// `load_partitions()` fail with `ESP_ERR_NOT_FOUND`) is covered by the
-/// Milestone 4 rungs in `boot_progress.rs`.
+/// `load_partitions()` fail with `ESP_ERR_NOT_FOUND`) is covered by
+/// `boot_progress.rs`'s
+/// `load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`.
 #[test]
 fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     const FROM_CPU_0_REG: u32 = 0x600c_0028;
