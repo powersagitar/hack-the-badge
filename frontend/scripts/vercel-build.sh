@@ -6,10 +6,15 @@ set -euo pipefail
 
 WASM_PACK_VERSION=0.15.0
 
-if ! command -v cargo >/dev/null; then
+# The image may ship a rustup toolchain without the wasm target; add it there
+# if possible, otherwise install a private toolchain under $HOME.
+if ! { command -v rustup >/dev/null && rustup target add wasm32-unknown-unknown; }; then
+  export RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --target wasm32-unknown-unknown
-  . "$HOME/.cargo/env"
+    | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+      --target wasm32-unknown-unknown
+  export PATH="$CARGO_HOME/bin:$PATH"
+  rustup default stable
 fi
 
 if ! command -v wasm-pack >/dev/null; then
