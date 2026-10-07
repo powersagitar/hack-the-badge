@@ -616,7 +616,11 @@
 //!       came in Task 8, entry 18; `strncpy`, `0x4000_0368`, [`STRNCPY`],
 //!       and `strcmp`, `0x4000_036c`, [`STRCMP`], came in Milestone 4:
 //!       newlib semantics, `strncpy` copies to NUL then NUL-pads to `n`,
-//!       `strcmp` returns the unsigned-byte difference at the first mismatch).
+//!       `strcmp` returns the unsigned-byte difference at the first mismatch);
+//!       `strlcat`, `0x4000_03ec`, [`STRLCAT`], came in Milestone 4 Task 5:
+//!       BSD/newlib semantics, append within `siz`, return the length tried;
+//!       `strspn`, `0x4000_0410`, [`STRSPN`], and `strcspn`, `0x4000_03e4`,
+//!       [`STRCSPN`], came right after it, for littlefs's path walk).
 //!
 //!     With these, boot runs fault-free to step 442,140. The next stall is
 //!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
@@ -881,8 +885,9 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 4 Task 3**: 100 stubs (Task D13's 98 plus `strncpy` and
-//! `strcmp`, Milestone 4). With the flash MMU modeled (Milestone 4 Task 2),
+//! **As of Milestone 4 Task 5**: 103 stubs (Task D13's 98 plus `strncpy` and
+//! `strcmp`, Milestone 4 Task 2, and `strlcat`/`strspn`/`strcspn`, Milestone 4
+//! Task 5). With the flash MMU modeled (Milestone 4 Task 2),
 //! `load_partitions()` reads the synthesized partition table through its own
 //! `spi_flash_mmap` window and uses the ROM MD5 stubs (entry 24) end to
 //! end: `MD5Init`, one `MD5Update` per table entry (4 observed), `MD5Final`,
@@ -1380,6 +1385,28 @@ pub const STRNCPY: u32 = 0x4000_0368;
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strcmp`]), added in Milestone 4:
 /// first called from the partition-lookup code after `load_partitions()`.
 pub const STRCMP: u32 = 0x4000_036c;
+
+/// ROM libc `strlcat`'s fixed address (`esp32c3.rom.libc.ld`: `strlcat =
+/// 0x400003ec;`; the ROM ELF names that slot `__call_strlcat`, a jump to
+/// newlib's `strlcat` at `0x4005_8dfa`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strlcat`]), added in Milestone 4
+/// Task 5: first called by `esp_vfs_littlefs_register` after the littlefs
+/// format.
+pub const STRLCAT: u32 = 0x4000_03ec;
+
+/// ROM libc `strcspn`'s fixed address (`esp32c3.rom.libc.ld`: `strcspn =
+/// 0x400003e4;`, ROM ELF `__call_strcspn`, newlib code at `0x4005_8d90`).
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Strcspn`]), Milestone 4
+/// Task 5: littlefs's path walk (`0x420f_71ea`) calls it right after
+/// [`STRSPN`].
+pub const STRCSPN: u32 = 0x4000_03e4;
+
+/// ROM libc `strspn`'s fixed address (`esp32c3.rom.libc.ld`: `strspn =
+/// 0x40000410;`, ROM ELF `__call_strspn`, newlib code at `0x4005_90b0`).
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Strspn`]), Milestone 4
+/// Task 5: first called by littlefs's path walk (return address
+/// `0x420f_721c`) after `hal_fs` mounts the filesystem.
+pub const STRSPN: u32 = 0x4000_0410;
 
 /// ROM libc `div`'s fixed address (`esp32c3.rom.libc.ld`: `div =
 /// 0x40000428;`; trampoline to `0x400319c6 <div>`). Real HLE
@@ -1946,6 +1973,9 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRNCMP, RomStub::strncmp("strncmp")),
     (STRNCPY, RomStub::strncpy("strncpy")),
     (STRCMP, RomStub::strcmp("strcmp")),
+    (STRLCAT, RomStub::strlcat("strlcat")),
+    (STRSPN, RomStub::strspn("strspn")),
+    (STRCSPN, RomStub::strcspn("strcspn")),
     (MEMCHR, RomStub::memchr("memchr")),
     (MEMMOVE, RomStub::memmove("memmove")),
     (DIV, RomStub::div_t("div")),
@@ -2255,6 +2285,9 @@ mod tests {
             (STRNCMP, RomStubEffect::Strncmp),
             (STRNCPY, RomStubEffect::Strncpy),
             (STRCMP, RomStubEffect::Strcmp),
+            (STRLCAT, RomStubEffect::Strlcat),
+            (STRSPN, RomStubEffect::Strspn),
+            (STRCSPN, RomStubEffect::Strcspn),
             (MEMCHR, RomStubEffect::Memchr),
             (MEMMOVE, RomStubEffect::Memmove),
         ] {
@@ -3352,6 +3385,105 @@ mod tests {
             [b'a', b'b', b'c', 0, 0, 0, 0x55, 0x55],
             "NUL copied, then padded with NULs up to n only"
         );
+    }
+
+    #[test]
+    fn strlcat_stub_appends_within_siz_terminates_and_returns_the_tried_length() {
+        let (src, dst) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(src, 32);
+        bus.add_scratch_ram(dst, 32);
+        for (i, x) in b"xyz\0".iter().enumerate() {
+            bus.write8(src + i as u32, *x);
+        }
+        // dst starts as "ab" (or unterminated within siz), rest 0x55.
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, init: &[u8], siz: u32| {
+            for i in 0..16 {
+                bus.write8(dst + i, 0x55);
+            }
+            for (i, x) in init.iter().enumerate() {
+                bus.write8(dst + i as u32, *x);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, dst);
+            cpu.regs.write(REG_A1, src);
+            cpu.regs.write(REG_A2, siz);
+            cpu.regs.pc = STRLCAT;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRLCAT));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            let ret = cpu.regs.read(REG_A0);
+            (ret, (0..8).map(|i| bus.read8(dst + i)).collect::<Vec<u8>>())
+        };
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"ab\0", 16),
+            (5, b"abxyz\0\x55\x55".to_vec()),
+            "fits: full append, terminated"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"ab\0", 4),
+            (5, b"abx\0\x55\x55\x55\x55".to_vec()),
+            "truncated to siz - 1, terminated, returns the length tried"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"ab\0", 3),
+            (5, b"ab\0\x55\x55\x55\x55\x55".to_vec()),
+            "no room: dst untouched"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"ab", 2),
+            (5, b"ab\x55\x55\x55\x55\x55\x55".to_vec()),
+            "no NUL within siz: siz + strlen(src), nothing written"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"", 0),
+            (3, [0x55; 8].to_vec()),
+            "siz 0 writes nothing"
+        );
+    }
+
+    /// Runs ROM `addr` as `size_t f(const char *s, const char *set)`.
+    fn span_call(addr: u32, s: &[u8], set: &[u8]) -> u32 {
+        let (sa, seta) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(sa, 32);
+        bus.add_scratch_ram(seta, 32);
+        for (i, x) in s.iter().enumerate() {
+            bus.write8(sa + i as u32, *x);
+        }
+        for (i, x) in set.iter().enumerate() {
+            bus.write8(seta + i as u32, *x);
+        }
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, sa);
+        cpu.regs.write(REG_A1, seta);
+        cpu.regs.pc = addr;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(addr));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        cpu.regs.read(REG_A0)
+    }
+
+    #[test]
+    fn strspn_stub_counts_the_leading_bytes_in_the_set() {
+        assert_eq!(span_call(STRSPN, b"//a/b ", b"/ "), 2);
+        assert_eq!(span_call(STRSPN, b"abc ", b"/ "), 0);
+        assert_eq!(span_call(STRSPN, b"abc ", b"cba "), 3, "stops at NUL");
+        assert_eq!(span_call(STRSPN, b"abc ", b" "), 0, "empty set");
+    }
+
+    #[test]
+    fn strcspn_stub_counts_the_leading_bytes_not_in_the_set() {
+        assert_eq!(span_call(STRCSPN, b"littlefs/x ", b"/ "), 8);
+        assert_eq!(span_call(STRCSPN, b"/x ", b"/ "), 0);
+        assert_eq!(span_call(STRCSPN, b"abc ", b"/ "), 3, "stops at NUL");
+        assert_eq!(span_call(STRCSPN, b"abc ", b" "), 3, "empty set");
     }
 
     #[test]

@@ -453,11 +453,14 @@ history entry).
 dedicated write-enable, sector-erase and page-program commands, `RDSR` and
 the DIO fast read, so that poll is gone and `esp_littlefs` formats the blank
 `storage` partition (the littlefs superblock lands in its blocks 0 and 1).
-Boot then faults on the unstubbed ROM `strlcat` (`0x4000_03ec`) in
-`esp_vfs_littlefs_register` and the panic handler reboots into the
-unstubbed `software_reset_cpu`; the splash stays on screen (see the
-"Milestone 4 Task 5" history entry).
-
+ROM `strlcat`, `strspn` and `strcspn`, which the littlefs VFS registration
+and path walk call next, are real stubs, so the console continues with
+`hal_fs: littlefs mounted at /littlefs (used 8192 / 1310720 bytes)`,
+`hal_identity`'s "badge is unprovisioned" warning (blank flash) and
+`hal_buttons: buttons ready`. There is no fault through step 30,000,000.
+Boot then stops printing: the physical badge's next line is `hal_accel`'s
+accelerometer detection, and the firmware is driving the unmodeled I2C0
+controller at that point (see the "Milestone 4 Task 5" history entry).
 
 **Resolved in Milestone 3** (details in the history below):
 
@@ -1651,25 +1654,57 @@ writes as byte-split words (all failed before the change). Decisions are in
   `Guru Meditation Error: Core  0 panic'ed (Instruction access fault)`,
   `MEPC 0x400003ec`, `RA 0x420f2776`, a register dump, `Rebooting...`, and
   `Panic handler entered multiple times` repeating.
-- **Stall (next task):** an instruction fetch fault at ROM `strlcat`
-  (`0x4000_03ec`, `esp32c3.rom.libc.ld`) by step 5,728,900, the next ROM
-  libc function without a stub. The caller (`0x420f_2740`, return address
-  `0x420f_2776`) calls a function that returns 0, then
+- **Next stall, then fixed in the same task (fix round 1):** an
+  instruction fetch fault at ROM `strlcat` (`0x4000_03ec`,
+  `esp32c3.rom.libc.ld`; ROM ELF `__call_strlcat`) at step ~5,728,800.
+  The caller (`0x420f_2740`, return address `0x420f_2776`) calls a
+  function that returns 0, then
   `strlcat(_efs[index] + 0xc, conf->base_path, 16)` with `_efs` at
   `0x3fcb_c2a8`. That matches `esp_vfs_littlefs_register` in
   `joltwallet/esp_littlefs` (`esp_littlefs_init`, which mounts and formats,
   returned `ESP_OK`; then `strlcat` into `base_path`,
   `ESP_VFS_LITTLEFS_PATH_MAX + 1` = 16). The panic handler's reboot then
-  faults on the unstubbed `software_reset_cpu` (`0x4000_0094`), as in
-  earlier stalls. Hot PCs just before the fault are `0x420f_2978..0x420f_29ac`
-  (~920 hits each, a loop in the same littlefs code); the unmapped tail is
-  `0x6000_8040` (RTC_CNTL, read 28, written 32) and `0x600c_4000` (read 4).
+  faulted on the unstubbed `software_reset_cpu` (`0x4000_0094`). With a
+  real `strlcat` stub, the next fault was ROM `strspn` (`0x4000_0410`,
+  return address `0x420f_721c`), in a littlefs path-walk loop that calls
+  `strcspn` (`0x4000_03e4`, from `0x420f_71ea`) right after. Both are now
+  real stubs too; first calls at steps 5,728,808 (`strlcat`, once),
+  5,872,938 (`strspn`, 15 calls to step 12M) and 5,872,946 (`strcspn`, 16).
+  Unit tests: `strlcat_stub_appends_within_siz_terminates_and_returns_the_tried_length`,
+  `strspn_stub_counts_the_leading_bytes_in_the_set`,
+  `strcspn_stub_counts_the_leading_bytes_not_in_the_set` (each failed
+  first with a trap). `boots_to_first_real_frame` and its WASM twin keep
+  their full fault and panic window (an earlier draft had narrowed it; see
+  `milestone-4-decisions.md`).
+- **Console now:** after `formatting...`,
+  `I (440) hal_fs: littlefs mounted at /littlefs (used 8192 / 1310720 bytes)`
+  (the physical badge prints the same line with its own usage),
+  `W (450) hal_identity: no identity at /littlefs/identity.json — badge is
+  unprovisioned` (blank flash; the physical badge has an identity file),
+  `I (470) hal_buttons: buttons ready`. New rungs
+  `boot_reaches_hal_fs_littlefs_mounted` (8,000,000) and
+  `boot_reaches_hal_buttons_ready` (10,000,000).
+- **Current stall** (release `boot-probe` and scratch tracing to step
+  30,000,000): no fault and no panic. The console gets no new line after
+  `hal_buttons: buttons ready` (printed between steps 6M and 7M). The
+  physical badge's next line is `hal_accel: SC7A20H detected (0x11)`.
+  What it is: the firmware programs I2C0 (`0x6001_3000`, not modeled,
+  every access logged as unmapped) from step ~6,040,000 on: `+0x04`,
+  `+0x18`, `+0x1c`, `+0x24`, `+0x28`, `+0x50`, `+0x54` and the command
+  registers `+0x58..+0x6c`, presumably the accelerometer probe, and gets
+  zeros back (no I2C model, no I2C interrupt). What it is not: a spin or a
+  flash problem. SPIMEM1 shows 471 transactions and nothing unmodeled. The
+  IROM hot PCs are the idle task's hook loop (`0x4212_81d2..`, 8 hook
+  slots) and `gpio_set_level` (`0x420f_917c`) on GPIO20/GPIO21: the
+  74HC165 button scan (LOAD/CLK, 8 clocks per latch), so `hal_buttons` is
+  polling normally. The IRAM hot PCs `0x4038_f930..` are FreeRTOS critical
+  sections (writes to `INTERRUPT_CORE0_CPU_INT_THRESH`, `0x600c_2194`).
   The framebuffer is still the splash (2,340 values, hash unchanged).
-- Because the fault follows the splash by under 1,000,000 steps,
-  `boots_to_first_real_frame` and its WASM twin now check faults and panic
-  text only up to step 5,500,000 (`SPLASH_FAULT_FREE_STEPS`); their hash
-  check is unchanged and still passes (the panic does not redraw).
-  Restore the full checks once the `strlcat` stall is fixed.
+  Other unmapped accesses: SPIMEM1 `+0xA4` (`SPI_MEM_SUS_STATUS_REG`, read
+  by `spi_flash_hal_check_status`; now named in `Spimem1::handles`),
+  IO_MUX `0x6000_9000`, SYSTEM `0x600c_0000` (`+0x08`, `+0x58`), RTC_CNTL
+  `0x6000_80bc`, and ASSIST_DEBUG `0x600c_e0xx`. Next task: model I2C0
+  enough for the accelerometer probe, or trace why `hal_accel` waits.
 
 ## Emulated flash chip: what it contains
 

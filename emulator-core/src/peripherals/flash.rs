@@ -100,7 +100,7 @@
 //!   earlier writes, so one `sw` runs exactly one operation.
 //!   `spimem_flash_ll_user_start` sets `SPI_MEM_USR` (or `SPI_MEM_USR |
 //!   SPI_MEM_FLASH_PE`, bits 18 and 17, for program/erase; `FLASH_PE`
-//!   triggers nothing on its own); the dedicated commands are set one at a
+//!   set without `USR` runs nothing, completes and is logged); the dedicated commands are set one at a
 //!   time by `spimem_flash_ll_set_write_protect` (`flash_wren`/
 //!   `flash_wrdi`), `spimem_flash_ll_erase_sector` (`flash_se`) and
 //!   `spimem_flash_ll_program_page` (`flash_pp`), called from
@@ -187,7 +187,9 @@
 //! driver treats a block as 64 KiB, so it waits until observed), `CE`, `DP`,
 //! `RES`, `HPM`, user-command `WREN`/`WRDI`/erase/program, clock and timing
 //! registers (stored only), and auto-suspend (`SPI_MEM_FLASH_SUS_CTRL_REG`
-//! stored only; `SPI_MEM_SUS_STATUS_REG`'s `FLASH_SUS` reads as stored, 0).
+//! stored only; `SPI_MEM_SUS_STATUS_REG` (`+0xA4`, named in [`Spimem1::handles`]
+//! because `spi_flash_hal_check_status` reads its `FLASH_SUS` bit on every
+//! idle wait) reads as stored, 0).
 
 use std::collections::VecDeque;
 
@@ -385,6 +387,10 @@ pub const W15_REG: u32 = 0x094;
 pub const FLASH_WAITI_CTRL_REG: u32 = 0x098;
 /// `SPI_MEM_FLASH_SUS_CTRL_REG` (`+0x09C`).
 pub const FLASH_SUS_CTRL_REG: u32 = 0x09C;
+/// `SPI_MEM_SUS_STATUS_REG` (`+0x0A4`): `spi_flash_hal_check_status` reads
+/// its `SPI_MEM_FLASH_SUS` (bit 0) on every `wait_idle` pass. Plain storage,
+/// so it reads 0 (not suspended) unless the firmware writes it.
+pub const SUS_STATUS_REG: u32 = 0x0A4;
 /// `SPI_MEM_CLOCK_GATE_REG` (`+0x0DC`).
 pub const CLOCK_GATE_REG: u32 = 0x0DC;
 
@@ -392,8 +398,9 @@ pub const CLOCK_GATE_REG: u32 = 0x0DC;
 const CMD_USR: u32 = 1 << 18;
 /// `SPI_MEM_FLASH_PE` (`SPI_MEM_CMD_REG` bit 17): set together with
 /// `SPI_MEM_USR` by `spimem_flash_ll_user_start(dev, true)` and cleared with
-/// it on completion; it triggers nothing on its own.
+/// it on completion; set alone it runs nothing (completed and logged).
 const CMD_FLASH_PE: u32 = 1 << 17;
+const CMD_FLASH_PE_BIT: u32 = 17;
 /// `SPI_MEM_FLASH_READ` .. `SPI_MEM_FLASH_HPM` (`SPI_MEM_CMD_REG` bits
 /// 31..19): the dedicated flash commands. Each is `R/W/SC`: setting it
 /// starts the operation and the controller clears it when done.
@@ -455,7 +462,8 @@ pub const NO_COMMAND_PHASE: u16 = 0xFFFF;
 
 /// What [`Spimem1::unmodeled_commands`] records for a dedicated
 /// `SPI_MEM_FLASH_*` command bit with no modeled effect: this base OR'd with
-/// the bit's position in `SPI_MEM_CMD_REG` (19..=31, so `0xFF13..=0xFF1F`).
+/// the bit's position in `SPI_MEM_CMD_REG` (17 for a lone `SPI_MEM_FLASH_PE`, 19..=31 for the dedicated commands, so
+/// `0xFF11` and `0xFF13..=0xFF1F`).
 /// The on-wire opcode the controller sends for those bits is not documented
 /// in `spi_mem_reg.h`, so the bit position is what is recorded.
 pub const DEDICATED_COMMAND_BASE: u16 = 0xFF00;
@@ -519,6 +527,7 @@ impl Spimem1 {
                 | MISC_REG
                 | FLASH_WAITI_CTRL_REG
                 | FLASH_SUS_CTRL_REG
+                | SUS_STATUS_REG
                 | CLOCK_GATE_REG
         ) || (W0_REG..=W15_REG).contains(&word)
     }
@@ -551,6 +560,12 @@ impl Spimem1 {
         if set_now & CMD_USR != 0 {
             self.run_user_transaction(flash);
             self.regs[widx] &= !(CMD_USR | CMD_FLASH_PE);
+        } else if set_now & CMD_FLASH_PE != 0 {
+            // `SPI_MEM_FLASH_PE` only qualifies a `SPI_MEM_USR` transaction;
+            // set alone it has nothing to run. Complete and log it so a
+            // poll on it cannot spin silently.
+            self.log_unmodeled(DEDICATED_COMMAND_BASE | CMD_FLASH_PE_BIT as u16);
+            self.regs[widx] &= !CMD_FLASH_PE;
         }
         for bit in (CMD_FLASH_HPM_BIT..=CMD_FLASH_READ_BIT).rev() {
             if set_now & (1 << bit) != 0 {
@@ -1157,6 +1172,36 @@ mod tests {
         set_write_protect(&mut dev, &mut flash, false);
         program_page_via_hal(&mut dev, &mut flash, 0x9010, &[0xF0]);
         assert_eq!(flash.read(0x9010), 0x10);
+    }
+
+    #[test]
+    fn page_program_length_is_capped_at_the_64_byte_buffer() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        for i in 0..16 {
+            w(&mut dev, &mut flash, W0_REG + 4 * i, 0);
+        }
+        set_write_protect(&mut dev, &mut flash, false);
+        set_addr_bitlen_24(&mut dev, &mut flash);
+        // ADDR[31:24] = 0xC8 (200 bytes): more than W0..W15 holds.
+        w(&mut dev, &mut flash, ADDR_REG, 0x9000 | (200 << 24));
+        rmw(&mut dev, &mut flash, CMD_REG, !0, 1 << 25);
+        assert_eq!(r(&dev, CMD_REG), 0);
+        assert_eq!(flash.read(0x9000 + 63), 0x00, "64th byte programmed");
+        assert_eq!(flash.read(0x9000 + 64), 0xFF, "nothing past the buffer");
+    }
+
+    #[test]
+    fn a_lone_flash_pe_bit_completes_and_is_logged() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        rmw(&mut dev, &mut flash, CMD_REG, !0, 1 << 17);
+        assert_eq!(r(&dev, CMD_REG), 0);
+        assert_eq!(dev.transaction_count(), 0);
+        assert_eq!(
+            dev.unmodeled_commands().iter().copied().collect::<Vec<_>>(),
+            vec![DEDICATED_COMMAND_BASE | 17]
+        );
     }
 
     #[test]

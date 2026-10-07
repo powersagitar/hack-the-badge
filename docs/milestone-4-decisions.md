@@ -137,13 +137,15 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   becomes a visible log entry. `BE` is left out on purpose: `spi_mem_reg.h`
   calls it a 32 KiB erase while ESP-IDF's generic driver erases 64 KiB
   blocks with it, so its size waits for evidence.
-- **Finish-line fault checks narrowed.** The `strlcat` fault that follows
-  the format comes less than 1,000,000 steps after the splash's final
-  update, so `boots_to_first_real_frame` and its WASM twin check faults and
-  panic text only up to step 5,500,000; the hash check is unchanged. The
-  fault-free run past the splash is pinned by
-  `boot_formats_the_blank_storage_partition_with_littlefs`. Restore the full
-  checks when that stall is fixed.
+- **A lone `SPI_MEM_FLASH_PE`** (bit 17 without `SPI_MEM_USR`) runs
+  nothing; it completes and is logged as `DEDICATED_COMMAND_BASE | 17`.
+- **Finish-line tests are never narrowed** (coordinator ruling, fix round
+  1). An observed ROM libc call that faults gets a real-implementation stub
+  in the task that hits it, as `strncpy`/`strcmp` did in Task 2. Task 5
+  first narrowed `boots_to_first_real_frame`'s fault window around the
+  `strlcat` fault; that was reverted and ROM `strlcat`, `strspn` and
+  `strcspn` (all observed: `esp_vfs_littlefs_register`, then littlefs's
+  path walk) became real stubs (BSD/newlib semantics) instead.
 
 ## Milestone 5 backlog
 

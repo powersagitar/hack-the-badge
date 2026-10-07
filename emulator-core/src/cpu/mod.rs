@@ -661,6 +661,60 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, diff as u32);
             }
+            RomStubEffect::Strlcat => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let siz = self.regs.read(rom_stubs::REG_A2);
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                // dlen = strlen(dst), but never past siz (newlib's first loop).
+                let mut dlen: u32 = 0;
+                while dlen < siz.min(cap) && bus.read8(dst.wrapping_add(dlen)) != 0 {
+                    dlen += 1;
+                }
+                let mut slen: u32 = 0;
+                while slen < cap && bus.read8(src.wrapping_add(slen)) != 0 {
+                    slen += 1;
+                }
+                if dlen < siz {
+                    // Room for siz - dlen - 1 bytes plus the terminator.
+                    let n = slen.min(siz - dlen - 1);
+                    for i in 0..n {
+                        let byte = bus.read8(src.wrapping_add(i));
+                        bus.write8(dst.wrapping_add(dlen).wrapping_add(i), byte);
+                    }
+                    bus.write8(dst.wrapping_add(dlen).wrapping_add(n), 0);
+                }
+                self.regs.write(rom_stubs::REG_A0, dlen.wrapping_add(slen));
+            }
+            RomStubEffect::Strspn | RomStubEffect::Strcspn => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let set = self.regs.read(rom_stubs::REG_A1);
+                let want_in_set = matches!(stub.effect, RomStubEffect::Strspn);
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                let mut len: u32 = 0;
+                while len < cap {
+                    let c = bus.read8(s.wrapping_add(len));
+                    if c == 0 {
+                        break;
+                    }
+                    let mut in_set = false;
+                    for j in 0..cap {
+                        let x = bus.read8(set.wrapping_add(j));
+                        if x == 0 {
+                            break;
+                        }
+                        if x == c {
+                            in_set = true;
+                            break;
+                        }
+                    }
+                    if in_set != want_in_set {
+                        break;
+                    }
+                    len += 1;
+                }
+                self.regs.write(rom_stubs::REG_A0, len);
+            }
             RomStubEffect::Memchr => {
                 let s = self.regs.read(rom_stubs::REG_A0);
                 let c = self.regs.read(rom_stubs::REG_A1) as u8;

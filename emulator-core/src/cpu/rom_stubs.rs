@@ -58,8 +58,8 @@
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
-//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`DivT`, the writing
-//!    `Strncpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`DivT`, the writing
+//!    `Strncpy`/`Strlcat`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
@@ -280,6 +280,26 @@ pub enum RomStubEffect {
     /// (same convention as [`RomStubEffect::Strncmp`]). Scan capped at
     /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller branches on the result.
     Strcmp,
+    /// `size_t strlcat(char *dst, const char *src, size_t siz)`: the BSD
+    /// `strlcat` newlib ships (`newlib/libc/string/strlcat.c`, OpenBSD's):
+    /// finds `dst = a0`'s NUL within its first `siz = a2` bytes, appends
+    /// `src = a1` through the bus copying at most `siz - strlen(dst) - 1`
+    /// bytes, and NUL-terminates unless `siz <= strlen(dst)` (no room, or no
+    /// NUL within `siz`: nothing is written). Returns
+    /// `min(siz, strlen(dst)) + strlen(src)` in `a0`, the length it tried to create. Every scan
+    /// and the copy are capped at [`MAX_STUB_MEMORY_BYTES`]. Real: the ROM
+    /// entry is a jump to newlib code, and the caller uses the string.
+    Strlcat,
+    /// `size_t strspn(const char *s, const char *set)`: newlib's
+    /// `strspn.c`: the length of the leading run of `s = a0` made only of
+    /// bytes in NUL-terminated `set = a1`, in `a0`. Scans capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: littlefs uses it to walk paths.
+    Strspn,
+    /// `size_t strcspn(const char *s, const char *set)`: newlib's
+    /// `strcspn.c`: the length of the leading run of `s = a0` with no byte
+    /// in `set = a1` (stops at `s`'s NUL), in `a0`. Scans capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real, like [`RomStubEffect::Strspn`].
+    Strcspn,
     /// `void *memchr(const void *s, int c, size_t n)`: scans `n = a2` bytes
     /// of `s = a0` through the bus for the byte `(unsigned char)c` (`c =
     /// a1`), returning in `a0` the address of the first match, or 0 (NULL)
@@ -1255,6 +1275,30 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strcmp,
+        }
+    }
+
+    /// A real high-level-emulated `strlcat` -- see [`RomStubEffect::Strlcat`].
+    pub const fn strlcat(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strlcat,
+        }
+    }
+
+    /// A real high-level-emulated `strspn` -- see [`RomStubEffect::Strspn`].
+    pub const fn strspn(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strspn,
+        }
+    }
+
+    /// A real high-level-emulated `strcspn` -- see [`RomStubEffect::Strcspn`].
+    pub const fn strcspn(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strcspn,
         }
     }
 

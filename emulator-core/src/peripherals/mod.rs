@@ -56,7 +56,8 @@
 //!   erase/program semantics (writes are in memory only); and
 //!   [`flash::Spimem1`], the SPI1 flash controller (`0x6000_2000`) whose
 //!   commands reach that chip (RDID, RDSR, reads, and the dedicated
-//!   write-enable, sector-erase and page-program bits). `FirmwareBus` holds them as `flash_chip` and `spimem1`.
+//!   write-enable, sector-erase and page-program bits). `FirmwareBus`
+//!   holds them as `flash_chip` and `spimem1`.
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
