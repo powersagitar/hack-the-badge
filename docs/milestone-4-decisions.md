@@ -98,6 +98,53 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   and it marks the point just before the current stall. If wrong (e.g. a
   later task seeds a littlefs image): change or retire that rung.
 
+## SPIMEM1 flash writes (Task 5)
+
+- **The flash is never busy.** Every SPIMEM1 operation (dedicated command
+  or user transaction) completes inside the byte write that starts it: its
+  `CMD` bit reads 0 on the first poll, and the chip's status register
+  reports `SR_WIP` = 0 on every `RDSR`, straight after an erase or program.
+  A real sector erase takes tens of milliseconds and a page program around
+  a millisecond, during which `spi_flash_chip_generic_wait_idle` keeps
+  polling `RDSR` and calling `delay_us`. If wrong: firmware that times its
+  busy-waits, or counts on an erase taking long enough for another task to
+  run, sees zero-latency flash; ESP-IDF's erase/program timeouts can never
+  fire, and auto-suspend (not modeled) can never trigger.
+- **The write enable latch is modeled, as chip state kept in `Spimem1`.**
+  `spi_flash_chip_generic_set_write_protect` reads `SR_WREN` back after
+  `WREN`/`WRDI` and fails if it did not change, and `wait_idle` treats a
+  latch still set after an erase or program as "command not accepted", so
+  a model without it fails every write. As on SPI NOR flash, `WREN` sets
+  it, `WRDI` clears it, and sector erase and page program run only while it
+  is set and clear it. If wrong (the badge's chip ignores the latch): no
+  observable difference for ESP-IDF, which always sends `WREN` first.
+- **Erase and program addresses are `ADDR[23:0]`; anything past the
+  4 MiB chip is ignored**, not wrapped. A real 4 MiB part ignores the upper
+  address bits and would wrap. If wrong: a write past the chip lands at
+  its start on hardware; ESP-IDF's own bounds checks reject such writes
+  before they reach the controller.
+- **Page program wraps within its 256-byte page**, the standard NOR page
+  program behaviour; the write slicer (`memspi_host_write_data_slicer`)
+  never crosses a page, so nothing observed depends on it.
+- **The read family is modeled together.** `CMD_READ` 0x03 and the fast
+  reads 0x0B/0x3B/0x6B/0xBB/0xEB differ only in line width and dummy
+  cycles, which do not change the data, so all six return flash bytes;
+  only 0xBB is observed. If wrong: none of the others is issued by this
+  firmware today.
+- **Dedicated commands without a model** (`FLASH_READ`, `RDID`, `RDSR`,
+  `WRSR`, `BE`, `CE`, `DP`, `RES`, `HPM`) complete with no effect and are
+  logged as `DEDICATED_COMMAND_BASE | bit` (`0xFF13..0xFF1F`), so a hang
+  becomes a visible log entry. `BE` is left out on purpose: `spi_mem_reg.h`
+  calls it a 32 KiB erase while ESP-IDF's generic driver erases 64 KiB
+  blocks with it, so its size waits for evidence.
+- **Finish-line fault checks narrowed.** The `strlcat` fault that follows
+  the format comes less than 1,000,000 steps after the splash's final
+  update, so `boots_to_first_real_frame` and its WASM twin check faults and
+  panic text only up to step 5,500,000; the hash check is unchanged. The
+  fault-free run past the splash is pinned by
+  `boot_formats_the_blank_storage_partition_with_littlefs`. Restore the full
+  checks when that stall is fixed.
+
 ## Milestone 5 backlog
 
 (To be filled in by later Milestone 4 tasks.)

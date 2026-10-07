@@ -88,22 +88,63 @@
 //!   read-modify-write them. Offsets at or past `0x100` read 0 and drop
 //!   writes (the only register there, `SPI_MEM_DATE_REG` `+0x3FC`, is
 //!   unused).
-//! - **Trigger.** `spimem_flash_ll_user_start` does `dev->cmd.val |=
-//!   usr_pe` with `usr_pe = SPI_MEM_USR` (bit 18), or `SPI_MEM_USR |
-//!   SPI_MEM_FLASH_PE` (bits 18 and 17) for program/erase. A 32-bit store
-//!   reaches this model as four ascending byte writes (Review Focus 1), so
-//!   the transaction fires on **byte 2 only** (bits 16..23, which hold
-//!   `SPI_MEM_USR`) when that byte sets bit 2; bytes 0, 1 and 3 never fire
-//!   it, so one `sw` runs exactly one transaction. The transaction reads
-//!   the other registers it needs (`USER`, `USER2`, `MISO_DLEN`, …), which
-//!   were written by earlier stores.
-//! - **Completion.** The transaction completes within that same byte write;
-//!   then `SPI_MEM_USR` and `SPI_MEM_FLASH_PE` are cleared, so the register
-//!   reads 0 and `spimem_flash_ll_cmd_is_done` (`dev->cmd.val == 0`) is true
-//!   on the first poll. (The status field `SPI_MEM_MST_ST` reads 0, idle.)
+//! - **Trigger.** Every bit of `CMD` from 17 to 31 is `R/W/SC` in
+//!   `spi_mem_reg.h`: setting it starts an operation, and the controller
+//!   clears it when the operation is done. A 32-bit store reaches this model
+//!   as four ascending byte writes (Review Focus 1), so an operation fires
+//!   on the write of **the byte holding its bit**, and only when that byte
+//!   sets it: `SPI_MEM_USR` (bit 18) and `SPI_MEM_FLASH_BE`/`_CE`/`_DP`/
+//!   `_RES`/`_HPM` (23..19) in byte 2, `SPI_MEM_FLASH_READ`/`_WREN`/`_WRDI`/
+//!   `_RDID`/`_RDSR`/`_WRSR`/`_PP`/`_SE` (31..24) in byte 3. Every field an
+//!   operation reads (`ADDR`, `USER*`, `MISO_DLEN`, `W0..`) was stored by
+//!   earlier writes, so one `sw` runs exactly one operation.
+//!   `spimem_flash_ll_user_start` sets `SPI_MEM_USR` (or `SPI_MEM_USR |
+//!   SPI_MEM_FLASH_PE`, bits 18 and 17, for program/erase; `FLASH_PE`
+//!   triggers nothing on its own); the dedicated commands are set one at a
+//!   time by `spimem_flash_ll_set_write_protect` (`flash_wren`/
+//!   `flash_wrdi`), `spimem_flash_ll_erase_sector` (`flash_se`) and
+//!   `spimem_flash_ll_program_page` (`flash_pp`), called from
+//!   `spi_flash_hal_set_write_protect`/`_erase_sector`/`_program_page`
+//!   (`components/hal/spi_flash_hal_iram.c`), the host driver
+//!   `ESP_FLASH_DEFAULT_HOST_DRIVER()` (`spi_flash/include/memspi_host_driver.h`)
+//!   wires up for SPI1.
+//! - **Completion.** Every operation completes within that same byte write;
+//!   then its bit (and `SPI_MEM_FLASH_PE`) is cleared, so the register reads
+//!   0 and `spimem_flash_ll_cmd_is_done` (`dev->cmd.val == 0`) is true on
+//!   the first poll. (The status field `SPI_MEM_MST_ST` reads 0, idle, so
+//!   `spimem_flash_ll_host_idle` is true too.)
+//! - **The chip is never busy.** Erase and program finish instantly, so the
+//!   status register's `SR_WIP` (bit 0, `spi_flash_defs.h`) always reads 0
+//!   and `spi_flash_chip_generic_wait_idle` returns on its first `RDSR`.
+//! - **Write enable latch.** `SR_WREN` ([`SR_WEL`], bit 1) is modeled because
+//!   the generic chip driver checks it: `spi_flash_chip_generic_set_write_protect`
+//!   reads it back after `WREN`/`WRDI` (and fails with `ESP_ERR_NOT_FOUND` if
+//!   it did not change), and `spi_flash_chip_generic_wait_idle` treats a WEL
+//!   still set after an erase or program as "command not accepted"
+//!   (`ESP_ERR_NOT_SUPPORTED`). As on a SPI NOR chip, `FLASH_WREN` sets it,
+//!   `FLASH_WRDI` clears it, and `FLASH_SE`/`FLASH_PP` run only while it is
+//!   set and clear it.
+//! - **`SPI_MEM_FLASH_SE` (bit 24)** erases the 4 KiB sector holding
+//!   `ADDR[23:0]` (`spi_flash_hal_erase_sector`: 24-bit address phase,
+//!   `ADDR = start_address & 0xFFFFFF`).
+//! - **`SPI_MEM_FLASH_PP` (bit 25)** programs `ADDR[31:24]` bytes (the
+//!   "byte length of a transfer" field of `SPI_MEM_USR_ADDR_VALUE`, set by
+//!   `spi_flash_hal_program_page` as `address | length << 24`; at most the
+//!   64-byte buffer) from `W0..` (packed little-endian by
+//!   `spimem_flash_ll_set_buffer_data`) at `ADDR[23:0]`, with NOR AND
+//!   semantics ([`EmulatedFlash::program`]), wrapping within the 256-byte
+//!   page as a NOR page program does (the write slicer never crosses one).
 //! - **Command phase.** With `SPI_MEM_USR_COMMAND` (`USER` bit 31) set, the
 //!   command is `SPI_MEM_USR_COMMAND_VALUE` (`USER2` bits 15..0), as written
 //!   by `spimem_flash_ll_set_command`.
+//! - **Address phase.** With `SPI_MEM_USR_ADDR` (`USER` bit 30) set, the
+//!   address is the low `SPI_MEM_USR_ADDR_BITLEN + 1` bits (`USER1` bits
+//!   31..26, `spimem_flash_ll_set_addr_bitlen` stores `bitlen - 1`) of
+//!   `ADDR` (`spimem_flash_ll_set_usr_address` stores the address
+//!   unshifted). On the ESP32-C3 the read path's address phase is 24 bits:
+//!   `SOC_SPI_PERIPH_SUPPORT_CONTROL_DUMMY_OUT` is 1 (`soc/soc_caps.h`), so
+//!   `spi_flash_hal_configure_host_io_mode` sends DIO/QIO mode bits through
+//!   the dummy phase instead of widening the address.
 //! - **MISO phase.** With `SPI_MEM_USR_MISO` (`USER` bit 28) set, the
 //!   controller receives `SPI_MEM_USR_MISO_DBITLEN + 1` bits
 //!   (`MISO_DLEN` bits 9..0, set by `spimem_flash_ll_set_miso_bitlen` as
@@ -115,18 +156,38 @@
 //!   and `memspi_host_read_id_hs`'s byte swap gives chip ID `0x464016`. A
 //!   read longer than 3 bytes gets only the 3 ID bytes (not observed; what a
 //!   chip sends after its ID is chip-specific).
-//! - **Any other command**, or a transaction without a command phase, still
-//!   completes (so no poll hangs) but has no effect on the buffer or the
-//!   chip; its value is recorded in [`Spimem1::unmodeled_commands`]
-//!   ([`NO_COMMAND_PHASE`] for "no command phase"), which `boot-probe`
-//!   prints. RDSR, READ, WREN, erase and program are deliberately not
-//!   modeled until the probe shows the firmware issuing them.
+//! - **RDSR (`0x05`, `CMD_RDSR`)**, as `memspi_host_read_status_hs` issues it
+//!   (one MISO byte), answers the status register: `SR_WIP` 0, [`SR_WEL`].
+//! - **Reads** ([`FLASH_READ_COMMANDS`]: `CMD_READ` 0x03 and the fast reads
+//!   0x0B/0x3B/0x6B/0xBB/0xEB that `spi_flash_chip_generic_config_host_io_mode`
+//!   chooses by IO mode; the badge runs DIO, so it issues `CMD_FASTRD_DIO`
+//!   0xBB through `spi_flash_hal_read`) return the flash bytes at the
+//!   address phase's address, `0xFF` past the end of the chip. A read
+//!   without an address phase is logged as unmodeled.
+//! - **Any other command**, or a transaction without a command phase, or a
+//!   dedicated bit other than `WREN`/`WRDI`/`SE`/`PP`, still completes (so no
+//!   poll hangs) but has no effect on the buffer or the chip; it is recorded
+//!   in [`Spimem1::unmodeled_commands`] ([`NO_COMMAND_PHASE`] for "no command
+//!   phase", [`DEDICATED_COMMAND_BASE`]` | bit` for a dedicated bit), which
+//!   `boot-probe` prints.
 //!
-//! Not modeled: the address, dummy and MOSI phases (no observed command
-//! uses them), `SPI_MEM_USR_MISO_HIGHPART`, the dedicated `SPI_MEM_FLASH_*`
-//! command bits in `CMD` (bits 19..31; stored, but they trigger nothing,
-//! so a firmware that used one would visibly spin on `cmd_is_done`), clock
-//! and timing registers (stored only), and auto-suspend.
+//! **Observed write path (boot-probe and disassembly of `factory.bin`,
+//! Milestone 4 Task 5)**: `esp_littlefs` formatting the blank `storage`
+//! partition polls `CMD` in `spi_flash_hal_poll_cmd_done` (`0x4039_3916`)
+//! after `spi_flash_hal_set_write_protect` (`0x4039_3e2a`) sets
+//! `SPI_MEM_FLASH_WREN`; it then uses `spi_flash_hal_erase_sector`
+//! (`0x4039_3d4a`) and `spi_flash_hal_program_page` (`0x4039_3ddc`), user
+//! `RDSR` (0x05) for every status poll, and user `CMD_FASTRD_DIO` (0xBB)
+//! reads. No other command is issued through the end of the format.
+//!
+//! Not modeled: the dummy and MOSI phases (no observed user command sends
+//! data), `SPI_MEM_USR_MISO_HIGHPART`, the dedicated `FLASH_READ`, `RDID`,
+//! `RDSR` (which would answer into `SPI_MEM_RD_STATUS_REG`), `WRSR`, `BE`
+//! (its `spi_mem_reg.h` description says 32 KiB while ESP-IDF's generic
+//! driver treats a block as 64 KiB, so it waits until observed), `CE`, `DP`,
+//! `RES`, `HPM`, user-command `WREN`/`WRDI`/erase/program, clock and timing
+//! registers (stored only), and auto-suspend (`SPI_MEM_FLASH_SUS_CTRL_REG`
+//! stored only; `SPI_MEM_SUS_STATUS_REG`'s `FLASH_SUS` reads as stored, 0).
 
 use std::collections::VecDeque;
 
@@ -327,26 +388,60 @@ pub const FLASH_SUS_CTRL_REG: u32 = 0x09C;
 /// `SPI_MEM_CLOCK_GATE_REG` (`+0x0DC`).
 pub const CLOCK_GATE_REG: u32 = 0x0DC;
 
-/// `SPI_MEM_USR` (`SPI_MEM_CMD_REG` bit 18): lives in byte 2, bit 2.
-const CMD_USR_BYTE_IDX: u32 = 2;
-const CMD_USR_BIT_IN_BYTE: u8 = 1 << (18 - 16);
-/// `SPI_MEM_USR | SPI_MEM_FLASH_PE` (bits 18 and 17), the bits
-/// `spimem_flash_ll_user_start` sets and the controller clears on
-/// completion.
-const CMD_USR_AND_PE: u32 = (1 << 18) | (1 << 17);
+/// `SPI_MEM_USR` (`SPI_MEM_CMD_REG` bit 18).
+const CMD_USR: u32 = 1 << 18;
+/// `SPI_MEM_FLASH_PE` (`SPI_MEM_CMD_REG` bit 17): set together with
+/// `SPI_MEM_USR` by `spimem_flash_ll_user_start(dev, true)` and cleared with
+/// it on completion; it triggers nothing on its own.
+const CMD_FLASH_PE: u32 = 1 << 17;
+/// `SPI_MEM_FLASH_READ` .. `SPI_MEM_FLASH_HPM` (`SPI_MEM_CMD_REG` bits
+/// 31..19): the dedicated flash commands. Each is `R/W/SC`: setting it
+/// starts the operation and the controller clears it when done.
+const CMD_FLASH_WREN_BIT: u32 = 30;
+const CMD_FLASH_WRDI_BIT: u32 = 29;
+const CMD_FLASH_PP_BIT: u32 = 25;
+const CMD_FLASH_SE_BIT: u32 = 24;
+const CMD_FLASH_HPM_BIT: u32 = 19;
+const CMD_FLASH_READ_BIT: u32 = 31;
 
 /// `SPI_MEM_USR_COMMAND` (`SPI_MEM_USER_REG` bit 31).
 pub const USER_USR_COMMAND: u32 = 1 << 31;
+/// `SPI_MEM_USR_ADDR` (`SPI_MEM_USER_REG` bit 30).
+pub const USER_USR_ADDR: u32 = 1 << 30;
 /// `SPI_MEM_USR_MISO` (`SPI_MEM_USER_REG` bit 28).
 pub const USER_USR_MISO: u32 = 1 << 28;
 
+/// `SPI_MEM_USR_ADDR_BITLEN` (`SPI_MEM_USER1_REG` bits `[31:26]`).
+const USER1_ADDR_BITLEN_SHIFT: u32 = 26;
+const USER1_ADDR_BITLEN_MASK: u32 = 0x3F;
 /// `SPI_MEM_USR_COMMAND_VALUE` (`SPI_MEM_USER2_REG` bits `[15:0]`).
 const USER2_COMMAND_VALUE_MASK: u32 = 0xFFFF;
 /// `SPI_MEM_USR_MISO_DBITLEN` (`SPI_MEM_MISO_DLEN_REG` bits `[9:0]`).
 const DLEN_BITLEN_MASK: u32 = 0x3FF;
+/// The 24-bit flash address in `SPI_MEM_ADDR_REG` for the dedicated
+/// commands (bits `[23:0]`; bits `[31:24]` are the byte length, per the
+/// register's description in `spi_mem_reg.h`).
+const ADDR_24BIT_MASK: u32 = 0xFF_FFFF;
+/// Size of `W0..W15`: the most bytes one transaction moves
+/// (`SPI_FLASH_HAL_MAX_WRITE_BYTES`/`_READ_BYTES` = 64 in
+/// `memspi_host_driver.c`).
+const BUFFER_BYTES: usize = 64;
+/// A NOR page: page program wraps within it.
+const PAGE_SIZE: u32 = 256;
 
 /// `CMD_RDID` (`spi_flash/include/spi_flash/spi_flash_defs.h`).
 pub const FLASH_CMD_RDID: u8 = 0x9F;
+/// `CMD_RDSR` (`spi_flash_defs.h`): read status register 1.
+pub const FLASH_CMD_RDSR: u8 = 0x05;
+/// The 24-bit-address read commands `spi_flash_chip_generic_config_host_io_mode`
+/// picks from by IO mode (`spi_flash_defs.h`): `CMD_READ` 0x03,
+/// `CMD_FASTRD` 0x0B, `CMD_FASTRD_DUAL` 0x3B, `CMD_FASTRD_QUAD` 0x6B,
+/// `CMD_FASTRD_DIO` 0xBB, `CMD_FASTRD_QIO` 0xEB. They differ only in line
+/// width and dummy cycles, which do not change the bytes returned.
+pub const FLASH_READ_COMMANDS: [u8; 6] = [0x03, 0x0B, 0x3B, 0x6B, 0xBB, 0xEB];
+/// `SR_WREN` (`spi_flash_defs.h`): status register bit 1, the write enable
+/// latch (WEL). `SR_WIP` (bit 0) is always 0 here (see the module doc).
+pub const SR_WEL: u8 = 1 << 1;
 /// The badge's flash JEDEC ID, in the order the chip sends it:
 /// manufacturer `0x46`, then device ID `0x40 0x16` (milestone hardware
 /// facts; `memspi: chip_id` would log it as `0x464016`).
@@ -357,6 +452,13 @@ pub const JEDEC_ID: [u8; 3] = [0x46, 0x40, 0x16];
 /// values are at most 16 bits wide (`SPI_MEM_USR_COMMAND_VALUE`), and no
 /// flash command is `0xFFFF`, so this cannot collide with an observed one.
 pub const NO_COMMAND_PHASE: u16 = 0xFFFF;
+
+/// What [`Spimem1::unmodeled_commands`] records for a dedicated
+/// `SPI_MEM_FLASH_*` command bit with no modeled effect: this base OR'd with
+/// the bit's position in `SPI_MEM_CMD_REG` (19..=31, so `0xFF13..=0xFF1F`).
+/// The on-wire opcode the controller sends for those bits is not documented
+/// in `spi_mem_reg.h`, so the bit position is what is recorded.
+pub const DEDICATED_COMMAND_BASE: u16 = 0xFF00;
 
 /// How many unmodeled commands [`Spimem1`] remembers (a debugging aid for
 /// `boot-probe`, not device state).
@@ -373,12 +475,17 @@ pub struct Spimem1 {
     /// The most recent command values the model has no behavior for,
     /// oldest first, capped at [`UNMODELED_LOG_CAPACITY`].
     unmodeled: VecDeque<u16>,
+    /// The flash chip's write enable latch (status bit [`SR_WEL`]). Chip
+    /// state, kept here because the chip is otherwise plain storage
+    /// ([`EmulatedFlash`]) and only this controller reaches it.
+    wel: bool,
 }
 
 impl Default for Spimem1 {
     fn default() -> Self {
         Self {
             regs: [0; SPIMEM_REGS_WORDS],
+            wel: false,
             transactions: 0,
             unmodeled: VecDeque::with_capacity(UNMODELED_LOG_CAPACITY),
         }
@@ -434,9 +541,22 @@ impl Spimem1 {
         let widx = (offset >> 2) as usize;
         let idx = offset & 0b11;
         set_byte(&mut self.regs[widx], idx, val);
-        if offset & !0b11 == CMD_REG && idx == CMD_USR_BYTE_IDX && val & CMD_USR_BIT_IN_BYTE != 0 {
+        if offset & !0b11 != CMD_REG {
+            return;
+        }
+        // Only the bits this byte sets can fire (Review Focus 1): the
+        // fields a command reads were stored by earlier writes, and the
+        // other bytes of the same word never re-trigger it.
+        let set_now = (val as u32) << (idx * 8);
+        if set_now & CMD_USR != 0 {
             self.run_user_transaction(flash);
-            self.regs[widx] &= !CMD_USR_AND_PE;
+            self.regs[widx] &= !(CMD_USR | CMD_FLASH_PE);
+        }
+        for bit in (CMD_FLASH_HPM_BIT..=CMD_FLASH_READ_BIT).rev() {
+            if set_now & (1 << bit) != 0 {
+                self.run_dedicated_command(bit, flash);
+                self.regs[widx] &= !(1 << bit);
+            }
         }
     }
 
@@ -476,11 +596,75 @@ impl Spimem1 {
         }
     }
 
-    /// Runs one `SPI_MEM_USR` transaction. `_flash` is the chip the
-    /// transaction talks to; no command modeled so far (only RDID) reads or
-    /// writes its contents, so it is unused until READ/erase/program are
-    /// observed (see the module doc).
-    fn run_user_transaction(&mut self, _flash: &mut EmulatedFlash) {
+    /// `true` iff the chip's write enable latch is set (status bit
+    /// [`SR_WEL`]).
+    pub fn write_enabled(&self) -> bool {
+        self.wel
+    }
+
+    /// The chip's status register 1 as `RDSR` returns it: `SR_WIP` (bit 0)
+    /// is always 0 (never busy), [`SR_WEL`] (bit 1) is the latch.
+    fn status(&self) -> u8 {
+        if self.wel {
+            SR_WEL
+        } else {
+            0
+        }
+    }
+
+    /// Runs the dedicated command for `SPI_MEM_CMD_REG` bit `bit` (see the
+    /// module doc's `SPI_MEM_FLASH_SE`/`_PP` and "Write enable latch"
+    /// items). It completes at once; the caller clears the bit.
+    fn run_dedicated_command(&mut self, bit: u32, flash: &mut EmulatedFlash) {
+        let addr = self.reg(ADDR_REG) & ADDR_24BIT_MASK;
+        match bit {
+            CMD_FLASH_WREN_BIT => self.wel = true,
+            CMD_FLASH_WRDI_BIT => self.wel = false,
+            CMD_FLASH_SE_BIT => {
+                if std::mem::take(&mut self.wel) {
+                    flash.erase_sector(addr);
+                }
+            }
+            CMD_FLASH_PP_BIT => {
+                if std::mem::take(&mut self.wel) {
+                    let len = ((self.reg(ADDR_REG) >> 24) as usize).min(BUFFER_BYTES);
+                    let page = addr & !(PAGE_SIZE - 1);
+                    for i in 0..len {
+                        // A page program wraps within its 256-byte page.
+                        let a = page | (addr.wrapping_add(i as u32) & (PAGE_SIZE - 1));
+                        flash.program(a, &[self.buffer_byte(i)]);
+                    }
+                }
+            }
+            other => self.log_unmodeled(DEDICATED_COMMAND_BASE | other as u16),
+        }
+    }
+
+    /// Byte `i` of `W0..W15` (little-endian within each word, the order
+    /// `spimem_flash_ll_set_buffer_data` packs them in).
+    fn buffer_byte(&self, i: usize) -> u8 {
+        self.regs[(W0_REG >> 2) as usize + i / 4].to_le_bytes()[i % 4]
+    }
+
+    /// The address-phase value of a user transaction: the low
+    /// `SPI_MEM_USR_ADDR_BITLEN + 1` bits of `ADDR`, or `None` with
+    /// `SPI_MEM_USR_ADDR` clear.
+    fn user_address(&self) -> Option<u32> {
+        if self.reg(USER_REG) & USER_USR_ADDR == 0 {
+            return None;
+        }
+        let bits = ((self.reg(USER1_REG) >> USER1_ADDR_BITLEN_SHIFT) & USER1_ADDR_BITLEN_MASK) + 1;
+        let mask = if bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << bits) - 1
+        };
+        Some(self.reg(ADDR_REG) & mask)
+    }
+
+    /// Runs one `SPI_MEM_USR` transaction against `flash` (see the module
+    /// doc).
+    fn run_user_transaction(&mut self, flash: &mut EmulatedFlash) {
         self.transactions += 1;
         let user = self.reg(USER_REG);
         let command = if user & USER_USR_COMMAND != 0 {
@@ -498,6 +682,21 @@ impl Spimem1 {
                 // after its ID is chip-specific.
                 let n = miso_len.min(JEDEC_ID.len());
                 self.store_miso(&JEDEC_ID[..n]);
+            }
+            c if c == FLASH_CMD_RDSR as u16 => {
+                // One status byte; only 1-byte reads are observed.
+                let status = [self.status()];
+                self.store_miso(&status[..miso_len.min(1)]);
+            }
+            c if c <= 0xFF && FLASH_READ_COMMANDS.contains(&(c as u8)) => {
+                let Some(addr) = self.user_address() else {
+                    self.log_unmodeled(c);
+                    return;
+                };
+                let data: Vec<u8> = (0..miso_len as u32)
+                    .map(|i| addr.checked_add(i).map_or(0xFF, |a| flash.read(a)))
+                    .collect();
+                self.store_miso(&data);
             }
             other => self.log_unmodeled(other),
         }
@@ -783,6 +982,238 @@ mod tests {
         assert_eq!(
             dev.unmodeled_commands().iter().copied().collect::<Vec<_>>(),
             vec![0xAB]
+        );
+    }
+
+    // ---- SPIMEM1 erase/program/read (Milestone 4 Task 5) ----
+    //
+    // Each helper replays the register writes of one HAL function in its
+    // source order (`spi_flash_hal_iram.c` / `spi_flash_hal_common.inc` /
+    // `spimem_flash_ll.h`, v5.5.3), every store as a whole word delivered
+    // as 4 ascending bytes. Bit positions are `spi_mem_reg.h`'s.
+
+    /// `reg = (reg & and) | or`, as one load and one `sw` (a bitfield
+    /// assignment in an LL function).
+    fn rmw(dev: &mut Spimem1, flash: &mut EmulatedFlash, off: u32, and: u32, or: u32) {
+        let v = r(dev, off);
+        w(dev, flash, off, (v & and) | or);
+    }
+
+    /// `spimem_flash_ll_set_addr_bitlen(dev, 24)`: `USER1.usr_addr_bitlen`
+    /// (bits 31:26) = 23, then `USER.usr_addr` (bit 30) = 1.
+    fn set_addr_bitlen_24(dev: &mut Spimem1, flash: &mut EmulatedFlash) {
+        rmw(dev, flash, USER1_REG, 0x03FF_FFFF, 23 << 26);
+        rmw(dev, flash, USER_REG, !0, 1 << 30);
+    }
+
+    /// `spi_flash_hal_set_write_protect(host, wp)`: `cmd.flash_wrdi = 1`
+    /// (bit 29) or `cmd.flash_wren = 1` (bit 30), then `poll_cmd_done`.
+    fn set_write_protect(dev: &mut Spimem1, flash: &mut EmulatedFlash, wp: bool) {
+        rmw(dev, flash, CMD_REG, !0, if wp { 1 << 29 } else { 1 << 30 });
+    }
+
+    /// `spi_flash_hal_erase_sector`: addr bitlen 24, `ADDR = start &
+    /// 0xFFFFFF`, then `spimem_flash_ll_erase_sector` (`ctrl.val = 0`,
+    /// `cmd.flash_se = 1`, bit 24).
+    fn erase_sector_via_hal(dev: &mut Spimem1, flash: &mut EmulatedFlash, start: u32) {
+        set_addr_bitlen_24(dev, flash);
+        w(dev, flash, ADDR_REG, start & 0xFF_FFFF);
+        w(dev, flash, CTRL_REG, 0);
+        rmw(dev, flash, CMD_REG, !0, 1 << 24);
+    }
+
+    /// `spi_flash_hal_program_page`: addr bitlen 24, `ADDR = (address &
+    /// 0xFFFFFF) | (length << 24)`, then `spimem_flash_ll_program_page`
+    /// (`user.usr_dummy = 0` (bit 29), `set_buffer_data` into `W0..`,
+    /// `cmd.flash_pp = 1`, bit 25).
+    fn program_page_via_hal(dev: &mut Spimem1, flash: &mut EmulatedFlash, addr: u32, data: &[u8]) {
+        set_addr_bitlen_24(dev, flash);
+        w(
+            dev,
+            flash,
+            ADDR_REG,
+            (addr & 0xFF_FFFF) | ((data.len() as u32) << 24),
+        );
+        rmw(dev, flash, USER_REG, !(1 << 29), 0);
+        for (i, chunk) in data.chunks(4).enumerate() {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            w(dev, flash, W0_REG + 4 * i as u32, u32::from_le_bytes(word));
+        }
+        rmw(dev, flash, CMD_REG, !0, 1 << 25);
+    }
+
+    /// `spi_flash_hal_configure_host_io_mode(command, addr_bitlen, 0, ..)`
+    /// (`set_command`, `set_addr_bitlen`, `set_dummy(0)`, MISO/MOSI off).
+    fn configure_host_io_mode(
+        dev: &mut Spimem1,
+        flash: &mut EmulatedFlash,
+        command: u32,
+        addr_bitlen: u32,
+    ) {
+        rmw(dev, flash, USER_REG, !0, USER_USR_COMMAND);
+        rmw(dev, flash, USER2_REG, 0xFFFF_0000, command);
+        rmw(dev, flash, USER2_REG, 0x0FFF_FFFF, 7 << 28);
+        let bitlen_field = addr_bitlen.wrapping_sub(1) & 0x3F;
+        rmw(dev, flash, USER1_REG, 0x03FF_FFFF, bitlen_field << 26);
+        let usr_addr = if addr_bitlen > 0 { 1 << 30 } else { 0 };
+        rmw(dev, flash, USER_REG, !(1 << 30), usr_addr);
+        rmw(dev, flash, USER_REG, !(1 << 29), 0); // usr_dummy = 0
+        rmw(dev, flash, USER_REG, !USER_USR_MISO, 0);
+        w(dev, flash, MISO_DLEN_REG, 0);
+        rmw(dev, flash, USER_REG, !(1 << 27), 0); // usr_mosi = 0
+        w(dev, flash, MOSI_DLEN_REG, 0);
+    }
+
+    /// `memspi_host_read_status_hs`: `spi_flash_hal_common_command` with
+    /// `CMD_RDSR` (0x05) and one MISO byte; returns that byte.
+    fn rdsr_via_hal(dev: &mut Spimem1, flash: &mut EmulatedFlash) -> u8 {
+        configure_host_io_mode(dev, flash, 0x05, 0);
+        w(dev, flash, ADDR_REG, 0);
+        rmw(dev, flash, USER_REG, !0, USER_USR_MISO);
+        w(dev, flash, MISO_DLEN_REG, 7);
+        user_start(dev, flash, false);
+        assert_eq!(r(dev, CMD_REG), 0, "RDSR completes");
+        r(dev, W0_REG) as u8
+    }
+
+    /// `spi_flash_hal_read` after `configure_host_io_mode(CMD_FASTRD_DIO
+    /// 0xBB, 24, ..)`: `ADDR = address`, `set_miso_bitlen(len * 8)`,
+    /// `user_start(false)`.
+    fn dio_read_via_hal(dev: &mut Spimem1, flash: &mut EmulatedFlash, addr: u32, len: u32) {
+        configure_host_io_mode(dev, flash, 0xBB, 24);
+        w(dev, flash, ADDR_REG, addr);
+        rmw(dev, flash, USER_REG, !0, USER_USR_MISO);
+        w(dev, flash, MISO_DLEN_REG, len * 8 - 1);
+        user_start(dev, flash, false);
+    }
+
+    #[test]
+    fn wren_and_wrdi_self_clear_and_toggle_the_write_enable_latch() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash), 0);
+        set_write_protect(&mut dev, &mut flash, false);
+        assert_eq!(r(&dev, CMD_REG), 0, "SPI_MEM_FLASH_WREN self-clears");
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash), SR_WEL);
+        set_write_protect(&mut dev, &mut flash, true);
+        assert_eq!(r(&dev, CMD_REG), 0, "SPI_MEM_FLASH_WRDI self-clears");
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash), 0);
+    }
+
+    #[test]
+    fn rdsr_is_never_busy() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        set_write_protect(&mut dev, &mut flash, false);
+        erase_sector_via_hal(&mut dev, &mut flash, 0x9000);
+        // SR_WIP (bit 0) clear straight after the erase.
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash) & 1, 0);
+    }
+
+    #[test]
+    fn sector_erase_blanks_the_4k_sector_self_clears_and_resets_wel() {
+        let app = vec![0x00u8; 0x3000];
+        let mut flash = EmulatedFlash::from_app_image(&app);
+        let mut dev = Spimem1::new();
+        set_write_protect(&mut dev, &mut flash, false);
+        erase_sector_via_hal(&mut dev, &mut flash, APP_OFFSET + 0x1000);
+        assert_eq!(r(&dev, CMD_REG), 0, "SPI_MEM_FLASH_SE self-clears");
+        assert_eq!(flash.read(APP_OFFSET + 0x0FFF), 0x00);
+        assert_eq!(flash.read(APP_OFFSET + 0x1000), 0xFF);
+        assert_eq!(flash.read(APP_OFFSET + 0x1FFF), 0xFF);
+        assert_eq!(flash.read(APP_OFFSET + 0x2000), 0x00);
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash), 0, "WEL cleared");
+    }
+
+    #[test]
+    fn sector_erase_without_write_enable_is_ignored() {
+        let app = vec![0x00u8; 0x1000];
+        let mut flash = EmulatedFlash::from_app_image(&app);
+        let mut dev = Spimem1::new();
+        erase_sector_via_hal(&mut dev, &mut flash, APP_OFFSET);
+        assert_eq!(r(&dev, CMD_REG), 0, "still completes");
+        assert_eq!(flash.read(APP_OFFSET), 0x00, "chip ignored it");
+    }
+
+    #[test]
+    fn page_program_ands_the_buffer_into_flash_for_the_programmed_length() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        // Stale buffer bytes past the length must not be programmed.
+        w(&mut dev, &mut flash, W0_REG + 4, 0);
+        set_write_protect(&mut dev, &mut flash, false);
+        program_page_via_hal(
+            &mut dev,
+            &mut flash,
+            0x9010,
+            &[0x12, 0x34, 0x56, 0x78, 0x0F],
+        );
+        assert_eq!(r(&dev, CMD_REG), 0, "SPI_MEM_FLASH_PP self-clears");
+        let got: Vec<u8> = (0x900F..0x9016).map(|a| flash.read(a)).collect();
+        assert_eq!(got, vec![0xFF, 0x12, 0x34, 0x56, 0x78, 0x0F, 0xFF]);
+        assert_eq!(rdsr_via_hal(&mut dev, &mut flash), 0, "WEL cleared");
+        // NOR: a second program only clears bits.
+        set_write_protect(&mut dev, &mut flash, false);
+        program_page_via_hal(&mut dev, &mut flash, 0x9010, &[0xF0]);
+        assert_eq!(flash.read(0x9010), 0x10);
+    }
+
+    #[test]
+    fn page_program_without_write_enable_is_ignored() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        program_page_via_hal(&mut dev, &mut flash, 0x9000, &[0x00]);
+        assert_eq!(r(&dev, CMD_REG), 0);
+        assert_eq!(flash.read(0x9000), 0xFF);
+    }
+
+    #[test]
+    fn dio_fast_read_returns_flash_bytes_in_w_little_endian() {
+        let mut flash = EmulatedFlash::from_app_image(&[0xE9, 0x06, 0x02, 0x20, 0xAB, 0xCD]);
+        let mut dev = Spimem1::new();
+        w(&mut dev, &mut flash, W0_REG + 4, 0x1111_1111);
+        dio_read_via_hal(&mut dev, &mut flash, APP_OFFSET, 6);
+        assert_eq!(r(&dev, CMD_REG), 0);
+        assert_eq!(r(&dev, W0_REG), 0x2002_06E9);
+        // Bytes past the 6 received keep their old value.
+        assert_eq!(r(&dev, W0_REG + 4), 0x1111_CDAB);
+        assert!(dev.unmodeled_commands().is_empty());
+    }
+
+    #[test]
+    fn a_64_byte_read_fills_w0_to_w15() {
+        let app: Vec<u8> = (0..64u8).collect();
+        let mut flash = EmulatedFlash::from_app_image(&app);
+        let mut dev = Spimem1::new();
+        dio_read_via_hal(&mut dev, &mut flash, APP_OFFSET, 64);
+        assert_eq!(r(&dev, W0_REG), 0x0302_0100);
+        assert_eq!(r(&dev, W15_REG), 0x3F3E_3D3C);
+    }
+
+    #[test]
+    fn out_of_range_erase_program_and_read_never_panic() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        set_write_protect(&mut dev, &mut flash, false);
+        erase_sector_via_hal(&mut dev, &mut flash, 0xFF_F000);
+        set_write_protect(&mut dev, &mut flash, false);
+        program_page_via_hal(&mut dev, &mut flash, 0xFF_FFFE, &[0; 8]);
+        dio_read_via_hal(&mut dev, &mut flash, 0xFF_FFFE, 4);
+        assert_eq!(r(&dev, W0_REG), 0xFFFF_FFFF, "past the chip reads blank");
+        assert_eq!(r(&dev, CMD_REG), 0);
+    }
+
+    #[test]
+    fn an_unmodeled_dedicated_command_is_recorded_and_still_self_clears() {
+        let mut flash = EmulatedFlash::from_app_image(&[]);
+        let mut dev = Spimem1::new();
+        // SPI_MEM_FLASH_HPM (bit 19).
+        rmw(&mut dev, &mut flash, CMD_REG, !0, 1 << 19);
+        assert_eq!(r(&dev, CMD_REG), 0);
+        assert_eq!(
+            dev.unmodeled_commands().iter().copied().collect::<Vec<_>>(),
+            vec![DEDICATED_COMMAND_BASE | 19]
         );
     }
 

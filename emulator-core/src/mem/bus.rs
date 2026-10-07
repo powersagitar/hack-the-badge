@@ -112,8 +112,9 @@
 //!    module's doc.
 //! 12. **SPIMEM1** ([`crate::mem::soc::SPIMEM1_RANGE`], the SPI1 flash
 //!    controller): routed to [`FirmwareBus::spimem1`], same ruling — see
-//!    `crate::peripherals::flash`. A write that sets `SPI_MEM_CMD_REG`'s
-//!    `SPI_MEM_USR` bit runs a flash command against
+//!    `crate::peripherals::flash`. A write that sets one of `SPI_MEM_CMD_REG`.s
+//!    command bits (`SPI_MEM_USR` or a dedicated `SPI_MEM_FLASH_*` bit) runs
+//!    a flash command against
 //!    [`FirmwareBus::flash_chip`] (the emulated 4 MiB chip), another direct
 //!    cross-field access. Offsets `Spimem1::handles` does not name are
 //!    still logged into [`FirmwareBus::unmapped_log`], like RTC_CNTL's.

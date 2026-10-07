@@ -159,6 +159,7 @@ file or the code, this file and the code win.
   bootloader's extra `MMU_DROM_END_ENTRY` page (notes, history item 7).
 - SPIMEM1 `CMD` bits 19..31 (dedicated `SPI_MEM_FLASH_*` commands) are
   stored but never self-cleared; flash erase/write will spin on them.
+  *(Resolved in Milestone 4 Task 5.)*
 
 ### Console and logging
 

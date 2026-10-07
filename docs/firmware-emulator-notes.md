@@ -449,6 +449,16 @@ formatting...`). The format is what issues the `SPI_MEM_FLASH_WREN` poll
 above, so the stall itself is unchanged (see the "Milestone 4 Task 4"
 history entry).
 
+**Update (Milestone 4 Task 5):** SPIMEM1 now runs the flash driver's
+dedicated write-enable, sector-erase and page-program commands, `RDSR` and
+the DIO fast read, so that poll is gone and `esp_littlefs` formats the blank
+`storage` partition (the littlefs superblock lands in its blocks 0 and 1).
+Boot then faults on the unstubbed ROM `strlcat` (`0x4000_03ec`) in
+`esp_vfs_littlefs_register` and the panic handler reboots into the
+unstubbed `software_reset_cpu`; the splash stays on screen (see the
+"Milestone 4 Task 5" history entry).
+
+
 **Resolved in Milestone 3** (details in the history below):
 
 - TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
@@ -1510,6 +1520,8 @@ Next stall, from `boot-probe --steps 12000000 --window 500000` (release):
 - **Unmapped-access tail:** `0x600c_e000..0x600c_e03c` (the
   ASSIST_DEBUG block, `DR_REG_ASSIST_DEBUG_BASE`): reads and writes of
   `+0x000`, writes of `+0x038` and `+0x03c` (12 each), `+0x000` 20 each.
+- **Resolved in Milestone 4 Task 5** (see that entry): the bits below,
+  `RDSR` and the `0xbb` reads are modeled.
 - **Next task:** model SPIMEM1's dedicated `SPI_MEM_FLASH_*` command bits in
   `CMD` (at least `WREN`, and the ones `esp_flash` issues next: `RDSR`,
   `PP`, `SE`/`BE`, `READ`), with their self-clear and the effect on the
@@ -1580,6 +1592,85 @@ fix on its first assertion: the bit read 0).
   splash with 2,340 values). It is littlefs's format, after the mount
   failure, that writes to flash.
 
+### Milestone 4 Task 5: flash writes through SPIMEM1; littlefs formats `storage`
+
+**Found.** Disassembly of factory.bin's IRAM segment around the Task 3/4
+poll identifies the ESP-IDF v5.5.3 HAL functions (`spi_flash_hal_iram.c`,
+`spi_flash_hal_common.inc`, LL in `hal/esp32c3/include/hal/spimem_flash_ll.h`,
+bits from `soc/esp32c3/register/soc/spi_mem_reg.h`):
+
+- `0x4039_3916` is `spi_flash_hal_poll_cmd_done` (`while (dev->cmd.val != 0)`).
+- `0x4039_3e2a` is `spi_flash_hal_set_write_protect`: `CMD |= 0x4000_0000`
+  (`SPI_MEM_FLASH_WREN`, bit 30) or `0x2000_0000` (`FLASH_WRDI`, bit 29),
+  then the poll; the poll's return address `0x4039_3e42` is the one Task 3
+  recorded.
+- `0x4039_3d4a` is `spi_flash_hal_erase_sector`: `USER1.usr_addr_bitlen =
+  23`, `USER.usr_addr = 1`, `ADDR = start & 0xFFFFFF`, `CTRL = 0`,
+  `CMD |= 0x0100_0000` (`FLASH_SE`, bit 24).
+- `0x4039_3ddc` is `spi_flash_hal_program_page`: the same address setup with
+  `ADDR = (address & 0xFFFFFF) | length << 24`, then
+  `spimem_flash_ll_program_page` (`0x4039_3896`: clear `USER.usr_dummy`,
+  copy the data into `W0..`, `CMD |= 0x0200_0000`, `FLASH_PP`, bit 25).
+- Erase chip (`FLASH_CE`, bit 22) and erase block (`FLASH_BE`, bit 23)
+  sit next to them but are not called during boot.
+
+These are the SPI1 host driver's functions (`ESP_FLASH_DEFAULT_HOST_DRIVER()`
+in `spi_flash/include/memspi_host_driver.h`). Status polls go through the
+user command `RDSR` (0x05, `memspi_host_read_status_hs`) and reads through
+the user command `CMD_FASTRD_DIO` (0xBB, `spi_flash_hal_read`; the chip runs
+in DIO mode). Both had been completing with no effect (the `0xbb` reads
+returned stale buffer bytes). The generic chip driver
+(`spi_flash_chip_generic.c`) also reads the write enable latch back
+(`SR_WREN`, status bit 1) after `WREN` and after every erase or program,
+so the latch has to be modeled for any write to succeed.
+
+**Resolved.** `crate::peripherals::flash::Spimem1` runs `FLASH_WREN`,
+`FLASH_WRDI`, `FLASH_SE` and `FLASH_PP` on the byte write that sets their
+bit and clears it, keeps the chip's write enable latch (set by `WREN`,
+cleared by `WRDI` and by an accepted erase or program; erase and program
+are ignored without it), answers `RDSR` with `WIP` = 0 and the latch, and
+serves the 24-bit-address reads (0x03, 0x0B, 0x3B, 0x6B, 0xBB, 0xEB) from
+the emulated chip. Other dedicated bits complete with no effect and are
+logged. Ten unit tests in `flash.rs` replay each HAL function's register
+writes as byte-split words (all failed before the change). Decisions are in
+`milestone-4-decisions.md`.
+
+**After the fix** (release `boot-probe`):
+
+- `esp_littlefs`'s format runs: 83 SPIMEM1 transactions, no unmodeled
+  command. The littlefs superblock is written to `storage` blocks 0
+  (`0x2b_0000`, by step ~5,654,200) and 1 (`0x2b_1000`, by step
+  ~5,690,100); `nvs` is still blank. New rung:
+  `boot_formats_the_blank_storage_partition_with_littlefs` (both
+  superblocks within 8,000,000 steps, no fault, nothing unmodeled, write
+  enable latch clear afterwards). The Task 4 rung's budget is widened to
+  8,000,000.
+- **Console:** unchanged up to `W (430) esp_littlefs: mount failed,  (-84).
+  formatting...`; the `Corrupted dir pair` error before it now comes from
+  reading the real blank partition instead of stale buffer bytes. Then
+  `Guru Meditation Error: Core  0 panic'ed (Instruction access fault)`,
+  `MEPC 0x400003ec`, `RA 0x420f2776`, a register dump, `Rebooting...`, and
+  `Panic handler entered multiple times` repeating.
+- **Stall (next task):** an instruction fetch fault at ROM `strlcat`
+  (`0x4000_03ec`, `esp32c3.rom.libc.ld`) by step 5,728,900, the next ROM
+  libc function without a stub. The caller (`0x420f_2740`, return address
+  `0x420f_2776`) calls a function that returns 0, then
+  `strlcat(_efs[index] + 0xc, conf->base_path, 16)` with `_efs` at
+  `0x3fcb_c2a8`. That matches `esp_vfs_littlefs_register` in
+  `joltwallet/esp_littlefs` (`esp_littlefs_init`, which mounts and formats,
+  returned `ESP_OK`; then `strlcat` into `base_path`,
+  `ESP_VFS_LITTLEFS_PATH_MAX + 1` = 16). The panic handler's reboot then
+  faults on the unstubbed `software_reset_cpu` (`0x4000_0094`), as in
+  earlier stalls. Hot PCs just before the fault are `0x420f_2978..0x420f_29ac`
+  (~920 hits each, a loop in the same littlefs code); the unmapped tail is
+  `0x6000_8040` (RTC_CNTL, read 28, written 32) and `0x600c_4000` (read 4).
+  The framebuffer is still the splash (2,340 values, hash unchanged).
+- Because the fault follows the splash by under 1,000,000 steps,
+  `boots_to_first_real_frame` and its WASM twin now check faults and panic
+  text only up to step 5,500,000 (`SPLASH_FAULT_FREE_STEPS`); their hash
+  check is unchanged and still passes (the panic does not redraw).
+  Restore the full checks once the `strlcat` stall is fixed.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
@@ -1598,7 +1689,9 @@ So `nvs`, `phy_init` and `storage` start blank, as on a freshly erased
 chip, and no personal data from the physical badge is involved. The
 partition layout itself is not personal data. Erase and program work in
 memory only (program ANDs, so bits only go 1 -> 0); nothing is written back
-to any file. `emulator-core/tests/flash_partition_table.rs` checks the
+to any file. Since Milestone 4 Task 5 the firmware writes it through SPIMEM1
+(sector erase and page program), so e.g. `storage` holds a fresh littlefs
+after boot formats it. `emulator-core/tests/flash_partition_table.rs` checks the
 synthesized table byte-for-byte against the real chip's, but only when
 `BADGE_FULL_DUMP` points at the local dump; without it the test skips.
 A committed unit test (Task D10) also recomputes the MD5 constant from the

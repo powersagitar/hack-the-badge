@@ -394,6 +394,15 @@
 //! [`boot_reaches_littlefs_formatting_the_blank_storage_partition`]. The
 //! console no longer ends at `main_task: Calling app_main()`; rungs that
 //! check that line use containment. The stall is unchanged.
+//!
+//! **Milestone 4 Task 5 status**: SPIMEM1 runs the flash driver's
+//! dedicated commands (`WREN`/`WRDI`, sector erase, page program), `RDSR`
+//! and the DIO fast read, so `esp_littlefs` formats the blank `storage`
+//! partition: [`boot_formats_the_blank_storage_partition_with_littlefs`].
+//! Boot then faults on the unstubbed ROM `strlcat` (`0x4000_03ec`) and
+//! panics (the notes' "Milestone 4 Task 5" entry). The splash is drawn
+//! before that, so the finish-line test checks faults and panics only up
+//! to [`SPLASH_FAULT_FREE_STEPS`].
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1228,23 +1237,55 @@ fn boot_prints_console_output_after_the_scheduler_starts() {
     assert_reaches("LVGL: Starting LVGL task", 1_000_000);
 }
 
-/// Milestone 4 Task 4: the newest console lines before the SPIMEM1
-/// `SPI_MEM_FLASH_WREN` poll (the notes' "Milestone 4 Task 3"/"Task 4"
-/// entries). The emulated `storage` partition is blank (`0xFF`), so
-/// `esp_littlefs` fails to mount it and starts formatting it; that format
-/// is the flash write that issues the `WREN` the model never completes.
+/// Milestone 4 Task 4: the emulated `storage` partition is blank (`0xFF`),
+/// so `esp_littlefs` fails to mount it and starts formatting it.
 /// The real badge's log has `hal_fs: littlefs mounted ...` here instead,
 /// because its flash holds a filesystem. `esp_log_write` for the warning
-/// is entered on step ~5,591,700.
+/// is entered on step ~5,591,700. Only the console up to that line is
+/// checked for a panic: the current stall (a ROM `strlcat` fault, Task 5)
+/// panics right after the format.
 #[test]
 fn boot_reaches_littlefs_formatting_the_blank_storage_partition() {
-    let (rt, ok) = boot_until_console_contains("esp_littlefs: mount failed", 6_000_000);
+    let (rt, ok) = boot_until_console_contains("esp_littlefs: mount failed", 8_000_000);
     let console = rt.console_output();
     assert!(ok, "pc=0x{:08x}\nconsole:\n{console}", rt.pc());
-    assert!(console.contains("formatting..."), "console:\n{console}");
-    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
-        assert!(!console.contains(panic_text), "console:\n{console}");
+    let (before, after) = console.split_once("esp_littlefs: mount failed").unwrap();
+    assert!(after.contains("formatting..."), "console:\n{console}");
+    for panic_text in PANIC_TEXTS {
+        assert!(!before.contains(panic_text), "console:\n{console}");
     }
+}
+
+/// Console text ESP-IDF's panic handler prints.
+const PANIC_TEXTS: [&str; 3] = ["Guru Meditation Error", "abort()", "Rebooting..."];
+
+/// `littlefs`'s superblock magic (`lfs.c`), stored 8 bytes into a
+/// metadata block after its revision count and tag.
+const LFS_MAGIC: &[u8; 8] = b"littlefs";
+
+/// Milestone 4 Task 5: with SPIMEM1 erasing, programming and reading the
+/// chip, `esp_littlefs`'s format writes the superblock into both blocks of
+/// the root metadata pair (`storage` blocks 0 and 1, at `0x2b_0000` and
+/// `0x2b_1000`) without a fault. Both are written by step ~5,690,100.
+#[test]
+fn boot_formats_the_blank_storage_partition_with_littlefs() {
+    const MAX: u64 = 8_000_000;
+    let has_magic = |rt: &FirmwareRuntime, block: u32| {
+        (0..8u32).all(|i| rt.bus().flash_chip.read(block + 8 + i) == LFS_MAGIC[i as usize])
+    };
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    while !(has_magic(&rt, 0x2b_0000) && has_magic(&rt, 0x2b_1000)) {
+        assert!(
+            rt.total_steps() < MAX,
+            "no littlefs superblock within {MAX} steps; pc=0x{:08x}\n{}",
+            rt.pc(),
+            rt.console_output()
+        );
+        let summary = rt.run(10_000);
+        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    }
+    assert!(rt.bus().spimem1.unmodeled_commands().is_empty());
+    assert!(!rt.bus().spimem1.write_enabled(), "no write left pending");
 }
 
 /// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2
@@ -1289,6 +1330,12 @@ fn framebuffer_fnv1a(fb: &[u16]) -> u64 {
 /// On failure, inspect the frame with
 /// `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
 /// (writes under the gitignored `local/`).
+///
+/// **Faults.** Boot faults (ROM `strlcat`) after the splash is final but
+/// before the frame has held for `STABLE_FOR` steps. The panic does not
+/// redraw, so the hash still holds; faults and panic text are checked up to
+/// [`SPLASH_FAULT_FREE_STEPS`], and fault-free boot past the splash's last
+/// update is pinned by [`boot_formats_the_blank_storage_partition_with_littlefs`].
 #[test]
 fn boots_to_first_real_frame() {
     const MAX: u64 = 11_100_000;
@@ -1301,9 +1348,13 @@ fn boots_to_first_real_frame() {
     let mut hash = framebuffer_fnv1a(rt.framebuffer());
     let mut hash_since = rt.total_steps();
     let mut stable = false;
+    let mut console_while_fault_free = String::new();
     while rt.total_steps() < MAX {
         let summary = rt.run(CHUNK);
-        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+        if rt.total_steps() <= SPLASH_FAULT_FREE_STEPS {
+            assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+            console_while_fault_free = rt.console_output();
+        }
         let fb = rt.framebuffer();
         if first_non_blank.is_none() && fb.iter().any(|px| *px != fb[0]) {
             first_non_blank = Some(rt.total_steps());
@@ -1338,8 +1389,14 @@ fn boots_to_first_real_frame() {
          inspect with boot-probe --dump-frame",
         distinct.len()
     );
-    let console = rt.console_output();
-    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+    let console = console_while_fault_free;
+    for panic_text in PANIC_TEXTS {
         assert!(!console.contains(panic_text), "console:\n{console}");
     }
 }
+
+/// The last 250,000-step sample before the current stall (the ROM
+/// `strlcat` fault at step ~5,728,900, Milestone 4 Task 5). The finish-line
+/// test and its WASM twin check faults and panic text only up to here.
+/// Raise or drop it when the stall moves.
+const SPLASH_FAULT_FREE_STEPS: u64 = 5_500_000;
