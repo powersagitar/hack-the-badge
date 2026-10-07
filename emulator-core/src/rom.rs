@@ -197,7 +197,7 @@
 //!    zero/status return would silently corrupt whatever the copied bytes
 //!    were meant to become, which is worse than the loud fault it replaces.
 //!    The sibling functions in that same linker script (`memmove`, `memcmp`,
-//!    `strcpy`, `strncpy`, `strcmp`, `strncmp`) were checked against a
+//!    `strcpy`, `strncpy`, `strcmp`, `strncmp`; `strncpy` and `strcmp` were later stubbed for real, Milestone 4) were checked against a
 //!    post-fix boot-probe re-run and were **not** observed being called
 //!    within the tested budget — see `tests/rom_stub_boot.rs` and this
 //!    task's report for the exact re-probe evidence — so, per this module's
@@ -610,9 +610,10 @@
 //!       in the ROM ELF whose semantics the doc comment of its effect states
 //!       (`memcmp`/`strncmp` return the unsigned-byte difference; `div` is
 //!       truncating division, its two fixups being dead code under RISC-V
-//!       `div`/`rem`). Not stubbed until observed: `strcpy`, `strncpy`,
-//!       `strcmp`, `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
-//!       came in Task 8, entry 18).
+//!       `div`/`rem`). Not stubbed until observed: `strcpy`,
+//!       `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
+//!       came in Task 8, entry 18; `strncpy`, `0x4000_0368`, [`STRNCPY`],
+//!       came in Milestone 4: newlib semantics, copy to NUL then NUL-pad to `n`).
 //!
 //!     With these, boot runs fault-free to step 442,140. The next stall is
 //!     *not* ROM: ESP-IDF's flash-chip detection reads the JEDEC ID through
@@ -865,8 +866,8 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`strcpy`, `strncpy`,
-//! `strcmp`, `atoi`, …) and the float half of ROM
+//! The rest of ROM libc/newlib (`strcpy`,
+//! `atoi`, …) and the float half of ROM
 //! libgcc are **absent by design**, for the same reason `memset` and
 //! `__udivdi3` are special-cased rather than defaulted: a generic
 //! "return 0, do nothing" stub for a function whose *output* the caller uses
@@ -890,7 +891,7 @@
 //! keeps scheduling, but prints no new console line and draws nothing new:
 //! the boot splash stays in the framebuffer, unchanged. See
 //! `tests/rom_stub_boot.rs`'s
-//! `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`.
+//! `boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash` (renamed and truncated in Milestone 4 Task 2; was `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`).
 //! The Task 6 paragraph below is kept as history.
 //!
 //! **As of Task 6** (history; CPU and interrupt changes, no stub changes): still 95
@@ -1102,8 +1103,9 @@ pub const MEMSET: u32 = 0x4000_0354;
 /// see the module doc's entry 9 below). That same script defines
 /// `memmove = 0x4000_035c`, `memcmp = 0x4000_0360`, `strcpy = 0x4000_0364`,
 /// `strncpy = 0x4000_0368`, `strcmp = 0x4000_036c`, `strncmp = 0x4000_0370`
-/// contiguously after it — none observed called in this task's boot-probe
-/// re-run, so none are stubbed (see the module doc's "What is NOT stubbed"
+/// contiguously after it — at this task's boot-probe re-run none were observed
+/// called; `strncmp`, `memmove`, `memcmp` and (Milestone 4) `strncpy`/`strcmp` have since
+/// become real stubs, and the rest are not stubbed (see the module doc's "What is NOT stubbed"
 /// section).
 pub const MEMCPY: u32 = 0x4000_0358;
 
@@ -1358,6 +1360,19 @@ pub const MEMCMP: u32 = 0x4000_0360;
 /// 0x40000370;`; trampoline to `0x40058fa6 <strncmp>`). Real HLE
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strncmp`]); module doc entry 17.
 pub const STRNCMP: u32 = 0x4000_0370;
+
+/// ROM libc `strncpy`'s fixed address (`esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`:
+/// `strncpy = 0x40000368;`, the variant this firmware links, same as
+/// [`MEMCPY`]). Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Strncpy`]):
+/// newlib `strncpy` semantics, entry 17. First called by `load_partitions()`
+/// right after the first `MD5Init` (about step 5.56M).
+pub const STRNCPY: u32 = 0x4000_0368;
+
+/// ROM libc `strcmp`'s fixed address (`esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`:
+/// `strcmp = 0x4000036c;`, right after [`STRNCPY`]). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strcmp`]), added in Milestone 4:
+/// first called from the partition-lookup code after `load_partitions()`.
+pub const STRCMP: u32 = 0x4000_036c;
 
 /// ROM libc `div`'s fixed address (`esp32c3.rom.libc.ld`: `div =
 /// 0x40000428;`; trampoline to `0x400319c6 <div>`). Real HLE
@@ -1922,6 +1937,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRLEN, RomStub::strlen("strlen")),
     (MEMCMP, RomStub::memcmp("memcmp")),
     (STRNCMP, RomStub::strncmp("strncmp")),
+    (STRNCPY, RomStub::strncpy("strncpy")),
+    (STRCMP, RomStub::strcmp("strcmp")),
     (MEMCHR, RomStub::memchr("memchr")),
     (MEMMOVE, RomStub::memmove("memmove")),
     (DIV, RomStub::div_t("div")),
@@ -2220,11 +2237,7 @@ mod tests {
         // esp32c3.rom.libc.ld / esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld.
         let table = esp32c3_rom_stubs();
         // Task D9 gave strlen/memcmp/strncmp real effects (checked below).
-        for addr in [
-            0x4000_0364u32, /* strcpy */
-            0x4000_0368,    /* strncpy */
-            0x4000_036c,    /* strcmp */
-        ] {
+        for addr in [0x4000_0364u32 /* strcpy */] {
             assert_eq!(
                 table.lookup(addr),
                 None,
@@ -2235,6 +2248,8 @@ mod tests {
             (STRLEN, RomStubEffect::Strlen),
             (MEMCMP, RomStubEffect::Memcmp),
             (STRNCMP, RomStubEffect::Strncmp),
+            (STRNCPY, RomStubEffect::Strncpy),
+            (STRCMP, RomStubEffect::Strcmp),
             (MEMCHR, RomStubEffect::Memchr),
             (MEMMOVE, RomStubEffect::Memmove),
         ] {
@@ -3284,6 +3299,95 @@ mod tests {
         bus.write8(a + 4, b'p');
         bus.write8(b + 4, b'q');
         assert_eq!(call(&mut cpu, &mut bus, 16), 0, "stops at NUL");
+    }
+
+    #[test]
+    fn strncpy_stub_copies_to_nul_pads_and_respects_n() {
+        let (src, dst) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(src, 32);
+        bus.add_scratch_ram(dst, 32);
+        for (i, x) in b"abc\0zzz".iter().enumerate() {
+            bus.write8(src + i as u32, *x);
+        }
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, n: u32| {
+            for i in 0..16 {
+                bus.write8(dst + i, 0x55);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, dst);
+            cpu.regs.write(REG_A1, src);
+            cpu.regs.write(REG_A2, n);
+            cpu.regs.pc = STRNCPY;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRNCPY));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            assert_eq!(cpu.regs.read(REG_A0), dst, "returns dst");
+            (0..8).map(|i| bus.read8(dst + i)).collect::<Vec<u8>>()
+        };
+        assert_eq!(
+            call(&mut cpu, &mut bus, 0),
+            [0x55; 8],
+            "n = 0 writes nothing"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, 2),
+            [b'a', b'b', 0x55, 0x55, 0x55, 0x55, 0x55, 0x55],
+            "n < strlen: no terminator"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, 3),
+            [b'a', b'b', b'c', 0x55, 0x55, 0x55, 0x55, 0x55],
+            "n == strlen: no terminator"
+        );
+        assert_eq!(
+            call(&mut cpu, &mut bus, 6),
+            [b'a', b'b', b'c', 0, 0, 0, 0x55, 0x55],
+            "NUL copied, then padded with NULs up to n only"
+        );
+    }
+
+    #[test]
+    fn strcmp_stub_returns_the_unsigned_byte_difference_at_first_mismatch_or_nul() {
+        let (a, b) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(a, 16);
+        bus.add_scratch_ram(b, 16);
+        let call = |cpu: &mut Cpu, bus: &mut FirmwareBus, x: &[u8], y: &[u8]| {
+            for (i, v) in x.iter().enumerate() {
+                bus.write8(a + i as u32, *v);
+            }
+            for (i, v) in y.iter().enumerate() {
+                bus.write8(b + i as u32, *v);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, a);
+            cpu.regs.write(REG_A1, b);
+            cpu.regs.pc = STRCMP;
+            let info = cpu.step(bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRCMP));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            cpu.regs.read(REG_A0) as i32
+        };
+        assert_eq!(call(&mut cpu, &mut bus, b"abc\0", b"abc\0"), 0, "equal");
+        assert_eq!(call(&mut cpu, &mut bus, b"abX\0", b"abY\0"), -1);
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"ab\0", b"abc\0"),
+            -0x63,
+            "shorter < longer"
+        );
+        assert_eq!(call(&mut cpu, &mut bus, b"abc\0", b"ab\0"), 0x63);
+        assert_eq!(
+            call(&mut cpu, &mut bus, b"\xff\0", b"\x01\0"),
+            0xfe,
+            "unsigned bytes"
+        );
     }
 
     #[test]

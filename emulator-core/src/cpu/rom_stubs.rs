@@ -58,7 +58,7 @@
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
-//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`,
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`DivT`, and the writing `Strncpy`,
 //!    and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
@@ -266,6 +266,20 @@ pub enum RomStubEffect {
     /// strings match), in `a0`. Mirrors the ROM's disassembly
     /// (`0x40058fa6`). `n` capped at [`MAX_STUB_MEMORY_BYTES`].
     Strncmp,
+    /// `char *strncpy(char *dst, const char *src, size_t n)`: newlib's
+    /// `strncpy` (`newlib/libc/string/strncpy.c`): copies bytes of `src = a1`
+    /// to `dst = a0` through the bus until a NUL has been copied or `n = a2`
+    /// bytes are written; if the NUL came before `n`, pads `dst` with NULs up
+    /// to `n`. Does not terminate when `n <= strlen(src)`. Returns `dst`
+    /// (already in `a0`). `n` capped at [`MAX_STUB_MEMORY_BYTES`]. Real: the
+    /// ROM entry is a `j` trampoline to newlib code, same as `strncmp`.
+    Strncpy,
+    /// `int strcmp(const char *s1, const char *s2)`: compares `s1 = a0` and
+    /// `s2 = a1` as `unsigned char` through the bus until they differ or both
+    /// hit NUL, returning `s1[i] - s2[i]` of the last pair examined in `a0`
+    /// (same convention as [`RomStubEffect::Strncmp`]). Scan capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller branches on the result.
+    Strcmp,
     /// `void *memchr(const void *s, int c, size_t n)`: scans `n = a2` bytes
     /// of `s = a0` through the bus for the byte `(unsigned char)c` (`c =
     /// a1`), returning in `a0` the address of the first match, or 0 (NULL)
@@ -1225,6 +1239,22 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strncmp,
+        }
+    }
+
+    /// A real high-level-emulated `strncpy` -- see [`RomStubEffect::Strncpy`].
+    pub const fn strncpy(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strncpy,
+        }
+    }
+
+    /// A real high-level-emulated `strcmp` -- see [`RomStubEffect::Strcmp`].
+    pub const fn strcmp(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strcmp,
         }
     }
 
