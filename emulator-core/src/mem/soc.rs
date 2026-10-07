@@ -400,16 +400,25 @@ mod tests {
         assert_eq!(MMU_DROM_END_ENTRY_ID, 127); // MMU_LL_END_DROM_ENTRY_ID
         assert_eq!(DBUS_CACHE_RANGE, 0x3c00_0000..0x3c80_0000); // SOC_DRAM0_CACHE_ADDRESS_LOW/HIGH
         assert_eq!(IBUS_CACHE_RANGE, 0x4200_0000..0x4280_0000); // SOC_IRAM0_CACHE_ADDRESS_LOW/HIGH
-        // One entry per 64 KiB page of either aperture.
+                                                                // One entry per 64 KiB page of either aperture.
         assert_eq!(
             (DBUS_CACHE_RANGE.end - DBUS_CACHE_RANGE.start) / MMU_PAGE_SIZE,
             MMU_ENTRY_NUM as u32
         );
         // The cache apertures sit inside the coarse XIP ranges.
-        assert!(DROM_RANGE.start <= DBUS_CACHE_RANGE.start && DBUS_CACHE_RANGE.end <= DROM_RANGE.end);
-        assert!(IROM_RANGE.start <= IBUS_CACHE_RANGE.start && IBUS_CACHE_RANGE.end <= IROM_RANGE.end);
+        assert!(
+            DROM_RANGE.start <= DBUS_CACHE_RANGE.start && DBUS_CACHE_RANGE.end <= DROM_RANGE.end
+        );
+        assert!(
+            IROM_RANGE.start <= IBUS_CACHE_RANGE.start && IBUS_CACHE_RANGE.end <= IROM_RANGE.end
+        );
         // The MMU block does not overlap any other modeled peripheral.
-        for r in [&SYSTEM_RANGE, &INTERRUPT_CORE0_RANGE, &GDMA_RANGE, &SPIMEM1_RANGE] {
+        for r in [
+            &SYSTEM_RANGE,
+            &INTERRUPT_CORE0_RANGE,
+            &GDMA_RANGE,
+            &SPIMEM1_RANGE,
+        ] {
             assert!(MMU_TABLE_RANGE.end <= r.start || r.end <= MMU_TABLE_RANGE.start);
         }
     }

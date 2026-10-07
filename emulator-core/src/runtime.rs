@@ -243,12 +243,14 @@ mod tests {
     /// entry instruction is an endless self-branch, so `run()` can be called
     /// without the CPU wandering anywhere. Mirrors
     /// `crate::boot`'s own test helper.
+    /// The segment sits at `0x4200_0020` because its data is at file offset 32:
+    /// the MMU seeding needs flash offset and vaddr to agree mod 64 KiB.
     fn synthetic_image() -> Vec<u8> {
         let mut buf = vec![0u8; 24];
         buf[0] = 0xE9;
         buf[1] = 1; // one segment
-        buf[4..8].copy_from_slice(&0x4200_0000u32.to_le_bytes());
-        buf.extend_from_slice(&0x4200_0000u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x4200_0020u32.to_le_bytes());
+        buf.extend_from_slice(&0x4200_0020u32.to_le_bytes());
         // `c.j 0` (0xa001) twice: a 2-byte self-loop, padded to 4 bytes so the
         // segment covers both halfwords the fetcher may look at.
         let code: [u8; 4] = [0x01, 0xa0, 0x01, 0xa0];
@@ -264,8 +266,8 @@ mod tests {
         let mut buf = vec![0u8; 24];
         buf[0] = 0xE9;
         buf[1] = 1;
-        buf[4..8].copy_from_slice(&0x4200_0000u32.to_le_bytes());
-        buf.extend_from_slice(&0x4200_0000u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x4200_0020u32.to_le_bytes());
+        buf.extend_from_slice(&0x4200_0020u32.to_le_bytes());
         let mut code = Vec::new();
         code.extend_from_slice(&0x1050_0073u32.to_le_bytes()); // wfi
         code.extend_from_slice(&0x0000_006fu32.to_le_bytes()); // j .
@@ -283,7 +285,7 @@ mod tests {
         assert_eq!(s.steps, 1000);
         assert_eq!(s.traps, 0);
         assert!(rt.cpu().is_waiting());
-        assert_eq!(rt.pc(), 0x4200_0004, "parked after the wfi");
+        assert_eq!(rt.pc(), 0x4200_0024, "parked after the wfi");
         assert_eq!(rt.total_steps(), 1000);
         // Nothing armed: time still passes at the ordinary one-step rate.
         assert_eq!(
@@ -305,12 +307,12 @@ mod tests {
     #[test]
     fn runtime_boots_a_synthetic_image_and_runs_a_budget() {
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
-        assert_eq!(rt.pc(), 0x4200_0000);
+        assert_eq!(rt.pc(), 0x4200_0020);
         let summary = rt.run(100);
         assert_eq!(summary.steps, 100);
         assert_eq!(summary.traps, 0, "a self-branch must not trap");
         assert_eq!(summary.last_instruction_fault, None);
-        assert_eq!(summary.pc, 0x4200_0000, "still spinning on itself");
+        assert_eq!(summary.pc, 0x4200_0020, "still spinning on itself");
         assert_eq!(rt.total_steps(), 100);
     }
 
@@ -407,7 +409,7 @@ mod tests {
         rt.reset()
             .expect("reset should re-parse the retained image");
         assert_eq!(rt.total_steps(), 0);
-        assert_eq!(rt.pc(), 0x4200_0000);
+        assert_eq!(rt.pc(), 0x4200_0020);
         assert!(rt.raw_button(0), "held buttons survive a reset");
         assert!(
             !rt.bus().gpio.pin_level(crate::peripherals::gpio::PIN_START),
@@ -421,7 +423,7 @@ mod tests {
         let mut hist = HashMap::new();
         let summary = rt.run_traced(50, &mut hist);
         assert_eq!(summary.steps, 50);
-        assert_eq!(hist.get(&0x4200_0000), Some(&50));
+        assert_eq!(hist.get(&0x4200_0020), Some(&50));
         assert_eq!(hist.len(), 1, "self-branch never leaves this one pc");
     }
 

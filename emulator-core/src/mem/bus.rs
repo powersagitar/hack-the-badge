@@ -3,17 +3,26 @@
 //!
 //! An ordered sequence of named address ranges, checked in this order on
 //! every access:
-//! 1. **XIP** (flash-mapped, [`crate::mem::soc::is_xip_addr`]): read directly
-//!    out of the original flash image bytes at `file_offset + (addr -
-//!    load_addr)`. Writes are silently dropped (real hardware: read-only
-//!    flash cache). Each XIP segment's *mapped window* is wider than its
-//!    own `[load_addr, load_addr + len)` -- see
-//!    [`FirmwareBus::from_segments`]'s doc for why (page-granular flash-
-//!    cache MMU mapping, matching what the real 2nd-stage bootloader's
-//!    `set_cache_and_start_app()` programs; Task D5). A byte inside that
-//!    mapped window but past the actual `flash` buffer's own length reads
-//!    `0xFF` (Task D5 fix round 1, M2) -- real NOR flash's erased state,
-//!    not the catch-all tier's `0`.
+//! 1. **XIP** (the flash-cache apertures, [`crate::mem::soc::DBUS_CACHE_RANGE`]
+//!    and [`crate::mem::soc::IBUS_CACHE_RANGE`], 8 MiB each): every access
+//!    translates through the flash MMU ([`FirmwareBus::mmu`]) to a physical
+//!    flash page and reads [`FirmwareBus::flash_chip`] there (the physical
+//!    page wraps modulo the 4 MiB chip). An access through an *invalid*
+//!    entry reads `0` and is logged into [`FirmwareBus::unmapped_log`] (no
+//!    cache-error interrupt is modeled); an instruction fetch there traps.
+//!    Writes are silently dropped (real hardware: read-only flash cache).
+//!    The DBUS aperture is readable but **never fetchable**; only IBUS
+//!    through a valid entry is. `DROM_RANGE`/`IROM_RANGE` are wider than the
+//!    apertures: addresses in them but outside both apertures are not XIP at
+//!    all and fall through to the catch-all. The table is seeded at
+//!    construction by replaying the 2nd-stage bootloader's mapping of the
+//!    app image ([`FirmwareBus::from_segments`]); after that only the
+//!    firmware's own writes to the table change it.
+//! 1b. **Flash MMU table** ([`crate::mem::soc::MMU_TABLE_RANGE`]): routed to
+//!    [`FirmwareBus::mmu`], same concrete-field ruling -- see
+//!    `crate::peripherals::mmu`. Offsets `FlashMmu::handles` rejects are
+//!    logged as unmapped. Checked after the RAM/ROM tiers like the other
+//!    peripherals; XIP itself is checked first.
 //! 2. **RAM-copied**: a real, mutable, per-segment `Vec<u8>` that the
 //!    segment's bytes were copied into at boot. Reads/writes go straight to
 //!    it.
@@ -108,11 +117,8 @@
 //!    [`FirmwareBus::flash_chip`] (the emulated 4 MiB chip), another direct
 //!    cross-field access. Offsets `Spimem1::handles` does not name are
 //!    still logged into [`FirmwareBus::unmapped_log`], like RTC_CNTL's.
-//!    `flash_chip` and the XIP tier's `flash` buffer are separate for now:
-//!    XIP still reads the app image through Task D5's page-granular
-//!    mapping, so a flash write through SPIMEM1 is not visible through XIP
-//!    (no observed code path needs that yet; the flash MMU sub-unit would
-//!    unify them).
+//!    `flash_chip` is the only flash store: XIP reads it through the MMU, so
+//!    a flash program through SPIMEM1 is visible through XIP.
 //! 13. **GDMA** ([`crate::mem::soc::GDMA_RANGE`]): routed to
 //!    [`FirmwareBus::gdma`], same ruling — see `crate::peripherals::gdma`.
 //!    Register offsets [`crate::peripherals::gdma::Gdma::handles`] does not
@@ -144,10 +150,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::peripherals::console::Console;
-use crate::peripherals::flash::{EmulatedFlash, Spimem1};
+use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
 use crate::peripherals::gdma::{self, Gdma};
 use crate::peripherals::gpio::Gpio;
 use crate::peripherals::intc::{self, InterruptController};
+use crate::peripherals::mmu::FlashMmu;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::system::System;
@@ -157,9 +164,10 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, INTERRUPT_CORE0_RANGE, MMU_PAGE_SIZE,
-    RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_RANGE,
-    TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    is_xip_addr, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, IBUS_CACHE_RANGE,
+    INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
+    MMU_VALID_VAL_MASK, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
+    SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -173,22 +181,6 @@ pub const UNMAPPED_LOG_CAPACITY: usize = 256;
 pub struct UnmappedAccess {
     pub addr: u32,
     pub is_write: bool,
-}
-
-/// A flash-mapped (XIP) window: `[load_addr, load_addr + len)` reads
-/// straight out of `flash[file_offset + (addr - load_addr)]`.
-struct XipRegion {
-    load_addr: u32,
-    len: u32,
-    file_offset: usize,
-}
-
-impl XipRegion {
-    fn contains(&self, addr: u32) -> bool {
-        let start = self.load_addr as u64;
-        let end = start + self.len as u64;
-        (addr as u64) >= start && (addr as u64) < end
-    }
 }
 
 /// A RAM-copied window: `[load_addr, load_addr + data.len())` is backed by a
@@ -285,10 +277,9 @@ impl RomDataBlob {
 /// regions read/write dispatch (XIP, RAM, ROM code, then one concrete field
 /// per peripheral, then a never-panic catch-all).
 pub struct FirmwareBus {
-    /// The original flash image bytes, kept once and shared (never copied)
-    /// — XIP regions index directly into this.
-    flash: Arc<[u8]>,
-    xip_regions: Vec<XipRegion>,
+    /// The flash MMU table (`crate::peripherals::mmu`): every DBUS/IBUS
+    /// access translates through it to [`FirmwareBus::flash_chip`].
+    pub mmu: FlashMmu,
     ram_regions: Vec<RamRegion>,
     /// Read-only executable ROM code blobs ([`RomCodeBlob`]), installed by
     /// [`FirmwareBus::map_rom_code`]. Empty unless a caller installs some
@@ -337,11 +328,10 @@ pub struct FirmwareBus {
     /// The SPI1 flash controller (`crate::peripherals::flash::Spimem1`),
     /// same ruling — runs flash commands against [`FirmwareBus::flash_chip`].
     pub spimem1: Spimem1,
-    /// The emulated 4 MiB flash chip behind SPIMEM1
-    /// (`crate::peripherals::flash::EmulatedFlash`): blank except a
-    /// synthesized partition table and the app image at `0x10000`. Distinct
-    /// from `flash` above, which only backs XIP reads (see the module doc's
-    /// SPIMEM1 tier for why the two are not unified yet).
+    /// The emulated 4 MiB flash chip (`crate::peripherals::flash::EmulatedFlash`):
+    /// blank except a synthesized partition table and the app image at
+    /// `0x10000`. The only flash store; XIP reads it through `mmu`, and
+    /// SPIMEM1 commands run against it.
     pub flash_chip: EmulatedFlash,
     /// Capped sink for everything the firmware prints
     /// (`crate::peripherals::console`), fed by
@@ -352,164 +342,54 @@ pub struct FirmwareBus {
     unmapped_log: VecDeque<UnmappedAccess>,
 }
 
-/// Computes the page-aligned XIP mapping window a real ESP32-C3 2nd-stage
-/// bootloader's flash-cache MMU setup would expose for one segment --
-/// see [`FirmwareBus::from_segments`]'s doc comment for the citation chain
-/// (`bootloader_support/src/bootloader_utility.c`'s
-/// `set_cache_and_start_app()` composed with `hal/mmu_hal.c`'s
-/// `mmu_hal_map_region()`). Returns `(aligned_load_addr,
-/// aligned_file_offset, aligned_len)`: the same segment, widened to the
-/// full 64 KiB page(s) it lives in, both before `load_addr` (where
-/// `cpu_start`'s header check actually reads from -- Task D5) and after
-/// `load_addr + len` (real hardware's MMU maps whole pages, not partial
-/// ones).
-///
-/// The leading extension is clamped to the bytes actually available before
-/// `file_offset` in the source buffer: real hardware's physical flash chip
-/// always has *some* bytes there (it's one contiguous chip), but a
-/// synthetic or browser-supplied partial image sometimes won't.
-///
-/// ## The window's end is computed from the true page grid, not from the
-/// ## (possibly clamped) leading extension
-///
-/// **Fix round 1, Important finding**: an earlier version computed the end
-/// as `aligned_load_addr + round_up(back_extend + len, page_size)`. That is
-/// only correct when the leading extension reached the full `gap` (i.e.
-/// `aligned_load_addr` really is page-aligned). When it was clamped short
-/// (no earlier bytes available -- see above), `aligned_load_addr` is
-/// *not* page-aligned, so rounding up from it lands on the wrong grid and
-/// overshoots into the *next* page by up to `gap - back_extend` bytes --
-/// concretely, `load_addr=0x4200_0020, file_offset=0, len=2` used to
-/// produce `[0x4200_0020, 0x4201_0020)`, 0x20 bytes into the next page,
-/// silently mapping address space that must stay a genuine catch-all miss.
-/// Fixed by computing the end independently, directly from the *true*
-/// (unclamped) page grid -- `round_up(load_addr + len, page_size)` -- which
-/// is always 0-grid-aligned regardless of where the clamped start landed,
-/// then subtracting `aligned_load_addr` to get the length. See
-/// `xip_page_window_clamps_gracefully_when_no_earlier_flash_bytes_exist`'s
-/// assertion that the next page is still a catch-all miss.
-///
-/// ## `aligned_file_offset`'s assumption
-///
-/// `aligned_file_offset = file_offset - back_extend` implicitly assumes the
-/// segment's flash *file offset* and its *virtual load address* have the
-/// same low bits mod `page_size` -- i.e. that subtracting the vaddr gap from
-/// `file_offset` lands on that same offset's own page-aligned start. Real
-/// hardware doesn't need this (`set_cache_and_start_app` page-aligns the
-/// physical flash paddr *independently* of the vaddr,
-/// `bootloader_utility.c:1068`ish: `drom_addr_aligned = drom_addr &
-/// MMU_FLASH_MASK_FROM_VAL(mmu_page_size)`), but this emulator's `flash`
-/// buffer is indexed by a single flat `file_offset`, not by a separate
-/// paddr, so the two must coincide for this subtraction to land on the
-/// right byte. This holds for every segment `esptool`-produced app images
-/// (and specifically `factory.bin`) actually contain: an app image's
-/// segments are written contiguously into the flash partition in link
-/// order with no gaps, so each segment's flash offset within the partition
-/// equals `load_addr`'s own low bits by construction (confirmed directly:
-/// segment 0's `load_addr=0x3c13_0020` and `file_offset=0x20` already agree
-/// mod 64 KiB). Not re-derived from first principles here -- flagged as an
-/// assumption specific to esptool-style images, not a general property.
-///
-/// All arithmetic here is checked -- this must never panic on adversarial
-/// input. `FirmwareEmulator::new` (`emulator-wasm`) reaches
-/// [`FirmwareBus::from_segments`] directly with a browser-supplied image,
-/// and `usize` is 32 bits on that target, so a malformed `len`/
-/// `file_offset` must not be able to overflow this arithmetic and panic
-/// (the same contract `from_segments`'s existing RAM-region path already
-/// holds, see its comment). Any overflow here simply falls back to the
-/// segment's own unwidened window -- degrading gracefully, same as the
-/// bus's never-panic catch-all tier, rather than fabricating an unsound
-/// mapping.
-fn xip_page_window(
-    load_addr: u32,
-    file_offset: usize,
-    len: usize,
-    page_size: u32,
-) -> (u32, usize, u32) {
-    // `len as u32` truncates if `len` doesn't fit -- same as this
-    // function's caller did unconditionally before Task D5 (`seg.len as
-    // u32`), so the fallback preserves pre-existing behavior exactly rather
-    // than introducing a new truncation risk.
-    let fallback = (load_addr, file_offset, len as u32);
-    let Ok(len_u32) = u32::try_from(len) else {
-        return fallback;
-    };
-
-    let gap = load_addr % page_size;
-    let back_extend = (gap as usize).min(file_offset);
-    let Ok(back_extend_u32) = u32::try_from(back_extend) else {
-        return fallback;
-    };
-    let aligned_load_addr = load_addr - back_extend_u32;
-    let aligned_file_offset = file_offset - back_extend;
-
-    // The end must come from the TRUE (unclamped) page grid -- see this
-    // function's doc comment's "Fix round 1" note -- not from rounding up
-    // `back_extend + len` starting at `aligned_load_addr`, which is only
-    // grid-aligned when `back_extend == gap`.
-    let Some(true_end) = load_addr.checked_add(len_u32) else {
-        return fallback;
-    };
-    let page_count_end = true_end.div_ceil(page_size);
-    let Some(page_end) = page_count_end.checked_mul(page_size) else {
-        return fallback;
-    };
-    let Some(aligned_len) = page_end.checked_sub(aligned_load_addr) else {
-        return fallback;
-    };
-
-    (aligned_load_addr, aligned_file_offset, aligned_len)
-}
-
 impl FirmwareBus {
     /// Builds a `FirmwareBus` from a flash image and its already-parsed
     /// segment table (see `crate::mem::image::parse_image`). Categorizes
     /// each segment as XIP or RAM-copied purely by `load_addr`
-    /// ([`is_xip_addr`]) — XIP segments keep referencing `flash` in place;
-    /// RAM segments get their bytes copied into a fresh owned buffer here.
+    /// ([`is_xip_addr`]): RAM segments get their bytes copied into a fresh
+    /// owned buffer here; XIP segments are not copied at all -- the image
+    /// goes into [`FirmwareBus::flash_chip`] at [`APP_OFFSET`], and the XIP
+    /// segments are made visible by seeding the flash MMU the way the real
+    /// 2nd-stage bootloader does.
     ///
-    /// ## XIP segments are widened to their containing MMU page(s)
+    /// ## MMU seeding
     ///
-    /// Real hardware's flash cache is paged (`crate::mem::soc::MMU_PAGE_SIZE`,
-    /// 64 KiB on ESP32-C3): the 2nd-stage bootloader's
-    /// `set_cache_and_start_app()` page-aligns each XIP segment's `load_addr`
-    /// *down* and its mapped byte count *up* to whole pages
-    /// (`bootloader_support/src/bootloader_utility.c`, composed with
-    /// `hal/mmu_hal.c`'s `mmu_hal_map_region()` -- see
-    /// [`xip_page_window`]'s doc for the full citation), so whatever else
-    /// happens to sit in the same physical flash page as a segment --
-    /// before its `load_addr` or after `load_addr + len` -- becomes
-    /// readable at the matching virtual address too, not just the
-    /// segment's own declared bytes.
+    /// ESP-IDF v5.5.3's `set_cache_and_start_app()`
+    /// (`bootloader_support/src/bootloader_utility.c`) maps each XIP segment
+    /// with `hal/mmu_hal.c`'s `mmu_hal_map_region()`: the vaddr and flash
+    /// paddr are both rounded *down* to a 64 KiB page, the length is
+    /// extended by the vaddr's page offset and rounded *up* to whole pages
+    /// (`page_num = (len + page_size - 1) / page_size`), and one MMU entry
+    /// per page is written, to consecutive physical pages. It also maps the
+    /// DROM's first physical page at `MMU_DROM_END_ENTRY_ID` (entry 127) so
+    /// the app can find its own image.
+    /// [`FirmwareBus::seed_mmu_like_bootloader`] replays exactly that for
+    /// each XIP segment, with `paddr = APP_OFFSET + file_offset`, written
+    /// through the bus's own MMU-table write path.
     ///
-    /// This matters concretely: ESP-IDF v5.5.3's `cpu_start`
-    /// (`components/esp_system/port/cpu_start.c`) reads the running app's
-    /// own `esp_image_header_t` from `&_rodata_reserved_start -
-    /// sizeof(esp_image_header_t) - sizeof(esp_image_segment_header_t)` --
-    /// a linker symbol that resolves to the DROM segment's own `load_addr`,
-    /// so this read lands 32 bytes *before* `load_addr`, in this leading
-    /// page gap. Confirmed against `factory.bin`'s real segment table (Task
-    /// D5's report): DROM segment 0's `load_addr` is `0x3c13_0020` (32
-    /// bytes into its containing page, `0x3c13_0000`), and a real boot
-    /// trace shows `cpu_start` reading exactly 24 consecutive bytes
-    /// (`sizeof(esp_image_header_t)`) starting at `0x3c13_0000` -- which,
-    /// pre-fix, fell through to the bus's never-panic catch-all (reads 0)
-    /// since `[0x3c13_0000, 0x3c13_0020)` sat outside the segment's own
-    /// `[load_addr, load_addr+len)`, making the magic-byte check
-    /// (`fhdr.magic != ESP_IMAGE_HEADER_MAGIC`) fail and call `abort()`.
+    /// The bootloader's paddr is independent of the vaddr; this emulator
+    /// derives it from `file_offset`, so a segment whose flash offset and
+    /// `load_addr` disagree modulo 64 KiB cannot be mapped faithfully and is
+    /// left unmapped (its fetches trap). Esptool-built images -- including
+    /// `factory.bin` -- always agree.
+    ///
+    /// Mapping whole pages matters concretely: ESP-IDF's `cpu_start`
+    /// (`components/esp_system/port/cpu_start.c`) reads the running app's own
+    /// `esp_image_header_t` from `&_rodata_reserved_start -
+    /// sizeof(esp_image_header_t) - sizeof(esp_image_segment_header_t)`, i.e.
+    /// 32 bytes *before* the DROM segment's `load_addr` (`0x3c13_0020` in
+    /// `factory.bin`), in the same page. Those bytes are simply the chip's
+    /// bytes at `APP_OFFSET`, visible because the whole page is mapped.
+    ///
+    /// All arithmetic on segment-derived values is checked: a browser-supplied
+    /// image must never be able to panic this constructor.
     pub fn from_segments(flash: Arc<[u8]>, segments: &[SegmentDescriptor]) -> Self {
-        let mut xip_regions = Vec::new();
         let mut ram_regions = Vec::new();
 
         for seg in segments {
             if is_xip_addr(seg.load_addr) {
-                let (load_addr, file_offset, len) =
-                    xip_page_window(seg.load_addr, seg.file_offset, seg.len, MMU_PAGE_SIZE);
-                xip_regions.push(XipRegion {
-                    load_addr,
-                    len,
-                    file_offset,
-                });
+                // Mapped by `seed_mmu_like_bootloader` below.
+                continue;
             } else {
                 // `seg.file_offset + seg.len` used to be unchecked here. It
                 // was safe when this function's only caller was
@@ -539,9 +419,8 @@ impl FirmwareBus {
         }
 
         let flash_chip = EmulatedFlash::from_app_image(&flash);
-        Self {
-            flash,
-            xip_regions,
+        let mut bus = Self {
+            mmu: FlashMmu::new(),
             ram_regions,
             rom_code: Vec::new(),
             rom_data: Vec::new(),
@@ -559,7 +438,61 @@ impl FirmwareBus {
             flash_chip,
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
+        };
+        bus.seed_mmu_like_bootloader(segments);
+        bus
+    }
+
+    /// Replays the 2nd-stage bootloader's `set_cache_and_start_app()` MMU
+    /// programming (ESP-IDF v5.5.3 `bootloader_support/src/bootloader_utility.c`;
+    /// page rounding from `hal/mmu_hal.c`'s `mmu_hal_map_region`) for the
+    /// app at [`APP_OFFSET`]. See [`FirmwareBus::from_segments`].
+    fn seed_mmu_like_bootloader(&mut self, segments: &[SegmentDescriptor]) {
+        let mut drom_end_mapped = false;
+        for seg in segments.iter().filter(|s| is_xip_addr(s.load_addr)) {
+            let Some(first_phys) = self.map_xip_segment(seg) else {
+                continue;
+            };
+            if DBUS_CACHE_RANGE.contains(&seg.load_addr) && !drom_end_mapped {
+                self.write_mmu_entry(MMU_DROM_END_ENTRY_ID, first_phys);
+                drom_end_mapped = true;
+            }
         }
+    }
+
+    /// Maps one XIP segment's pages; returns its first physical page, or
+    /// `None` (nothing written) if the segment cannot be mapped faithfully.
+    fn map_xip_segment(&mut self, seg: &SegmentDescriptor) -> Option<u32> {
+        let aperture = [&DBUS_CACHE_RANGE, &IBUS_CACHE_RANGE]
+            .into_iter()
+            .find(|r| r.contains(&seg.load_addr))?;
+        let paddr = APP_OFFSET.checked_add(u32::try_from(seg.file_offset).ok()?)?;
+        if paddr % MMU_PAGE_SIZE != seg.load_addr % MMU_PAGE_SIZE {
+            return None;
+        }
+        let end = seg.load_addr.checked_add(u32::try_from(seg.len).ok()?)?;
+        if end > aperture.end {
+            return None;
+        }
+        let first_page = seg.load_addr / MMU_PAGE_SIZE;
+        let page_count = end.div_ceil(MMU_PAGE_SIZE) - first_page;
+        let first_phys = paddr / MMU_PAGE_SIZE;
+        let first_id = FlashMmu::entry_id(seg.load_addr);
+        for i in 0..page_count {
+            self.write_mmu_entry(first_id + i as usize, first_phys + i);
+        }
+        Some(first_phys)
+    }
+
+    /// `mmu_ll_write_entry`: `phys_page | ACCESS_FLASH (0) | VALID (0)`,
+    /// written through the bus like the bootloader's store.
+    fn write_mmu_entry(&mut self, id: usize, phys_page: u32) {
+        let addr = MMU_TABLE_RANGE.start + 4 * id as u32;
+        Bus::write32(self, addr, phys_page & MMU_VALID_VAL_MASK);
+    }
+
+    fn in_cache_aperture(addr: u32) -> bool {
+        DBUS_CACHE_RANGE.contains(&addr) || IBUS_CACHE_RANGE.contains(&addr)
     }
 
     /// The OR of every peripheral's currently-asserted interrupt *source*
@@ -679,21 +612,13 @@ impl FirmwareBus {
         self.unmapped_log
             .push_back(UnmappedAccess { addr, is_write });
     }
-
     fn read_byte(&mut self, addr: u32) -> u8 {
-        if let Some(region) = self.xip_regions.iter().find(|r| r.contains(addr)) {
-            let offset = region.file_offset + (addr - region.load_addr) as usize;
-            // Fix round 1, M2: a byte inside a *mapped* XIP window but past
-            // the end of the actual `flash` buffer (e.g. the trailing part
-            // of a page-widened region this emulator's reconstructed image
-            // doesn't carry real bytes for -- see
-            // `xip_page_window`'s doc) reads as `0xFF`, not `0`: real NOR
-            // flash's erased/blank state is all-ones, not all-zeros. This
-            // is distinct from the bus's never-panic *catch-all* tier below
-            // (genuinely unmapped address space), which still reads `0` --
-            // that's a different, deliberate convention (see the module
-            // doc), not flash-specific.
-            return self.flash.get(offset).copied().unwrap_or(0xFF);
+        if Self::in_cache_aperture(addr) {
+            if let Some(paddr) = self.mmu.translate(addr) {
+                return self.flash_chip.read(paddr % FLASH_SIZE as u32);
+            }
+            self.record_unmapped(addr, false);
+            return 0;
         }
         if let Some(region) = self.ram_regions.iter().find(|r| r.contains(addr)) {
             let offset = (addr - region.load_addr) as usize;
@@ -704,6 +629,13 @@ impl FirmwareBus {
         }
         if let Some(blob) = self.rom_data.iter().find(|b| b.contains(addr)) {
             return blob.byte_at(addr);
+        }
+        if MMU_TABLE_RANGE.contains(&addr) {
+            let offset = addr - MMU_TABLE_RANGE.start;
+            if !FlashMmu::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.mmu.read_byte(offset);
         }
         if SYSTIMER_RANGE.contains(&addr) {
             let offset = addr - SYSTIMER_RANGE.start;
@@ -773,7 +705,7 @@ impl FirmwareBus {
     }
 
     fn write_byte(&mut self, addr: u32, val: u8) {
-        if self.xip_regions.iter().any(|r| r.contains(addr)) {
+        if Self::in_cache_aperture(addr) {
             // Flash is read-only at runtime on real hardware; drop silently.
             return;
         }
@@ -787,6 +719,14 @@ impl FirmwareBus {
         {
             // Mask ROM is read-only on real hardware; drop silently, same as
             // the XIP tier above.
+            return;
+        }
+        if MMU_TABLE_RANGE.contains(&addr) {
+            let offset = addr - MMU_TABLE_RANGE.start;
+            if !FlashMmu::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.mmu.write_byte(offset, val);
             return;
         }
         if SYSTIMER_RANGE.contains(&addr) {
@@ -1059,7 +999,7 @@ impl FirmwareBus {
     /// same region-membership checks [`FirmwareBus::read_byte`]/
     /// [`FirmwareBus::write_byte`] use, rather than duplicating them.
     fn is_mapped(&self, addr: u32) -> bool {
-        self.xip_regions.iter().any(|r| r.contains(addr))
+        (IBUS_CACHE_RANGE.contains(&addr) && self.mmu.translate(addr).is_some())
             || self.ram_regions.iter().any(|r| r.contains(addr))
             || self.rom_code.iter().any(|b| b.contains(addr))
     }
@@ -1113,14 +1053,23 @@ impl Bus for FirmwareBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::soc::{MMU_DROM_END_ENTRY_ID, MMU_ENTRY_NUM, MMU_INVALID};
 
+    /// Builds a bus from `(load_addr, bytes)` segments laid out the way an
+    /// esptool image is: each XIP segment's bytes start at a file offset
+    /// with the same low 16 bits as its `load_addr` (padding with `0xFF`),
+    /// so `APP_OFFSET + file_offset` and `load_addr` agree mod 64 KiB and
+    /// the bootloader-style MMU seeding maps it.
     fn bus_with(segments: Vec<(u32, Vec<u8>)>) -> FirmwareBus {
-        // Build a fake "flash image": concatenate each segment's bytes back
-        // to back, tracking file offsets, so FirmwareBus's XIP path has real
-        // bytes to index into.
         let mut flash = Vec::new();
         let mut descriptors = Vec::new();
         for (load_addr, data) in &segments {
+            if is_xip_addr(*load_addr) {
+                let want = (*load_addr % MMU_PAGE_SIZE) as usize;
+                while flash.len() % MMU_PAGE_SIZE as usize != want {
+                    flash.push(0xFF);
+                }
+            }
             let file_offset = flash.len();
             flash.extend_from_slice(data);
             descriptors.push(SegmentDescriptor {
@@ -1154,138 +1103,175 @@ mod tests {
         assert_eq!(bus.read8(0x42000020), 0x01, "IROM write must be dropped");
     }
 
-    // Task D5: `cpu_start`'s app-image-header check reads the image header
-    // via a linker symbol (`_rodata_reserved_start`, ESP-IDF v5.5.3's
-    // `components/esp_system/port/cpu_start.c`) that resolves to the DROM
-    // segment's own `load_addr` -- i.e. bytes *before* `load_addr`, in the
-    // same 64 KiB flash-cache MMU page, per `bootloader_support/src/
-    // bootloader_utility.c`'s `set_cache_and_start_app()` (page-align
-    // `load_addr`/flash paddr down, extend size by the leading gap) and
-    // `hal/mmu_hal.c`'s `mmu_hal_map_region()` (round the total mapped
-    // length up to a whole number of pages). A segment whose `load_addr`
-    // isn't itself page-aligned must therefore expose the *whole*
-    // containing page -- both the leading gap before `load_addr` and any
-    // trailing gap after `load_addr + len` -- not just the segment's own
-    // declared bytes.
     #[test]
-    fn xip_regions_expose_the_full_containing_64kib_page_not_just_the_declared_segment() {
-        // A segment 0x20 bytes into its containing 64 KiB page, with real
-        // flash bytes present both before (the "header") and only up to its
-        // own declared end (nothing stored past it, mirroring a real image
-        // file that simply ends there).
-        let load_addr = 0x3c13_0020u32;
-        let file_offset = 0x20usize;
-        let seg_data = [0xCCu8, 0xDD, 0xEE, 0xFF];
-        let mut flash = vec![0u8; file_offset + seg_data.len()];
-        for (i, b) in flash.iter_mut().enumerate().take(file_offset) {
-            *b = 0xA0 + i as u8;
-        }
-        flash[file_offset..file_offset + seg_data.len()].copy_from_slice(&seg_data);
+    fn seeding_maps_each_xip_segment_like_the_bootloader() {
+        // factory.bin's shape: DROM at 0x3c13_0020, IROM at 0x4200_0020.
+        let drom = vec![0xA1; 0x30];
+        let irom = vec![0xB2; 0x30];
+        let bus = bus_with(vec![(0x3c13_0020, drom), (0x4200_0020, irom)]);
+        // DROM: file offset 0x20 -> paddr 0x10020 -> page 1 at entry 19.
+        assert_eq!(bus.mmu.entry(19), 1);
+        // IROM: padded to file offset 0x10020 -> paddr 0x20020 -> page 2 at entry 0.
+        assert_eq!(bus.mmu.entry(0), 2);
+        // Entry 127 -> the DROM's first physical page.
+        assert_eq!(bus.mmu.entry(MMU_DROM_END_ENTRY_ID), 1);
+        // Everything else stays invalid.
+        assert_eq!(bus.mmu.entry(1), MMU_INVALID);
+        assert_eq!(bus.mmu.entry(20), MMU_INVALID);
+    }
 
-        let descriptors = [SegmentDescriptor {
-            load_addr,
-            file_offset,
-            len: seg_data.len(),
-        }];
-        let mut bus =
-            FirmwareBus::from_segments(Arc::from(flash.clone().into_boxed_slice()), &descriptors);
+    #[test]
+    fn leading_page_bytes_before_load_addr_read_from_the_chip() {
+        // Task D5's cpu_start case: the image header sits 0x20 bytes before
+        // the DROM load_addr, in the same page. Through the MMU those bytes
+        // are simply the chip's bytes at APP_OFFSET.
+        let mut bus = bus_with(vec![(0x3c13_0020, vec![0x5A; 4])]);
+        // bus_with pads the first 0x20 bytes of the image with 0xFF.
+        assert_eq!(bus.read8(0x3c13_0000), 0xFF);
+        assert_eq!(bus.read8(0x3c13_0020), 0x5A);
+        // Past the image: blank flash, not catch-all 0.
+        assert_eq!(bus.read8(0x3c13_ff00), 0xFF);
+        // The entry-127 alias reads the same page.
+        assert_eq!(bus.read8(0x3c7f_0020), 0x5A);
+    }
 
-        let page_start = load_addr & !0xFFFF;
-        assert_eq!(page_start, 0x3c13_0000);
+    #[test]
+    fn invalid_entry_reads_zero_logged_and_fetch_traps() {
+        let mut bus = bus_with(vec![(0x4200_0000, vec![0x13, 0x00, 0x00, 0x00])]);
+        assert_eq!(bus.read32(0x4210_0000), 0, "entry 16 is invalid");
+        assert!(bus
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == 0x4210_0000 && !a.is_write));
+        assert_eq!(bus.fetch16(0x4210_0000), None);
+        assert_eq!(bus.fetch16(0x4200_0000), Some(0x0013));
+    }
 
-        // The leading gap (the page's first 0x20 bytes, including where
-        // cpu_start's header copy actually reads from) is now real, mapped
-        // flash data -- not the never-panic catch-all.
-        assert!(bus.unmapped_log().is_empty());
-        for i in 0u32..file_offset as u32 {
-            assert_eq!(
-                bus.read8(page_start + i),
-                flash[i as usize],
-                "byte at page offset 0x{i:x} (before load_addr) should come from the flash page"
-            );
-        }
-        assert!(
-            bus.unmapped_log().is_empty(),
-            "page-prefix bytes must be mapped, not fall through to the catch-all"
-        );
+    #[test]
+    fn dbus_is_readable_but_never_fetchable() {
+        let mut bus = bus_with(vec![(0x3c00_0000, vec![0x13, 0x00, 0x00, 0x00])]);
+        assert_eq!(bus.read16(0x3c00_0000), 0x0013);
+        assert_eq!(bus.fetch16(0x3c00_0000), None);
+    }
 
-        // The segment's own declared bytes are unchanged.
-        for (i, b) in seg_data.iter().enumerate() {
-            assert_eq!(bus.read8(load_addr + i as u32), *b);
-        }
-
-        // A trailing same-page address past the segment's own declared end
-        // must also be mapped now (real hardware's MMU maps the whole
-        // page): this synthetic flash buffer has no real bytes there, so it
-        // reads 0xFF (Task D5 fix round 1, M2 -- real NOR flash's erased
-        // state), via the mapped region's own out-of-bounds fallback, not
-        // the catch-all (which would read 0 instead -- a different,
-        // deliberate convention for genuinely unmapped space).
-        let just_past_segment = load_addr + seg_data.len() as u32;
-        assert_eq!(bus.read8(just_past_segment), 0xFF);
-        assert!(
-            bus.unmapped_log().is_empty(),
-            "trailing same-page bytes must be mapped too, not fall through to the catch-all"
-        );
-
-        // Writes anywhere in the widened window are still dropped (still
-        // XIP/read-only), same as the pre-existing segment bytes.
-        bus.write8(page_start, 0xFF);
-        assert_eq!(bus.read8(page_start), flash[0]);
-
-        // But the *next* 64 KiB page must still be a genuine catch-all miss
-        // -- this rule must not swallow unrelated address space.
-        let next_page = page_start + 0x1_0000;
-        assert_eq!(bus.read8(next_page), 0);
+    #[test]
+    fn mmu_table_writes_through_the_bus_take_effect() {
+        let mut bus = bus_with(vec![]);
+        // Map entry 39 to physical page 0 (spi_flash_mmap's window in M3's stall):
+        // the synthesized partition table at 0x8000 becomes visible at 0x3c27_8000.
+        bus.write32(MMU_TABLE_RANGE.start + 39 * 4, 0);
         assert_eq!(
-            bus.unmapped_log().len(),
-            1,
-            "the next page must not be swept into this XIP region"
+            bus.read16(0x3c27_8000),
+            0x50AA,
+            "ESP_PARTITION_MAGIC, little-endian"
+        );
+        assert_eq!(bus.read32(MMU_TABLE_RANGE.start + 39 * 4), 0, "reads back");
+        // Past the table, inside the block: logged catch-all.
+        bus.write32(MMU_TABLE_RANGE.start + 0x200, 1);
+        assert!(bus
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == MMU_TABLE_RANGE.start + 0x200));
+    }
+
+    #[test]
+    fn remapping_an_entry_redirects_reads_immediately() {
+        let mut bus = bus_with(vec![(0x3c00_0000, vec![0x11; 4])]);
+        assert_eq!(bus.read8(0x3c00_0000), 0x11);
+        bus.write32(MMU_TABLE_RANGE.start, 0); // entry 0 -> page 0 (partition-table page)
+        assert_eq!(bus.read16(0x3c00_8000), 0x50AA);
+        bus.write32(MMU_TABLE_RANGE.start, MMU_INVALID);
+        assert_eq!(bus.read8(0x3c00_0000), 0, "unmapped now");
+    }
+
+    #[test]
+    fn spimem1_flash_program_is_visible_through_xip() {
+        let mut bus = bus_with(vec![]);
+        bus.write32(MMU_TABLE_RANGE.start + 43 * 4, 0x2b); // entry 43 -> page 0x2b (storage partition start 0x2b0000)
+        assert_eq!(bus.read8(0x3c2b_0000), 0xFF, "blank");
+        bus.flash_chip.program(0x2b_0000, &[0x00]);
+        assert_eq!(bus.read8(0x3c2b_0000), 0x00);
+    }
+
+    #[test]
+    fn physical_pages_past_the_chip_wrap() {
+        let mut bus = bus_with(vec![]);
+        // Page 0x40 is 4 MiB: wraps to page 0 on a 4 MiB chip.
+        bus.write32(MMU_TABLE_RANGE.start + 5 * 4, 0x40);
+        assert_eq!(bus.read16(0x3c05_8000), 0x50AA);
+    }
+
+    #[test]
+    fn addresses_past_the_8mib_cache_apertures_do_not_alias_mmu_entries() {
+        let mut bus = bus_with(vec![
+            (0x3c00_0000, vec![0x77; 4]),
+            (0x4200_0000, vec![0x13, 0, 0, 0]),
+        ]);
+        assert_eq!(
+            bus.read8(0x3c80_0000),
+            0,
+            "0x3c80_0000 & 0x7fffff would alias entry 0"
+        );
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == 0x3c80_0000));
+        assert_eq!(bus.fetch16(0x4280_0000), None);
+    }
+
+    #[test]
+    fn misaligned_xip_segment_is_left_unmapped() {
+        // load_addr low bits 0x20, but file offset 0 -> paddr 0x10000 (low bits 0).
+        let flash: Arc<[u8]> = Arc::from(vec![0x13u8, 0, 0, 0].into_boxed_slice());
+        let seg = SegmentDescriptor {
+            load_addr: 0x4200_0020,
+            file_offset: 0,
+            len: 4,
+        };
+        let mut bus = FirmwareBus::from_segments(flash, &[seg]);
+        assert_eq!(bus.mmu.entry(0), MMU_INVALID);
+        assert_eq!(
+            bus.fetch16(0x4200_0020),
+            None,
+            "traps loudly, never runs wrong bytes"
         );
     }
 
     #[test]
-    fn xip_page_window_clamps_gracefully_when_no_earlier_flash_bytes_exist() {
-        // A synthetic image whose only bytes ARE the segment itself
-        // (file_offset 0), but whose load_addr isn't page-aligned. Real
-        // hardware's physical flash chip always has *some* bytes earlier in
-        // the same page; this emulator's reconstructed image sometimes
-        // won't (e.g. a browser-supplied partial image). Must not panic
-        // (no unchecked subtraction) and must not fabricate bytes it
-        // doesn't have -- it just can't expose the leading gap in this
-        // case, same as real hardware couldn't if handed a truncated image.
-        let seg_data = [0x01u8, 0x02];
-        let descriptors = [SegmentDescriptor {
-            load_addr: 0x4200_0020,
-            file_offset: 0,
-            len: seg_data.len(),
-        }];
-        let mut bus = FirmwareBus::from_segments(
-            Arc::from(seg_data.to_vec().into_boxed_slice()),
-            &descriptors,
-        );
-
-        assert_eq!(bus.read8(0x4200_0020), 0x01);
-        assert_eq!(bus.read8(0x4200_0021), 0x02);
-
-        // Fix round 1, Important finding: when the leading extension is
-        // clamped short (no earlier bytes available, as here), the window's
-        // START isn't page-aligned, so its END must be computed from the
-        // TRUE (unclamped) page grid -- `round_up(load_addr + len,
-        // page_size)` -- not by rounding up from the clamped, unaligned
-        // start. An earlier version got this wrong and produced a window
-        // extending 0x20 bytes into the NEXT page (`[0x4200_0020,
-        // 0x4201_0020)` instead of `[0x4200_0020, 0x4201_0000)`). Assert the
-        // true page boundary is still a genuine catch-all miss.
-        assert_eq!(bus.read8(0x4201_0000), 0);
-        assert!(
-            bus.unmapped_log()
-                .iter()
-                .any(|a| a.addr == 0x4201_0000 && !a.is_write),
-            "0x4201_0000 (the next page after this clamped window's TRUE \
-             page-grid end) must show up in unmapped_log as a genuine \
-             catch-all miss, not silently be swept into the XIP window"
-        );
+    fn adversarial_xip_segments_do_not_panic_and_map_nothing_wrong() {
+        let flash: Arc<[u8]> = Arc::from(vec![0u8; 16].into_boxed_slice());
+        let cases = [
+            SegmentDescriptor {
+                load_addr: 0x3c00_0000,
+                file_offset: usize::MAX,
+                len: 4,
+            },
+            SegmentDescriptor {
+                load_addr: 0x3c00_0000,
+                file_offset: 0,
+                len: usize::MAX,
+            },
+            // Straddles the end of the DBUS aperture.
+            SegmentDescriptor {
+                load_addr: 0x3c7f_0000,
+                file_offset: 0,
+                len: 0x2_0000,
+            },
+            // In DROM_RANGE but past the cache aperture.
+            SegmentDescriptor {
+                load_addr: 0x3d00_0000,
+                file_offset: 0,
+                len: 4,
+            },
+            SegmentDescriptor {
+                load_addr: 0xffff_fff0,
+                file_offset: 0,
+                len: 0x100,
+            },
+        ];
+        for seg in cases {
+            let bus = FirmwareBus::from_segments(flash.clone(), &[seg]);
+            for id in 0..MMU_ENTRY_NUM {
+                assert_eq!(bus.mmu.entry(id), MMU_INVALID, "{seg:?} entry {id}");
+            }
+        }
     }
 
     #[test]

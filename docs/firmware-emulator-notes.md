@@ -81,9 +81,13 @@ app expects true at its own entry point is public and documented (ESP-IDF's
 `components/esp_system/startup.c`), unlike the mask ROM/bootloader's own
 internals.
 
-**Milestone 3 Task D5**: those DROM/IROM XIP regions are page-granular, not
-just `[load_addr, load_addr+len)` (`emulator-core/src/mem/bus.rs`'s
-`FirmwareBus::from_segments`/`xip_page_window`) — matching what the real
+**Milestone 3 Task D5, superseded by the flash MMU (Milestone 4 Task 2)**:
+the bus now models the flash MMU (`emulator-core/src/peripherals/mmu.rs`) and
+`FirmwareBus::from_segments` seeds it like the bootloader, so XIP is
+page-granular by construction (see `docs/milestone-4-decisions.md`); the
+D5 text that follows describes the replaced mechanism. D5 made those
+DROM/IROM XIP regions page-granular, not just `[load_addr, load_addr+len)`
+(`xip_page_window`, now deleted) — matching what the real
 2nd-stage bootloader's `set_cache_and_start_app()` +
 `mmu_hal_map_region()` actually expose (see history item 1's "Resolved
 in Milestone 3, Task D5" paragraph, under "History: the stall-by-stall
@@ -422,6 +426,12 @@ table reads as zeros, and partition loading fails with
 `ESP_ERR_NOT_FOUND` (history item 1's "Task D13" paragraphs have the
 details). The firmware keeps scheduling with the splash on screen.
 
+**Update (Milestone 4 Task 2):** the flash MMU is now modeled, so that stall
+is gone; boot proceeds past `load_partitions()`'s read (ROM `strncpy` and
+`strcmp` are now real stubs) with no fault through step 10,000,000, but no
+new console line or frame yet (see the history entry at the end of the stall
+log).
+
 **Resolved in Milestone 3** (details in the history below):
 
 - TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
@@ -429,7 +439,8 @@ details). The firmware keeps scheduling with the splash on screen.
   and libgcc helpers, `ets_printf` as a real formatter, the interrupt-matrix
   and GPIO-matrix ROM calls, ROM MD5, and ROM data/`.data` the shortcut
   boot seeds (layout table, SPI-flash legacy data, `RTC_XTAL_FREQ_REG`).
-- Page-granular XIP mapping (Task D5).
+- Page-granular XIP mapping (Task D5), replaced by the real flash MMU
+  model in Milestone 4 Task 2.
 - The SPI1 flash controller and a synthetic 4 MiB flash chip (Task 8; see
   "Emulated flash chip" below).
 - The interrupt matrix with priority/threshold and the SYSTEM FROM_CPU
@@ -446,7 +457,10 @@ plan text), plus the full Milestone 4 backlog, are in
 current blocker (the backlog in `milestone-3-decisions.md` is the complete
 list):
 
-1. **Flash MMU (plan Task 8, sub-unit 3): the next blocker.** The bus has
+1. **Flash MMU (plan Task 8, sub-unit 3): modeled in Milestone 4 Task 2.**
+   *(The text below describes the state at the end of Milestone 3; the MMU
+   now exists and boot proceeds past it, see the "Milestone 4 Task 2" history
+   entry.)* The bus has
    no MMU table: the firmware's entry writes (`DR_REG_MMU_TABLE`,
    `0x600c_5000`) are dropped and reads through a `spi_flash_mmap` window
    return 0. The fix is an MMU table model that the DROM/IROM read path
@@ -1269,7 +1283,7 @@ predicted these blockers would surface once TIMG unblocks further boot
    every 1,000 steps from step 5,555,000 to 7,600,000, the framebuffer is
    unchanged, the boot splash with 2,340 distinct RGB565 values. Pinned in
    `emulator-core/tests/rom_stub_boot.rs`'s
-   `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`.
+   `boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash` (renamed and truncated in Milestone 4 Task 2; was `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`).
 
    One loose end: `load_partitions()`'s `ESP_LOGE` does run
    (`esp_log_write` from `0x420f_a826`, for about 2,700 steps), but no byte
@@ -1354,8 +1368,8 @@ predicted these blockers would surface once TIMG unblocks further boot
 6. **`TICKS_PER_STEP = 1`** (the emulator's steps-to-real-cycles ratio) is
    roughly 10× the real SYSTIMER/CPU clock ratio — harmless while boot never
    reaches timing-sensitive code, but will need recalibrating once it does.
-7. **The real bootloader's extra "boot partition lookup" DROM page isn't
-   modeled** (Task D5 fix round 1, M4). Beyond widening each XIP segment to
+7. **Resolved in Milestone 4 Task 2: entry 127 is seeded.** (Originally: the real bootloader's extra "boot partition lookup" DROM page wasn't
+   modeled.) (Task D5 fix round 1, M4). Beyond widening each XIP segment to
    its own containing page (item 1 above), `set_cache_and_start_app()`
    (`bootloader_support/src/bootloader_utility.c:1084-1086`, v5.5.3) also
    maps one *extra*, unrelated MMU entry: `MMU_DROM_END_ENTRY_VADDR`
@@ -1414,6 +1428,30 @@ code paths that would exercise them. They were recorded so Milestone 3
 started from a known list instead of rediscovering each one by stepping
 through a debugger, and they carry over to Milestone 4 in "Open
 limitations" at the top of this section.
+
+### Milestone 4 Task 2: flash MMU
+
+XIP now goes through the flash MMU instead of D5's page windows
+(`emulator-core/src/peripherals/mmu.rs`, `FirmwareBus::mmu`; decisions and
+what-if-wrong notes in [`milestone-4-decisions.md`](milestone-4-decisions.md)).
+Reads in the DBUS/IBUS cache apertures translate through the table to
+`flash_chip`; `FirmwareBus::from_segments` seeds the table by replaying the
+bootloader's `set_cache_and_start_app()` mapping (including entry 127, which
+resolves history item 7). `XipRegion`, `xip_page_window` and the bus's own
+copy of the image are deleted; a SPIMEM1 flash program is now visible through
+XIP.
+
+- **Splash unchanged.** The framebuffer hash `0x5599c270ab0429fa` is reached
+  at the same 5,750,000-step sample as before, and every earlier boot-ladder
+  rung still passes.
+- **Boot moves on.** `load_partitions()` now reads the real
+  synthesized table, so boot proceeds past the Milestone 3 stall. Just after `MD5Init` it called ROM `strncpy` (`0x4000_0368`), then `strcmp`
+  (`0x4000_036c`); both are now real HLE stubs (`RomStubEffect::Strncpy`/`Strcmp`).
+  `boots_to_first_real_frame` passes again with hash `0x5599c270ab0429fa`
+  unchanged, no fault through step 6.75M. The pinned-stall test in
+  `rom_stub_boot.rs` was truncated to its Phases 1 to 10.
+- **Performance.** `boot-probe --steps 5750000` (release), median of three:
+  0.40 s before, 0.39 s after; no translation cache was needed.
 
 ## Emulated flash chip: what it contains
 

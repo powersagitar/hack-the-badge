@@ -289,6 +289,9 @@ mod tests {
     use super::*;
     use crate::mem::Bus;
 
+    /// The first segment's data lands at file offset 32 (0x20), so an XIP
+    /// segment must use a `load_addr` ending in `0x20` for the MMU seeding to
+    /// map it (flash offset and vaddr must agree modulo 64 KiB).
     fn build_synthetic_image(entry_addr: u32, segments: &[(u32, &[u8])]) -> Vec<u8> {
         let mut buf = vec![0u8; 24];
         buf[0] = 0xE9;
@@ -309,16 +312,16 @@ mod tests {
         let code = [0x13, 0x00, 0x00, 0x00]; // addi x0, x0, 0 (NOP), 4 bytes
         let ram_data = [0xAAu8; 4];
         let image = build_synthetic_image(
-            0x4200_0000,
-            &[(0x4200_0000, &code), (0x4038_0000, &ram_data)],
+            0x4200_0020,
+            &[(0x4200_0020, &code), (0x4038_0000, &ram_data)],
         );
 
         let (mut cpu, mut bus) =
             boot_from_factory_image(&image).expect("synthetic image should parse and boot");
 
-        assert_eq!(cpu.regs.pc, 0x4200_0000);
+        assert_eq!(cpu.regs.pc, 0x4200_0020);
         // XIP: the code we baked into the image is readable at its address.
-        assert_eq!(bus.read32(0x4200_0000), 0x0000_0013);
+        assert_eq!(bus.read32(0x4200_0020), 0x0000_0013);
         // RAM: the copied segment bytes are present and mutable.
         assert_eq!(bus.read8(0x4038_0000), 0xAA);
         bus.write8(0x4038_0000, 0x55);
@@ -327,7 +330,7 @@ mod tests {
         // The CPU can actually execute starting from entry_addr.
         let info = cpu.step(&mut bus);
         assert!(!info.trap_taken);
-        assert_eq!(cpu.regs.pc, 0x4200_0004);
+        assert_eq!(cpu.regs.pc, 0x4200_0024);
     }
 
     #[test]
@@ -335,8 +338,8 @@ mod tests {
         let code = [0x13, 0x00, 0x00, 0x00]; // addi x0, x0, 0
         let dram_data = [0u8; 16];
         let image = build_synthetic_image(
-            0x4200_0000,
-            &[(0x4200_0000, &code), (0x3fc99c00, &dram_data)],
+            0x4200_0020,
+            &[(0x4200_0020, &code), (0x3fc99c00, &dram_data)],
         );
 
         let (cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
@@ -368,8 +371,8 @@ mod tests {
         let code = [0x13, 0x00, 0x00, 0x00];
         let dram_data = [0u8; 16];
         let image = build_synthetic_image(
-            0x4200_0000,
-            &[(0x4200_0000, &code), (0x3fc99c00, &dram_data)],
+            0x4200_0020,
+            &[(0x4200_0020, &code), (0x3fc99c00, &dram_data)],
         );
         let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
 
@@ -402,7 +405,7 @@ mod tests {
         // the image's segment table, so an image with no DRAM segment at all
         // still gets a usable stack.
         let code = [0x13, 0x00, 0x00, 0x00];
-        let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
         let (cpu, _bus) = boot_from_factory_image(&image).expect("should boot");
         assert_eq!(cpu.regs.read(2), initial_stack_pointer());
     }
@@ -410,7 +413,7 @@ mod tests {
     #[test]
     fn ram_initializers_are_written_in_order_into_backed_ram() {
         let code = [0x13, 0x00, 0x00, 0x00];
-        let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
         let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
 
         apply_ram_initializers(
@@ -444,7 +447,7 @@ mod tests {
     #[test]
     fn rom_stub_boot_seeds_the_rom_spiflash_legacy_data_before_the_first_instruction() {
         let code = [0x13, 0x00, 0x00, 0x00];
-        let mut image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let mut image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
         image[3] = 0x2f; // factory.bin's spi_speed_size: 4 MB flash
         let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
 
@@ -465,7 +468,7 @@ mod tests {
     #[test]
     fn rom_stub_boot_seeds_rtc_xtal_freq_reg_through_the_rtc_cntl_model() {
         let code = [0x13, 0x00, 0x00, 0x00];
-        let image = build_synthetic_image(0x4200_0000, &[(0x4200_0000, &code)]);
+        let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
         let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
         // RTC_XTAL_FREQ_REG (RTC_CNTL_STORE4_REG) as the bootloader's
         // clk_ll_xtal_store_freq_mhz(40) left it.

@@ -21,7 +21,9 @@
 //! access, which is what the firmware's cache invalidation after every
 //! table change guarantees on real hardware.
 
-use crate::mem::soc::{MMU_ENTRY_NUM, MMU_INVALID, MMU_PAGE_SIZE, MMU_VADDR_MASK, MMU_VALID_VAL_MASK};
+use crate::mem::soc::{
+    MMU_ENTRY_NUM, MMU_INVALID, MMU_PAGE_SIZE, MMU_VADDR_MASK, MMU_VALID_VAL_MASK,
+};
 
 use super::set_byte;
 
