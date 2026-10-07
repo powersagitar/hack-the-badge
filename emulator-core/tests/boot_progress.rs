@@ -384,6 +384,16 @@
 //! [`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`].
 //! Boot then stalls in a 3-instruction poll of SPIMEM1's `CMD` register
 //! (the notes' "Milestone 4 Task 3" entry).
+//!
+//! **Milestone 4 Task 4 status**: log lines after the scheduler starts
+//! reach the console. The USB-Serial-JTAG model reports SOF frames from an
+//! attached host, so ESP-IDF's connection monitor no longer marks the port
+//! unplugged on the first tick (which made the VFS drop every `stdout`
+//! byte). New rungs: [`boot_prints_console_output_after_the_scheduler_starts`]
+//! (`LVGL: Starting LVGL task`) and
+//! [`boot_reaches_littlefs_formatting_the_blank_storage_partition`]. The
+//! console no longer ends at `main_task: Calling app_main()`; rungs that
+//! check that line use containment. The stall is unchanged.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1201,6 +1211,40 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
             .any(|a| (0x3c00_0000..0x3c80_0000).contains(&a.addr) && !a.is_write),
         "no DBUS read went through an invalid MMU entry"
     );
+}
+
+/// Milestone 4 Task 4's console rung: the first log line printed after
+/// `main_task: Calling app_main()`. ESP-IDF's USB-Serial-JTAG VFS write
+/// (`usb_serial_jtag_vfs.c`) drops everything while
+/// `usb_serial_jtag_is_connected()` is false, and the connection monitor's
+/// FreeRTOS tick hook clears that flag on the first tick with no SOF frame
+/// (`SOF_INT_RAW`, `usb_serial_jtag_connection_monitor.c`). The model now
+/// reports a host that keeps sending SOFs, so the line reaches the console
+/// (`esp_log_write` for it is entered on step ~663,700). The timestamp is
+/// left out of the needle: post-scheduler timestamps come from the FreeRTOS
+/// tick count, so they move whenever boot timing does.
+#[test]
+fn boot_prints_console_output_after_the_scheduler_starts() {
+    assert_reaches("LVGL: Starting LVGL task", 1_000_000);
+}
+
+/// Milestone 4 Task 4: the newest console lines before the SPIMEM1
+/// `SPI_MEM_FLASH_WREN` poll (the notes' "Milestone 4 Task 3"/"Task 4"
+/// entries). The emulated `storage` partition is blank (`0xFF`), so
+/// `esp_littlefs` fails to mount it and starts formatting it; that format
+/// is the flash write that issues the `WREN` the model never completes.
+/// The real badge's log has `hal_fs: littlefs mounted ...` here instead,
+/// because its flash holds a filesystem. `esp_log_write` for the warning
+/// is entered on step ~5,591,700.
+#[test]
+fn boot_reaches_littlefs_formatting_the_blank_storage_partition() {
+    let (rt, ok) = boot_until_console_contains("esp_littlefs: mount failed", 6_000_000);
+    let console = rt.console_output();
+    assert!(ok, "pc=0x{:08x}\nconsole:\n{console}", rt.pc());
+    assert!(console.contains("formatting..."), "console:\n{console}");
+    for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
 }
 
 /// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2

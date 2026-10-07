@@ -433,11 +433,21 @@ new console line or frame yet (see the history entry at the end of the stall
 log).
 
 **Update (Milestone 4 Task 3):** partition loading succeeds: `load_partitions()`
-returns `ESP_OK` after 4 `MD5Update` calls and 1 `MD5Final`, pinned by
+returns `ESP_OK` (observed 4 `MD5Update` calls and 1 `MD5Final`), pinned by
 `boot_progress.rs`'s
-`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`. The
+`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu` (which
+asserts `ESP_OK`, exactly 1 `MD5Final` and at least 1 `MD5Update`). The
 next stall is a poll of SPIMEM1's `CMD` register for `SPI_MEM_FLASH_WREN` to
 clear (see the "Milestone 4 Task 3" history entry).
+
+**Update (Milestone 4 Task 4):** log output after the scheduler starts now
+reaches the emulated console (open limitation 2 below is resolved). After
+`main_task: Calling app_main()` the console shows `LVGL: Starting LVGL task`
+and then `esp_littlefs`'s mount failure on the blank `storage` partition
+(`Corrupted dir pair at {0x0, 0x1}`, then `mount failed, (-84).
+formatting...`). The format is what issues the `SPI_MEM_FLASH_WREN` poll
+above, so the stall itself is unchanged (see the "Milestone 4 Task 4"
+history entry).
 
 **Resolved in Milestone 3** (details in the history below):
 
@@ -475,7 +485,10 @@ list):
    stopped short of it: the spec builds flash/partition support only if
    boot reaches it before the first frame, and the first frame comes
    first.
-2. **Console output after the scheduler starts is missing.**
+2. **Console output after the scheduler starts: resolved in Milestone 4
+   Task 4** (the USB-Serial-JTAG model now reports SOF frames from an
+   attached host; see the "Milestone 4 Task 4" history entry). *(The text
+   below describes the state before the fix.)*
    `load_partitions()`'s `ESP_LOGE` runs (`esp_log_write`), but no byte
    reaches the emulated console. Every console line so far was printed
    before or just after the scheduler started. How later log output
@@ -499,7 +512,11 @@ list):
 5. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
-6. **Every log timestamp reads `I (0)`** (likewise `W (0)`/`E (0)`). On
+6. **Every log timestamp up to `main_task: Calling app_main()` reads
+   `I (0)`** (likewise `W (0)`/`E (0)`). The lines printed after it
+   (Milestone 4 Task 4) carry non-zero timestamps (`I (120)`, `E (430)`,
+   ...), which on ESP-IDF come from the FreeRTOS tick count once the
+   scheduler runs. On
    real hardware ESP-IDF's log timestamp is milliseconds since boot and
    advances line by line. The likely cause (not traced) is that the early
    timestamp comes from the CPU cycle counter, and the ESP32-C3's
@@ -1468,8 +1485,8 @@ The rung `load_partitions_accepts_the_synthesized_table_through_the_flash_mmu`
 (`boot_progress.rs`) single-steps from the first `MD5Init` to
 `load_partitions()`'s epilogue (`0x420f_a878`): 4 `MD5Update` calls (one per
 partition entry), 1 `MD5Final`, `s4` = `ESP_OK`, no DBUS read through an
-invalid MMU entry, no fault. Its `MD5Update` count is 4, matching the table's
-four entries.
+invalid MMU entry, no fault. Observed 4 `MD5Update` calls, one per table entry
+(the rung asserts at least 1).
 
 Next stall, from `boot-probe --steps 12000000 --window 500000` (release):
 
@@ -1498,6 +1515,70 @@ Next stall, from `boot-probe --steps 12000000 --window 500000` (release):
   `PP`, `SE`/`BE`, `READ`), with their self-clear and the effect on the
   emulated flash chip; the `0xbb` reads and `RDSR` as user commands are
   related. ASSIST_DEBUG accesses are probably a separate, benign later item.
+
+### Milestone 4 Task 4: console output after the scheduler starts
+
+**Found.** Boot entered `esp_log_write` (`0x4039_708e` in factory.bin) eight
+times in the first 12,000,000 steps, but only the two `main_task` calls
+(steps ~529,200 and ~549,400) produced bytes. The first silent one after
+them was `LVGL: Starting LVGL task` (step ~663,700); the last two were
+`esp_littlefs` errors (steps ~5,585,500 and ~5,591,700). Diffing the
+control flow of the `Calling app_main()` call against the `LVGL` one
+showed both reach `vprintf` and newlib's write path identically, and part
+at the VFS write (`0x4200_8160`): `usb_serial_jtag_write()` in
+`esp_driver_usb_serial_jtag/src/usb_serial_jtag_vfs.c` (v5.5.3) starts with
+`if (!usb_serial_jtag_is_connected()) return -1;`.
+`usb_serial_jtag_is_connected()` (`0x4200_7ae6`) returns
+`s_usb_serial_jtag_conn_status`. In
+`usb_serial_jtag_connection_monitor.c`, `usb_serial_jtag_conn_status_init`
+sets it true (step ~501,800) and registers
+`usb_serial_jtag_sof_tick_hook` (`0x4038_1b16`), a FreeRTOS tick hook that
+reads `USB_SERIAL_JTAG_INT_RAW_REG`, clears `SOF_INT` through
+`USB_SERIAL_JTAG_INT_CLR_REG`, and sets the flag false once a tick passes
+without `SOF_INT_RAW` (bit 1) and the tolerance is used up
+(`ALLOWED_NO_SOF_TICKS` is 0 in this build: the init stores 0 into
+`remaining_allowed_no_sof_ticks`, `0x4200_7acc`). The model never set `SOF_INT_RAW`, so the first
+tick hook (step 597,330) marked the port disconnected, and from then on
+every `stdout` write returned -1 with no FIFO access. Not the cause:
+the interrupt-driven `usb_serial_jtag` driver (the VFS write never got as
+far as its `tx_func`, and the physical badge starts its console REPL, the
+usual installer of that driver, only after the launcher), newlib locks, and
+log level or line buffering (the bytes never reached the VFS write's loop).
+
+The `pm` and `coexist` `esp_log_write` calls before step ~501,800 are also
+dropped, because the flag starts false until the init function runs. That is
+real behavior: the physical badge's serial log has no such lines either.
+
+**Resolved.** `crate::peripherals::usb_serial_jtag` forces `SOF_INT_RAW` to
+read 1, like `SERIAL_IN_EMPTY_INT_RAW`: the emulated badge has a host
+attached that sends a start-of-frame every 1 ms, so the bit is set again by
+the next read whatever `INT_CLR` did (decision and what-if-wrong in
+`milestone-4-decisions.md`). Unit test
+`sof_int_raw_reads_set_even_after_a_byte_split_int_clr` (failed before the
+fix on its first assertion: the bit read 0).
+
+**After the fix**, from `boot-probe --steps 12000000 --window 500000`
+(release):
+
+- **Console:** the tail after `main_task: Calling app_main()` is
+  `I (120) LVGL: Starting LVGL task`, then
+  `E (430) esp_littlefs: ./managed_components/joltwallet__littlefs/src/littlefs/lfs.c:1383:error: Corrupted dir pair at {0x0, 0x1}`
+  and `W (430) esp_littlefs: mount failed,  (-84). formatting...`. The
+  littlefs lines come from the blank (`0xFF`) emulated `storage`
+  partition; the physical badge mounts its filesystem here instead.
+  Rungs: `boot_prints_console_output_after_the_scheduler_starts`
+  (`LVGL: Starting LVGL task` within 1,000,000 steps) and
+  `boot_reaches_littlefs_formatting_the_blank_storage_partition`
+  (`esp_littlefs: mount failed` and `formatting...` within 6,000,000).
+- **Timeline:** printing the `LVGL` line through the VFS costs 3,736 guest
+  steps, so `load_partitions()`'s `MD5Init` moves from step 5,555,258 to
+  5,558,994 (`tests/rom_stub_boot.rs`'s pinned-stall test was updated; its
+  console check is now containment, not "the last line"). Every earlier
+  step count is unchanged. `boots_to_first_real_frame`'s hash is unchanged.
+- **Stall:** unchanged, the `SPI_MEM_FLASH_WREN` poll at
+  `0x4039_3916..0x4039_391a` (no fault, 303 traps, framebuffer still the
+  splash with 2,340 values). It is littlefs's format, after the mount
+  failure, that writes to flash.
 
 ## Emulated flash chip: what it contains
 

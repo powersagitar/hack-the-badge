@@ -420,7 +420,9 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// guest instructions), and the stall below is unchanged.
 ///
 /// **The boot reaches `load_partitions()`'s `MD5Init`**, and it returns. On
-/// the 5,555,258th step the CPU is on ROM `MD5Init` (`esp32c3.rom.ld`:
+/// the 5,558,994th step (5,555,258th before Milestone 4 Task 4, whose
+/// `LVGL: Starting LVGL task` line now really goes through the VFS write
+/// path, 3,736 more steps) the CPU is on ROM `MD5Init` (`esp32c3.rom.ld`:
 /// `MD5Init = 0x40000614`), called by ESP-IDF's `load_partitions()`
 /// (`components/esp_partition/partition.c`, at `0x420f_a6ce` in factory.bin)
 /// as its first act (a0 = the stack `md5_context_t`, `0x3fcb_fd30`), and
@@ -428,7 +430,8 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// history up to there: the SYSTIMER/WFI fast-forward and FreeRTOS ticks,
 /// SPI2 `TRANS_DONE` interrupts for DMA transfers feeding the ST7789 (the
 /// framebuffer holds the 2,340-colour boot splash), the console lines
-/// through `Calling app_main()`, and no exception before the `MD5Init`
+/// through `Calling app_main()` (and, since Milestone 4 Task 4, later ones),
+/// and no exception before the `MD5Init`
 /// call. What happens *after* it (Milestone 3: the unmapped flash MMU made
 /// `load_partitions()` fail with `ESP_ERR_NOT_FOUND`) is covered by
 /// `boot_progress.rs`'s
@@ -588,9 +591,10 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     assert_eq!(rt.bus().systimer.elapsed_ticks() - elapsed_before, jump);
 
     // Phase 9: no exception up to the MD5Init call. LVGL flushes frames
-    // over SPI2 through GDMA channel 0 (Task 10), so they are drawn; no new
-    // console line and no panic.
-    let summary = rt.run(5_555_257 - 596_610);
+    // over SPI2 through GDMA channel 0 (Task 10), so they are drawn; no
+    // panic. (Milestone 4 Task 4: one new console line, `LVGL: Starting
+    // LVGL task`, which moved MD5Init from step 5,555,258 to 5,558,994.)
+    let summary = rt.run(5_558_993 - 596_610);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
         rt.cpu().csr.mcause & 0x8000_0000,
@@ -617,15 +621,15 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
         "framebuffer holds a drawn frame: {} distinct colors",
         distinct.len()
     );
+    // Containment, not "the last line" (Milestone 4 Task 4): post-scheduler
+    // log lines (`LVGL: Starting LVGL task`) now reach the console too.
     let console = rt.console_output();
     assert!(
-        console
-            .trim_end()
-            .ends_with("I (0) main_task: Calling app_main()"),
+        console.contains("I (0) main_task: Calling app_main()"),
         "console:\n{console}"
     );
 
-    // Phase 10: the 5,555,258th step is the ROM MD5Init stub, called by
+    // Phase 10: the 5,558,994th step is the ROM MD5Init stub, called by
     // load_partitions() with its stack md5_context_t; it returns.
     assert_eq!(rt.pc(), ROM_MD5_INIT);
     assert_eq!(rt.cpu().regs.read(10), 0x3fcb_fd30, "a0 = &context");

@@ -65,6 +65,39 @@ truncated to its Phases 1 to 10. Where boot goes after that (it still never
 reaches the launcher) is the next stall-loop task: boot-probe to step
 10,000,000 shows no fault, the same console, the splash unchanged.
 
+## USB-Serial-JTAG: a host is always attached (Task 4)
+
+- **`SOF_INT_RAW` (bit 1 of `USB_SERIAL_JTAG_INT_RAW_REG`) always reads
+  1.** ESP-IDF's connection monitor
+  (`esp_driver_usb_serial_jtag/src/usb_serial_jtag_connection_monitor.c`,
+  v5.5.3) treats a tick without a SOF frame as "unplugged", and the VFS
+  write then drops every `stdout` byte. A real host sends a SOF every 1 ms,
+  and the emulator has no USB frame timing, so the bit is forced on, as
+  `SERIAL_IN_EMPTY_INT_RAW` already was. The physical badge's serial log
+  was captured over this same USB port, so "connected" is the state to
+  match. If wrong: firmware that behaves differently when unplugged (no
+  console, or code that waits for a host to go away) would never take that
+  path in the emulator; and if firmware ever enables `SOF_INT_ENA`, nothing
+  raises `ETS_USB_SERIAL_JTAG_INTR_SOURCE` (no USB-Serial-JTAG interrupt
+  source is modeled yet), so an ISR expecting 1 kHz SOF interrupts would
+  never run.
+- **No USB-Serial-JTAG interrupt source yet.** The brief's first candidate
+  (the interrupt-driven `usb_serial_jtag` driver waiting on
+  `ETS_USB_SERIAL_JTAG_INTR_SOURCE`) was not the cause: the dropped writes
+  returned before reaching any `tx_func`, and the physical badge starts its
+  console REPL (the usual installer of that driver) only after the app
+  launcher. It will be needed when
+  boot gets there. If wrong: an earlier `usb_serial_jtag_driver_install()`
+  would queue bytes in its ring buffer and print nothing.
+- **Rungs leave the timestamp out.** Post-scheduler timestamps come from
+  the FreeRTOS tick count and move with boot timing, so the console rungs
+  match the tag and message only.
+- **A rung pins an emulator-only line.** `esp_littlefs`'s `mount failed ...
+  formatting...` is not in the physical badge's log (its flash holds a
+  filesystem); it is what blank synthetic flash makes the real firmware do,
+  and it marks the point just before the current stall. If wrong (e.g. a
+  later task seeds a littlefs image): change or retire that rung.
+
 ## Milestone 5 backlog
 
 (To be filled in by later Milestone 4 tasks.)

@@ -33,7 +33,21 @@
 //!   interrupt-driven TX driver polling this bit for "FIFO empty, safe to
 //!   queue more" must always see it set, or it stalls waiting for an
 //!   interrupt this emulator's peripheral model has no timing/edge
-//!   machinery to raise.
+//!   machinery to raise. Bit 1 `SOF_INT_RAW` (header: R/WTC/SS, default
+//!   0, "turns to high level when a SOF frame is received") is forced to
+//!   read 1 the same way (Milestone 4 Task 4): the emulated badge has a USB
+//!   host attached that sends a start-of-frame every 1 ms, so the bit is
+//!   always set again by the next read, whatever `INT_CLR_REG` (+0x14,
+//!   `USB_SERIAL_JTAG_SOF_INT_CLR` = bit 1) or a store here did. ESP-IDF
+//!   depends on it: `usb_serial_jtag_connection_monitor.c` (v5.5.3,
+//!   `esp_driver_usb_serial_jtag`) reads it from a FreeRTOS tick hook
+//!   through `usb_serial_jtag_ll_get_intraw_mask()` (`hal/esp32c3/include/
+//!   hal/usb_serial_jtag_ll.h`, `int_raw.val`), clears it with
+//!   `usb_serial_jtag_ll_clr_intsts_mask()` (`int_clr.val = mask`), and
+//!   marks the port disconnected on the first tick without it; while
+//!   disconnected, `usb_serial_jtag_vfs.c`'s `usb_serial_jtag_write()`
+//!   returns -1 without touching the FIFO, so every `stdout` byte (every
+//!   `ESP_LOG*` line after the scheduler starts) is dropped.
 //! - Every other offset (`CONF0_REG`, `MISC_CONF_REG`, the various `*_ST`
 //!   status registers, interrupt enable/clear, …): plain read/write word
 //!   storage, keyed by word-aligned offset in [`UsbSerialJtag::regs`], so a
@@ -67,6 +81,12 @@ pub const SERIAL_IN_EP_DATA_FREE: u32 = 1 << 1;
 pub const SERIAL_OUT_EP_DATA_AVAIL: u32 = 1 << 2;
 /// `USB_SERIAL_JTAG_SERIAL_IN_EMPTY_INT_RAW`, bit 3 of [`INT_RAW_REG`].
 pub const SERIAL_IN_EMPTY_INT_RAW: u32 = 1 << 3;
+/// `USB_SERIAL_JTAG_INT_CLR_REG`. Plain storage (see the module doc).
+pub const INT_CLR_REG: u32 = 0x14;
+/// `USB_SERIAL_JTAG_SOF_INT_RAW`, bit 1 of [`INT_RAW_REG`].
+pub const SOF_INT_RAW: u32 = 1 << 1;
+/// `USB_SERIAL_JTAG_SOF_INT_CLR`, bit 1 of [`INT_CLR_REG`].
+pub const SOF_INT_CLR: u32 = 1 << 1;
 
 /// The USB-Serial-JTAG peripheral. See the module doc for what's modeled.
 #[derive(Default)]
@@ -88,7 +108,9 @@ impl UsbSerialJtag {
             EP1_REG => 0,
             EP1_CONF_REG => SERIAL_IN_EP_DATA_FREE,
             INT_RAW_REG => {
-                self.regs.get(&word_offset).copied().unwrap_or(0) | SERIAL_IN_EMPTY_INT_RAW
+                self.regs.get(&word_offset).copied().unwrap_or(0)
+                    | SERIAL_IN_EMPTY_INT_RAW
+                    | SOF_INT_RAW
             }
             _ => self.regs.get(&word_offset).copied().unwrap_or(0),
         };
@@ -183,5 +205,31 @@ mod tests {
             0,
             "TX is modeled as always-empty; interrupt-driven TX drivers must see this bit set"
         );
+    }
+
+    /// Milestone 4 Task 4: ESP-IDF's connection monitor
+    /// (`usb_serial_jtag_connection_monitor.c`) reads `SOF_INT_RAW` from a
+    /// FreeRTOS tick hook, then clears it through `INT_CLR` (a word store,
+    /// which reaches the peripheral as four ascending byte writes). A host
+    /// sends a SOF every 1 ms, so by the next read the bit is set again; a
+    /// clear must never make the badge look unplugged.
+    #[test]
+    fn sof_int_raw_reads_set_even_after_a_byte_split_int_clr() {
+        let (mut u, mut c) = (UsbSerialJtag::new(), Console::new());
+        assert_ne!(
+            read_word(&mut u, INT_RAW_REG) & SOF_INT_RAW,
+            0,
+            "before any clear"
+        );
+        write_word(&mut u, &mut c, INT_CLR_REG, SOF_INT_CLR);
+        assert_ne!(
+            read_word(&mut u, INT_RAW_REG) & SOF_INT_RAW,
+            0,
+            "a host keeps sending SOF frames; the next read sees the bit again"
+        );
+        // A raw-register store (R/WTC on hardware) must not clear it either.
+        write_word(&mut u, &mut c, INT_RAW_REG, 0);
+        assert_ne!(read_word(&mut u, INT_RAW_REG) & SOF_INT_RAW, 0);
+        assert!(c.bytes().is_empty(), "no register store prints a byte");
     }
 }
