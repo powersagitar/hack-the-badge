@@ -139,7 +139,8 @@ file or the code, this file and the code win.
   panel's: `MADCTL` is unmodeled (see backlog), so modeling it may change
   the hash without the image being wrong.
 - The human comparison of the frame with the physical badge
-  (2026-10-06, a match) is recorded in the notes' "Current state".
+  (2026-10-06, a match) is recorded in the notes ("Milestone 3's end
+  state", under the history).
 - **Idle time is compressed.** WFI fast-forward skips straight to the next
   SYSTIMER alarm, and one step is one SYSTIMER tick. The browser can
   therefore run the firmware faster (or slower) than real time. Timing

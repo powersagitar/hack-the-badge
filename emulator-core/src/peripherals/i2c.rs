@@ -117,9 +117,9 @@ pub const INT_ENA_REG: u32 = 0x28;
 pub const INT_STATUS_REG: u32 = 0x2C;
 /// `I2C_COMD0_REG`; `COMDn` is at `COMD0_REG + 4 * n`, `n < 8`.
 pub const COMD0_REG: u32 = 0x58;
-/// `I2C_SCL_STRETCH_CONF_REG`, the last named register before the gap.
 /// `I2C_SCL_SP_CONF_REG`.
 pub const SCL_SP_CONF_REG: u32 = 0x80;
+/// `I2C_SCL_STRETCH_CONF_REG`, the last named register before the gap.
 pub const SCL_STRETCH_CONF_REG: u32 = 0x84;
 /// `I2C_DATE_REG`.
 pub const DATE_REG: u32 = 0xF8;

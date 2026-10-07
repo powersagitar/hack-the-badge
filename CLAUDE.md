@@ -12,27 +12,33 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestones 2–3): the badge's *built-in* apps (Snake,
+2. **Real-firmware mode** (Milestones 2–4): the badge's *built-in* apps (Snake,
    Dice, etc.) are native RISC-V machine code baked into one monolithic
    ESP-IDF app image — not extractable as Lua files (confirmed by
    flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   **Current state (end of Milestone 3):** boot runs through the ESP-IDF
-   startup log, FreeRTOS and `app_main`, and draws the firmware's **boot
-   splash** to the emulated ST7789 framebuffer (final from step 5,535,126;
-   pinned by `boots_to_first_real_frame` in
-   `emulator-core/tests/boot_progress.rs`). It then stalls without a
-   fault: `load_partitions()` reads the partition table through the flash
-   MMU, which is not modeled, gets zeros, and never reaches the app
-   launcher or any built-in app. The flash MMU is the next blocker
-   (Milestone 4). Read `docs/firmware-emulator-notes.md`'s "Known
-   limitations" (current state, open limitations, and the stall-by-stall
-   history) before assuming a built-in app is reachable in this mode.
-   Milestone 3's design decisions (some override the plan text, e.g.
-   interrupt threshold `>=`) and the Milestone 4 backlog are in
-   `docs/milestone-3-decisions.md`.
+   **Current state (end of Milestone 4):** boot runs through the ESP-IDF
+   startup log, FreeRTOS and `app_main` (the boot splash is final from
+   step 5,535,126, `boots_to_first_real_frame`), loads the partition
+   table through the flash MMU, formats and mounts littlefs on the blank
+   `storage` partition, and launches its first app, My Badge, which shows
+   its unregistered **first-run screen** (stable from the 15,500,000-step
+   sample; `boots_to_first_run_screen` in
+   `emulator-core/tests/boot_progress.rs`). START opens the firmware's
+   hardware self-test (`first_run_screen_responds_to_start`); both frames
+   were compared with a factory-reset physical badge and match. The app
+   launcher is **not** reachable: on blank flash the badge is
+   unprovisioned, and My Badge then keeps HOME for itself. The next
+   blocker is a provisioned identity in emulated flash (Milestone 5; needs
+   a data-handling ruling). Read `docs/firmware-emulator-notes.md`'s
+   "Known limitations" (current state, open limitations, and the
+   stall-by-stall history) before assuming a built-in app is reachable in
+   this mode. Design decisions (some override the plan text, e.g.
+   interrupt threshold `>=`) are in `docs/milestone-3-decisions.md` and
+   `docs/milestone-4-decisions.md`; the latter has the Milestone 5
+   backlog.
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -78,10 +84,11 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
 - `cargo test -p emulator-core --release --test boot_progress` — the
   real-firmware boot ratchet: each test boots `factory.bin` and asserts a
   console line, a no-fault point, or a framebuffer state (the finish line
-  is `boots_to_first_real_frame`). It also passes in a debug build, but the
+  is `boots_to_first_run_screen` plus `first_run_screen_responds_to_start`;
+  the whole suite takes ~3 s). It also passes in a debug build, but the
   multi-million-step boots are much faster with `--release`. When boot
-  moves, update the rung whose budget it affects and the module doc's
-  per-task status.
+  moves, update the rung whose budget it affects; the per-task history
+  goes in the notes, not the test docs.
 - `cargo run -p emulator-core --release --example boot-probe -- [--steps N] [--window W] [--dump-frame PATH]`
   — the "why is boot stuck" diagnostic: console output, run summary, hot
   PCs, unmapped accesses, framebuffer diversity; `--dump-frame` writes a
@@ -187,15 +194,17 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       the blob's own bytes become fetchable. A
                       `RomDataBlob` region (Task D7,
                       `FirmwareBus::map_rom_data`) maps read-only ROM
-                      *data* the same way, but is never fetchable. Each
-                      XIP (DROM/IROM) segment is widened to its containing
-                      64 KiB flash-cache MMU page (Milestone 3 Task D5,
-                      `xip_page_window`), not just its own declared
-                      `[load_addr, load_addr+len)`, matching what the real
-                      2nd-stage bootloader's page-granular MMU setup
-                      exposes — load-bearing for `cpu_start`'s
-                      app-image-header check, which reads bytes just before
-                      the DROM segment's own `load_addr`.
+                      *data* the same way, but is never fetchable. XIP
+                      (the 8 MiB DBUS/IBUS cache apertures) translates
+                      every access through the flash MMU
+                      (`FirmwareBus::mmu`, peripherals/mmu.rs) to a
+                      physical page of `flash_chip`, the only flash store;
+                      `FirmwareBus::from_segments` seeds the table by
+                      replaying the 2nd-stage bootloader's page-granular
+                      mapping (Milestone 4; it replaced Milestone 3's D5
+                      page windows and the bus's separate copy of the
+                      image). An invalid entry reads 0 (logged) and a fetch
+                      through it traps; DBUS is never fetchable.
                       mem/image.rs parses the ESP-IDF app-image format;
                       mem/soc.rs holds the ESP32-C3 address-space ranges
                       plus the ESP32-C3's fixed 64 KiB MMU page size.
@@ -228,8 +237,15 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       USB-Serial-JTAG EP1 TX FIFO (usb_serial_jtag.rs, the
                       badge's real console), written both by firmware
                       directly and by the ROM ets_printf HLE stub. UART0
-                      and the ROM putc functions are not modeled.
-                      The flash MMU is not modeled (the current stall).
+                      and the ROM putc functions are not modeled. The
+                      USB-Serial-JTAG model reports SOF frames from an
+                      attached host (Milestone 4), so post-scheduler log
+                      output reaches the console. mmu.rs is the flash MMU
+                      table (`0x600c_5000`); i2c.rs is I2C0 as a master
+                      with no device on the bus (every address byte is
+                      NACKed); rmt.rs is RMT as a zero-latency TX engine
+                      (Milestone 4; decisions in
+                      docs/milestone-4-decisions.md).
                       Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
                       from.
@@ -243,10 +259,13 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       "Emulated flash chip" section). Also Spimem1, the
                       SPI1 flash controller (0x6000_2000): user-command
                       transactions fire on the SPI_MEM_USR byte of CMD and
-                      self-clear; only RDID (the badge's JEDEC ID) has an
-                      effect so far. The bus holds both as named fields
-                      (spimem1, flash_chip); XIP still reads the app image
-                      via the D5 page mapping, not through flash_chip.
+                      self-clear: RDID (the badge's JEDEC ID), RDSR and
+                      the read family; the dedicated SPI_MEM_FLASH_* bits
+                      run WREN/WRDI (a modeled write-enable latch), sector
+                      erase and page program (Milestone 4 Task 5), always
+                      completing at once. The bus holds both as named
+                      fields (spimem1, flash_chip); XIP reads flash_chip
+                      through the MMU, so programmed data is visible there.
   src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
                       fixed addresses to intercept + what each pretends to
                       have done — including, for the six interrupt-matrix/

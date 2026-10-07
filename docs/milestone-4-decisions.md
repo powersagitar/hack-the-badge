@@ -240,6 +240,145 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   the syscall table after init): the code reads the pointer on every
   call, as the ROM does, so it follows the swap.
 
+## Finish line: the first-run screen, not the launcher (Task 7)
+
+- **The finish line pins what blank-flash boot shows** (spec Part 3; the
+  human partner's choice, 2026-10-07). Boot reaches My Badge's
+  unregistered first-run screen and stops there by firmware design: an
+  unprovisioned My Badge claims HOME and reacts only to START (the notes'
+  "Why the app launcher is not reached"). So `boots_to_first_run_screen`
+  replaces the planned `boots_to_launcher`, and
+  `first_run_screen_responds_to_start` replaces
+  `launcher_responds_to_buttons` (START is the one button that screen
+  reacts to; DOWN/RIGHT do nothing there, on the badge too). If wrong (the
+  launcher was the bar): Milestone 5's first backlog item.
+- **No synthetic identity in emulated flash yet.** Provisioning the
+  emulated badge would get past My Badge to the launcher, but it is
+  synthetic data in the `storage` partition, which the data-handling rules
+  keep blank; it needs its own ruling. If wrong: nothing breaks; the
+  launcher just waits a milestone.
+- **One stable-frame helper.** `run_until_stable_frame` (250,000-step
+  samples) serves the splash, first-run and post-press rungs. A uniform
+  frame (blank or a solid fill) and any hash in a skip list never count as
+  stable; the first-run rung skips the splash, which is itself stable for
+  millions of steps before the app draws. It returns the first sampled
+  step that showed the stable frame. If wrong (a later frame is uniform on
+  purpose): pass a different predicate.
+- **An 8,000,000-step window after a button press.** After START the
+  firmware computes for about 6,000,000 steps before the self-test frame
+  lands, so the boot rungs' 1,000,000-step window reports the unchanged
+  first-run frame as stable. The post-press rung does not skip the
+  first-run hash, so a press the firmware ignores fails on the hash
+  assertion instead of timing out. If wrong (the busy phase grows past
+  8M, e.g. with real-time calibration): widen the window.
+- **Caps** are the measured first stable sample plus the window plus
+  1,000,000, rounded up to 250,000: 17,500,000 for the first-run screen
+  (15,500,000 + 2,000,000, as the plan asked) and 31,500,000 for the
+  self-test (22,350,000 + 8,000,000 + 1,000,000). They are only reached if
+  a frame never stabilizes.
+- **MADCTL stays unmodeled (Task 6 skipped).** Its trigger, a frame the
+  human comparison finds rotated or mirrored, did not happen: the
+  first-run and self-test frames match the badge in orientation, and the
+  screen test's corner fiducials are fully lit, so nothing is clipped. If
+  wrong (another screen draws through a window the default order gets
+  wrong): Task 6 as planned; the pinned hashes should not change for a
+  model that keeps today's image.
+- **No shared-checkpoint fixture** (spec Part 4). The `--release`
+  `boot_progress` suite takes about 2.6 s (35 tests, run in parallel),
+  well under the ~10 s trigger, so `FirmwareRuntime` does not derive
+  `Clone`.
+
+## Remarks
+
+- **Finish-line tests** (`emulator-core/tests/boot_progress.rs`):
+  `boots_to_first_run_screen` pins the first-run screen,
+  `0x8c5027cec0f79490` (45 colors, stable from the 15,500,000-step sample,
+  found at 16,500,000), and `first_run_screen_responds_to_start` pins the
+  self-test's button screen after a 100,000-step START press,
+  `0x7f325d838835baaa` (48 colors, stable from the 22,350,000-step sample,
+  found at 30,350,000). `boots_to_first_real_frame` still pins the splash,
+  `0x5599c270ab0429fa`. The WASM twins in `frontend/test/cpu-wasm.test.ts`
+  reach the splash and the first-run hash through the wasm-bindgen build.
+- **Human comparison** (2026-10-07): the first-run and self-test frames
+  match a factory-reset physical badge in content and orientation (the
+  notes' "Current state").
+- **The self-test hashes beyond the first** (A lit, B lit, ..., the
+  summary screen) were measured in exploration and are not pinned; the
+  sequence is in the notes' "Milestone 4 Task 7" entry.
+- **Idle time is still compressed** (WFI fast-forward, one step per
+  SYSTIMER tick), and RMT, I2C0 and SPIMEM1 complete in zero emulated
+  time. Step counts are not real time.
+
 ## Milestone 5 backlog
 
-(To be filled in by later Milestone 4 tasks.)
+### Launcher and apps
+
+- **Reaching the app launcher needs a provisioned identity in emulated
+  flash: the first blocker.** On blank flash `hal_identity` finds no
+  `/littlefs/identity.json` and the firmware marks the badge unprovisioned
+  (flag byte at `0x3fca_92b2`, read by `0x4200_ee06`). My Badge's
+  "handles HOME" hook (`0x4201_3920`) always says yes, and its button
+  handler (`0x4201_4130`) reacts only to START while unprovisioned; with
+  the flag set, HOME goes to the launcher (`0x4203_8cba`). So a synthetic
+  identity in the littlefs `storage` partition (its format to be read from
+  the firmware, never from the physical badge's dump) would get there; it
+  needs a data-handling ruling first. Then the planned launcher rungs:
+  `boots_to_launcher` and a DOWN/RIGHT navigation rung (whichever moves
+  the selection).
+- Launching and playing a built-in app (Snake, Dice) comes after the
+  launcher.
+- The ~6,000,000-step busy phase after START (hot PCs `0x420b_ead4`,
+  `0x420b_b6a4`, no frame writes) is not traced; it may be real work or an
+  artifact of untimed peripherals.
+
+### Peripherals
+
+- No I2C device: the accelerometer probe is NACKed and the self-test reads
+  0 mg. An SC7A20H model behind the address phase would change
+  `hal_accel`'s line.
+- RMT transmissions are consumed but not decoded, so the LEDs are never
+  shown; a frontend LED view would need symbol capture.
+- NFC is not modeled (the self-test waits for a card forever).
+- No USB-Serial-JTAG interrupt source; the console REPL the badge starts
+  after the launcher may install the interrupt-driven driver.
+- Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`),
+  SYSTEM `0x600c_0058`/`+0x08`, RTC_CNTL `0x6000_80bc`. Harmless so far.
+- Zero-latency RMT, I2C0 and SPIMEM1 (see their sections above).
+
+### Carried from the Milestone 3 backlog (untouched)
+
+- Every log timestamp up to `main_task: Calling app_main()` reads `I (0)`
+  (likely the unmodeled performance-counter CSR); later ones come from the
+  tick count.
+- ST7789 `MADCTL` (`0x20`, then `0x60`) is unmodeled; orientation is
+  human-confirmed for the frames seen so far (Task 6 skipped, above).
+- GPIO0 (the display D/C pin) is routed as SPI2 `FSPIWP`/`FSPIHD`; routing
+  is stored only. Revisit if D/C misbehaves.
+- eFuse block unmodeled: boot logs chip revision v0.0, the badge is v0.4.
+- `CPU_FREQ_MHZ` stub returns 160; the real CPU runs at 80 MHz.
+- `TICKS_PER_STEP = 1` is about 10x the real SYSTIMER/CPU ratio; no
+  real-time calibration.
+- Flagged ROM-stub guesses: `rom_i2c_readReg*` returning 0,
+  `Cache_Get_*` returning 0 (notes, history item 5).
+- Edge-type interrupts are simplified: `CPU_INT_TYPE_REG` and
+  `CPU_INT_CLEAR_REG` are plain storage.
+- GDMA: DMA spans that cross into an adjacent RAM region are rejected;
+  the RX in-link walk, CPU FIFO push/pop, the `OUT_DSCR*` pre-fetch
+  registers and transfer timing are not modeled; a trailing zero-length
+  `suc_eof` descriptor is never visited; `RESTART` with nothing to restart
+  leaves the channel active.
+- `boot_until_console_contains` checks in 250,000-step chunks, so rung
+  budgets are looser than they read; the stable-frame step is quantized
+  the same way.
+- The boot-ladder tests each boot from scratch (the suite takes ~2.6 s
+  today); add the shared-checkpoint fixture if it passes ~10 s.
+- `MAX_STUB_MEMORY_BYTES` clamps in the `strlen`/`memcmp`/`MD5Update`
+  stubs truncate silently.
+- Small duplications: the `memcpy`/`memset` and `memcmp`/`strncmp` stub
+  arms, and the `header_with_speed_size` test helper in `image.rs` and
+  `rom.rs`.
+
+Resolved from the Milestone 3 backlog in Milestone 4: the flash MMU and
+real `load_partitions()` MD5 acceptance, the D5 window's replacement and
+the extra DROM entry, SPIMEM1's dedicated commands, console output after
+the scheduler starts, and the condensed test-history prose.

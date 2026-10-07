@@ -392,99 +392,99 @@ button presses on real hardware. Do this live, with the badge in hand, not
 via a subagent — it's exactly the kind of check that needs a human looking
 at the actual device.
 
+Milestone 4 Task 7 confirmed the mapping from the firmware's side: in the
+hardware self-test, each raw slot lights the on-screen label of the
+button in this table (slot 8 is the self-test's "SideSwitch"). That is
+the firmware agreeing with the table, still not a press on real hardware.
+
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 3)
+### Current state (end of Milestone 4)
 
-Real-firmware boot reaches its **first real ST7789 frame**: the firmware's
-boot splash ("Hack the North × SOLANA" and the FW version line; no
-personal data). From a cold shortcut boot of `factory.bin`:
+Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
+synthetic flash through the whole of `app_main` to the first app's
+screen, and that screen responds to buttons. From a cold boot:
 
-- The framebuffer is blank through step 1,128,604. It is first non-blank
-  on step 1,128,605 (2 distinct RGB565 values, not yet the finished
-  splash).
-- It changes 33 times (sampled every 1,000 steps) and is final from step
-  5,535,126 on: 2,340 distinct values, unchanged at every 1,000-step sample
-  to step 10,000,000.
-- `emulator-core/tests/boot_progress.rs`'s `boots_to_first_real_frame`
-  pins that stable frame by an FNV-1a hash of the framebuffer
-  (`0x5599c270ab0429fa`). It samples every 250,000 steps and stops once
-  the hash has held for 1,000,000 steps (at step 6,750,000). It takes
-  about 0.5 s with `--release` and about 6.5 s in a debug build.
-- 2026-10-06: the human partner compared this frame by eye with the
-  physical badge's first screen and confirmed they match.
+- The boot splash is final from step 5,535,126 (`boots_to_first_real_frame`,
+  hash `0x5599c270ab0429fa`, 2,340 distinct RGB565 values; unchanged by
+  the flash MMU).
+- `load_partitions()` accepts the synthesized partition table through the
+  flash MMU, `esp_littlefs` formats and mounts the blank `storage`
+  partition, the hardware abstraction layer starts (buttons, the absent
+  accelerometer, the RMT LED driver, the sleep manager), and the app
+  registry launches its first app, `app_reg: launched My Badge` (step
+  ~12.29M).
+- My Badge finds no identity (`hal_identity: no identity at
+  /littlefs/identity.json — badge is unprovisioned`) and draws its
+  first-run screen: "Not registered yet", "This badge hasn't been linked
+  to an attendee. Bring it to a registration desk.", "Press START for
+  hardware self-test". The framebuffer leaves the splash at ~13.36M,
+  changes 9 more times as the screen draws in, and is stable from the
+  15,500,000-step sample on (45 distinct values, hash
+  `0x8c5027cec0f79490`; unchanged with no input to at least step
+  46,500,000). `boots_to_first_run_screen` pins it (250,000-step samples,
+  stable for 1,000,000 steps, found at step 16,500,000; cap 17,500,000).
+- Pressing START (slot 0, held 100,000 steps) starts My Badge's hardware
+  self-test. The firmware computes for about 6,000,000 steps without
+  drawing (hot PCs `0x420b_ead4`, `0x420b_b6a4`; not traced), then shows
+  the self-test's "Press every button" screen: stable from the 22,350,000-step
+  sample, 48 distinct values, hash `0x7f325d838835baaa`.
+  `first_run_screen_responds_to_start` pins it with an 8,000,000-step
+  stability window (a 1,000,000-step window mistakes the busy phase for
+  "START did nothing").
+- The WASM twins in `frontend/test/cpu-wasm.test.ts` reach the same splash
+  and first-run hashes through the wasm-bindgen build.
+- No fault, no panic text and no unmodeled SPIMEM1 command on the way.
+  The idle hot PCs are the FreeRTOS idle set (IRAM `0x4038_f930..`, the
+  idle hooks, the 74HC165 scan): the firmware is waiting for input. The
+  unmapped-access tail is ASSIST_DEBUG (`0x600c_e0xx`), SYSTEM
+  `0x600c_0058`/`+0x08` and RTC_CNTL `0x6000_80bc`.
+- **Human comparison, 2026-10-07:** the human partner compared the dumped
+  first-run frame and the self-test frames with the physical badge after a
+  factory reset (spec Part 3: the emulated flash holds no identity, so
+  the reference is a badge without one) and confirmed they match, in content
+  and in orientation. So the frames pinned are what blank-flash boot shows
+  and what a factory-reset badge shows.
 - To look at the frame:
-  `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
+  `cargo run -p emulator-core --release --example boot-probe -- --steps 16500000 --dump-frame first-run.png`
   writes a PNG under the gitignored `local/`.
 
-After the frame, boot takes no instruction-access fault and prints no
-panic text (checked to step 10,000,000; history item 1 checked for no
-exception at all to step 7,600,000), but it never reaches the app launcher or a built-in app. Once the splash is
-drawn, `load_partitions()` reads the partition table through a
-`spi_flash_mmap` window, the flash MMU behind it is not modeled, the
-table reads as zeros, and partition loading fails with
-`ESP_ERR_NOT_FOUND` (history item 1's "Task D13" paragraphs have the
-details). The firmware keeps scheduling with the splash on screen.
+**Why the app launcher is not reached.** It is firmware logic, not an
+emulator gap. On a HOME press the app manager first asks the current app
+whether it handles HOME itself; My Badge always says yes, and its button
+handler checks the provisioned flag. Unprovisioned (as on blank flash), it
+reacts only to START (the self-test); provisioned, HOME takes it to the
+launcher. Every other button on the first-run screen does nothing, on the
+emulator and on the badge. The input path was traced end to end on a HOME
+hold (scan, debouncer, event queue, timer callback, app manager). So the
+launcher needs a provisioned identity in emulated flash, which is
+synthetic data and needs its own ruling (Milestone 5 backlog,
+`milestone-4-decisions.md`). The self-test also confirms the button slot
+mapping from the firmware's side: each raw slot lights the matching
+on-screen label (see "Physical pin map").
 
-**Update (Milestone 4 Task 2):** the flash MMU is now modeled, so that stall
-is gone; boot proceeds past `load_partitions()`'s read (ROM `strncpy` and
-`strcmp` are now real stubs) with no fault through step 10,000,000, but no
-new console line or frame yet (see the history entry at the end of the stall
-log).
+**What the self-test shows that the emulator does not model:** the
+accelerometer reads "0 mg" on every axis (no I2C device; the badge shows
+live values), the lights test drives the LEDs over RMT but the emulator
+does not show them, and the NFC test waits forever for a card (the summary
+lists NFC as skipped). "Hold HOME" exits the self-test back to the
+first-run screen, as A does after the summary.
 
-**Update (Milestone 4 Task 3):** partition loading succeeds: `load_partitions()`
-returns `ESP_OK` (observed 4 `MD5Update` calls and 1 `MD5Final`), pinned by
-`boot_progress.rs`'s
-`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu` (which
-asserts `ESP_OK`, exactly 1 `MD5Final` and at least 1 `MD5Update`). The
-next stall is a poll of SPIMEM1's `CMD` register for `SPI_MEM_FLASH_WREN` to
-clear (see the "Milestone 4 Task 3" history entry).
+**Resolved in Milestone 4** (details in the history below and in
+[`milestone-4-decisions.md`](milestone-4-decisions.md)):
 
-**Update (Milestone 4 Task 4):** log output after the scheduler starts now
-reaches the emulated console (open limitation 2 below is resolved). After
-`main_task: Calling app_main()` the console shows `LVGL: Starting LVGL task`
-and then `esp_littlefs`'s mount failure on the blank `storage` partition
-(`Corrupted dir pair at {0x0, 0x1}`, then `mount failed, (-84).
-formatting...`). The format is what issues the `SPI_MEM_FLASH_WREN` poll
-above, so the stall itself is unchanged (see the "Milestone 4 Task 4"
-history entry).
-
-**Update (Milestone 4 Task 5):** SPIMEM1 now runs the flash driver's
-dedicated write-enable, sector-erase and page-program commands, `RDSR` and
-the DIO fast read, so that poll is gone and `esp_littlefs` formats the blank
-`storage` partition (the littlefs superblock lands in its blocks 0 and 1).
-ROM `strlcat`, `strspn` and `strcspn`, which the littlefs VFS registration
-and path walk call next, are real stubs, so the console continues with
-`hal_fs: littlefs mounted at /littlefs (used 8192 / 1310720 bytes)`,
-`hal_identity`'s "badge is unprovisioned" warning (blank flash) and
-`hal_buttons: buttons ready`. There is no fault through step 30,000,000.
-Boot then stops printing: the physical badge's next line is `hal_accel`'s
-accelerometer detection, and the firmware is driving the unmodeled I2C0
-controller at that point (see the "Milestone 4 Task 5" history entry).
-
-**Update (Milestone 4 Task D-M4-1):** I2C0 is modeled as a master with no
-device on the bus, so the accelerometer probe's address byte is NACKed
-and the driver's ISR reports it; the console continues with
-`E (470) hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE`
-(non-fatal; the physical badge, which has the accelerometer, prints its
-detection line instead). The next function converts a clock frequency
-with ROM libgcc's soft-double helpers, now real stubs. There is no fault
-through step 30,000,000. Boot then stops printing while the firmware
-drives the unmodeled RMT controller (see the "Milestone 4 Task D-M4-1"
-history entry); the physical badge's next line is `hal_sleep`'s.
-
-**Update (Milestone 4 Task D-M4-2):** RMT is modeled as a TX engine that
-completes each transmission in zero emulated time
-(`milestone-4-decisions.md`), so the LED driver's transmission ends and
-the console continues with `hal_sleep: sleep manager ready (...)`. ROM
-`strdup` (guest code calling the firmware's `_malloc_r`), `strchr` and
-`strcpy` are now real, so the app registry enters and launches its first
-app, `I (890) app_reg: launched My Badge` (step ~12.29M). On the blank
-emulated flash that app shows its unregistered-badge screen: the
-framebuffer leaves the splash from step ~13.36M and settles (45 colors)
-by step ~15.48M. There is no fault through step 30,000,000; the firmware
-then idles waiting for input (see the "Milestone 4 Task D-M4-2" history
-entry).
+- The flash MMU (Tasks 1 and 2), replacing Milestone 3's D5 page windows:
+  XIP reads `flash_chip` through the MMU table, so `load_partitions()`
+  works (Task 3).
+- Console output after the scheduler starts (Task 4: the USB-Serial-JTAG
+  model reports an attached host).
+- SPIMEM1's dedicated flash commands, `RDSR` and the DIO fast read (Task
+  5), so littlefs formats and mounts `storage`.
+- I2C0 with no device on the bus (Task D-M4-1) and RMT as a zero-latency
+  TX engine (Task D-M4-2).
+- ROM stubs: `strncpy`, `strcmp`, `strlcat`, `strspn`, `strcspn`, the
+  libgcc soft-double helpers, `strchr`, `strcpy`, and guest-executed
+  `strdup` (109 stubs in all).
 
 **Resolved in Milestone 3** (details in the history below):
 
@@ -507,58 +507,40 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 4 candidates)**, the first one being the
-current blocker (the backlog in `milestone-3-decisions.md` is the complete
-list):
+**Open limitations (Milestone 5 candidates)**, the first one being the
+next blocker (the Milestone 5 backlog in `milestone-4-decisions.md` is the
+complete list):
 
-1. **Flash MMU (plan Task 8, sub-unit 3): modeled in Milestone 4 Task 2.**
-   *(The text below describes the state at the end of Milestone 3; the MMU
-   now exists and boot proceeds past it, see the "Milestone 4 Task 2" history
-   entry.)* The bus has
-   no MMU table: the firmware's entry writes (`DR_REG_MMU_TABLE`,
-   `0x600c_5000`) are dropped and reads through a `spi_flash_mmap` window
-   return 0. The fix is an MMU table model that the DROM/IROM read path
-   consults, backed by the emulated flash chip. Milestone 3 deliberately
-   stopped short of it: the spec builds flash/partition support only if
-   boot reaches it before the first frame, and the first frame comes
-   first.
-2. **Console output after the scheduler starts: resolved in Milestone 4
-   Task 4** (the USB-Serial-JTAG model now reports SOF frames from an
-   attached host; see the "Milestone 4 Task 4" history entry). *(The text
-   below describes the state before the fix.)*
-   `load_partitions()`'s `ESP_LOGE` runs (`esp_log_write`), but no byte
-   reaches the emulated console. Every console line so far was printed
-   before or just after the scheduler started. How later log output
-   leaves the chip (newlib stdout through the VFS, and whether it waits on
-   a USB-Serial-JTAG interrupt the emulator does not raise) is not traced.
-   Until it is, a missing console line is not proof the firmware did not
-   log it.
-3. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
+1. **No identity in emulated flash**, so My Badge stays on its first-run
+   screen and the app launcher (and every built-in app behind it) is out
+   of reach; see "Why the app launcher is not reached" above.
+2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
-   hardcodes the unrotated 320x240 order. The splash comes out right only
-   because the firmware's address window fits that default order. So
-   `boots_to_first_real_frame`'s pinned hash is of *this* framebuffer
-   orientation; modeling `MADCTL` may change the hash without the image
-   being wrong.
+   hardcodes the unrotated 320x240 order. The pinned hashes are of *this*
+   framebuffer order. The splash, the first-run screen and the self-test
+   frames were compared with the physical badge and match in orientation
+   (the screen test's corner fiducials are all fully lit, so nothing is
+   clipped), so the conditional Milestone 4 MADCTL task was skipped.
+3. **No I2C devices, no LED output, no NFC.** The accelerometer probe is
+   NACKed (the self-test reads 0 mg), RMT transmissions are consumed but
+   not shown, and NFC is not modeled.
 4. The dormant items from the history below: flagged ROM-stub guesses
    (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
-   "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6),
-   the bootloader's extra DROM page (item 7) and simplified edge
-   interrupts (item 9).
+   "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6)
+   and simplified edge interrupts (item 9). Item 7 (the bootloader's
+   extra DROM page) is resolved: the MMU seeds entry 127.
 5. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
 6. **Every log timestamp up to `main_task: Calling app_main()` reads
-   `I (0)`** (likewise `W (0)`/`E (0)`). The lines printed after it
-   (Milestone 4 Task 4) carry non-zero timestamps (`I (120)`, `E (430)`,
-   ...), which on ESP-IDF come from the FreeRTOS tick count once the
-   scheduler runs. On
-   real hardware ESP-IDF's log timestamp is milliseconds since boot and
-   advances line by line. The likely cause (not traced) is that the early
-   timestamp comes from the CPU cycle counter, and the ESP32-C3's
-   performance-counter CSR is not modeled. Cosmetic; no test depends on
-   it.
+   `I (0)`** (likewise `W (0)`/`E (0)`). Later lines carry non-zero
+   timestamps (`I (120)`, `E (470)`, ...), which on ESP-IDF come from the
+   FreeRTOS tick count once the scheduler runs. On real hardware the log
+   timestamp is milliseconds since boot and advances line by line. The
+   likely cause (not traced) is that the early timestamp comes from the
+   CPU cycle counter, and the ESP32-C3's performance-counter CSR is not
+   modeled. Cosmetic; no test depends on it.
 
 ### Ground truth from the physical badge
 
@@ -1357,8 +1339,8 @@ predicted these blockers would surface once TIMG unblocks further boot
 
    **Task 11 (Milestone 3 finish line).** No emulator change. The
    splash is final from step 5,535,126 on, and
-   `boots_to_first_real_frame` pins it by hash (see "Current state" at
-   the top of this section). The flash MMU above is the next blocker,
+   `boots_to_first_real_frame` pins it by hash (see "Milestone 3's end
+   state" below). The flash MMU above is the next blocker,
    left for Milestone 4.
 2. **SYSTIMER: resolved (Milestone 3 Task 5).** Milestone 2 modeled only
    unit 0/target 0, with a `COMP0_LOAD` rule that contradicted the real
@@ -1489,6 +1471,155 @@ code paths that would exercise them. They were recorded so Milestone 3
 started from a known list instead of rediscovering each one by stepping
 through a debugger, and they carry over to Milestone 4 in "Open
 limitations" at the top of this section.
+
+### Milestone 3's end state, with Milestone 4's interim updates
+
+Superseded by "Current state (end of Milestone 4)" above; kept as the
+record of where Milestone 3 ended, the updates each Milestone 4 task made
+to it, and Milestone 3's open-limitations list.
+
+Real-firmware boot reaches its **first real ST7789 frame**: the firmware's
+boot splash ("Hack the North × SOLANA" and the FW version line; no
+personal data). From a cold shortcut boot of `factory.bin`:
+
+- The framebuffer is blank through step 1,128,604. It is first non-blank
+  on step 1,128,605 (2 distinct RGB565 values, not yet the finished
+  splash).
+- It changes 33 times (sampled every 1,000 steps) and is final from step
+  5,535,126 on: 2,340 distinct values, unchanged at every 1,000-step sample
+  to step 10,000,000.
+- `emulator-core/tests/boot_progress.rs`'s `boots_to_first_real_frame`
+  pins that stable frame by an FNV-1a hash of the framebuffer
+  (`0x5599c270ab0429fa`). It samples every 250,000 steps and stops once
+  the hash has held for 1,000,000 steps (at step 6,750,000). It takes
+  about 0.5 s with `--release` and about 6.5 s in a debug build.
+- 2026-10-06: the human partner compared this frame by eye with the
+  physical badge's first screen and confirmed they match.
+- To look at the frame:
+  `cargo run -p emulator-core --release --example boot-probe -- --steps 6600000 --dump-frame first-frame.png`
+  writes a PNG under the gitignored `local/`.
+
+After the frame, boot takes no instruction-access fault and prints no
+panic text (checked to step 10,000,000; history item 1 checked for no
+exception at all to step 7,600,000), but it never reaches the app launcher or a built-in app. Once the splash is
+drawn, `load_partitions()` reads the partition table through a
+`spi_flash_mmap` window, the flash MMU behind it is not modeled, the
+table reads as zeros, and partition loading fails with
+`ESP_ERR_NOT_FOUND` (history item 1's "Task D13" paragraphs have the
+details). The firmware keeps scheduling with the splash on screen.
+
+**Update (Milestone 4 Task 2):** the flash MMU is now modeled, so that stall
+is gone; boot proceeds past `load_partitions()`'s read (ROM `strncpy` and
+`strcmp` are now real stubs) with no fault through step 10,000,000, but no
+new console line or frame yet (see the history entry at the end of the stall
+log).
+
+**Update (Milestone 4 Task 3):** partition loading succeeds: `load_partitions()`
+returns `ESP_OK` (observed 4 `MD5Update` calls and 1 `MD5Final`), pinned by
+`boot_progress.rs`'s
+`load_partitions_accepts_the_synthesized_table_through_the_flash_mmu` (which
+asserts `ESP_OK`, exactly 1 `MD5Final` and at least 1 `MD5Update`). The
+next stall is a poll of SPIMEM1's `CMD` register for `SPI_MEM_FLASH_WREN` to
+clear (see the "Milestone 4 Task 3" history entry).
+
+**Update (Milestone 4 Task 4):** log output after the scheduler starts now
+reaches the emulated console (open limitation 2 below is resolved). After
+`main_task: Calling app_main()` the console shows `LVGL: Starting LVGL task`
+and then `esp_littlefs`'s mount failure on the blank `storage` partition
+(`Corrupted dir pair at {0x0, 0x1}`, then `mount failed, (-84).
+formatting...`). The format is what issues the `SPI_MEM_FLASH_WREN` poll
+above, so the stall itself is unchanged (see the "Milestone 4 Task 4"
+history entry).
+
+**Update (Milestone 4 Task 5):** SPIMEM1 now runs the flash driver's
+dedicated write-enable, sector-erase and page-program commands, `RDSR` and
+the DIO fast read, so that poll is gone and `esp_littlefs` formats the blank
+`storage` partition (the littlefs superblock lands in its blocks 0 and 1).
+ROM `strlcat`, `strspn` and `strcspn`, which the littlefs VFS registration
+and path walk call next, are real stubs, so the console continues with
+`hal_fs: littlefs mounted at /littlefs (used 8192 / 1310720 bytes)`,
+`hal_identity`'s "badge is unprovisioned" warning (blank flash) and
+`hal_buttons: buttons ready`. There is no fault through step 30,000,000.
+Boot then stops printing: the physical badge's next line is `hal_accel`'s
+accelerometer detection, and the firmware is driving the unmodeled I2C0
+controller at that point (see the "Milestone 4 Task 5" history entry).
+
+**Update (Milestone 4 Task D-M4-1):** I2C0 is modeled as a master with no
+device on the bus, so the accelerometer probe's address byte is NACKed
+and the driver's ISR reports it; the console continues with
+`E (470) hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE`
+(non-fatal; the physical badge, which has the accelerometer, prints its
+detection line instead). The next function converts a clock frequency
+with ROM libgcc's soft-double helpers, now real stubs. There is no fault
+through step 30,000,000. Boot then stops printing while the firmware
+drives the unmodeled RMT controller (see the "Milestone 4 Task D-M4-1"
+history entry); the physical badge's next line is `hal_sleep`'s.
+
+**Update (Milestone 4 Task D-M4-2):** RMT is modeled as a TX engine that
+completes each transmission in zero emulated time
+(`milestone-4-decisions.md`), so the LED driver's transmission ends and
+the console continues with `hal_sleep: sleep manager ready (...)`. ROM
+`strdup` (guest code calling the firmware's `_malloc_r`), `strchr` and
+`strcpy` are now real, so the app registry enters and launches its first
+app, `I (890) app_reg: launched My Badge` (step ~12.29M). On the blank
+emulated flash that app shows its unregistered-badge screen: the
+framebuffer leaves the splash from step ~13.36M and settles (45 colors)
+by step ~15.48M. There is no fault through step 30,000,000; the firmware
+then idles waiting for input (see the "Milestone 4 Task D-M4-2" history
+entry).
+
+**Open limitations at the end of Milestone 3 (Milestone 4 candidates)**, the first one being the
+current blocker (the backlog in `milestone-3-decisions.md` is the complete
+list):
+
+1. **Flash MMU (plan Task 8, sub-unit 3): modeled in Milestone 4 Task 2.**
+   *(The text below describes the state at the end of Milestone 3; the MMU
+   now exists and boot proceeds past it, see the "Milestone 4 Task 2" history
+   entry.)* The bus has
+   no MMU table: the firmware's entry writes (`DR_REG_MMU_TABLE`,
+   `0x600c_5000`) are dropped and reads through a `spi_flash_mmap` window
+   return 0. The fix is an MMU table model that the DROM/IROM read path
+   consults, backed by the emulated flash chip. Milestone 3 deliberately
+   stopped short of it: the spec builds flash/partition support only if
+   boot reaches it before the first frame, and the first frame comes
+   first.
+2. **Console output after the scheduler starts: resolved in Milestone 4
+   Task 4** (the USB-Serial-JTAG model now reports SOF frames from an
+   attached host; see the "Milestone 4 Task 4" history entry). *(The text
+   below describes the state before the fix.)*
+   `load_partitions()`'s `ESP_LOGE` runs (`esp_log_write`), but no byte
+   reaches the emulated console. Every console line so far was printed
+   before or just after the scheduler started. How later log output
+   leaves the chip (newlib stdout through the VFS, and whether it waits on
+   a USB-Serial-JTAG interrupt the emulator does not raise) is not traced.
+   Until it is, a missing console line is not proof the firmware did not
+   log it.
+3. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
+   and then `0x60` (row/column exchange, then also column-address
+   mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
+   hardcodes the unrotated 320x240 order. The splash comes out right only
+   because the firmware's address window fits that default order. So
+   `boots_to_first_real_frame`'s pinned hash is of *this* framebuffer
+   orientation; modeling `MADCTL` may change the hash without the image
+   being wrong.
+4. The dormant items from the history below: flagged ROM-stub guesses
+   (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
+   "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6),
+   the bootloader's extra DROM page (item 7) and simplified edge
+   interrupts (item 9).
+5. **The eFuse block is not modeled**, so the emulated boot logs
+   `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
+   "Ground truth from the physical badge"). Nothing has stalled on it.
+6. **Every log timestamp up to `main_task: Calling app_main()` reads
+   `I (0)`** (likewise `W (0)`/`E (0)`). The lines printed after it
+   (Milestone 4 Task 4) carry non-zero timestamps (`I (120)`, `E (430)`,
+   ...), which on ESP-IDF come from the FreeRTOS tick count once the
+   scheduler runs. On
+   real hardware ESP-IDF's log timestamp is milliseconds since boot and
+   advances line by line. The likely cause (not traced) is that the early
+   timestamp comes from the CPU cycle counter, and the ESP32-C3's
+   performance-counter CSR is not modeled. Cosmetic; no test depends on
+   it.
 
 ### Milestone 4 Task 2: flash MMU
 
@@ -1842,7 +1973,44 @@ writes as byte-split words (all failed before the change). Decisions are in
   ASSIST_DEBUG `0x600c_e000`/`0x600c_e038`/`0x600c_e03c` only. SPIMEM1:
   1,735 transactions, nothing unmodeled. The physical badge prints the
   same `hal_sleep` and three `app_reg` lines (with its own heap figures
-  and timestamps); being provisioned, it presumably shows a different "My Badge" screen.
+  and timestamps). Task 7 found that My Badge branches on whether the
+  badge is provisioned (an identity at `/littlefs/identity.json`); a
+  factory-reset physical badge shows this same first-run screen
+  (human-confirmed, see "Current state"). What a provisioned badge
+  shows was not compared.
+
+### Milestone 4 Task 7: the finish line (first-run screen)
+
+- **Found** (release scratch runs over `FirmwareRuntime`, frames dumped
+  under `local/`): the first stable non-splash frame is My Badge's
+  first-run screen (see "Current state" for steps and hashes). No input
+  path or emulator gap stops boot: the firmware waits for input.
+- **Buttons on the first-run screen:** HOME, B, A, DOWN, LEFT, RIGHT, UP
+  and AUX1, each held 100,000 steps (HOME, B and A also for 1M, 4M and
+  30M), leave the frame and the console unchanged, with no fault. A
+  single-stepped HOME hold showed every stage working: the button task's
+  scan returns the pressed mask, the debouncer posts the event after two
+  equal scans, the 10-tick timer callback hands it to the app manager,
+  and My Badge claims it and ignores it while unprovisioned (see "Why the
+  app launcher is not reached").
+- **START:** the self-test (no console lines, no app switch). Walking it
+  with A presses gives, in order, the button screen (each slot lights its
+  label: 0 Start, 1 A, 2 B, 3 Home, 4 DOWN, 5 LEFT, 6 RIGHT, 7 UP, 8
+  SideSwitch), a screen test with lit 8x8 fiducials in all four corners,
+  the accelerometer (0 mg), the lights test, NFC ("Waiting for card..."),
+  the "Hardware test complete" summary, and back to the first-run screen
+  (same hash). Hold HOME also exits to the first-run screen. No path leads
+  to the launcher.
+- **Human gate (2026-10-07):** match after a factory reset, content and
+  orientation (see "Current state"). The MADCTL task was therefore
+  skipped.
+- **Rungs:** `boots_to_first_run_screen` and
+  `first_run_screen_responds_to_start` in `boot_progress.rs`, sharing
+  `run_until_stable_frame` with `boots_to_first_real_frame`; the WASM twin
+  "boots factory.bin to the same first-run screen as the native
+  finish-line test". The per-rung task history that used to live in
+  `boot_progress.rs`'s and `rom_stub_boot.rs`'s docs is in this log; the
+  test docs now say only what each rung asserts.
 
 ## Emulated flash chip: what it contains
 

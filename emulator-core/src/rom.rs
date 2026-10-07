@@ -911,7 +911,14 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 4 Task D-M4-2**: 109 stubs (`strchr` and `strcpy`)
+//! **As of the end of Milestone 4**: 109 stubs and two guest-executed ROM
+//! routines (`qsort`, `strdup`), unchanged since Task D-M4-2. Boot reaches
+//! the first app's stable first-run screen and its START-launched
+//! self-test without needing another ROM call (`tests/boot_progress.rs`'s
+//! `boots_to_first_run_screen` and `first_run_screen_responds_to_start`;
+//! the notes' "Current state").
+//!
+//! **As of Milestone 4 Task D-M4-2** (history): 109 stubs (`strchr` and `strcpy`)
 //! and a second guest-executed ROM routine, `strdup` (entry 25). With RMT
 //! modeled, boot launches its first app and draws its screen, with no
 //! exception through step 30,000,000 (the notes' "Milestone 4 Task
@@ -1514,8 +1521,8 @@ pub const QSORT: u32 = 0x4000_0434;
 /// `strdup` allocates through the firmware's `_malloc_r`.
 pub const STRDUP: u32 = 0x4000_03dc;
 
-/// `syscall_table_ptr`, the ROM `.bss` word (`esp32c3.rom.newlib.ld`'s
-/// group; `0x3fcdffe0` in `esp32c3_rev3_rom.elf`, section
+/// `syscall_table_ptr`, the ROM `.bss` word (`esp32c3.rom.libc.ld`, line
+/// 57; `0x3fcdffe0` in `esp32c3_rev3_rom.elf`, section
 /// `.bss.interface.newlib`) through which ROM newlib reaches the
 /// firmware's `struct syscall_stub_table` (`esp_rom/include/esp32c3/rom/
 /// libc_stubs.h`): `__getreent` at offset 0, `_malloc_r` at offset 4.
