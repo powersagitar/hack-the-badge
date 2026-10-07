@@ -1245,8 +1245,18 @@ mod tests {
         let mut bus = bus_with(vec![]);
         bus.write32(MMU_TABLE_RANGE.start + 43 * 4, 0x2b); // entry 43 -> page 0x2b (storage partition start 0x2b0000)
         assert_eq!(bus.read8(0x3c2b_0000), 0xFF, "blank");
-        bus.flash_chip.program(0x2b_0000, &[0x00]);
-        assert_eq!(bus.read8(0x3c2b_0000), 0x00);
+        let base = 0x6000_2000u32;
+        // WREN (CMD bit 30), then PP (CMD bit 25) as spi_flash_hal does:
+        // 24-bit address phase, ADDR = addr | len << 24, data in W0.
+        bus.write32(base + 0x04, 0x2b_0000 | (1 << 24));
+        bus.write32(base + 0x1C, 23 << 26);
+        bus.write32(base + 0x58, 0x3C);
+        bus.write32(base, 1 << 30);
+        assert_eq!(bus.read32(base), 0, "WREN self-clears");
+        bus.write32(base, 1 << 25);
+        assert_eq!(bus.read32(base), 0, "PP self-clears");
+        assert_eq!(bus.read8(0x3c2b_0000), 0x3C);
+        assert_eq!(bus.read8(0x3c2b_0001), 0xFF, "only len bytes programmed");
     }
 
     #[test]

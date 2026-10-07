@@ -703,23 +703,24 @@ impl Cpu {
                 let set = self.regs.read(rom_stubs::REG_A1);
                 let want_in_set = matches!(stub.effect, RomStubEffect::Strspn);
                 let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                // Read `set` once (up to its NUL, same cap) into a 256-bit
+                // membership table, then scan `s` once: linear, not
+                // |s| * |set| bus reads.
+                let mut table = [0u32; 8];
+                for j in 0..cap {
+                    let x = bus.read8(set.wrapping_add(j));
+                    if x == 0 {
+                        break;
+                    }
+                    table[(x >> 5) as usize] |= 1 << (x & 31);
+                }
                 let mut len: u32 = 0;
                 while len < cap {
                     let c = bus.read8(s.wrapping_add(len));
                     if c == 0 {
                         break;
                     }
-                    let mut in_set = false;
-                    for j in 0..cap {
-                        let x = bus.read8(set.wrapping_add(j));
-                        if x == 0 {
-                            break;
-                        }
-                        if x == c {
-                            in_set = true;
-                            break;
-                        }
-                    }
+                    let in_set = table[(c >> 5) as usize] & (1 << (c & 31)) != 0;
                     if in_set != want_in_set {
                         break;
                     }
@@ -1994,6 +1995,35 @@ mod tests {
         assert_eq!(bus.mem[0x205], 0x11, "must not write past n bytes");
         assert_eq!(cpu.regs.read(10), 0x200, "memset returns dst");
         assert_eq!(cpu.regs.pc, 0x40);
+    }
+
+    #[test]
+    fn strspn_and_strcspn_stubs_are_linear_in_long_strings() {
+        // A few hundred KiB each of non-matching bytes: the old nested scan
+        // needed ~1e11 bus reads here and would hang.
+        const N: usize = 300_000;
+        const SET: usize = 0x1000;
+        const S: usize = SET + N + 16;
+        for (stub, expect) in [
+            (RomStub::strspn("strspn"), 0u32),
+            (RomStub::strcspn("strcspn"), N as u32),
+        ] {
+            let mut cpu = Cpu::new();
+            let mut table = RomStubTable::new();
+            table.insert(ROM_STUB_ADDR, stub);
+            cpu.set_rom_stubs(table);
+            let mut bus = rom_stub_test_bus();
+            bus.mem.resize(S + N + 16, 0);
+            bus.mem[SET..SET + N].fill(b'a');
+            bus.mem[S..S + N].fill(b'z');
+            cpu.regs.write(10, S as u32);
+            cpu.regs.write(11, SET as u32);
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+            assert_eq!(cpu.regs.read(10), expect);
+        }
     }
 
     #[test]

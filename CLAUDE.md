@@ -276,9 +276,12 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       calls bounds-checked),
                       paired with cpu/rom_stubs.rs's generic mechanism
                       above. Also the guest-executed ROM code blobs
-                      (`ESP32C3_ROM_CODE`: qsort's one-`jal` jump-table
-                      slot plus its insertion-sort body in a ROM range no
-                      linker-script symbol points into) and the ROM data
+                      (`ESP32C3_ROM_CODE`: the one-`jal` jump-table slot
+                      plus body of qsort (insertion sort) and of strdup,
+                      in ROM ranges no linker-script symbol points into;
+                      strdup reaches the firmware's `_malloc_r` through
+                      the ROM `.bss` `syscall_table_ptr` word at
+                      0x3fcd_ffe0, which the firmware's libc init fills) and the ROM data
                       tables (`ESP32C3_ROM_DATA`: the `ets_rom_layout_p`
                       layout table, values from Espressif's ROM ELF),
                       and the ROM's writable `.data` boot reads

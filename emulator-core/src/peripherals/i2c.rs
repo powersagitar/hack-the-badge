@@ -77,7 +77,7 @@
 //!   (`+0x100`/`+0x180`, one byte per word); a CPU write lands in TX RAM
 //!   without moving the pointers and is dropped for RX RAM.
 //!   `FIFO_CONF.TX_FIFO_RST`/`RX_FIFO_RST` (bits 13/12) empty their FIFO
-//!   while set. `SR.RXFIFO_CNT`/`TXFIFO_CNT` and `FIFO_ST`'s four pointers
+//!   on the write that sets the bit. `SR.RXFIFO_CNT`/`TXFIFO_CNT` and `FIFO_ST`'s four pointers
 //!   are computed from the FIFO state.
 //! - **Bus state**: `SR.BUS_BUSY` is 1 from an RSTART until a STOP (an END
 //!   leaves the bus held), otherwise 0. `FSM_RST` releases it.

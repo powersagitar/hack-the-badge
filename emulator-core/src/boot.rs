@@ -117,7 +117,7 @@ pub fn initial_stack_pointer() -> u32 {
 /// high-level-emulation stub table ([`crate::rom::esp32c3_rom_stubs`])
 /// installed on the returned [`Cpu`], and the ESP32-C3's guest-executed ROM
 /// code blobs ([`crate::rom::install_esp32c3_rom_code`] -- currently ROM
-/// libc `qsort`, Milestone 3 Task D6) mapped onto the returned
+/// libc `qsort` and `strdup`, Milestone 3 Task D6) mapped onto the returned
 /// [`FirmwareBus`], along with its read-only ROM data
 /// ([`crate::rom::install_esp32c3_rom_data`] -- currently the ROM layout
 /// table behind `ets_rom_layout_p`, Milestone 3 Task D7), and finally the

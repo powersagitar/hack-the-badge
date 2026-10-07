@@ -422,12 +422,10 @@ mod tests {
             MMU_ENTRY_NUM as u32
         );
         // The cache apertures sit inside the coarse XIP ranges.
-        assert!(
-            DROM_RANGE.start <= DBUS_CACHE_RANGE.start && DBUS_CACHE_RANGE.end <= DROM_RANGE.end
-        );
-        assert!(
-            IROM_RANGE.start <= IBUS_CACHE_RANGE.start && IBUS_CACHE_RANGE.end <= IROM_RANGE.end
-        );
+        let (d, db) = (DROM_RANGE, DBUS_CACHE_RANGE);
+        assert!(d.start <= db.start && db.end <= d.end);
+        let (i, ib) = (IROM_RANGE, IBUS_CACHE_RANGE);
+        assert!(i.start <= ib.start && ib.end <= i.end);
         // The MMU block does not overlap any other modeled peripheral.
         for r in [
             &SYSTEM_RANGE,
