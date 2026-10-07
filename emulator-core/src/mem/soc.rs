@@ -94,6 +94,22 @@ pub const ROM_STACK_SIZE: u32 = 0x2000;
 /// header check reads bytes that live in this leading gap).
 pub const MMU_PAGE_SIZE: u32 = 0x1_0000;
 
+/// `SOC_MMU_ENTRY_NUM` (`components/soc/esp32c3/include/soc/ext_mem_defs.h`,
+/// ESP-IDF v5.5.3): the number of 32-bit entries in the MMU table.
+pub const MMU_ENTRY_NUM: usize = 128;
+/// `SOC_MMU_INVALID` (`ext_mem_defs.h`): bit 8 set = entry unmapped.
+pub const MMU_INVALID: u32 = 1 << 8;
+/// `SOC_MMU_VALID_VAL_MASK` (`ext_mem_defs.h`): the physical page number.
+pub const MMU_VALID_VAL_MASK: u32 = 0xff;
+/// `SOC_MMU_VADDR_MASK` (`ext_mem_defs.h`); `mmu_ll_get_entry_id()`
+/// (`hal/esp32c3/include/hal/mmu_ll.h`) is `(vaddr & SOC_MMU_VADDR_MASK) >> 16`.
+pub const MMU_VADDR_MASK: u32 = 0x7F_FFFF;
+/// `MMU_LL_END_DROM_ENTRY_ID = SOC_MMU_ENTRY_NUM - 1` (`mmu_ll.h`): the
+/// entry the bootloader maps to the DROM's first page "for app to find the
+/// boot partition" (`bootloader_support/src/bootloader_utility.c`,
+/// `set_cache_and_start_app`).
+pub const MMU_DROM_END_ENTRY_ID: usize = MMU_ENTRY_NUM - 1;
+
 /// `true` if `addr` falls inside one of the flash-mapped XIP apertures
 /// ([`DROM_RANGE`] or [`IROM_RANGE`]). Everything else in the app image
 /// (DRAM/IRAM/RTC segments) is RAM-copied at boot instead — see
@@ -209,6 +225,24 @@ pub const SPIMEM1_RANGE: Range<u32> = 0x6000_2000..0x6000_3000;
 /// page: `gdma_reg.h`'s highest register, `GDMA_OUT_PERI_SEL_CH2_REG`, is
 /// at `+0x280`. See `crate::peripherals::gdma`.
 pub const GDMA_RANGE: Range<u32> = 0x6003_F000..0x6004_0000;
+
+/// The flash MMU table: `DR_REG_MMU_TABLE = 0x600c5000`
+/// (`components/soc/esp32c3/register/soc/reg_base.h`, ESP-IDF v5.5.3).
+/// `SOC_MMU_ENTRY_NUM` (128) 32-bit entries occupy the first `0x200`
+/// bytes; the rest of this 4 KiB block is not modeled (catch-all).
+pub const MMU_TABLE_RANGE: Range<u32> = 0x600c_5000..0x600c_6000;
+
+/// The data-bus flash-cache aperture the MMU translates:
+/// `SOC_DRAM0_CACHE_ADDRESS_LOW..HIGH`
+/// (`components/soc/esp32c3/include/soc/ext_mem_defs.h`). Narrower than
+/// [`DROM_RANGE`]: addresses in `DROM_RANGE` past this end are not
+/// cache-backed at all.
+pub const DBUS_CACHE_RANGE: Range<u32> = 0x3C00_0000..0x3C80_0000;
+
+/// The instruction-bus flash-cache aperture:
+/// `SOC_IRAM0_CACHE_ADDRESS_LOW..HIGH` (same header). Shares the 128 MMU
+/// entries with [`DBUS_CACHE_RANGE`].
+pub const IBUS_CACHE_RANGE: Range<u32> = 0x4200_0000..0x4280_0000;
 
 #[cfg(test)]
 mod tests {
@@ -354,5 +388,29 @@ mod tests {
             assert!(!other.contains(&GDMA_RANGE.start));
         }
         assert!(!is_xip_addr(GDMA_RANGE.start));
+    }
+
+    #[test]
+    fn mmu_constants_match_esp_idf_v5_5_3() {
+        assert_eq!(MMU_TABLE_RANGE.start, 0x600c_5000); // DR_REG_MMU_TABLE
+        assert_eq!(MMU_ENTRY_NUM, 128); // SOC_MMU_ENTRY_NUM
+        assert_eq!(MMU_INVALID, 1 << 8); // SOC_MMU_INVALID
+        assert_eq!(MMU_VALID_VAL_MASK, 0xff); // SOC_MMU_VALID_VAL_MASK
+        assert_eq!(MMU_VADDR_MASK, 0x7f_ffff); // SOC_MMU_VADDR_MASK
+        assert_eq!(MMU_DROM_END_ENTRY_ID, 127); // MMU_LL_END_DROM_ENTRY_ID
+        assert_eq!(DBUS_CACHE_RANGE, 0x3c00_0000..0x3c80_0000); // SOC_DRAM0_CACHE_ADDRESS_LOW/HIGH
+        assert_eq!(IBUS_CACHE_RANGE, 0x4200_0000..0x4280_0000); // SOC_IRAM0_CACHE_ADDRESS_LOW/HIGH
+        // One entry per 64 KiB page of either aperture.
+        assert_eq!(
+            (DBUS_CACHE_RANGE.end - DBUS_CACHE_RANGE.start) / MMU_PAGE_SIZE,
+            MMU_ENTRY_NUM as u32
+        );
+        // The cache apertures sit inside the coarse XIP ranges.
+        assert!(DROM_RANGE.start <= DBUS_CACHE_RANGE.start && DBUS_CACHE_RANGE.end <= DROM_RANGE.end);
+        assert!(IROM_RANGE.start <= IBUS_CACHE_RANGE.start && IBUS_CACHE_RANGE.end <= IROM_RANGE.end);
+        // The MMU block does not overlap any other modeled peripheral.
+        for r in [&SYSTEM_RANGE, &INTERRUPT_CORE0_RANGE, &GDMA_RANGE, &SPIMEM1_RANGE] {
+            assert!(MMU_TABLE_RANGE.end <= r.start || r.end <= MMU_TABLE_RANGE.start);
+        }
     }
 }

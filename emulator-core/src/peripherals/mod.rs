@@ -69,6 +69,7 @@ pub mod flash;
 pub mod gdma;
 pub mod gpio;
 pub mod intc;
+pub mod mmu;
 pub mod rtc_cntl;
 pub mod spi;
 pub mod system;
