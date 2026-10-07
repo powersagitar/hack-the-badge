@@ -147,6 +147,7 @@ pub const SYSTEM_RANGE: Range<u32> = 0x600c_0000..0x600c_1000;
 /// `0x04C`, `SYSTIMER_TARGET0_INT_MAP_REG` = `0x094`,
 /// `DMA_CH0_INT_MAP_REG` = `0x0B0`, `CPU_INTR_FROM_CPU_0_MAP_REG` = `0x0C8`).
 pub const SRC_SPI2: u32 = 19; // ETS_SPI2_INTR_SOURCE
+pub const SRC_RMT: u32 = 28; // ETS_RMT_INTR_SOURCE (INTERRUPT_CORE0_RMT_INTR_MAP_REG = 0x070)
 pub const SRC_I2C_EXT0: u32 = 29; // ETS_I2C_EXT0_INTR_SOURCE
 pub const SRC_SYSTIMER_TARGET0: u32 = 37; // ETS_SYSTIMER_TARGET0_INTR_SOURCE
 pub const SRC_SYSTIMER_TARGET1: u32 = 38;
@@ -232,6 +233,13 @@ pub const GDMA_RANGE: Range<u32> = 0x6003_F000..0x6004_0000;
 /// page: `i2c_reg.h`'s highest address, `I2C_RXFIFO_START_ADDR_REG` RAM, ends
 /// at `+0x200`. See `crate::peripherals::i2c`.
 pub const I2C0_RANGE: Range<u32> = 0x6001_3000..0x6001_4000;
+
+/// RMT registers and RAM (`DR_REG_RMT_BASE = 0x6001_6000`, ESP-IDF v5.5.3
+/// `components/soc/esp32c3/register/soc/reg_base.h`; `RMTMEM = 0x6001_6400`,
+/// `components/soc/esp32c3/ld/rmt.peripherals.ld`). One 4 KiB page (TRM
+/// v1.4 table 3.3-3: `0x6001_6000..=0x6001_6FFF`); the 192-word RAM ends at
+/// `+0x700`. See `crate::peripherals::rmt`.
+pub const RMT_RANGE: Range<u32> = 0x6001_6000..0x6001_7000;
 
 /// The flash MMU table: `DR_REG_MMU_TABLE = 0x600c5000`
 /// (`components/soc/esp32c3/register/soc/reg_base.h`, ESP-IDF v5.5.3).

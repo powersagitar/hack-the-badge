@@ -56,7 +56,7 @@
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
 //!    (`CPU_INT_EIP_STATUS_REG`) needs the live asserted interrupt sources
-//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM, SPI2, GDMA and I2C0) to answer a
+//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM, SPI2, GDMA, I2C0 and RMT) to answer a
 //!    read, which is exactly the cross-peripheral access the ruling
 //!    anticipated: [`FirmwareBus::read_byte`] reads the concrete fields
 //!    directly, no trait object involved.
@@ -132,7 +132,13 @@
 //!    Offsets [`crate::peripherals::i2c::I2c::handles`] does not name are
 //!    logged into [`FirmwareBus::unmapped_log`]. Its `INT_STATUS != 0` level
 //!    is `SRC_I2C_EXT0` in [`FirmwareBus::pending_sources`].
-//! 15. **Catch-all**: any address covered by none of the above (every
+//! 15. **RMT** ([`crate::mem::soc::RMT_RANGE`], registers and RMT RAM):
+//!    routed to [`FirmwareBus::rmt`], same ruling — see
+//!    `crate::peripherals::rmt`. Offsets [`crate::peripherals::rmt::Rmt::handles`]
+//!    does not name (the APB FIFO data registers, reserved words) are logged
+//!    into [`FirmwareBus::unmapped_log`]. Its `INT_ST != 0` level is
+//!    `SRC_RMT` in [`FirmwareBus::pending_sources`].
+//! 16. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -162,6 +168,7 @@ use crate::peripherals::gpio::Gpio;
 use crate::peripherals::i2c::I2c;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::mmu::FlashMmu;
+use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::system::System;
@@ -173,7 +180,7 @@ use super::image::SegmentDescriptor;
 use super::soc::{
     is_xip_addr, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
     IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
-    MMU_VALID_VAL_MASK, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
+    MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
     SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
@@ -322,6 +329,9 @@ pub struct FirmwareBus {
     /// The I2C0 controller (`crate::peripherals::i2c`), same ruling: a
     /// master with no device on the bus, so every address phase NACKs.
     pub i2c0: I2c,
+    /// The RMT controller (`crate::peripherals::rmt`), same ruling: a TX
+    /// engine that completes each transmission in zero time.
+    pub rmt: Rmt,
     /// The USB-Serial-JTAG peripheral (`crate::peripherals::usb_serial_jtag`),
     /// same ruling — the badge's actual console transport.
     pub usb_serial_jtag: UsbSerialJtag,
@@ -441,6 +451,7 @@ impl FirmwareBus {
             spi: Spi::new(),
             gdma: Gdma::new(),
             i2c0: I2c::new(),
+            rmt: Rmt::new(),
             usb_serial_jtag: UsbSerialJtag::new(),
             timg0: Timg::new(),
             timg1: Timg::new(),
@@ -513,13 +524,15 @@ impl FirmwareBus {
     /// so far: SYSTIMER targets 0..2 (`SRC_SYSTIMER_TARGET0..2`, Task 5), the
     /// SYSTEM `FROM_CPU_0..3` software interrupts, SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9), and
     /// GDMA channels 0..2 (`SRC_DMA_CH0..2`, `INT_RAW & INT_ENA`, Task 10),
-    /// and I2C0 (`SRC_I2C_EXT0`, `INT_STATUS != 0`, Milestone 4 Task D-M4-1).
+    /// I2C0 (`SRC_I2C_EXT0`, `INT_STATUS != 0`, Milestone 4 Task D-M4-1), and RMT
+    /// (`SRC_RMT`, `INT_ST != 0`, Task D-M4-2).
     pub fn pending_sources(&self) -> u64 {
         let mut p = self.systimer.pending_sources();
         p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
         p |= self.spi.pending_sources();
         p |= self.gdma.pending_sources();
         p |= self.i2c0.pending_sources();
+        p |= self.rmt.pending_sources();
         p
     }
 
@@ -720,6 +733,13 @@ impl FirmwareBus {
             }
             return self.i2c0.read_byte(offset);
         }
+        if RMT_RANGE.contains(&addr) {
+            let offset = addr - RMT_RANGE.start;
+            if !Rmt::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.rmt.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -858,6 +878,14 @@ impl FirmwareBus {
                 self.record_unmapped(addr, true);
             }
             self.i2c0.write_byte(offset, val);
+            return;
+        }
+        if RMT_RANGE.contains(&addr) {
+            let offset = addr - RMT_RANGE.start;
+            if !Rmt::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.rmt.write_byte(offset, val);
             return;
         }
         self.record_unmapped(addr, true);
@@ -1741,5 +1769,30 @@ mod tests {
             .any(|a| I2C0_RANGE.contains(&a.addr)));
         bus.read32(base + 0x88);
         assert!(bus.unmapped_log().iter().any(|a| a.addr == base + 0x88));
+    }
+    /// RMT (`0x6001_6000`) is routed to `FirmwareBus::rmt`: symbols written
+    /// to RMT RAM (`+0x400`) and `TX_START` raise `TX_END`, asserting
+    /// `SRC_RMT`; the APB FIFO data register `+0x00` stays logged.
+    #[test]
+    fn rmt_transmission_through_the_bus_asserts_its_source() {
+        use crate::mem::soc::{RMT_RANGE, SRC_RMT};
+        let mut bus = bus_with(vec![]);
+        let base = 0x6001_6000;
+        bus.write32(base + 0x40, 1); // INT_ENA: CH0_TX_END
+        bus.write32(base + 0x400, 0x0009_8003); // one symbol
+        bus.write32(base + 0x404, 0); // end-marker
+        assert_eq!(bus.read32(base + 0x400), 0x0009_8003);
+        assert_eq!(bus.pending_sources() & (1u64 << SRC_RMT), 0);
+        bus.write32(base + 0x10, 0x0071_0201); // CH0CONF0: TX_START
+        assert_eq!(bus.read32(base + 0x3C), 1); // INT_ST: CH0_TX_END
+        assert_ne!(bus.pending_sources() & (1u64 << SRC_RMT), 0);
+        bus.write32(base + 0x44, 1); // INT_CLR
+        assert_eq!(bus.pending_sources() & (1u64 << SRC_RMT), 0);
+        assert!(!bus
+            .unmapped_log()
+            .iter()
+            .any(|a| RMT_RANGE.contains(&a.addr)));
+        bus.read32(base);
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == base));
     }
 }

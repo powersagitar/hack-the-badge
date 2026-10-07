@@ -473,6 +473,19 @@ through step 30,000,000. Boot then stops printing while the firmware
 drives the unmodeled RMT controller (see the "Milestone 4 Task D-M4-1"
 history entry); the physical badge's next line is `hal_sleep`'s.
 
+**Update (Milestone 4 Task D-M4-2):** RMT is modeled as a TX engine that
+completes each transmission in zero emulated time
+(`milestone-4-decisions.md`), so the LED driver's transmission ends and
+the console continues with `hal_sleep: sleep manager ready (...)`. ROM
+`strdup` (guest code calling the firmware's `_malloc_r`), `strchr` and
+`strcpy` are now real, so the app registry enters and launches its first
+app, `I (890) app_reg: launched My Badge` (step ~12.29M). On the blank
+emulated flash that app shows its unregistered-badge screen: the
+framebuffer leaves the splash from step ~13.36M and settles (45 colors)
+by step ~15.48M. There is no fault through step 30,000,000; the firmware
+then idles waiting for input (see the "Milestone 4 Task D-M4-2" history
+entry).
+
 **Resolved in Milestone 3** (details in the history below):
 
 - TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
@@ -1771,6 +1784,65 @@ writes as byte-split words (all failed before the change). Decisions are in
   of the system runs normally. Other unmapped accesses are unchanged
   (ASSIST_DEBUG `0x600c_e0xx`, SYSTEM `0x600c_0058`). SPIMEM1: 471
   transactions, nothing unmodeled. Next task: model RMT TX.
+
+### Milestone 4 Task D-M4-2: RMT TX; the first app launches
+
+- **Found:** the D-M4-1 stall above, traced: the firmware creates TX
+  channel 0 with two RAM blocks (`RMT_MEM_SIZE_CH0` = 2, 96 words),
+  `TX_LIM` 48, wrap mode on, enables `CH0_TX_THR_EVENT` and `CH0_TX_END`,
+  fills all 96 words with WS2812-style symbols (`0x0009_8003`: level 1 for
+  3 ticks, level 0 for 9), sets `TX_START`, and blocks in
+  `rmt_tx_wait_all_done()` (ESP-IDF v5.5.3 `esp_driver_rmt/src/rmt_tx.c`,
+  non-DMA ping-pong: each threshold interrupt refills the half just sent).
+  No interrupt ever came.
+- **Resolved:** `peripherals/rmt.rs` models RMT (`0x6001_6000`, RAM at
+  `+0x400..+0x700`) as a TX engine that consumes symbols inside the
+  `TX_START` write, stops at an end-marker (`TX_END`), pauses after each
+  *enabled* `TX_THR_EVENT`/`TX_LOOP` until the ISR clears or disables it,
+  wraps in wrap/continuous mode, and raises `ERR` + `MEM_EMPTY` on a
+  non-wrap overrun. `INT_ST` drives `SRC_RMT` (source 28,
+  `INTERRUPT_CORE0_RMT_INTR_MAP_REG` = `0x070`). Offsets, access types and
+  reset values from `rmt_reg.h`/`rmt_struct.h`, accessors from
+  `rmt_ll.h`, behavior from the ESP32-C3 TRM v1.4 chapter 33. Unit tests
+  in `rmt.rs` (9 of 12 failed first: 8 against an empty transmitter, 1 on
+  a `MEM_RADDR_EX` reset-value bug; the `ping_pong_...` test replays the
+  observed transaction) and a bus test
+  `rmt_transmission_through_the_bus_asserts_its_source` (failed before the
+  routing). Decisions (zero latency, pause-until-ack) in
+  `milestone-4-decisions.md`.
+- **Console now:** `I (470) hal_sleep: sleep manager ready (idle 300s,
+  wake on START)` (step ~6.14M). New rung
+  `boot_reaches_hal_sleep_after_the_rmt_transmission_completes`
+  (8,000,000; channel 0 not left running).
+- **Then three ROM faults, fixed in this task (ruling R10):** ROM newlib
+  `strdup` (`0x4000_03dc`, return address `0x420f_1214`), then ROM libc
+  `strchr` (`0x4000_03e0`, return address `0x420f_7ee4`), then, after
+  `app_reg: heap after exit ?: ...` (step ~8.23M) and `app_reg: heap after
+  enter My Badge: ...`, ROM libc `strcpy` (`0x4000_0364`, return address
+  `0x4206_1f20`). `strchr`/`strcpy` are atomic real stubs; `strdup` is
+  guest-executed ROM code like `qsort`, because it calls the firmware's
+  `_malloc_r` through ROM newlib's `syscall_table_ptr` (`rom.rs` module
+  doc entry 25). Each test failed first (a trap at the ROM address, or
+  a missing effect).
+- **Console now:** `I (890) app_reg: launched My Badge` (step ~12.29M).
+  New rung `boot_launches_the_first_app_and_leaves_the_splash_without_faulting`
+  (16,000,000 to the line, then fault- and panic-free to 20,000,000 with
+  the framebuffer changed). `boots_to_first_real_frame` still passes
+  unchanged: the splash is stable from 5,535,126 until the app draws at
+  ~13.36M.
+- **Current state** (release `boot-probe` to step 30,000,000): no fault, no
+  panic, 9,599 traps (interrupts), 73,359 ROM stub calls. The
+  framebuffer shows the "My Badge" app's unregistered-badge screen (45
+  values; frame dumped to `local/m4-task-d2-frame.png`, which shows no
+  personal data: the emulated flash is blank). The last console line is
+  `app_reg: launched My Badge`; the hot PCs are the same idle set as
+  before (IRAM `0x4038_f930..0x4038_f97c`, FreeRTOS critical sections,
+  plus the idle hooks and the 74HC165 button scan), i.e. the firmware is
+  waiting for input, not stalled on a peripheral. Unmapped tail:
+  ASSIST_DEBUG `0x600c_e000`/`0x600c_e038`/`0x600c_e03c` only. SPIMEM1:
+  1,735 transactions, nothing unmodeled. The physical badge prints the
+  same `hal_sleep` and three `app_reg` lines (with its own heap figures
+  and timestamps); being provisioned, it presumably shows a different "My Badge" screen.
 
 ## Emulated flash chip: what it contains
 

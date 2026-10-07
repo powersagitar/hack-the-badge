@@ -200,7 +200,8 @@
 //!    `strcpy`, `strncpy`, `strcmp`, `strncmp`) were checked against a
 //!    post-fix boot-probe re-run and were **not** observed being called
 //!    within the tested budget (`strncpy` and `strcmp` were later observed,
-//!    after Milestone 4's flash MMU, and stubbed for real) — see `tests/rom_stub_boot.rs` and this
+//!    after Milestone 4's flash MMU, and `strcpy` in Milestone 4 Task D-M4-2,
+//!    all stubbed for real) — see `tests/rom_stub_boot.rs` and this
 //!    task's report for the exact re-probe evidence — so, per this module's
 //!    own "only stub what's observed" rule, they remain unstubbed for now.
 //!
@@ -611,7 +612,7 @@
 //!       in the ROM ELF whose semantics the doc comment of its effect states
 //!       (`memcmp`/`strncmp` return the unsigned-byte difference; `div` is
 //!       truncating division, its two fixups being dead code under RISC-V
-//!       `div`/`rem`). Not stubbed until observed: `strcpy`,
+//!       `div`/`rem`). Not stubbed until observed:
 //!       `strstr`, `bzero`, `ldiv`, ... (`memmove` and `memchr`
 //!       came in Task 8, entry 18; `strncpy`, `0x4000_0368`, [`STRNCPY`],
 //!       and `strcmp`, `0x4000_036c`, [`STRCMP`], came in Milestone 4:
@@ -866,6 +867,31 @@
 //!     `load_partitions()`'s call pattern through all three over the
 //!     synthesized partition table and gets its stored digest.
 //!
+//! 25. **After the RMT transmission: `strdup`, `strchr`, `strcpy`** —
+//!     Milestone 4 Task D-M4-2 (ruling R10: an observed, faulting ROM libc
+//!     call gets a real implementation in the task that hits it). Right
+//!     after `hal_sleep` reports ready, ROM newlib `strdup` (`0x4000_03dc`,
+//!     `esp32c3.rom.newlib.ld`, [`STRDUP`]) faulted (return address
+//!     `0x420f_1214`). `strdup` allocates, so like `qsort` (entry 14) it is
+//!     **guest-executed code**, not an atomic stub: a one-instruction slot
+//!     ([`STRDUP_SLOT`]) jumps to [`STRDUP_BODY`] in
+//!     [`ROM_CODE_FREE_RANGE`], which does what the rev3 ROM ELF's
+//!     `strdup`/`_strdup_r` (`0x40058db2`/`0x40058dc4`) do: `__getreent()`
+//!     and `_malloc_r(reent, strlen(s) + 1)` through slots 0 and 1 of the
+//!     firmware's `struct syscall_stub_table` at `*`[`SYSCALL_TABLE_PTR`]
+//!     (`0x3fcd_ffe0`, which ESP-IDF's `esp_newlib_init` sets; the ROM's
+//!     own `__getreent`/`_malloc_r` trampolines read the same word), then
+//!     `strlen` and `memcpy` through their stubbed ROM entries. Then ROM
+//!     libc `strchr` (`0x4000_03e0`, [`STRCHR`]; return address
+//!     `0x420f_7ee4`) and, once the app registry launches its first app,
+//!     `strcpy` (`0x4000_0364`, [`STRCPY`], from the
+//!     `libc-suboptimal_for_misaligned_mem` script; return address
+//!     `0x4206_1f20`) faulted; both are atomic real stubs
+//!     ([`RomStubEffect::Strchr`](crate::cpu::rom_stubs::RomStubEffect::Strchr),
+//!     [`RomStubEffect::Strcpy`](crate::cpu::rom_stubs::RomStubEffect::Strcpy)),
+//!     with C11 semantics matching the ROM's newlib code (`0x40058bf2`,
+//!     `0x40058d2e`).
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -873,7 +899,7 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`strcpy`, `atoi`, …) and the rest of ROM
+//! The rest of ROM libc/newlib (`strstr`, `atoi`, …) and the rest of ROM
 //! libgcc's float half (all but the four soft-double helpers in
 //! [`LIBGCC_SOFT_DOUBLE_FAMILY`]) are **absent by design**, for the same
 //! reason `memset` and `__udivdi3` are special-cased rather than defaulted:
@@ -885,7 +911,13 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 4 Task D-M4-1**: 107 stubs: the four libgcc soft-double
+//! **As of Milestone 4 Task D-M4-2**: 109 stubs (`strchr` and `strcpy`)
+//! and a second guest-executed ROM routine, `strdup` (entry 25). With RMT
+//! modeled, boot launches its first app and draws its screen, with no
+//! exception through step 30,000,000 (the notes' "Milestone 4 Task
+//! D-M4-2" entry).
+//!
+//! **As of Milestone 4 Task D-M4-1** (history): 107 stubs: the four libgcc soft-double
 //! helpers ([`LIBGCC_SOFT_DOUBLE_FAMILY`]) the first function after the I2C0
 //! accelerometer probe calls. Boot takes no exception (checked to step
 //! 30,000,000) and goes silent in the RMT driver (the notes' "Milestone 4
@@ -1083,8 +1115,8 @@
 
 use crate::boot::RamInitializer;
 use crate::cpu::encode::{
-    add, addi, beq, bge, bgeu, bne, jal, jalr, lbu, lw, mul, sb, sub, sw, A0, A1, A2, A3, RA, S0,
-    S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
+    add, addi, beq, bge, bgeu, bne, jal, jalr, lbu, lui, lw, mul, sb, sub, sw, A0, A1, A2, A3, RA,
+    S0, S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, RomStub,
@@ -1407,6 +1439,23 @@ pub const STRLCAT: u32 = 0x4000_03ec;
 /// [`STRSPN`].
 pub const STRCSPN: u32 = 0x4000_03e4;
 
+/// ROM libc `strchr`'s fixed address (`esp32c3.rom.libc.ld`: `strchr =
+/// 0x400003e0;`, ROM ELF `__call_strchr`, a `j 0x40058bf2 <strchr>`
+/// trampoline). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strchr`]), Milestone 4 Task
+/// D-M4-2: called (return address `0x420f_7ee4`) right after `hal_sleep`
+/// reports the sleep manager ready.
+pub const STRCHR: u32 = 0x4000_03e0;
+
+/// ROM libc `strcpy`'s fixed address
+/// (`esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld`: `strcpy =
+/// 0x40000364;`, the script ESP-IDF links on the ESP32-C3 by default, see
+/// [`MEMCPY`]; ROM ELF `j 0x40058d2e <strcpy>`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strcpy`]), Milestone 4 Task
+/// D-M4-2: called (return address `0x4206_1f20`) after the app registry
+/// launches its first app.
+pub const STRCPY: u32 = 0x4000_0364;
+
 /// ROM libc `strspn`'s fixed address (`esp32c3.rom.libc.ld`: `strspn =
 /// 0x40000410;`, ROM ELF `__call_strspn`, newlib code at `0x4005_90b0`).
 /// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Strspn`]), Milestone 4
@@ -1458,6 +1507,20 @@ pub const MD5_FINAL: u32 = 0x4000_061c;
 /// ([`QSORT_SLOT`]) into a guest-executed body at [`QSORT_BODY_ADDR`] — see
 /// the module doc's entry 14 for why.
 pub const QSORT: u32 = 0x4000_0434;
+
+/// ROM newlib `strdup`'s fixed address (`esp32c3.rom.newlib.ld`: `strdup =
+/// 0x400003dc;`, before `strndup = 0x40000400;`). Like [`QSORT`], a
+/// guest-executed jump-table slot, not an HLE stub (module doc, entry 25):
+/// `strdup` allocates through the firmware's `_malloc_r`.
+pub const STRDUP: u32 = 0x4000_03dc;
+
+/// `syscall_table_ptr`, the ROM `.bss` word (`esp32c3.rom.newlib.ld`'s
+/// group; `0x3fcdffe0` in `esp32c3_rev3_rom.elf`, section
+/// `.bss.interface.newlib`) through which ROM newlib reaches the
+/// firmware's `struct syscall_stub_table` (`esp_rom/include/esp32c3/rom/
+/// libc_stubs.h`): `__getreent` at offset 0, `_malloc_r` at offset 4.
+/// ESP-IDF's newlib init stores it.
+pub const SYSCALL_TABLE_PTR: u32 = 0x3fcd_ffe0;
 
 /// The ROM addresses guest-executed ROM routine *bodies* may occupy
 /// (Milestone 3 Task D6). Chosen so that no symbol in any of ESP-IDF
@@ -1592,8 +1655,88 @@ const _: () = {
     assert!(QSORT_BODY_ADDR + 4 * QSORT_BODY.len() as u32 <= ROM_CODE_FREE_RANGE.end);
 };
 
+/// Where [`STRDUP_BODY`] is mapped: right after [`QSORT_BODY`], inside
+/// [`ROM_CODE_FREE_RANGE`].
+pub const STRDUP_BODY_ADDR: u32 = QSORT_BODY_ADDR + 4 * QSORT_BODY.len() as u32;
+
+/// `strdup`'s jump-table slot: one 4-byte `jal x0`, so execution can never
+/// run on into the next slot (as on silicon, where the slot is `j
+/// 0x40058db2 <strdup>`).
+pub const STRDUP_SLOT: [u32; 1] = [jal(ZERO, (STRDUP_BODY_ADDR - STRDUP) as i32)];
+
+// Instruction indices in STRDUP_BODY that the encoding below refers to.
+const SD_STRLEN_CALL: i32 = 13;
+const SD_NULL_CHECK: i32 = 20;
+const SD_MEMCPY_CALL: i32 = 23;
+const SD_DONE: i32 = 24;
+
+/// Byte offset from instruction index `from` of [`STRDUP_BODY`] to the
+/// absolute ROM address `target` (a stub's fixed address).
+const fn sd_rel_abs(from: i32, target: u32) -> i32 {
+    target.wrapping_sub(STRDUP_BODY_ADDR + 4 * from as u32) as i32
+}
+
+/// `char *strdup(const char *s)`, as ROM newlib implements it (the rev3
+/// ROM ELF's `strdup` at `0x40058db2` tail-calls `_strdup_r(__getreent(),
+/// s)`, which calls `strlen`, `_malloc_r(reent, len + 1)` and, if that
+/// succeeded, `memcpy(copy, s, len + 1)`). `__getreent` and `_malloc_r`
+/// are reached the way the ROM's own trampolines reach them: through
+/// `*`[`SYSCALL_TABLE_PTR`], slots 0 and 1 of the firmware's `struct
+/// syscall_stub_table` (`esp32c3/rom/libc_stubs.h`). `strlen` and
+/// `memcpy` are the ROM's own exported entries ([`STRLEN`], [`MEMCPY`]),
+/// which this module stubs. Returns the copy, or `NULL` if `_malloc_r`
+/// returned `NULL`. Module doc, entry 25.
+///
+/// Calling convention (RISC-V psABI, ILP32): `ra` and `s0..s3` are saved
+/// in a 32-byte frame and restored; nothing caller-saved is kept across a
+/// call. Register roles: `s0` = reent, then the copy; `s1` = `s`; `s2` =
+/// the syscall table; `s3` = `len + 1`.
+pub const STRDUP_BODY: [u32; 32] = [
+    addi(SP, SP, -32),                                            // 0  addi sp, sp, -32
+    sw(RA, SP, 28),                                               // 1  sw   ra, 28(sp)
+    sw(S0, SP, 24),                                               // 2  sw   s0, 24(sp)
+    sw(S1, SP, 20),                                               // 3  sw   s1, 20(sp)
+    sw(S2, SP, 16),                                               // 4  sw   s2, 16(sp)
+    sw(S3, SP, 12),                                               // 5  sw   s3, 12(sp)
+    addi(S1, A0, 0),                            // 6  mv   s1, a0               # s
+    lui(S2, (SYSCALL_TABLE_PTR + 0x800) >> 12), // 7  lui s2, %hi(syscall_table_ptr)
+    lw(S2, S2, ((SYSCALL_TABLE_PTR & 0xFFF) as i32) << 20 >> 20), // 8  lw s2, %lo(..)(s2)
+    lw(T0, S2, 0),                              // 9  lw   t0, 0(s2)            # ->__getreent
+    jalr(RA, T0, 0),                            // 10 jalr t0                   # a0 = reent
+    addi(S0, A0, 0),                            // 11 mv   s0, a0
+    addi(A0, S1, 0),                            // 12 mv   a0, s1
+    jal(RA, sd_rel_abs(SD_STRLEN_CALL, STRLEN)), // 13 jal strlen
+    addi(S3, A0, 1),                            // 14 addi s3, a0, 1            # len + 1
+    addi(A0, S0, 0),                            // 15 mv   a0, s0               # reent
+    addi(A1, S3, 0),                            // 16 mv   a1, s3
+    lw(T0, S2, 4),                              // 17 lw   t0, 4(s2)            # ->_malloc_r
+    jalr(RA, T0, 0),                            // 18 jalr t0                   # a0 = copy
+    addi(S0, A0, 0),                            // 19 mv   s0, a0
+    beq(A0, ZERO, rel(SD_NULL_CHECK, SD_DONE)), // 20 beqz a0, DONE
+    addi(A1, S1, 0),                            // 21 mv   a1, s1
+    addi(A2, S3, 0),                            // 22 mv   a2, s3
+    jal(RA, sd_rel_abs(SD_MEMCPY_CALL, MEMCPY)), // 23 jal memcpy
+    // DONE:
+    addi(A0, S0, 0),   // 24 mv   a0, s0
+    lw(RA, SP, 28),    // 25 lw   ra, 28(sp)
+    lw(S0, SP, 24),    // 26 lw   s0, 24(sp)
+    lw(S1, SP, 20),    // 27 lw   s1, 20(sp)
+    lw(S2, SP, 16),    // 28 lw   s2, 16(sp)
+    lw(S3, SP, 12),    // 29 lw   s3, 12(sp)
+    addi(SP, SP, 32),  // 30 addi sp, sp, 32
+    jalr(ZERO, RA, 0), // 31 ret
+];
+
+const _: () = {
+    assert!(STRDUP_BODY[SD_STRLEN_CALL as usize] == jal(RA, sd_rel_abs(SD_STRLEN_CALL, STRLEN)));
+    assert!(STRDUP_BODY[SD_NULL_CHECK as usize] == beq(A0, ZERO, rel(SD_NULL_CHECK, SD_DONE)));
+    assert!(STRDUP_BODY[SD_MEMCPY_CALL as usize] == jal(RA, sd_rel_abs(SD_MEMCPY_CALL, MEMCPY)));
+    assert!(STRDUP_BODY[SD_DONE as usize] == addi(A0, S0, 0));
+    assert!(STRDUP_BODY_ADDR + 4 * STRDUP_BODY.len() as u32 <= ROM_CODE_FREE_RANGE.end);
+};
+
 /// Every guest-executed ROM code blob this module maps (see the module
-/// doc's entry 14), installed by [`install_esp32c3_rom_code`].
+/// doc's entries 14 and 25), installed by [`install_esp32c3_rom_code`].
 pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
     RomCodeBlob {
         base: QSORT,
@@ -1602,6 +1745,14 @@ pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
     RomCodeBlob {
         base: QSORT_BODY_ADDR,
         words: &QSORT_BODY,
+    },
+    RomCodeBlob {
+        base: STRDUP,
+        words: &STRDUP_SLOT,
+    },
+    RomCodeBlob {
+        base: STRDUP_BODY_ADDR,
+        words: &STRDUP_BODY,
     },
 ];
 
@@ -1982,6 +2133,8 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRLCAT, RomStub::strlcat("strlcat")),
     (STRSPN, RomStub::strspn("strspn")),
     (STRCSPN, RomStub::strcspn("strcspn")),
+    (STRCHR, RomStub::strchr("strchr")),
+    (STRCPY, RomStub::strcpy("strcpy")),
     (MEMCHR, RomStub::memchr("memchr")),
     (MEMMOVE, RomStub::memmove("memmove")),
     (DIV, RomStub::div_t("div")),
@@ -2303,11 +2456,12 @@ mod tests {
         // real implementation -- never the generic default. Addresses from
         // esp32c3.rom.libc.ld / esp32c3.rom.libc-suboptimal_for_misaligned_mem.ld.
         let table = esp32c3_rom_stubs();
-        // Task D9 gave strlen/memcmp/strncmp real effects (checked below).
+        // Task D9 gave strlen/memcmp/strncmp real effects, Milestone 4 Task
+        // D-M4-2 strcpy (checked below).
         assert_eq!(
-            table.lookup(0x4000_0364), // strcpy
+            table.lookup(0x4000_0378), // strstr (esp32c3.rom.libc.ld)
             None,
-            "ROM libc strcpy must not carry a generic stub"
+            "ROM libc strstr must not carry a generic stub"
         );
         for (addr, effect) in [
             (STRLEN, RomStubEffect::Strlen),
@@ -2318,6 +2472,8 @@ mod tests {
             (STRLCAT, RomStubEffect::Strlcat),
             (STRSPN, RomStubEffect::Strspn),
             (STRCSPN, RomStubEffect::Strcspn),
+            (STRCHR, RomStubEffect::Strchr),
+            (STRCPY, RomStubEffect::Strcpy),
             (MEMCHR, RomStubEffect::Memchr),
             (MEMMOVE, RomStubEffect::Memmove),
         ] {
@@ -3508,6 +3664,72 @@ mod tests {
         assert_eq!(span_call(STRSPN, b"abc ", b" "), 0, "empty set");
     }
 
+    /// `char *strcpy(char *dst, const char *src)` (C11 §7.24.2.3, the ROM's
+    /// newlib code at `0x40058d2e`): copies `src` and its NUL, returns `dst`.
+    #[test]
+    fn strcpy_stub_copies_through_the_terminator_and_returns_dst() {
+        let (dst, src) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(dst, 32);
+        bus.add_scratch_ram(src, 32);
+        for i in 0..32 {
+            bus.write8(dst + i, 0x55);
+        }
+        for (i, x) in b"My Badge\0".iter().enumerate() {
+            bus.write8(src + i as u32, *x);
+        }
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, dst);
+        cpu.regs.write(REG_A1, src);
+        cpu.regs.pc = STRCPY;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(STRCPY));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        assert_eq!(cpu.regs.read(REG_A0), dst);
+        let out: Vec<u8> = (0..10).map(|i| bus.read8(dst + i)).collect();
+        assert_eq!(&out, b"My Badge\0\x55", "NUL copied, nothing after it");
+    }
+
+    /// Runs ROM `strchr(s, c)` with `s` at `0x3fc9_0400`.
+    fn strchr_call(s: &[u8], c: u32) -> u32 {
+        let sa = 0x3fc9_0400;
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(sa, 32);
+        for (i, x) in s.iter().enumerate() {
+            bus.write8(sa + i as u32, *x);
+        }
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, sa);
+        cpu.regs.write(REG_A1, c);
+        cpu.regs.pc = STRCHR;
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(STRCHR));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        cpu.regs.read(REG_A0)
+    }
+
+    /// C11 §7.24.5.2 and the ROM's newlib code (`0x40058bf2`): the first
+    /// `(unsigned char)c` in `s`, the terminating NUL included; else NULL.
+    #[test]
+    fn strchr_stub_finds_the_first_byte_including_the_terminator() {
+        let sa = 0x3fc9_0400;
+        assert_eq!(strchr_call(b"a/b/c\0", u32::from(b'/')), sa + 1);
+        assert_eq!(strchr_call(b"abc\0", u32::from(b'z')), 0);
+        assert_eq!(strchr_call(b"abc\0", 0), sa + 3, "c = 0 finds the NUL");
+        assert_eq!(strchr_call(b"\0", u32::from(b'a')), 0);
+        assert_eq!(
+            strchr_call(b"x/\0", 0x100 | u32::from(b'/')),
+            sa + 1,
+            "c is cast to unsigned char"
+        );
+    }
+
     #[test]
     fn strcspn_stub_counts_the_leading_bytes_not_in_the_set() {
         assert_eq!(span_call(STRCSPN, b"littlefs/x ", b"/ "), 8);
@@ -4063,7 +4285,7 @@ mod tests {
                     "{addr:#x} is both stubbed and ROM code"
                 );
             }
-            if blob.base != QSORT {
+            if blob.base != QSORT && blob.base != STRDUP {
                 assert!(
                     blob.base >= ROM_CODE_FREE_RANGE.start && end <= ROM_CODE_FREE_RANGE.end,
                     "blob at {:#x} is outside ROM_CODE_FREE_RANGE",
@@ -4180,5 +4402,126 @@ mod tests {
         // `FirmwareBus`'s overlap assertion.
         let mut bus = bus_with_rom_data();
         install_esp32c3_rom_code(&mut bus);
+    }
+
+    // ---- Milestone 4 Task D-M4-2: guest-executed ROM newlib `strdup` ----
+
+    const SD_GETREENT_ADDR: u32 = 0x4038_0000;
+    const SD_MALLOC_ADDR: u32 = 0x4038_0100;
+    /// `_malloc_r` records its `(reent, size)` arguments here.
+    const SD_RECORD_ADDR: u32 = 0x3fc9_0000;
+    const SD_STR_ADDR: u32 = 0x3fc9_1000;
+    const SD_TABLE_ADDR: u32 = 0x3fc9_2000;
+    const SD_REENT: u32 = 0x3fc9_3000;
+    const SD_HEAP: u32 = 0x3fc9_4000;
+
+    struct StrdupRun {
+        ret: u32,
+        heap: Vec<u8>,
+        malloc_reent: u32,
+        malloc_size: u32,
+    }
+
+    /// Calls ROM `strdup(SD_STR_ADDR)` with a firmware-style syscall table
+    /// (guest `__getreent` returning `SD_REENT`, guest `_malloc_r`
+    /// recording its arguments and returning `heap_ret`) and runs it to
+    /// completion, checking the psABI contract like `run_qsort`.
+    fn run_strdup(s: &[u8], heap_ret: u32) -> StrdupRun {
+        use crate::cpu::rom_stubs::{REG_RA, REG_SP};
+
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.add_scratch_ram(SD_RECORD_ADDR, (STACK_TOP - SD_RECORD_ADDR) as usize);
+        bus.add_scratch_ram(SD_GETREENT_ADDR, 0x1000);
+        bus.add_scratch_ram(SYSCALL_TABLE_PTR & !0xFFF, 0x1000);
+        install_esp32c3_rom_code(&mut bus);
+        let mut getreent = vec![lui(A0, SD_REENT >> 12)];
+        getreent.extend(CLOBBER_AND_RET);
+        let mut malloc = vec![
+            lui(T0, SD_RECORD_ADDR >> 12),
+            sw(A0, T0, 0),
+            sw(A1, T0, 4),
+            lui(A0, heap_ret >> 12),
+        ];
+        malloc.extend(CLOBBER_AND_RET);
+        for (base, code) in [(SD_GETREENT_ADDR, &getreent), (SD_MALLOC_ADDR, &malloc)] {
+            for (i, w) in code.iter().enumerate() {
+                bus.write32(base + 4 * i as u32, *w);
+            }
+        }
+        bus.write32(SD_TABLE_ADDR, SD_GETREENT_ADDR); // .__getreent
+        bus.write32(SD_TABLE_ADDR + 4, SD_MALLOC_ADDR); // ._malloc_r
+        bus.write32(SYSCALL_TABLE_PTR, SD_TABLE_ADDR);
+        for (i, b) in s.iter().enumerate() {
+            bus.write8(SD_STR_ADDR + i as u32, *b);
+        }
+        for i in 0..64 {
+            bus.write8(SD_HEAP + i, 0xAA);
+        }
+
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        const PRESERVED: [u8; 14] = [3, 4, 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27];
+        for r in PRESERVED {
+            cpu.regs.write(r, 0x5a00_0000 | u32::from(r));
+        }
+        cpu.regs.write(REG_A0, SD_STR_ADDR);
+        cpu.regs.write(REG_RA, RET_SENTINEL);
+        cpu.regs.write(REG_SP, STACK_TOP);
+        cpu.regs.pc = STRDUP;
+        let mut steps = 0u32;
+        while cpu.regs.pc != RET_SENTINEL {
+            assert!(steps < 10_000, "strdup did not return within 10,000 steps");
+            let info = cpu.step(&mut bus);
+            assert!(
+                !info.trap_taken,
+                "strdup trapped at {:#x} (mcause {}, mtval {:#x})",
+                info.pc_before, cpu.csr.mcause, cpu.csr.mtval
+            );
+            steps += 1;
+        }
+        assert_eq!(cpu.regs.read(REG_SP), STACK_TOP, "sp must be restored");
+        for r in PRESERVED {
+            assert_eq!(
+                cpu.regs.read(r),
+                0x5a00_0000 | u32::from(r),
+                "callee-saved/reserved x{r} must be preserved"
+            );
+        }
+        StrdupRun {
+            ret: cpu.regs.read(REG_A0),
+            heap: (0..64).map(|i| bus.read8(SD_HEAP + i)).collect(),
+            malloc_reent: bus.read32(SD_RECORD_ADDR),
+            malloc_size: bus.read32(SD_RECORD_ADDR + 4),
+        }
+    }
+
+    /// newlib `_strdup_r` (the body the ROM's slot jumps to, via `strdup`
+    /// = `_strdup_r(__getreent(), s)`): `_malloc_r(reent, strlen(s) + 1)`,
+    /// then `memcpy` of the string and its NUL.
+    #[test]
+    fn strdup_copies_into_memory_from_the_syscall_tables_malloc_r() {
+        let run = run_strdup(b"hal_sleep\0", SD_HEAP);
+        assert_eq!(run.ret, SD_HEAP);
+        assert_eq!(run.malloc_reent, SD_REENT);
+        assert_eq!(run.malloc_size, 10);
+        assert_eq!(&run.heap[..10], b"hal_sleep\0");
+        assert_eq!(run.heap[10], 0xAA, "nothing past the NUL is written");
+    }
+
+    #[test]
+    fn strdup_returns_null_when_malloc_fails() {
+        let run = run_strdup(b"x\0", 0);
+        assert_eq!(run.ret, 0);
+        assert_eq!(run.malloc_size, 2);
+        assert!(run.heap.iter().all(|b| *b == 0xAA));
+    }
+
+    #[test]
+    fn strdup_of_the_empty_string_allocates_one_byte() {
+        let run = run_strdup(b"\0", SD_HEAP);
+        assert_eq!(run.ret, SD_HEAP);
+        assert_eq!(run.malloc_size, 1);
+        assert_eq!(run.heap[0], 0);
+        assert_eq!(run.heap[1], 0xAA);
     }
 }

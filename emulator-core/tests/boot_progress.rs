@@ -412,6 +412,15 @@
 //! ROM soft-double helpers the next function calls (`__floatunsidf`,
 //! `__muldf3`, `__divdf3`, `__fixunsdfsi`) are real stubs. Boot then goes
 //! silent in the RMT driver (the notes' "Milestone 4 Task D-M4-1" entry).
+//!
+//! **Milestone 4 Task D-M4-2 status**: RMT is modeled as a TX engine that
+//! completes each transmission in zero time, so the LED transmission ends
+//! and `hal_sleep` starts:
+//! [`boot_reaches_hal_sleep_after_the_rmt_transmission_completes`]. ROM
+//! `strdup`, `strchr` and `strcpy` are real, so the app registry launches
+//! its first app, which draws over the splash and waits for input:
+//! [`boot_launches_the_first_app_and_leaves_the_splash_without_faulting`]
+//! (the notes' "Milestone 4 Task D-M4-2" entry).
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1334,6 +1343,57 @@ fn boot_reports_the_absent_accelerometer_after_i2c0_nacks() {
     for panic_text in PANIC_TEXTS {
         assert!(!console.contains(panic_text), "console:\n{console}");
     }
+}
+
+/// Milestone 4 Task D-M4-2: with RMT modeled, the LED driver's ping-pong
+/// transmission on TX channel 0 completes (threshold events refill the
+/// RMT RAM, the last one ends at an end-marker, `TX_END` reaches the
+/// driver's ISR through `SRC_RMT`), so `hal_sleep` starts. The physical
+/// badge prints this line too. Reached at about step 6.14M.
+#[test]
+fn boot_reaches_hal_sleep_after_the_rmt_transmission_completes() {
+    let needle = "hal_sleep: sleep manager ready";
+    let (rt, ok) = boot_until_console_contains(needle, 8_000_000);
+    assert!(
+        ok,
+        "pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    assert!(!rt.bus().rmt.tx_running(0), "the transmission finished");
+}
+
+/// Milestone 4 Task D-M4-2: ROM `strdup` (guest code calling the
+/// firmware's `_malloc_r`), `strchr` and `strcpy` are real, so the app
+/// registry enters and launches its first app without faulting. On the
+/// blank-flash emulated badge that is the "My Badge" app, which then
+/// shows its unregistered-badge screen (the framebuffer leaves the splash
+/// at about step 13.4M) and waits for input. Launched at about step
+/// 12.29M.
+#[test]
+fn boot_launches_the_first_app_and_leaves_the_splash_without_faulting() {
+    let needle = "app_reg: launched My Badge";
+    let (mut rt, ok) = boot_until_console_contains(needle, 16_000_000);
+    assert!(
+        ok,
+        "pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    let splash = framebuffer_fnv1a(rt.framebuffer());
+    while rt.total_steps() < 20_000_000 {
+        let summary = rt.run(500_000);
+        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    }
+    let console = rt.console_output();
+    for panic_text in PANIC_TEXTS {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
+    assert_ne!(
+        framebuffer_fnv1a(rt.framebuffer()),
+        splash,
+        "the app drew over the splash"
+    );
 }
 
 /// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2

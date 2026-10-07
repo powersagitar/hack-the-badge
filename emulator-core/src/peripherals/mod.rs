@@ -63,6 +63,11 @@
 //!   `TRANS_START`, every address phase NACKs, and `INT_STATUS` drives
 //!   `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds it as
 //!   `i2c0`.
+//! - [`rmt`]: [`rmt::Rmt`], the RMT controller as a TX engine that completes
+//!   each transmission in zero time (Milestone 4 Task D-M4-2): `TX_START`
+//!   consumes the channel's RMT RAM symbols, pausing at each enabled
+//!   threshold/loop interrupt until the ISR acknowledges it, and `INT_ST`
+//!   drives `SRC_RMT`. `FirmwareBus` holds it as `rmt`.
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -77,6 +82,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod intc;
 pub mod mmu;
+pub mod rmt;
 pub mod rtc_cntl;
 pub mod spi;
 pub mod system;

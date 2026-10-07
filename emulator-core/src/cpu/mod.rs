@@ -727,6 +727,37 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, len);
             }
+            RomStubEffect::Strcpy => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let mut i: u32 = 0;
+                loop {
+                    let byte = bus.read8(src.wrapping_add(i));
+                    bus.write8(dst.wrapping_add(i), byte);
+                    if byte == 0 || i >= rom_stubs::MAX_STUB_MEMORY_BYTES {
+                        break;
+                    }
+                    i += 1;
+                }
+                // strcpy returns dst, which is already in a0.
+            }
+            RomStubEffect::Strchr => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let c = self.regs.read(rom_stubs::REG_A1) as u8;
+                let mut found = 0;
+                for i in 0..rom_stubs::MAX_STUB_MEMORY_BYTES {
+                    let addr = s.wrapping_add(i);
+                    let byte = bus.read8(addr);
+                    if byte == c {
+                        found = addr;
+                        break;
+                    }
+                    if byte == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, found);
+            }
             RomStubEffect::Memchr => {
                 let s = self.regs.read(rom_stubs::REG_A0);
                 let c = self.regs.read(rom_stubs::REG_A1) as u8;

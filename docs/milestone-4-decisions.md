@@ -189,6 +189,57 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   soft-float library): only NaN payloads or a non-default rounding mode
   could differ; the ESP32-C3 has no FPU to set one.
 
+## RMT as a zero-latency TX engine (Task D-M4-2)
+
+- **A transmission runs in zero emulated time** (coordinator ruling R13).
+  The transmitter consumes RMT RAM symbols inside the `TX_START` byte
+  write; symbol durations, clock dividers and the carrier are stored but
+  never timed. If wrong (firmware that measures how long a frame takes,
+  or expects to run code between start and `TX_END`): it sees no gap; an
+  LED visualisation would need symbol capture with timestamps.
+- **The transmitter pauses at each enabled threshold/loop event until
+  the firmware acknowledges it** (clears the raw bit, or clears its
+  enable). Zero latency alone is ill-defined in wrap mode: with no time
+  passing, the transmitter would lap stale RAM before the ISR could
+  refill it. Pausing gives the sequence a real transmitter produces when
+  its ISR keeps up: after a threshold event the hardware is still sending
+  the other half, so letting the model send that half at the ISR's clear
+  and stop at the next boundary sends the same data in the same order,
+  and the half the ISR then refills is the next one sent. A disabled
+  event never pauses (its raw bit is still set). If wrong (firmware that
+  enables `TX_THR_EVENT` but never services it, or relies on an underrun
+  re-sending stale data): the model waits where hardware would run on.
+- **`TX_LIM` counts words sent since `TX_START` and restarts at every
+  event.** TRM §33.3.4.2/§33.3.7 say the event fires when the amount sent
+  reaches `TX_LIM`; the driver's ping-pong (`rmt_isr_handle_tx_threshold`
+  toggles halves on every event) needs it to recur every `TX_LIM`
+  words. An end-marker word is not counted.
+- **Continuous mode: the loop counter holds after `TX_LOOP`** until
+  `LOOP_COUNT_RESET` or the next `TX_START`; the channel keeps running
+  (no `SOC_RMT_SUPPORT_TX_LOOP_AUTO_STOP` on the ESP32-C3) until
+  `TX_STOP`. A running channel whose output has become periodic (a
+  whole RAM lap with no change to `INT_RAW` or the loop counter) is left
+  running without further work, and any later RMT write re-evaluates it.
+  If wrong (the counter really wraps and re-fires): only firmware that
+  leaves a looping channel running across several loop-count periods
+  without stopping it would see fewer `TX_LOOP` events. Unused by this
+  firmware (it never sets `TX_CONTI_MODE`).
+- **A non-wrap overrun raises `ERR` and `MEM_EMPTY`, not `TX_END`**
+  (TRM §33.3.7, register 33.8); `MEM_SIZE` 0 behaves as an exhausted
+  RAM. Unused by this firmware.
+- **Not modeled:** the APB FIFO access mode (`CHnDATA`, left unhandled
+  so the bus logs any use), RX channels (no input ever arrives),
+  simultaneous TX (`TX_SIM` is stored; each channel starts on its own
+  `TX_START`), the output level, and `STATUS.STATE` (reads 0).
+  `CONF_UPDATE` is a no-op: live register values are always used.
+- **ROM `strdup` is guest code, `strchr`/`strcpy` are atomic stubs**
+  (ruling R10). `strdup` must allocate through the firmware's heap, so,
+  like `qsort`, it is real RV32 code in `ROM_CODE_FREE_RANGE`, reaching
+  `__getreent` and `_malloc_r` through ROM newlib's `syscall_table_ptr`
+  exactly as the ROM's own trampolines do. If wrong (the firmware swaps
+  the syscall table after init): the code reads the pointer on every
+  call, as the ROM does, so it follows the swap.
+
 ## Milestone 5 backlog
 
 (To be filled in by later Milestone 4 tasks.)

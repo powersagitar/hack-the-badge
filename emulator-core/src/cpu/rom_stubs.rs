@@ -59,8 +59,8 @@
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
-//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`DivT`, the writing
-//!    `Strncpy`/`Strlcat`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`Strchr`/`DivT`, the writing
+//!    `Strncpy`/`Strlcat`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
@@ -306,6 +306,19 @@ pub enum RomStubEffect {
     /// in `set = a1` (stops at `s`'s NUL), in `a0`. Scans capped at
     /// [`MAX_STUB_MEMORY_BYTES`]. Real, like [`RomStubEffect::Strspn`].
     Strcspn,
+    /// `char *strchr(const char *s, int c)`: C11 §7.24.5.2, as the ROM's
+    /// newlib code (`0x40058bf2`) does it: `c` is cast to `unsigned char`,
+    /// then `s = a0` is scanned through the bus for it, the terminating NUL
+    /// included (so `c == 0` finds the NUL). Returns its address in `a0`,
+    /// or 0 (NULL). Scan capped at [`MAX_STUB_MEMORY_BYTES`] (NULL past
+    /// the cap). Real: the caller uses the pointer.
+    Strchr,
+    /// `char *strcpy(char *dst, const char *src)`: C11 §7.24.2.3, as the
+    /// ROM's newlib code (`0x40058d2e`) does it: copies `src = a1` through
+    /// the bus to `dst = a0` up to and including its NUL, returning `dst`
+    /// (already in `a0`). Capped at [`MAX_STUB_MEMORY_BYTES`] bytes like
+    /// [`RomStubEffect::Strcat`]'s copy. Real: the caller uses the string.
+    Strcpy,
     /// `void *memchr(const void *s, int c, size_t n)`: scans `n = a2` bytes
     /// of `s = a0` through the bus for the byte `(unsigned char)c` (`c =
     /// a1`), returning in `a0` the address of the first match, or 0 (NULL)
@@ -1383,6 +1396,22 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strcspn,
+        }
+    }
+
+    /// A real high-level-emulated `strchr` -- see [`RomStubEffect::Strchr`].
+    pub const fn strchr(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strchr,
+        }
+    }
+
+    /// A real high-level-emulated `strcpy` -- see [`RomStubEffect::Strcpy`].
+    pub const fn strcpy(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strcpy,
         }
     }
 
