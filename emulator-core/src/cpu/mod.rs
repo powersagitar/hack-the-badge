@@ -515,6 +515,18 @@ impl Cpu {
                 let a = self.regs.read(rom_stubs::REG_A0);
                 self.regs.write(rom_stubs::REG_A0, op.apply(a));
             }
+            RomStubEffect::SoftDouble(op) => {
+                // Same register-pair convention as `Int64` above.
+                let a = u64::from(self.regs.read(rom_stubs::REG_A0))
+                    | (u64::from(self.regs.read(rom_stubs::REG_A1)) << 32);
+                let b = u64::from(self.regs.read(rom_stubs::REG_A2))
+                    | (u64::from(self.regs.read(rom_stubs::REG_A3)) << 32);
+                let result = op.apply(a, b);
+                self.regs.write(rom_stubs::REG_A0, result as u32);
+                if op.returns_double() {
+                    self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
+                }
+            }
             RomStubEffect::BusRegisterWrite(write) => {
                 if let Some(addr) = self.bus_register_write_addr(&write) {
                     self.apply_bus_register_op(write.op, addr, bus);
@@ -2533,6 +2545,40 @@ mod tests {
             assert_eq!(cpu.regs.read(11), 0x1234);
             assert_eq!(cpu.regs.pc, 0x40, "pc == ra");
         }
+    }
+
+    #[test]
+    fn soft_double_rom_stubs_use_the_rv32_register_pairs() {
+        use rom_stubs::SoftDoubleOp;
+        let run = |op: SoftDoubleOp, regs: [u32; 4]| {
+            let mut cpu = Cpu::new();
+            let mut table = RomStubTable::new();
+            table.insert(ROM_STUB_ADDR, RomStub::soft_double("softdf", op));
+            cpu.set_rom_stubs(table);
+            for (i, v) in regs.iter().enumerate() {
+                cpu.regs.write(10 + i as u8, *v);
+            }
+            cpu.regs.write(1, 0x40);
+            cpu.regs.pc = ROM_STUB_ADDR;
+            let mut bus = rom_stub_test_bus();
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+            assert_eq!(cpu.regs.pc, 0x40, "pc == ra");
+            (cpu.regs.read(10), cpu.regs.read(11))
+        };
+        let split = |x: f64| [x.to_bits() as u32, (x.to_bits() >> 32) as u32];
+        // __floatunsidf(10_000_000): the observed boot call; a1 is the
+        // result's high word.
+        let r = run(SoftDoubleOp::FloatUnsSi, [10_000_000, 0x1234, 0, 0]);
+        assert_eq!([r.0, r.1], split(1e7));
+        // __muldf3(1e7, 2.5) in (a0, a1) x (a2, a3).
+        let (a, b) = (split(1e7), split(2.5));
+        let r = run(SoftDoubleOp::Mul, [a[0], a[1], b[0], b[1]]);
+        assert_eq!([r.0, r.1], split(2.5e7));
+        // __fixunsdfsi(2.5e7): unsigned result in a0; a1 untouched.
+        let a = split(2.5e7);
+        let r = run(SoftDoubleOp::FixUnsSi, [a[0], a[1], 0, 0]);
+        assert_eq!(r, (25_000_000, a[1]));
     }
 
     #[test]

@@ -147,6 +147,48 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   `strcspn` (all observed: `esp_vfs_littlefs_register`, then littlefs's
   path walk) became real stubs (BSD/newlib semantics) instead.
 
+## I2C0 with no device attached (Task D-M4-1)
+
+- **No device answers on the bus** (coordinator ruling R11). The
+  controller is modeled; the accelerometer (SC7A20H) and any other I2C
+  device are not. Every ACK slot reads 1 (SDA released), so an address
+  byte sent with ACK checking is NACKed and `hal_accel` logs "accelerometer
+  setup failed", a line the physical badge never prints. This is what the
+  hardware does with nothing on the bus, not a value chosen to make boot
+  proceed; emulating the sensor would add synthetic readings beyond the
+  smallest correct model. If wrong (the launcher or an app needs the
+  accelerometer): a later task adds a device model behind the address
+  phase, which changes this rung's line to the detection line.
+- **A transaction completes inside the `TRANS_START` byte write.** Nothing
+  on an empty bus can stretch SCL, so the whole command list runs at once
+  and its interrupts are raised before the next instruction. The driver
+  resets `event_queue` before starting and only reads it afterwards, so
+  zero latency is safe for it. If wrong: firmware that times an I2C
+  transfer, or expects to run code between start and completion, sees no
+  gap; the driver's hardware/software timeouts can never fire.
+- **The STOP after a NACK raises `TRANS_COMPLETE_INT` as well as
+  `NACK_INT`.** The driver waits for `SR.BUS_BUSY` to drop after a NACK
+  ("start->address->nack->stop"), so the STOP itself is certain; whether
+  the controller also flags it as a completed transaction is a judgment
+  (it detects its own STOP bit). The ISR checks NACK first and clears
+  every status bit it read, so the driver cannot tell. If wrong: an ISR
+  that tests `TRANS_COMPLETE` before `NACK` would report success.
+- **Not modeled:** timeouts, arbitration, watermark interrupts
+  (`TXFIFO_WM_INT_RAW` keeps its reset value 1 until cleared), slave
+  mode, non-FIFO mode, and the `CONF_UPGATE` shadow-register sync (live
+  values are always used). `SCL_RST_SLV_EN` (bus clear) self-clears at
+  once. None of these is reached by this firmware today.
+- **ROM soft-double helpers are real stubs, like the libgcc integer
+  ones** (ruling R10, applied to libgcc as `milestone-3-decisions.md`
+  already does for "ROM libc / libgcc helpers"). `__floatunsidf`,
+  `__muldf3`, `__divdf3` and `__fixunsdfsi` are computed with host `f64`
+  arithmetic, which is bit-identical to libgcc soft-fp's round-to-nearest
+  for every non-NaN result; NaN results are canonicalized to soft-fp's
+  RISC-V quiet NaN and `__fixunsdfsi` mirrors `_FP_TO_INT`'s NaN case
+  (sign clear: all ones). If wrong (the ROM was built with a different
+  soft-float library): only NaN payloads or a non-default rounding mode
+  could differ; the ESP32-C3 has no FPU to set one.
+
 ## Milestone 5 backlog
 
 (To be filled in by later Milestone 4 tasks.)

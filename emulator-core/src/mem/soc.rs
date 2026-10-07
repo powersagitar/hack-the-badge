@@ -147,6 +147,7 @@ pub const SYSTEM_RANGE: Range<u32> = 0x600c_0000..0x600c_1000;
 /// `0x04C`, `SYSTIMER_TARGET0_INT_MAP_REG` = `0x094`,
 /// `DMA_CH0_INT_MAP_REG` = `0x0B0`, `CPU_INTR_FROM_CPU_0_MAP_REG` = `0x0C8`).
 pub const SRC_SPI2: u32 = 19; // ETS_SPI2_INTR_SOURCE
+pub const SRC_I2C_EXT0: u32 = 29; // ETS_I2C_EXT0_INTR_SOURCE
 pub const SRC_SYSTIMER_TARGET0: u32 = 37; // ETS_SYSTIMER_TARGET0_INTR_SOURCE
 pub const SRC_SYSTIMER_TARGET1: u32 = 38;
 pub const SRC_SYSTIMER_TARGET2: u32 = 39;
@@ -225,6 +226,12 @@ pub const SPIMEM1_RANGE: Range<u32> = 0x6000_2000..0x6000_3000;
 /// page: `gdma_reg.h`'s highest register, `GDMA_OUT_PERI_SEL_CH2_REG`, is
 /// at `+0x280`. See `crate::peripherals::gdma`.
 pub const GDMA_RANGE: Range<u32> = 0x6003_F000..0x6004_0000;
+
+/// I2C0 controller registers (`DR_REG_I2C_EXT_BASE = 0x6001_3000`, ESP-IDF
+/// v5.5.3 `components/soc/esp32c3/register/soc/reg_base.h`). One 4 KiB
+/// page: `i2c_reg.h`'s highest address, `I2C_RXFIFO_START_ADDR_REG` RAM, ends
+/// at `+0x200`. See `crate::peripherals::i2c`.
+pub const I2C0_RANGE: Range<u32> = 0x6001_3000..0x6001_4000;
 
 /// The flash MMU table: `DR_REG_MMU_TABLE = 0x600c5000`
 /// (`components/soc/esp32c3/register/soc/reg_base.h`, ESP-IDF v5.5.3).

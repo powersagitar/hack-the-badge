@@ -462,6 +462,17 @@ Boot then stops printing: the physical badge's next line is `hal_accel`'s
 accelerometer detection, and the firmware is driving the unmodeled I2C0
 controller at that point (see the "Milestone 4 Task 5" history entry).
 
+**Update (Milestone 4 Task D-M4-1):** I2C0 is modeled as a master with no
+device on the bus, so the accelerometer probe's address byte is NACKed
+and the driver's ISR reports it; the console continues with
+`E (470) hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE`
+(non-fatal; the physical badge, which has the accelerometer, prints its
+detection line instead). The next function converts a clock frequency
+with ROM libgcc's soft-double helpers, now real stubs. There is no fault
+through step 30,000,000. Boot then stops printing while the firmware
+drives the unmodeled RMT controller (see the "Milestone 4 Task D-M4-1"
+history entry); the physical badge's next line is `hal_sleep`'s.
+
 **Resolved in Milestone 3** (details in the history below):
 
 - TIMG0/TIMG1 RTC calibration (Task 3) and the RTC_CNTL RTC timer (Task D1).
@@ -1705,6 +1716,61 @@ writes as byte-split words (all failed before the change). Decisions are in
   IO_MUX `0x6000_9000`, SYSTEM `0x600c_0000` (`+0x08`, `+0x58`), RTC_CNTL
   `0x6000_80bc`, and ASSIST_DEBUG `0x600c_e0xx`. Next task: model I2C0
   enough for the accelerometer probe, or trace why `hal_accel` waits.
+
+### Milestone 4 Task D-M4-1: I2C0 with no device; the RMT stall
+
+- **Found:** the Task 5 stall above. The firmware uses ESP-IDF v5.5.3's
+  `esp_driver_i2c` master driver: `s_i2c_send_commands()` writes the
+  command list and TX FIFO, sets `CTR.TRANS_START`, then blocks on
+  `event_queue`, which only the I2C ISR (`ETS_I2C_EXT0_INTR_SOURCE`,
+  source 29) feeds. With I2C0 unmodeled, no interrupt ever came.
+- **Resolved:** `peripherals/i2c.rs` models I2C0 (`0x6001_3000`) as a
+  controller with **no device attached** (`milestone-4-decisions.md`).
+  The command list runs inside the byte write that sets `TRANS_START`;
+  every ACK slot reads 1, so the address byte of the `hal_accel` probe is
+  NACKed: `NACK_INT`, then a STOP (bus released, `TRANS_COMPLETE_INT`).
+  `INT_STATUS` (`INT_RAW & INT_ENA`) drives `SRC_I2C_EXT0`; the ISR clears
+  it through `INT_CLR` and posts `I2C_EVENT_NACK`, and the transaction
+  returns `ESP_ERR_INVALID_STATE`. Offsets, access types and every
+  non-zero reset value come from `i2c_reg.h`/`i2c_struct.h`; accessors from
+  `i2c_ll.h`. Unit tests in `i2c.rs` (12 failed against the stub first,
+  then a bus-routing test `i2c0_probe_through_the_bus_nacks_and_asserts_its_source`).
+- **Console now:** after `hal_buttons: buttons ready`,
+  `E (470) hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE`
+  (step ~6.09M). The physical badge prints `hal_accel`'s detection line
+  instead. New rung `boot_reports_the_absent_accelerometer_after_i2c0_nacks`
+  (10,000,000, plus 1,000,000 fault-free steps after the line).
+- **Then a ROM fault, fixed in this task (ruling R10):** the next function
+  (`0x420e_d7f0` onward; `a0 = 10_000_000`, a clock frequency) faulted at
+  `0x4000_080c`, ROM `__floatunsidf` (`esp32c3.rom.libgcc.ld`), and calls
+  `__muldf3` (`0x4000_0848`), `__divdf3` (`0x4000_07b0`) and
+  `__fixunsdfsi` (`0x4000_07e8`) in sequence after it. All four are real
+  stubs (`RomStubEffect::SoftDouble`, libgcc soft-fp semantics:
+  round-to-nearest, canonical quiet NaN `0x7FF8_0000_0000_0000`,
+  `_FP_TO_INT`'s unsigned saturation). The fault fell inside
+  `boots_to_first_real_frame`'s fault window, so the stubs are what keeps
+  the finish line green. Unit tests
+  `soft_double_ops_match_libgcc_soft_fp` and
+  `soft_double_rom_stubs_use_the_rv32_register_pairs` (both failed first
+  against an `apply` that returned 0).
+- **Current stall** (release `boot-probe` and scratch tracing to step
+  30,000,000): no fault and no panic; no console line after the
+  `hal_accel` one. The framebuffer is still the splash (2,340 values, hash
+  unchanged). From step ~6.10M the firmware programs the **RMT**
+  controller (`DR_REG_RMT_BASE = 0x6001_6000`, `RMTMEM = 0x6001_6400`;
+  not modeled, logged as unmapped): `RMT_CH0CONF0_REG` (`+0x10`),
+  `RMT_INT_ENA_REG` (`+0x40`), `RMT_INT_CLR_REG` (`+0x44`),
+  `RMT_CH0_TX_LIM_REG` (`+0x58`), `RMT_SYS_CONF_REG` (`+0x68`),
+  `RMT_TX_SIM_REG` (`+0x6c`), `RMT_REF_CNT_RST_REG` (`+0x70`), and from
+  step ~6.12M writes the channel RAM words `+0x42c..+0x528`, then nothing
+  more. Presumably a TX (the 10 MHz resolution computed just before)
+  waiting for an RMT interrupt (`ETS_RMT_INTR_SOURCE`, source 28) that
+  never comes; the waiting task is not traced yet. The hot PCs are the
+  same as at the Task 5 stall: IRAM `0x4038_f930..` (FreeRTOS critical
+  sections) plus the idle hooks and the 74HC165 button scan, so the rest
+  of the system runs normally. Other unmapped accesses are unchanged
+  (ASSIST_DEBUG `0x600c_e0xx`, SYSTEM `0x600c_0058`). SPIMEM1: 471
+  transactions, nothing unmodeled. Next task: model RMT TX.
 
 ## Emulated flash chip: what it contains
 

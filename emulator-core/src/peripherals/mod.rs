@@ -58,6 +58,11 @@
 //!   commands reach that chip (RDID, RDSR, reads, and the dedicated
 //!   write-enable, sector-erase and page-program bits). `FirmwareBus`
 //!   holds them as `flash_chip` and `spimem1`.
+//! - [`i2c`]: [`i2c::I2c`], the I2C0 controller in master mode with no
+//!   device on the bus (Milestone 4 Task D-M4-1): the command list runs on
+//!   `TRANS_START`, every address phase NACKs, and `INT_STATUS` drives
+//!   `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds it as
+//!   `i2c0`.
 //!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
@@ -69,6 +74,7 @@ pub mod console;
 pub mod flash;
 pub mod gdma;
 pub mod gpio;
+pub mod i2c;
 pub mod intc;
 pub mod mmu;
 pub mod rtc_cntl;

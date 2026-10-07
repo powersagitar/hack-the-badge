@@ -405,6 +405,13 @@
 //! [`boot_reaches_hal_fs_littlefs_mounted`],
 //! [`boot_reaches_hal_buttons_ready`]. The notes' "Milestone 4 Task 5"
 //! entry has the stall after it.
+//!
+//! **Milestone 4 Task D-M4-1 status**: I2C0 is modeled with no device on
+//! the bus, so the accelerometer probe NACKs and `hal_accel` reports the
+//! failure: [`boot_reports_the_absent_accelerometer_after_i2c0_nacks`]. The
+//! ROM soft-double helpers the next function calls (`__floatunsidf`,
+//! `__muldf3`, `__divdf3`, `__fixunsdfsi`) are real stubs. Boot then goes
+//! silent in the RMT driver (the notes' "Milestone 4 Task D-M4-1" entry).
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1301,6 +1308,32 @@ fn boot_reaches_hal_fs_littlefs_mounted() {
 #[test]
 fn boot_reaches_hal_buttons_ready() {
     assert_reaches("hal_buttons: buttons ready", 10_000_000);
+}
+
+/// Milestone 4 Task D-M4-1: I2C0 is modeled with no device on the bus, so
+/// the accelerometer probe's address byte is NACKed, the driver's ISR sees
+/// `NACK_INT`, and `hal_accel` reports the failure (non-fatal) instead of
+/// blocking forever on `event_queue`. The physical badge, which has the
+/// accelerometer, prints its detection line here instead. Reached at about
+/// step 6.09M; the ROM soft-double helpers the next function calls run
+/// without faulting (`boots_to_first_real_frame` checks every chunk to past
+/// that point).
+#[test]
+fn boot_reports_the_absent_accelerometer_after_i2c0_nacks() {
+    let needle = "hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE";
+    let (mut rt, ok) = boot_until_console_contains(needle, 10_000_000);
+    assert!(
+        ok,
+        "pc=0x{:08x}\nconsole:\n{}",
+        rt.pc(),
+        rt.console_output()
+    );
+    let summary = rt.run(1_000_000);
+    assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    let console = rt.console_output();
+    for panic_text in PANIC_TEXTS {
+        assert!(!console.contains(panic_text), "console:\n{console}");
+    }
 }
 
 /// FNV-1a (64-bit) over the framebuffer's RGB565 pixels, each as 2

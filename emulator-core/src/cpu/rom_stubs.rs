@@ -54,7 +54,8 @@
 //!    value into `a0`/`x10`", the RV32 ABI's integer return register;
 //!    sometimes nothing at all (a `void` function); and for the ROM
 //!    functions whose *actual* work matters, the real thing: a real
-//!    register-only computation for [`RomStubEffect::Int64`], or a real
+//!    register-only computation for [`RomStubEffect::Int64`] (and
+//!    [`RomStubEffect::Int32Unary`]/[`RomStubEffect::SoftDouble`]), or a real
 //!    effect through the bus for [`RomStubEffect::Memset`],
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
@@ -166,6 +167,11 @@ pub enum RomStubEffect {
     /// the result to `a0`. See [`Int32UnaryOp`]. Real, not fabricated, for
     /// the same reason as [`RomStubEffect::Int64`].
     Int32Unary(Int32UnaryOp),
+    /// One of libgcc's soft-float `double` helpers: reads its operand
+    /// register pairs, writes the result to `a0` (and `a1` for a `double`).
+    /// See [`SoftDoubleOp`]. Real, not fabricated, for the same reason as
+    /// [`RomStubEffect::Int64`] (Milestone 4 Task D-M4-1).
+    SoftDouble(SoftDoubleOp),
     /// `void *memcpy(void *dst, const void *src, size_t n)`: copies `n = a2`
     /// bytes from `src = a1` to `dst = a0`, through the bus, one byte at a
     /// time (this project's whole `Bus` interface is byte/half/word
@@ -669,6 +675,84 @@ impl Int32UnaryOp {
                 _ => a.trailing_zeros() + 1,
             },
             Int32UnaryOp::Bswap => a.swap_bytes(),
+        }
+    }
+}
+
+/// One of libgcc's soft-float `double` helpers (`esp32c3.rom.libgcc.ld`):
+/// the ESP32-C3 has no FPU, so `double` arithmetic compiles into calls to
+/// these. RV32 ilp32 psABI: a `double` argument or result occupies an
+/// aligned register pair, low word first (`(a0, a1)`, then `(a2, a3)`); an
+/// `unsigned int` uses `a0` alone.
+///
+/// Semantics: GCC's libgcc soft-fp (`libgcc/soft-fp/{floatunsidf,muldf3,
+/// divdf3,fixunsdfsi}.c` over `op-common.h`), configured for RISC-V without
+/// an FPU by `libgcc/config/riscv/sfp-machine.h`: round to nearest
+/// (`FP_INIT_ROUNDMODE _frm = FP_RND_NEAREST` without `__riscv_flen`), full
+/// subnormal support, and every NaN result the canonical quiet NaN
+/// (`_FP_NANSIGN_D 0`, `_FP_NANFRAC_D _FP_QNANBIT_D, 0`,
+/// `_FP_KEEPNANFRACP 0`), i.e. `0x7FF8_0000_0000_0000`. IEEE 754
+/// round-to-nearest multiply and divide are exactly specified, so Rust's
+/// `f64` operators give the same bits for every non-NaN result. Exception
+/// flags are not observable without an FPU and are not modeled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftDoubleOp {
+    /// `double __floatunsidf(unsigned int i)`: exact (every `u32` is
+    /// representable).
+    FloatUnsSi,
+    /// `double __muldf3(double a, double b)`.
+    Mul,
+    /// `double __divdf3(double a, double b)`.
+    Div,
+    /// `unsigned int __fixunsdfsi(double a)`: truncates toward zero.
+    /// `_FP_TO_INT(..., rsigned = 0)` gives 0 for `|a| < 1` and for any
+    /// negative `a`, and all-ones for a positive `a >= 2^32`, `+inf` or a
+    /// NaN whose sign bit is clear (a NaN with the sign set reads as
+    /// negative: 0). Only that NaN case differs from Rust's saturating
+    /// `as u32`, which maps every NaN to 0.
+    FixUnsSi,
+}
+
+/// The canonical quiet NaN RISC-V soft-fp returns (see [`SoftDoubleOp`]).
+pub const SOFT_FP_CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
+
+impl SoftDoubleOp {
+    /// `true` if the result is a `double` (`(a0, a1)`), `false` if it is
+    /// an `unsigned int` (`a0` only; `a1` is left untouched).
+    pub fn returns_double(self) -> bool {
+        !matches!(self, SoftDoubleOp::FixUnsSi)
+    }
+
+    /// Applies this operation. `a` is the `(a0, a1)` pair (for
+    /// [`SoftDoubleOp::FloatUnsSi`], only its low word, `a0`, is read); `b`
+    /// is `(a2, a3)`, read only by the binary ops. Returns the result bits
+    /// (an `unsigned int` result is zero-extended).
+    pub fn apply(self, a: u64, b: u64) -> u64 {
+        let canonical = |x: f64| {
+            if x.is_nan() {
+                SOFT_FP_CANONICAL_NAN
+            } else {
+                x.to_bits()
+            }
+        };
+        let (x, y) = (f64::from_bits(a), f64::from_bits(b));
+        match self {
+            SoftDoubleOp::FloatUnsSi => f64::from(a as u32).to_bits(),
+            SoftDoubleOp::Mul => canonical(x * y),
+            SoftDoubleOp::Div => canonical(x / y),
+            SoftDoubleOp::FixUnsSi => {
+                if x.is_nan() {
+                    // Raw exponent 0x7FF: "overflow", signed by the sign bit.
+                    if x.is_sign_negative() {
+                        0
+                    } else {
+                        u64::from(u32::MAX)
+                    }
+                } else {
+                    // Saturating truncation: negative -> 0, >= 2^32 -> MAX.
+                    u64::from(x as u32)
+                }
+            }
         }
     }
 }
@@ -1369,6 +1453,14 @@ impl RomStub {
         }
     }
 
+    /// A real libgcc soft-float `double` helper — see [`SoftDoubleOp`].
+    pub const fn soft_double(name: &'static str, op: SoftDoubleOp) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::SoftDouble(op),
+        }
+    }
+
     /// A real high-level-emulated peripheral-register write — see
     /// [`RomStubEffect::BusRegisterWrite`].
     pub const fn bus_register_write(name: &'static str, write: BusRegisterWrite) -> Self {
@@ -1489,6 +1581,50 @@ mod tests {
                 op: BusRegisterOp::Store { value_reg: REG_A1 },
             })
         );
+    }
+
+    #[test]
+    fn soft_double_ops_match_libgcc_soft_fp() {
+        use SoftDoubleOp::*;
+        let d = |x: f64| x.to_bits();
+        // __floatunsidf: exact; the observed boot call converts 10,000,000.
+        assert_eq!(FloatUnsSi.apply(10_000_000, 0), d(1e7));
+        assert_eq!(FloatUnsSi.apply(10_000_000 | (0xDEAD << 32), 0), d(1e7));
+        assert_eq!(FloatUnsSi.apply(0, 0), 0);
+        assert_eq!(FloatUnsSi.apply(u64::from(u32::MAX), 0), d(4_294_967_295.0));
+        // __muldf3 / __divdf3: IEEE round-to-nearest.
+        assert_eq!(Mul.apply(d(1e7), d(2.5)), d(2.5e7));
+        assert_eq!(Mul.apply(d(0.1), d(3.0)), d(0.1 * 3.0));
+        assert_eq!(Div.apply(d(1e7), d(3.0)), d(1e7 / 3.0));
+        assert_eq!(Div.apply(d(1.0), d(0.0)), d(f64::INFINITY));
+        assert_eq!(Div.apply(d(-1.0), d(0.0)), d(f64::NEG_INFINITY));
+        // Subnormals are kept, not flushed.
+        assert_eq!(
+            Mul.apply(d(f64::MIN_POSITIVE), d(0.5)),
+            d(f64::MIN_POSITIVE / 2.0)
+        );
+        // NaN results are the canonical quiet NaN, sign clear.
+        assert_eq!(Div.apply(d(0.0), d(0.0)), SOFT_FP_CANONICAL_NAN);
+        assert_eq!(Mul.apply(d(f64::INFINITY), d(-0.0)), SOFT_FP_CANONICAL_NAN);
+        assert_eq!(
+            Mul.apply(0xFFF8_0000_0000_0001, d(1.0)),
+            SOFT_FP_CANONICAL_NAN
+        );
+        // __fixunsdfsi: truncation and _FP_TO_INT's unsigned edge cases.
+        assert_eq!(FixUnsSi.apply(d(3.9), 0), 3);
+        assert_eq!(FixUnsSi.apply(d(4_294_967_295.9), 0), u64::from(u32::MAX));
+        assert_eq!(FixUnsSi.apply(d(4_294_967_296.0), 0), u64::from(u32::MAX));
+        assert_eq!(FixUnsSi.apply(d(f64::INFINITY), 0), u64::from(u32::MAX));
+        assert_eq!(
+            FixUnsSi.apply(SOFT_FP_CANONICAL_NAN, 0),
+            u64::from(u32::MAX)
+        );
+        assert_eq!(FixUnsSi.apply(d(-0.5), 0), 0);
+        assert_eq!(FixUnsSi.apply(d(-1.0), 0), 0);
+        assert_eq!(FixUnsSi.apply(d(f64::NEG_INFINITY), 0), 0);
+        assert_eq!(FixUnsSi.apply(0xFFF8_0000_0000_0000, 0), 0);
+        assert!(!FixUnsSi.returns_double());
+        assert!(FloatUnsSi.returns_double() && Mul.returns_double() && Div.returns_double());
     }
 
     #[test]

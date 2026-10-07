@@ -56,7 +56,7 @@
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
 //!    (`CPU_INT_EIP_STATUS_REG`) needs the live asserted interrupt sources
-//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM, SPI2 and GDMA) to answer a
+//!    ([`FirmwareBus::pending_sources`]: SYSTIMER, SYSTEM, SPI2, GDMA and I2C0) to answer a
 //!    read, which is exactly the cross-peripheral access the ruling
 //!    anticipated: [`FirmwareBus::read_byte`] reads the concrete fields
 //!    directly, no trait object involved.
@@ -127,7 +127,12 @@
 //!    are still logged into [`FirmwareBus::unmapped_log`]. GDMA contributes
 //!    its channels' `INT_RAW & INT_ENA` levels to
 //!    [`FirmwareBus::pending_sources`].
-//! 14. **Catch-all**: any address covered by none of the above (every
+//! 14. **I2C0** ([`crate::mem::soc::I2C0_RANGE`]): routed to
+//!    [`FirmwareBus::i2c0`], same ruling — see `crate::peripherals::i2c`.
+//!    Offsets [`crate::peripherals::i2c::I2c::handles`] does not name are
+//!    logged into [`FirmwareBus::unmapped_log`]. Its `INT_STATUS != 0` level
+//!    is `SRC_I2C_EXT0` in [`FirmwareBus::pending_sources`].
+//! 15. **Catch-all**: any address covered by none of the above (every
 //!    genuinely not-yet-modeled ESP32-C3 peripheral MMIO register, plus
 //!    truly unmapped space). Reads return `0`, writes are dropped — this
 //!    must never panic, for any address, since real firmware immediately
@@ -154,6 +159,7 @@ use crate::peripherals::console::Console;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
 use crate::peripherals::gdma::{self, Gdma};
 use crate::peripherals::gpio::Gpio;
+use crate::peripherals::i2c::I2c;
 use crate::peripherals::intc::{self, InterruptController};
 use crate::peripherals::mmu::FlashMmu;
 use crate::peripherals::rtc_cntl::RtcCntl;
@@ -165,8 +171,8 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, IBUS_CACHE_RANGE,
-    INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
+    is_xip_addr, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
+    IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
     MMU_VALID_VAL_MASK, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
     SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
@@ -313,6 +319,9 @@ pub struct FirmwareBus {
     /// TX out-link feeds SPI2 when `SPI_DMA_TX_ENA` is set (see
     /// [`FirmwareBus::gdma_pull`]).
     pub gdma: Gdma,
+    /// The I2C0 controller (`crate::peripherals::i2c`), same ruling: a
+    /// master with no device on the bus, so every address phase NACKs.
+    pub i2c0: I2c,
     /// The USB-Serial-JTAG peripheral (`crate::peripherals::usb_serial_jtag`),
     /// same ruling — the badge's actual console transport.
     pub usb_serial_jtag: UsbSerialJtag,
@@ -431,6 +440,7 @@ impl FirmwareBus {
             gpio: Gpio::new(),
             spi: Spi::new(),
             gdma: Gdma::new(),
+            i2c0: I2c::new(),
             usb_serial_jtag: UsbSerialJtag::new(),
             timg0: Timg::new(),
             timg1: Timg::new(),
@@ -502,12 +512,14 @@ impl FirmwareBus {
     /// so a source de-asserts the moment its peripheral clears it. Sources
     /// so far: SYSTIMER targets 0..2 (`SRC_SYSTIMER_TARGET0..2`, Task 5), the
     /// SYSTEM `FROM_CPU_0..3` software interrupts, SPI2 (`SRC_SPI2`, `SPI_TRANS_DONE_INT_ST`, Task 9), and
-    /// GDMA channels 0..2 (`SRC_DMA_CH0..2`, `INT_RAW & INT_ENA`, Task 10).
+    /// GDMA channels 0..2 (`SRC_DMA_CH0..2`, `INT_RAW & INT_ENA`, Task 10),
+    /// and I2C0 (`SRC_I2C_EXT0`, `INT_STATUS != 0`, Milestone 4 Task D-M4-1).
     pub fn pending_sources(&self) -> u64 {
         let mut p = self.systimer.pending_sources();
         p |= u64::from(self.system.pending_mask()) << SRC_FROM_CPU_INTR0;
         p |= self.spi.pending_sources();
         p |= self.gdma.pending_sources();
+        p |= self.i2c0.pending_sources();
         p
     }
 
@@ -701,6 +713,13 @@ impl FirmwareBus {
             }
             return self.gdma.read_byte(offset);
         }
+        if I2C0_RANGE.contains(&addr) {
+            let offset = addr - I2C0_RANGE.start;
+            if !I2c::handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.i2c0.read_byte(offset);
+        }
         self.record_unmapped(addr, false);
         0
     }
@@ -831,6 +850,14 @@ impl FirmwareBus {
                 self.record_unmapped(addr, true);
             }
             self.gdma.write_byte(offset, val);
+            return;
+        }
+        if I2C0_RANGE.contains(&addr) {
+            let offset = addr - I2C0_RANGE.start;
+            if !I2c::handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.i2c0.write_byte(offset, val);
             return;
         }
         self.record_unmapped(addr, true);
@@ -1688,5 +1715,31 @@ mod tests {
             .unmapped_log()
             .iter()
             .any(|a| a.addr == 0x6000_23FC && !a.is_write));
+    }
+    /// I2C0 (`0x6001_3000`) is routed to `FirmwareBus::i2c0`: an
+    /// `i2c_master_probe` of an absent address raises NACK and asserts
+    /// `SRC_I2C_EXT0`; the gap at `+0x88` stays logged.
+    #[test]
+    fn i2c0_probe_through_the_bus_nacks_and_asserts_its_source() {
+        use crate::mem::soc::SRC_I2C_EXT0;
+        let mut bus = bus_with(vec![]);
+        let base = 0x6001_3000;
+        bus.write32(base + 0x04, 0x20B | (1 << 4)); // CTR: MS_MODE
+        bus.write32(base + 0x28, 0x5A8); // INT_ENA: I2C_LL_MASTER_EVENT_INTR
+        bus.write32(base + 0x58, 6 << 11); // COMD0: RSTART
+        bus.write32(base + 0x1C, 0x19 << 1); // DATA: address byte
+        bus.write32(base + 0x5C, (1 << 11) | (1 << 8) | 1); // COMD1: WRITE 1, ack check
+        bus.write32(base + 0x60, 2 << 11); // COMD2: STOP
+        bus.write32(base + 0x04, 0x20B | (1 << 4) | (1 << 5)); // TRANS_START
+        assert_eq!(bus.read32(base + 0x2C), (1 << 10) | (1 << 7)); // NACK | COMPLETE
+        assert_ne!(bus.pending_sources() & (1u64 << SRC_I2C_EXT0), 0);
+        bus.write32(base + 0x24, 0x5A8); // INT_CLR
+        assert_eq!(bus.pending_sources() & (1u64 << SRC_I2C_EXT0), 0);
+        assert!(!bus
+            .unmapped_log()
+            .iter()
+            .any(|a| I2C0_RANGE.contains(&a.addr)));
+        bus.read32(base + 0x88);
+        assert!(bus.unmapped_log().iter().any(|a| a.addr == base + 0x88));
     }
 }

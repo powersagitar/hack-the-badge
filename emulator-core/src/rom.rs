@@ -873,19 +873,25 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`strcpy`,
-//! `atoi`, …) and the float half of ROM
-//! libgcc are **absent by design**, for the same reason `memset` and
-//! `__udivdi3` are special-cased rather than defaulted: a generic
-//! "return 0, do nothing" stub for a function whose *output* the caller uses
-//! silently corrupts it. Each one gets a real HLE implementation when — and
+//! The rest of ROM libc/newlib (`strcpy`, `atoi`, …) and the rest of ROM
+//! libgcc's float half (all but the four soft-double helpers in
+//! [`LIBGCC_SOFT_DOUBLE_FAMILY`]) are **absent by design**, for the same
+//! reason `memset` and `__udivdi3` are special-cased rather than defaulted:
+//! a generic "return 0, do nothing" stub for a function whose *output* the
+//! caller uses silently corrupts it. Each one gets a real HLE implementation when — and
 //! only when — a boot run is actually observed to call it. Faulting on an
 //! unstubbed ROM address is a loud, diagnosable outcome; a wrong answer from a
 //! stub is not.
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 4 Task 5**: 103 stubs (Task D13's 98 plus `strncpy` and
+//! **As of Milestone 4 Task D-M4-1**: 107 stubs: the four libgcc soft-double
+//! helpers ([`LIBGCC_SOFT_DOUBLE_FAMILY`]) the first function after the I2C0
+//! accelerometer probe calls. Boot takes no exception (checked to step
+//! 30,000,000) and goes silent in the RMT driver (the notes' "Milestone 4
+//! Task D-M4-1" entry).
+//!
+//! **As of Milestone 4 Task 5** (history): 103 stubs (Task D13's 98 plus `strncpy` and
 //! `strcmp`, Milestone 4 Task 2, and `strlcat`/`strspn`/`strcspn`, Milestone 4
 //! Task 5). With the flash MMU modeled (Milestone 4 Task 2),
 //! `load_partitions()` reads the synthesized partition table through its own
@@ -1082,7 +1088,7 @@ use crate::cpu::encode::{
 };
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, RomStub,
-    RomStubTable, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
+    RomStubTable, SoftDoubleOp, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::image::ImageHeader;
@@ -2009,8 +2015,9 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
 /// choice.
 ///
 /// Only the routines observed in a boot run, plus their obvious siblings
-/// (signed/unsigned, the three shift directions), are listed — the float and
-/// bit-counting halves of `libgcc.ld` are left to fault loudly until something
+/// (signed/unsigned, the three shift directions), are listed — the float half
+/// (bar [`LIBGCC_SOFT_DOUBLE_FAMILY`]) and the bit-counting half (bar
+/// [`LIBGCC_INT32_FAMILY`]) of `libgcc.ld` are left to fault loudly until something
 /// actually calls them.
 const LIBGCC_INT64_FAMILY: &[(u32, &str, Int64Op)] = &[
     (0x4000_077c, "__ashldi3", Int64Op::Shl),
@@ -2033,6 +2040,19 @@ const LIBGCC_INT32_FAMILY: &[(u32, &str, Int32UnaryOp)] = &[
     (0x4000_0788, "__bswapsi2", Int32UnaryOp::Bswap),
     (0x4000_079c, "__clzsi2", Int32UnaryOp::Clz),
     (0x4000_07d4, "__ffssi2", Int32UnaryOp::Ffs),
+];
+
+/// libgcc's soft-float `double` helpers (`esp32c3.rom.libgcc.ld`), real
+/// implementations -- see [`SoftDoubleOp`]. Milestone 4 Task D-M4-1: once
+/// I2C0 lets boot past the accelerometer probe, one firmware function
+/// (`0x420e_d7f0` onward) converts a clock frequency (`a0 = 10_000_000`) to
+/// `double` and scales it with these four in sequence. The other float
+/// helpers are left to fault loudly until something calls them.
+const LIBGCC_SOFT_DOUBLE_FAMILY: &[(u32, &str, SoftDoubleOp)] = &[
+    (0x4000_07b0, "__divdf3", SoftDoubleOp::Div),
+    (0x4000_07e8, "__fixunsdfsi", SoftDoubleOp::FixUnsSi),
+    (0x4000_080c, "__floatunsidf", SoftDoubleOp::FloatUnsSi),
+    (0x4000_0848, "__muldf3", SoftDoubleOp::Mul),
 ];
 
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM
@@ -2121,6 +2141,9 @@ pub fn esp32c3_rom_stubs() -> RomStubTable {
     for (addr, name, op) in LIBGCC_INT32_FAMILY {
         table.insert(*addr, RomStub::int32_unary(name, *op));
     }
+    for (addr, name, op) in LIBGCC_SOFT_DOUBLE_FAMILY {
+        table.insert(*addr, RomStub::soft_double(name, *op));
+    }
     for (addr, name, returns_a_value) in REGI2C_FAMILY {
         let stub = if *returns_a_value {
             RomStub::returning(name, 0)
@@ -2195,6 +2218,11 @@ mod tests {
             assert_eq!(stub.name, *name);
             assert_eq!(stub.effect, RomStubEffect::Int32Unary(*op), "{name}");
         }
+        for (addr, name, op) in LIBGCC_SOFT_DOUBLE_FAMILY {
+            let stub = table.lookup(*addr).expect("stubbed");
+            assert_eq!(stub.name, *name);
+            assert_eq!(stub.effect, RomStubEffect::SoftDouble(*op), "{name}");
+        }
         for (addr, name, returns_a_value) in REGI2C_FAMILY {
             let stub = table
                 .lookup(*addr)
@@ -2217,12 +2245,14 @@ mod tests {
         let cache = CACHE_FAMILY.iter().map(|(a, _)| *a);
         let libgcc = LIBGCC_INT64_FAMILY.iter().map(|(a, _, _)| *a);
         let libgcc32 = LIBGCC_INT32_FAMILY.iter().map(|(a, _, _)| *a);
+        let softdf = LIBGCC_SOFT_DOUBLE_FAMILY.iter().map(|(a, _, _)| *a);
         let regi2c = REGI2C_FAMILY.iter().map(|(a, _, _)| *a);
         let mut total = 0usize;
         for addr in named
             .chain(cache)
             .chain(libgcc)
             .chain(libgcc32)
+            .chain(softdf)
             .chain(regi2c)
         {
             assert!(seen.insert(addr), "0x{addr:08x} is listed twice");
