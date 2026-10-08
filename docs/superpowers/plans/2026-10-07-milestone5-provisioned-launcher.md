@@ -1439,6 +1439,7 @@ Droppable without failing M5; if dropped, it heads the M6 backlog. Start after T
 
 ## Orchestrator notes
 
+- Execution method: subagent-driven (`superpowers:subagent-driven-development`), chosen by the human partner on 2026-10-07. Not `executing-plans`.
 - Order: Task 1 → 2 → 3 → (Task D instances as boot needs) → 4 (+ C1/C2/Task D as triggered) → 5 → 6 (waits on permission) → 7 → 8 → 9 (stretch) → whole-branch review → `superpowers:finishing-a-development-branch` (the human partner decides merge/PR/push).
 - If permission has not arrived when Task 5 is done, pause and ask the human partner for the fallback (R-M5-2); do not start Task 6.
 - Give each implementer: this plan's Global Constraints + Review Focus, their task text, the spec path, the "Trace facts" section, the latest ledger findings. Never paste fixture contents or any `local/` data into a brief; give paths.
