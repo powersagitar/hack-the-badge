@@ -26,6 +26,22 @@ shows that screen. Driving that path means the firmware validates the
 record and writes it through its own littlefs; the emulator needs only
 the USB-Serial-JTAG receive direction (a register model, already a
 backlog item), no littlefs code of its own and no committed binary image.
+**Found while planning (2026-10-07).** The console is
+`hal_console_start()` (`./main/hal/hal_console.cpp`), which calls
+`esp_console_new_repl_usb_serial_jtag` (the interrupt-driven
+`usb_serial_jtag` driver, prompt `badge> `) and logs `hal_console:
+console started`. On the physical badge that line follows `app_reg:
+launched My Badge` by about ten lines (untagged REPL output), then
+`main_task: Returned from app_main()`. The emulator never prints it (60M
+steps on blank flash): `app_main` is held up between the first app launch
+and the console start. The likely cause is the one
+`milestone-4-decisions.md` flagged: the driver queues console bytes in a
+ring buffer that only its ISR moves to the FIFO, and no USB-Serial-JTAG
+interrupt source is modeled. So the receive model below includes the
+interrupt source unconditionally, and Task 3's first rung is the console
+starting. The REPL's own commands include `put <path> <size>` ("then send
+<size> bytes", answering `OK <n>`), `cat`, `ls` and `press <button>`.
+
 Rejected alternatives: a committed littlefs image built by littlefs-python
 (commits a ~1.25 MiB binary or puts Python in the build; a config mismatch
 makes the firmware silently reformat), and a littlefs v2 writer in Rust
@@ -43,8 +59,9 @@ fallback the human partner would rule on).
    firmware's role table; whether the console REPL runs on blank flash
    and through which driver (polling VFS or the interrupt-driven
    `usb_serial_jtag` driver); the exact `put` syntax and where its bytes
-   go; and what `prov apply` does next (redraw, onboarding, reboot).
-   Every fact cites a firmware address.
+   go; what `prov apply` does next (redraw, onboarding, reboot); and why
+   `app_main` does not reach `hal_console_start()` in the emulator (see
+   "Found while planning"). Every fact cites a firmware address.
 2. **The console accepts input.** The USB-Serial-JTAG RX direction is
    modeled register-faithfully; rung `console_answers_prov_show_on_the_first_run_screen`:
    `prov show` typed on the first-run screen prints `provisioned=0`.
@@ -208,18 +225,33 @@ v5.5.3 `soc/esp32c3/register/soc/usb_serial_jtag_reg.h` and
   `EP1_REG` other than byte 0 do not pop.
 - **Interrupt status.** `INT_ST` becomes `INT_RAW & INT_ENA` instead of
   plain storage; `INT_CLR` clears raw bits (the forced ones re-assert on
-  the next read, as today). If Task 1 shows the console uses the
-  interrupt-driven driver, `ETS_USB_SERIAL_JTAG_INTR_SOURCE` (number from
-  `soc/esp32c3/include/soc/interrupts.h`) is asserted as a level in the
-  bus's `pending_sources()` while `INT_ST` is non-zero. Decision to
-  record: the forced `SOF_INT_RAW` and `SERIAL_IN_EMPTY_INT_RAW` would
-  hold that source asserted forever if their enables were set; if the
-  firmware enables either, the implementer stops and reports rather than
-  modeling around it.
+  the next read, as today). `ETS_USB_SERIAL_JTAG_INTR_SOURCE` (number
+  from `soc/esp32c3/include/soc/interrupts.h`) is asserted as a level in
+  the bus's `pending_sources()` while `INT_ST` is non-zero. The
+  forced `SERIAL_IN_EMPTY_INT_RAW` is what the driver's TX path wants: its
+  ISR enables `SERIAL_IN_EMPTY` only while its ring buffer holds bytes,
+  moves them to the FIFO (always empty here) and disables it again when
+  the ring buffer drains (v5.5.3 `esp_driver_usb_serial_jtag/src/usb_serial_jtag.c`).
+  Decision to record: a source that stays asserted while its ISR makes no
+  progress (an interrupt storm: the ISR's PCs dominate the hot-PC list
+  and no console byte or frame changes), e.g. if the firmware enabled the
+  forced `SOF_INT`, makes the implementer stop and report rather than
+  model around it.
 - **Runtime API.** `FirmwareRuntime::serial_input(&mut self, bytes:
-  &[u8])` appends to the host queue; `serial_pending(&self) -> usize`
-  reports bytes not yet delivered to the FIFO. No interpretation of the
-  bytes. A huge input must not panic (it is just queued).
+  &[u8]) -> usize` appends to the host queue and returns how many bytes
+  it accepted; `serial_pending(&self) -> usize` reports bytes the
+  firmware has not read yet (host queue plus FIFO). No interpretation of
+  the bytes. The host queue is capped at 1 MiB (excess is refused, never
+  a panic) so a browser cannot grow emulator memory without bound.
+- **Packet pacing.** A packet moves into the FIFO only when the FIFO is
+  empty and at least one packet time has passed since the previous one:
+  821 SYSTIMER ticks, a 64-byte full-speed bulk packet with its token and
+  handshake (~616 bits at 12 Mbit/s, ~51 µs) at SYSTIMER's 16 MHz.
+  Delivering packets back-to-back in zero time would let the driver's ISR
+  fill its receive ring buffer before the console task runs, dropping
+  bytes a real host's line rate never would. The WFI fast-forward stops
+  at the next packet time as it does at the next SYSTIMER alarm, so input
+  wakes an idle core.
 
 Unit tests drive the registers with byte-split word writes in the LL
 functions' order: packet loading and the 64-byte boundary, `DATA_AVAIL`
@@ -239,8 +271,10 @@ A shared test module (`emulator-core/tests/common/provision.rs`, used by
   JSON bytes, type `prov apply`, and run until the console contains
   `PROV OK` or `PROV FAIL` (returning which, plus the line).
 
-Rungs: criterion 2 and criterion 3. Both use no identity and are
-committed pre-gate. Any stall on the way is a Task D.
+Rungs: `boot_starts_the_console` (`hal_console: console started` within
+a budget, and the blank-flash first-run hash unchanged), then criterion 2
+and criterion 3. All use no identity and are committed pre-gate. Any
+stall on the way is a Task D.
 
 ### Part 4 — Local exploration to the launcher (Task 4)
 
