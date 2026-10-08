@@ -69,7 +69,7 @@
 //!
 //! A host-side queue ([`UsbSerialJtag::host_send`]) feeds the 64-byte OUT
 //! FIFO one full-speed bulk packet at a time: a packet loads when the FIFO
-//! is empty and [`PACKET_TICKS`] have passed since the previous load, and
+//! is empty and [`PACKET_STEPS`] CPU steps (as [`PACKET_TICKS`]) have passed since the previous load, and
 //! latches `SERIAL_OUT_RECV_PKT_INT_RAW` (bit 2 of RAW/ST/ENA/CLR,
 //! `usb_serial_jtag_reg.h`). `hal/esp32c3/include/hal/usb_serial_jtag_ll.h`'s
 //! `usb_serial_jtag_ll_read_rxfifo` loops while
@@ -89,6 +89,7 @@ use std::collections::{HashMap, VecDeque};
 
 use super::console::Console;
 use super::set_byte;
+use super::systimer::TICKS_PER_STEP;
 use crate::mem::soc::SRC_USB_SERIAL_JTAG;
 
 /// `USB_SERIAL_JTAG_EP1_REG`. See the module doc.
@@ -121,11 +122,25 @@ pub const SOF_INT_CLR: u32 = 1 << 1;
 pub const SERIAL_OUT_RECV_PKT_INT: u32 = 1 << 2;
 /// Full-speed bulk max packet size of the CDC OUT endpoint (the FIFO depth).
 pub const OUT_EP_MAX_PACKET: usize = 64;
-/// SYSTIMER ticks (16 MHz) one OUT packet occupies on a full-speed bus: a
-/// 64-byte DATA packet plus its OUT token and ACK handshake is ~616 bits,
-/// ~51.3 us at 12 Mbit/s, x 16 ticks/us = 821. A host cannot send the next
-/// packet sooner; see `docs/milestone-5-decisions.md`.
-pub const PACKET_TICKS: u64 = 821;
+/// CPU steps one OUT packet occupies on the full-speed bus. A 64-byte DATA
+/// packet plus its OUT token and ACK handshake is ~616 bits, ~51.3 us at
+/// 12 Mbit/s. The host-bus vs CPU race must be timed in CPU instructions,
+/// and the ESP32-C3 runs at 160 MHz (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`,
+/// default `ESP_DEFAULT_CPU_FREQ_MHZ_160` in ESP-IDF v5.5.3
+/// `components/esp_system/port/soc/esp32c3/Kconfig.cpu`; the badge
+/// firmware's own text says "160MHz"), so a packet is 51.3 us x 160
+/// instructions/us = 8,208, taken as 8,210. The emulator has no cycle model
+/// (one instruction per step), hence steps, not SYSTIMER ticks (16 MHz,
+/// which would give only 821 and overflow the driver's 256-byte RX ring).
+/// A future cycle model rescales this one constant. See
+/// `docs/milestone-5-decisions.md`.
+pub const PACKET_STEPS: u64 = 8_210;
+/// [`PACKET_STEPS`] in the unit [`UsbSerialJtag::advance`] counts. One step
+/// advances time by [`TICKS_PER_STEP`] ticks (1), so the idle fast-forward
+/// ([`UsbSerialJtag::ticks_until_next_packet`],
+/// `FirmwareBus::ticks_until_next_event`), which works in ticks, skips
+/// exactly the steps it replaces.
+pub const PACKET_TICKS: u64 = PACKET_STEPS * TICKS_PER_STEP;
 /// Bytes the emulated USB host will buffer before refusing more (a browser
 /// must not grow emulator memory without bound).
 pub const HOST_QUEUE_CAPACITY: usize = 1 << 20;
@@ -384,6 +399,17 @@ mod tests {
         assert_eq!(read_word(&mut u, EP1_REG), u32::from(b'b'));
         assert_eq!(read_word(&mut u, EP1_REG), 0, "empty FIFO reads 0");
         assert_eq!(u.host_pending(), 0);
+    }
+
+    #[test]
+    fn packet_pacing_is_a_bus_packet_time_in_cpu_steps() {
+        // 51.3 us of full-speed bus x 160 MHz CPU = 8,208, rounded to the
+        // brief's 8,210 steps; ticks and steps coincide (TICKS_PER_STEP = 1).
+        assert_eq!(PACKET_STEPS, 8_210);
+        assert_eq!(
+            PACKET_TICKS,
+            PACKET_STEPS * crate::peripherals::systimer::TICKS_PER_STEP
+        );
     }
 
     #[test]

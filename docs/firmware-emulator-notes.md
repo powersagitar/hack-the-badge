@@ -2112,6 +2112,19 @@ the `float` helpers `__mulsf3` (`0x4000_0854`), `__addsf3` (`0x4000_0770`),
 the path needs an identity, and identity-using tests wait for the
 Milestone 5 permission gate (R-M5-2).
 
+### Milestone 5 Task D-M5-1: USB OUT packet pacing against CPU throughput
+
+A payload larger than the driver's 256-byte RX ring was dropped: OUT
+packets arrived every 821 steps (the packet time at SYSTIMER's 16 MHz)
+while the `put` task needs ~20-24k steps to drain one. The model now paces
+in CPU steps: `PACKET_STEPS` = 8,210 (51.3 us x 160 MHz), with
+`PACKET_TICKS` derived so the idle fast-forward stays consistent. That
+alone fixes payloads up to ~320 bytes (the identity size class); the test
+host (`provision::put_file`) additionally sends 64-byte chunks
+`PUT_CHUNK_GAP_STEPS` = 48,000 steps apart. Rung:
+`put_accepts_a_payload_larger_than_the_rx_ring` (600 synthetic bytes, `OK
+600` at about step 17.9M). Decisions: `milestone-5-decisions.md`.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB

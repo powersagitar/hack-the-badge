@@ -987,6 +987,11 @@ fn boot_starts_the_console() {
 /// 18.4M; that + 25%, rounded to 1,000,000.
 const CONSOLE_DEADLINE: u64 = 23_000_000;
 
+/// [`put_accepts_a_payload_larger_than_the_rx_ring`]: total-step deadline.
+/// Measured (Milestone 5 Task D-M5-1): finished at 17.88M (50,000-step sampling, host-paced chunks); that + 25%, rounded
+/// to 1,000,000.
+const RING_TEST_DEADLINE: u64 = 23_000_000;
+
 /// Boots to the stable first-run screen (blank flash).
 fn first_run_screen() -> FirmwareRuntime {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
@@ -1013,6 +1018,25 @@ fn console_answers_prov_show_on_the_first_run_screen() {
         Outcome::Done(text) => assert!(text.contains("provisioned=0"), "{text}"),
         Outcome::Timeout(text) => panic!("no prompt after `prov show`:\n{text}"),
     }
+    assert_no_panic_text(&rt);
+}
+
+/// `put` of a payload more than twice the driver's 256-byte RX ring buffer
+/// (whose ISR drops what does not fit): the model must pace OUT packets
+/// against CPU throughput so the `put` task drains the ring in time.
+/// Synthetic pattern, no identity (R-M5-2).
+#[test]
+fn put_accepts_a_payload_larger_than_the_rx_ring() {
+    let mut rt = first_run_screen();
+    let payload: Vec<u8> = (b'a'..=b'z').cycle().take(600).collect();
+    let text = provision::put_file(
+        &mut rt,
+        "/littlefs/m5-ring-test.bin",
+        &payload,
+        RING_TEST_DEADLINE,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(text.contains("OK 600"), "{text}");
     assert_no_panic_text(&rt);
 }
 

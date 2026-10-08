@@ -256,11 +256,34 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
 
 ## USB-Serial-JTAG receive (Task 2)
 
-- **Pacing:** the host delivers one 64-byte OUT packet when the FIFO is
-  empty and `PACKET_TICKS` = 821 (~51.3 us of full-speed bus time at 16
-  ticks/us) have passed since the last. If wrong: input arrives faster or
-  slower than a real host; a faster model would overflow the driver's
-  256-byte ring buffer.
+- **Pacing (amended by R-T4-1 / R-D1-1, Task D-M5-1):** the host delivers
+  one 64-byte OUT packet when the FIFO is empty and `PACKET_STEPS` = 8,210
+  CPU steps have passed since the last. A packet occupies ~51.3 us of
+  full-speed bus (616 bits at 12 Mbit/s); the ESP32-C3 runs at 160 MHz
+  (ESP-IDF v5.5.3 `components/esp_system/port/soc/esp32c3/Kconfig.cpu`:
+  `default ESP_DEFAULT_CPU_FREQ_MHZ_160`; `.../esp32c3/clk.c` applies
+  `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`), and the emulator has no cycle model
+  (one instruction per step), so 51.3 us x 160 = 8,208, taken as 8,210. The
+  earlier 821 counted SYSTIMER ticks (16 MHz) and let packets arrive ~10x
+  too fast relative to the CPU. `PACKET_TICKS = PACKET_STEPS *
+  TICKS_PER_STEP` keeps the idle fast-forward (which works in ticks)
+  consistent: with `TICKS_PER_STEP` = 1 it skips exactly the steps it
+  replaces. If wrong: a future cycle model rescales this one constant.
+- **Host chunk pacing (R-D1-1):** 8,210 is the faithful bus rate, not
+  enough on its own: the bytes are dropped inside the firmware's driver
+  (the ISR pushes into a full 256-byte ring) because the `put` task spends
+  ~20-24k steps per 64-byte packet (measured: a 600-byte `put` fails at
+  20,000 steps/packet and passes at 24,000; 317 bytes passes at 8,210, 350
+  fails). A fast real host can overflow the ring the same way, so hosts
+  pace: `tests/common/provision.rs::put_file` sends the payload in 64-byte
+  chunks `PUT_CHUNK_GAP_STEPS` = 48,000 steps apart (2x the threshold).
+  This is host behavior, not a bus property; the bus constant was not
+  inflated. Context for where the cost goes (hot PCs while one packet is
+  drained, 40,000 steps): ~20% in one tight IRAM loop at
+  `0x4038_f930..0x4038_f9f0`, the rest spread over IRAM `0x4038_cf00..e1ff`
+  and flash `0x420f_29xx`, `0x4200_83xx..87xx`; not identified further (a
+  per-byte VFS read through the ring buffer is the suspect). If wrong: if
+  the cost is an emulator gap, a later task can lower the gap.
 - **Host queue cap:** 1 MiB (`HOST_QUEUE_CAPACITY`); excess is refused and
   reported by `serial_input`'s return value. If wrong: a client sending
   more is refused where a real host would block.

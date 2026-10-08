@@ -19,6 +19,13 @@ pub const LINE_END: &str = "\n";
 /// be enough in general (decisions file, R-T1-3).
 pub const PUT_READY: &str = "READY";
 const CHUNK: u32 = 50_000;
+/// Host-side pacing of a `put` payload, NOT a bus property: the host sends
+/// 64-byte chunks this many steps apart. The firmware's driver ISR drops
+/// what does not fit its 256-byte RX ring, and the `put` task needs about
+/// 20-24k steps per 64-byte packet to drain it (measured, Milestone 5 Task
+/// D-M5-1: a 600-byte payload fails at 20,000 steps/packet and passes at
+/// 24,000), so the gap is 2x that. See `docs/milestone-5-decisions.md`.
+pub const PUT_CHUNK_GAP_STEPS: u32 = 48_000;
 
 pub enum Outcome {
     Done(String),
@@ -62,19 +69,21 @@ pub fn type_line(rt: &mut FirmwareRuntime, line: &str, deadline: u64) -> Outcome
     }
 }
 
-/// The registration-desk flow: `put <IDENTITY_PATH> <len>`, wait for
-/// `READY`, the bytes, then `prov apply`. Waits for the first prompt before
+/// `put <path> <len>`, wait for `READY`, send `payload`, wait for
+/// `OK <len>` and the REPL's next prompt. Waits for the first prompt before
 /// typing (the REPL discards input during its 500 ms terminal probe).
-pub fn provision(
+/// Returns the console text from the `put` command on.
+pub fn put_file(
     rt: &mut FirmwareRuntime,
-    identity_json: &[u8],
+    path: &str,
+    payload: &[u8],
     deadline: u64,
 ) -> Result<String, String> {
     if wait_for_any(rt, 0, &[PROMPT], deadline).is_none() {
         return Err(format!("no `{PROMPT}` prompt by step {deadline}"));
     }
     let marker = rt.console_output().len();
-    let header = format!("put {IDENTITY_PATH} {}{LINE_END}", identity_json.len());
+    let header = format!("put {path} {}{LINE_END}", payload.len());
     if rt.serial_input(header.as_bytes()) != header.len() {
         return Err("serial queue refused the put command".into());
     }
@@ -84,10 +93,16 @@ pub fn provision(
             console_since(rt, marker)
         ));
     }
-    if rt.serial_input(identity_json) != identity_json.len() {
-        return Err("serial queue refused the payload".into());
+    for (i, chunk) in payload.chunks(64).enumerate() {
+        if i > 0 {
+            let s = rt.run(PUT_CHUNK_GAP_STEPS);
+            assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        }
+        if rt.serial_input(chunk) != chunk.len() {
+            return Err("serial queue refused the payload".into());
+        }
     }
-    let ok = format!("OK {}", identity_json.len());
+    let ok = format!("OK {}", payload.len());
     match wait_for_any(
         rt,
         marker,
@@ -102,6 +117,17 @@ pub fn provision(
     if wait_for_any(rt, marker, &[PROMPT], deadline).is_none() {
         return Err(format!("no prompt after put:\n{}", console_since(rt, marker)));
     }
+    Ok(console_since(rt, marker))
+}
+
+/// The registration-desk flow: `put <IDENTITY_PATH> <len>` (see
+/// [`put_file`]), then `prov apply`.
+pub fn provision(
+    rt: &mut FirmwareRuntime,
+    identity_json: &[u8],
+    deadline: u64,
+) -> Result<String, String> {
+    put_file(rt, IDENTITY_PATH, identity_json, deadline)?;
     let marker = rt.console_output().len();
     let apply = format!("prov apply{LINE_END}");
     if rt.serial_input(apply.as_bytes()) != apply.len() {
