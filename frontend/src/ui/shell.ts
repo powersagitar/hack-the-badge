@@ -43,6 +43,16 @@ const KEY_TO_BUTTON: Record<string, ButtonName> = {
   Space: "AUX1",
 };
 
+/** A firmware role string (`workshop_lead`) as a menu label (`workshop lead`). */
+export function roleLabel(role: string): string {
+  return role.replace(/_/g, " ");
+}
+
+export interface ProvisionControls {
+  setStatus(text: string): void;
+  setVisible(visible: boolean): void;
+}
+
 export interface ShellHandles {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
@@ -61,6 +71,16 @@ export interface ShellHandles {
    * and updates which button looks active.
    */
   mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void;
+  /**
+   * Mounts the role picker, "Provision test badge" and "Shake" buttons, a
+   * status span and a hint into `#provision-controls` (no-op handles if the
+   * element is missing). `onProvision` gets the selected role string.
+   */
+  mountProvisionControls(
+    roles: readonly string[],
+    onProvision: (role: string) => void,
+    onShake: () => void,
+  ): ProvisionControls;
 }
 
 export function mountShell(): ShellHandles {
@@ -145,5 +165,48 @@ export function mountShell(): ShellHandles {
     }
   }
 
-  return { canvas, ctx, mountButtons, mountKeyboard, renderLeds, mountModeToggle };
+  function mountProvisionControls(
+    roles: readonly string[],
+    onProvision: (role: string) => void,
+    onShake: () => void,
+  ): ProvisionControls {
+    const container = document.getElementById("provision-controls");
+    if (!container) return { setStatus: () => {}, setVisible: () => {} };
+    container.innerHTML = "";
+    const select = document.createElement("select");
+    select.className = "provision-role";
+    for (const role of roles) {
+      const opt = document.createElement("option");
+      opt.value = role;
+      opt.textContent = roleLabel(role);
+      select.appendChild(opt);
+    }
+    const provisionBtn = document.createElement("button");
+    provisionBtn.type = "button";
+    provisionBtn.className = "mode-btn";
+    provisionBtn.textContent = "Provision test badge";
+    provisionBtn.addEventListener("click", () => onProvision(select.value));
+    const shakeBtn = document.createElement("button");
+    shakeBtn.type = "button";
+    shakeBtn.className = "mode-btn";
+    shakeBtn.textContent = "Shake";
+    shakeBtn.addEventListener("click", () => onShake());
+    const status = document.createElement("span");
+    status.className = "provision-status";
+    const hint = document.createElement("p");
+    hint.className = "provision-hint";
+    hint.textContent =
+      "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake.";
+    container.append(select, provisionBtn, shakeBtn, status, hint);
+    return {
+      setStatus: (text) => {
+        status.textContent = text;
+      },
+      setVisible: (visible) => {
+        container.style.display = visible ? "" : "none";
+      },
+    };
+  }
+
+  return { canvas, ctx, mountButtons, mountKeyboard, renderLeds, mountModeToggle, mountProvisionControls };
 }
