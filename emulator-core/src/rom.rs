@@ -911,6 +911,16 @@
 //!
 //! ## Where this gets boot to
 //!
+//! **As of Milestone 5 Task 4**: 121 stubs. Provisioning and the
+//! onboarding app that follows it reach ROM calls the blank-flash boot never
+//! made, each observed faulting and now a real HLE: `strcasecmp`
+//! (`0x4000_03d0`, [`STRCASECMP`], `hal_identity`'s role lookup), the
+//! `double` helpers `__gedf2`, `__ledf2`, `__fixdfsi` and `__adddf3`
+//! (`prov apply`'s identity load; `LIBGCC_SOFT_DOUBLE_FAMILY`), and the
+//! `float` helpers `__mulsf3`, `__addsf3`, `__unordsf2` and `__ltsf2` (the
+//! onboarding's accelerometer page; `LIBGCC_SOFT_FLOAT_FAMILY`). Addresses
+//! from `esp32c3.rom.libc.ld` / `esp32c3.rom.libgcc.ld`.
+//!
 //! **As of Milestone 5 Task 3**: 112 stubs: `strlcpy` (`0x4000_03f0`,
 //! [`STRLCPY`]), `strtol` (`0x4000_0454`, [`STRTOL`]) and `strrchr`
 //! (`0x4000_0408`, [`STRRCHR`]), each a real HLE observed faulting on the
@@ -1133,7 +1143,7 @@ use crate::cpu::encode::{
 };
 use crate::cpu::rom_stubs::{
     BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, RomStub,
-    RomStubTable, SoftDoubleOp, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
+    RomStubTable, SoftDoubleOp, SoftFloatOp, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::image::ImageHeader;
@@ -1451,6 +1461,14 @@ pub const STRLCAT: u32 = 0x4000_03ec;
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strlcpy`]), Milestone 5 Task 3:
 /// the console REPL's first command (`0x4206_0074`, size 256) calls it.
 pub const STRLCPY: u32 = 0x4000_03f0;
+
+/// ROM libc `strcasecmp`'s fixed address (`esp32c3.rom.libc.ld`:
+/// `strcasecmp = 0x400003d0;`, ROM ELF `__call_strcasecmp`, newlib code at
+/// `0x4005_8afa`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strcasecmp`]), Milestone 5
+/// Task 4: `hal_identity`'s role lookup (`0x4200_e41a`) matches the
+/// identity's `role` against the role tables with it.
+pub const STRCASECMP: u32 = 0x4000_03d0;
 
 /// ROM libc `strtol`'s fixed address (`esp32c3.rom.libc.ld`: `strtol =
 /// 0x40000454;`, ROM ELF `__call_strtol`). Real HLE
@@ -2164,6 +2182,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRCMP, RomStub::strcmp("strcmp")),
     (STRLCAT, RomStub::strlcat("strlcat")),
     (STRLCPY, RomStub::strlcpy("strlcpy")),
+    (STRCASECMP, RomStub::strcasecmp("strcasecmp")),
     (STRTOL, RomStub::strtol("strtol")),
     (STRRCHR, RomStub::strrchr("strrchr")),
     (STRSPN, RomStub::strspn("strspn")),
@@ -2241,6 +2260,21 @@ const LIBGCC_SOFT_DOUBLE_FAMILY: &[(u32, &str, SoftDoubleOp)] = &[
     (0x4000_07e8, "__fixunsdfsi", SoftDoubleOp::FixUnsSi),
     (0x4000_080c, "__floatunsidf", SoftDoubleOp::FloatUnsSi),
     (0x4000_0848, "__muldf3", SoftDoubleOp::Mul),
+    (0x4000_0818, "__gedf2", SoftDoubleOp::Ge),
+    (0x4000_0828, "__ledf2", SoftDoubleOp::Le),
+    (0x4000_07dc, "__fixdfsi", SoftDoubleOp::FixSi),
+    (0x4000_076c, "__adddf3", SoftDoubleOp::Add),
+];
+
+/// libgcc's soft-float `float` helpers (`esp32c3.rom.libgcc.ld`), real
+/// implementations -- see [`SoftFloatOp`]. Milestone 5 Task 4: the
+/// onboarding app's sixth page ("Shake it!") calls these. The others are
+/// left to fault loudly until something calls them.
+const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
+    (0x4000_0854, "__mulsf3", SoftFloatOp::Mul),
+    (0x4000_0838, "__ltsf2", SoftFloatOp::Lt),
+    (0x4000_08c8, "__unordsf2", SoftFloatOp::Unord),
+    (0x4000_0770, "__addsf3", SoftFloatOp::Add),
 ];
 
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM
@@ -2329,6 +2363,9 @@ pub fn esp32c3_rom_stubs() -> RomStubTable {
     for (addr, name, op) in LIBGCC_INT32_FAMILY {
         table.insert(*addr, RomStub::int32_unary(name, *op));
     }
+    for (addr, name, op) in LIBGCC_SOFT_FLOAT_FAMILY {
+        table.insert(*addr, RomStub::soft_float(name, *op));
+    }
     for (addr, name, op) in LIBGCC_SOFT_DOUBLE_FAMILY {
         table.insert(*addr, RomStub::soft_double(name, *op));
     }
@@ -2406,6 +2443,11 @@ mod tests {
             assert_eq!(stub.name, *name);
             assert_eq!(stub.effect, RomStubEffect::Int32Unary(*op), "{name}");
         }
+        for (addr, name, op) in LIBGCC_SOFT_FLOAT_FAMILY {
+            let stub = table.lookup(*addr).expect("stubbed");
+            assert_eq!(stub.name, *name);
+            assert_eq!(stub.effect, RomStubEffect::SoftFloat(*op), "{name}");
+        }
         for (addr, name, op) in LIBGCC_SOFT_DOUBLE_FAMILY {
             let stub = table.lookup(*addr).expect("stubbed");
             assert_eq!(stub.name, *name);
@@ -2434,6 +2476,7 @@ mod tests {
         let libgcc = LIBGCC_INT64_FAMILY.iter().map(|(a, _, _)| *a);
         let libgcc32 = LIBGCC_INT32_FAMILY.iter().map(|(a, _, _)| *a);
         let softdf = LIBGCC_SOFT_DOUBLE_FAMILY.iter().map(|(a, _, _)| *a);
+        let softsf = LIBGCC_SOFT_FLOAT_FAMILY.iter().map(|(a, _, _)| *a);
         let regi2c = REGI2C_FAMILY.iter().map(|(a, _, _)| *a);
         let mut total = 0usize;
         for addr in named
@@ -2441,6 +2484,7 @@ mod tests {
             .chain(libgcc)
             .chain(libgcc32)
             .chain(softdf)
+            .chain(softsf)
             .chain(regi2c)
         {
             assert!(seen.insert(addr), "0x{addr:08x} is listed twice");
@@ -2506,6 +2550,7 @@ mod tests {
             (STRCMP, RomStubEffect::Strcmp),
             (STRLCAT, RomStubEffect::Strlcat),
             (STRLCPY, RomStubEffect::Strlcpy),
+            (STRCASECMP, RomStubEffect::Strcasecmp),
             (STRTOL, RomStubEffect::Strtol),
             (STRRCHR, RomStubEffect::Strrchr),
             (STRSPN, RomStubEffect::Strspn),
@@ -3868,6 +3913,42 @@ mod tests {
         assert_eq!(span_call(STRCSPN, b"/x ", b"/ "), 0);
         assert_eq!(span_call(STRCSPN, b"abc ", b"/ "), 3, "stops at NUL");
         assert_eq!(span_call(STRCSPN, b"abc ", b" "), 3, "empty set");
+    }
+
+    #[test]
+    fn strcasecmp_stub_compares_ascii_case_insensitively() {
+        let (a, b) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(a, 32);
+        bus.add_scratch_ram(b, 32);
+        let mut call = |x: &[u8], y: &[u8]| {
+            for (i, v) in x.iter().enumerate() {
+                bus.write8(a + i as u32, *v);
+            }
+            for (i, v) in y.iter().enumerate() {
+                bus.write8(b + i as u32, *v);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, a);
+            cpu.regs.write(REG_A1, b);
+            cpu.regs.pc = STRCASECMP;
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRCASECMP));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            cpu.regs.read(REG_A0) as i32
+        };
+        // The role lookup: a slug against a label, either case.
+        assert_eq!(call(b"hacker\0", b"Hacker\0"), 0);
+        assert_eq!(call(b"WORKSHOP_LEAD\0", b"workshop_lead\0"), 0);
+        // The difference is of the lowered bytes ('a' - 'b'), not the raw ones.
+        assert_eq!(call(b"A\0", b"b\0"), -1);
+        assert_eq!(call(b"judge\0", b"Judges\0"), -i32::from(b's'), "prefix");
+        // Only A..Z fold (the ROM's C-locale ctype): '@' and '[' do not.
+        assert_eq!(call(b"[\0", b"{\0"), i32::from(b'[') - i32::from(b'{'));
+        assert_eq!(call(b"\xC9\0", b"\xE9\0"), 0xC9 - 0xE9, "no Latin-1 folding");
     }
 
     #[test]

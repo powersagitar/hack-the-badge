@@ -527,6 +527,11 @@ impl Cpu {
                     self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
                 }
             }
+            RomStubEffect::SoftFloat(op) => {
+                let a = self.regs.read(rom_stubs::REG_A0);
+                let b = self.regs.read(rom_stubs::REG_A1);
+                self.regs.write(rom_stubs::REG_A0, op.apply(a, b));
+            }
             RomStubEffect::BusRegisterWrite(write) => {
                 if let Some(addr) = self.bus_register_write_addr(&write) {
                     self.apply_bus_register_op(write.op, addr, bus);
@@ -668,6 +673,20 @@ impl Cpu {
                     let y = bus.read8(s2.wrapping_add(i));
                     diff = i32::from(x) - i32::from(y);
                     if diff != 0 || x == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, diff as u32);
+            }
+            RomStubEffect::Strcasecmp => {
+                let s1 = self.regs.read(rom_stubs::REG_A0);
+                let s2 = self.regs.read(rom_stubs::REG_A1);
+                let mut diff: i32 = 0;
+                for i in 0..rom_stubs::MAX_STUB_MEMORY_BYTES {
+                    let x = bus.read8(s1.wrapping_add(i)).to_ascii_lowercase();
+                    let y = bus.read8(s2.wrapping_add(i)).to_ascii_lowercase();
+                    diff = i32::from(x) - i32::from(y);
+                    if diff != 0 || y == 0 {
                         break;
                     }
                 }
@@ -2743,6 +2762,31 @@ mod tests {
         let a = split(2.5e7);
         let r = run(SoftDoubleOp::FixUnsSi, [a[0], a[1], 0, 0]);
         assert_eq!(r, (25_000_000, a[1]));
+        // __gedf2(1.0, 2.0) = -1: an `int` in a0; a1 untouched.
+        let (a, b) = (split(1.0), split(2.0));
+        let r = run(SoftDoubleOp::Ge, [a[0], a[1], b[0], b[1]]);
+        assert_eq!(r, (-1i32 as u32, a[1]));
+    }
+
+    #[test]
+    fn soft_float_rom_stubs_read_a0_a1_and_write_a0() {
+        use rom_stubs::SoftFloatOp;
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::soft_float("__mulsf3", SoftFloatOp::Mul));
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 1.5f32.to_bits());
+        cpu.regs.write(11, 4.0f32.to_bits());
+        cpu.regs.write(12, 0x1234);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let mut bus = rom_stub_test_bus();
+        let info = cpu.step(&mut bus);
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.pc, 0x40, "pc == ra");
+        assert_eq!(cpu.regs.read(10), 6.0f32.to_bits());
+        assert_eq!(cpu.regs.read(11), 4.0f32.to_bits(), "a1 untouched");
+        assert_eq!(cpu.regs.read(12), 0x1234, "a2 untouched");
     }
 
     #[test]

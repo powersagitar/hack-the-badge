@@ -2096,6 +2096,22 @@ answers `provisioned=0`, and `put` / `prov apply` of `{}` print `READY`,
 `console_answers_prov_show_on_the_first_run_screen`,
 `console_rejects_an_empty_identity` (driver: `tests/common/provision.rs`).
 
+### Milestone 5 Task 4: ROM calls behind provisioning and onboarding
+
+Provisioning a (local, fake) identity and walking the onboarding app that
+`prov apply` switches to faulted on nine ROM calls in turn, each now a real
+stub (decision R-T3-1): `strcasecmp` (`0x4000_03d0`, the role lookup
+`0x4200_e41a`; semantics from the ROM ELF's `strcasecmp` at `0x4005_8afa`,
+C-locale ASCII folding), the soft-fp `double` helpers `__gedf2`
+(`0x4000_0818`), `__ledf2` (`0x4000_0828`), `__fixdfsi` (`0x4000_07dc`) and
+`__adddf3` (`0x4000_076c`), hit during `prov apply`'s identity load, and
+the `float` helpers `__mulsf3` (`0x4000_0854`), `__addsf3` (`0x4000_0770`),
+`__unordsf2` (`0x4000_08c8`) and `__ltsf2` (`0x4000_0838`), hit on the onboarding's "Shake it!" page
+(`RomStubEffect::{Strcasecmp,SoftDouble,SoftFloat}`; addresses from
+`esp32c3.rom.libc.ld` / `esp32c3.rom.libgcc.ld`). No rung pins them yet:
+the path needs an identity, and identity-using tests wait for the
+Milestone 5 permission gate (R-M5-2).
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
