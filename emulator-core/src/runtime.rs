@@ -105,6 +105,7 @@ impl FirmwareRuntime {
     /// than unwrapped so this stays panic-free across the WASM boundary.
     pub fn reset(&mut self) -> Result<(), ImageParseError> {
         let (cpu, bus) = boot_from_factory_image_with_rom_stubs(&self.image)?;
+        let accel = self.acceleration();
         self.cpu = cpu;
         self.bus = bus;
         self.total_steps = 0;
@@ -112,6 +113,8 @@ impl FirmwareRuntime {
         for (slot, pressed) in held.iter().enumerate() {
             self.apply_button(slot, *pressed);
         }
+        let [x, y, z] = accel;
+        self.bus.i2c0.accel.set_acceleration(x, y, z);
         Ok(())
     }
 
@@ -244,6 +247,22 @@ impl FirmwareRuntime {
     /// Serial input the firmware has not read yet.
     pub fn serial_pending(&self) -> usize {
         self.bus.usb_serial_jtag.host_pending()
+    }
+
+    /// Sets the acceleration the SC7A20H accelerometer reports, in mg per
+    /// axis (`crate::peripherals::sc7a20h`): any value is accepted and
+    /// clamped to ±16 g, and the output registers further clamp to the
+    /// full scale the firmware configured. The default is the badge lying
+    /// face up, (0, 0, +1000). Survives [`FirmwareRuntime::reset`] the way
+    /// held buttons do: the badge is still being held the same way.
+    pub fn set_acceleration(&mut self, x_mg: i32, y_mg: i32, z_mg: i32) {
+        self.bus.i2c0.accel.set_acceleration(x_mg, y_mg, z_mg);
+    }
+
+    /// The acceleration the SC7A20H currently reports, in mg (after the
+    /// ±16 g clamp).
+    pub fn acceleration(&self) -> [i32; 3] {
+        self.bus.i2c0.accel.acceleration()
     }
 }
 
@@ -427,6 +446,17 @@ mod tests {
             !rt.bus().gpio.pin_level(crate::peripherals::gpio::PIN_START),
             "and are re-applied to the freshly-built bus"
         );
+    }
+
+    #[test]
+    fn acceleration_defaults_face_up_is_clamped_and_survives_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
+        assert_eq!(rt.acceleration(), [0, 0, 1000], "face up");
+        rt.set_acceleration(i32::MAX, -2000, i32::MIN); // must not panic
+        assert_eq!(rt.acceleration(), [16_000, -2000, -16_000]);
+        assert_eq!(rt.bus().i2c0.accel.acceleration(), [16_000, -2000, -16_000]);
+        rt.reset().expect("reset");
+        assert_eq!(rt.acceleration(), [16_000, -2000, -16_000]);
     }
 
     #[test]

@@ -58,11 +58,13 @@
 //!   commands reach that chip (RDID, RDSR, reads, and the dedicated
 //!   write-enable, sector-erase and page-program bits). `FirmwareBus`
 //!   holds them as `flash_chip` and `spimem1`.
-//! - [`i2c`]: [`i2c::I2c`], the I2C0 controller in master mode with no
-//!   device on the bus (Milestone 4 Task D-M4-1): the command list runs on
-//!   `TRANS_START`, every address phase NACKs, and `INT_STATUS` drives
-//!   `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds it as
-//!   `i2c0`.
+//! - [`i2c`]: [`i2c::I2c`], the I2C0 controller in master mode (Milestone 4
+//!   Task D-M4-1): the command list runs on `TRANS_START`, and `INT_STATUS`
+//!   drives `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds
+//!   it as `i2c0`. One device answers on its bus (Milestone 5 Task D-M5-2):
+//!   [`sc7a20h::Sc7a20h`], the accelerometer at `0x19`, a concrete field of
+//!   the controller (`i2c0.accel`), with a host-set acceleration; every
+//!   other address NACKs.
 //! - [`rmt`]: [`rmt::Rmt`], the RMT controller as a TX engine that completes
 //!   each transmission in zero time (Milestone 4 Task D-M4-2): `TX_START`
 //!   consumes the channel's RMT RAM symbols, pausing at each enabled
@@ -84,6 +86,7 @@ pub mod intc;
 pub mod mmu;
 pub mod rmt;
 pub mod rtc_cntl;
+pub mod sc7a20h;
 pub mod spi;
 pub mod system;
 pub mod systimer;

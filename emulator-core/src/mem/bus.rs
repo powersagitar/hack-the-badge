@@ -327,7 +327,8 @@ pub struct FirmwareBus {
     /// [`FirmwareBus::gdma_pull`]).
     pub gdma: Gdma,
     /// The I2C0 controller (`crate::peripherals::i2c`), same ruling: a
-    /// master with no device on the bus, so every address phase NACKs.
+    /// master whose bus holds the SC7A20H accelerometer (`i2c0.accel`,
+    /// address `0x19`); every other address phase NACKs.
     pub i2c0: I2c,
     /// The RMT controller (`crate::peripherals::rmt`), same ruling: a TX
     /// engine that completes each transmission in zero time.
@@ -1788,7 +1789,7 @@ mod tests {
         bus.write32(base + 0x04, 0x20B | (1 << 4)); // CTR: MS_MODE
         bus.write32(base + 0x28, 0x5A8); // INT_ENA: I2C_LL_MASTER_EVENT_INTR
         bus.write32(base + 0x58, 6 << 11); // COMD0: RSTART
-        bus.write32(base + 0x1C, 0x19 << 1); // DATA: address byte
+        bus.write32(base + 0x1C, 0x18 << 1); // DATA: address byte (nobody at 0x18)
         bus.write32(base + 0x5C, (1 << 11) | (1 << 8) | 1); // COMD1: WRITE 1, ack check
         bus.write32(base + 0x60, 2 << 11); // COMD2: STOP
         bus.write32(base + 0x04, 0x20B | (1 << 4) | (1 << 5)); // TRANS_START

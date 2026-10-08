@@ -242,10 +242,12 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       attached host (Milestone 4), so post-scheduler log
                       output reaches the console. mmu.rs is the flash MMU
                       table (`0x600c_5000`); i2c.rs is I2C0 as a master
-                      with no device on the bus (every address byte is
-                      NACKed); rmt.rs is RMT as a zero-latency TX engine
-                      (Milestone 4; decisions in
-                      docs/milestone-4-decisions.md).
+                      whose bus holds one device, sc7a20h.rs (the SC7A20H
+                      accelerometer at 0x19, acceleration set by the host
+                      through FirmwareRuntime::set_acceleration; Milestone
+                      5), every other address byte NACKed; rmt.rs is RMT
+                      as a zero-latency TX engine (Milestone 4; decisions
+                      in docs/milestone-4-decisions.md).
                       Each module's doc comment cites the
                       exact ESP-IDF v5.5.3 header its register layout came
                       from.

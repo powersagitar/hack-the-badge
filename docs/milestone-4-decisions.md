@@ -149,6 +149,13 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
 
 ## I2C0 with no device attached (Task D-M4-1)
 
+> **Superseded in part by Milestone 5 Task D-M5-2**
+> (`milestone-5-decisions.md`, "SC7A20H accelerometer on I2C0"): the
+> SC7A20H accelerometer now answers at `0x19`, so `hal_accel` prints its
+> detection line and the boot rung pins that line. The first bullet below
+> (no device) still describes every other address; the rest of this
+> section stands.
+
 - **No device answers on the bus** (coordinator ruling R11). The
   controller is modeled; the accelerometer (SC7A20H) and any other I2C
   device are not. Every ACK slot reads 1 (SDA released), so an address

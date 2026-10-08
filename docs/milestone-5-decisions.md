@@ -253,6 +253,67 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
   is not on the provisioning path. The one ed25519 routine in the image
   (`crypto_sign_seed_keypair`, referenced at `0x4205_5126`, tag `solana`)
   is an app's wallet generator, unreachable from these roots.
+- **`ACCEL`** (Task D-M5-2; `hal_accel`, register helpers `0x4200_a76e`
+  read / `0x4200_a86e` write, init `0x4200_a8da`).
+  - Address: the init adds an I2C device with `dev_addr_length` 0 (7-bit),
+    `device_address` `0x19` (`0x4200_a8ec`) and `scl_speed_hz` 400,000
+    (`0x4200_a8f2`..`0x4200_a8f6`) to the bus from `0x4200_e22a`
+    (`i2c_master_bus_add_device`, `0x4212_3ce6`; failure logs `add
+    device`). Every access then takes a mutex (`0x4038_f31a`, created at
+    `0x4200_a918`).
+  - Register access: a read is the driver's transmit-receive
+    (`0x4212_4120`: one sub-address byte written, `len` bytes read,
+    timeout -1); for `len` > 1 the sub-address gets bit 7 set
+    (`ori a5, a5, -0x80` at `0x4200_a784`), the SC7A20H auto-increment
+    bit. A write is a two-byte transmit (`0x4212_4090`: register, value).
+  - Probe: `WHO_AM_I` (`0x0F`, 1 byte, `0x4200_a98e`) must read `0x11`
+    (`0x4200_a99a`); otherwise `unexpected WHO_AM_I 0x%02X` and
+    `ESP_ERR_NOT_FOUND` (`0x105`). A transfer error gives the
+    `accelerometer setup failed: %s` line (`0x4200_aace`), which is what an
+    empty bus produced (`ESP_ERR_INVALID_STATE`). Success logs `SC7A20H
+    detected (0x%02X)` (`0x4200_a9ec`).
+  - Setup writes, in order: `CTRL_REG1` (`0x20`) = `0x57` (`0x4200_a9fe`:
+    ODR 0101 = 100 Hz, `LPen` 0, X/Y/Z enabled), then `CTRL_REG4` (`0x23`)
+    = `0x80` (`0x4200_aa92`: `BDU` 1, `BLE` 0, `FS` 00 = +/-2 g, no
+    self-test), then `vTaskDelay(2)` (`0x4039_12f2` is `vTaskDelay`, per
+    its assert string). Nothing else is written: no `CTRL_REG3`/`CTRL_REG6`
+    interrupt routing, no FIFO, no `CTRL_REG0` (`HR`). A separate setter
+    (`0x4200_aae8`, used by apps) rewrites `CTRL_REG1` to `0x87` (ODR 1000,
+    800 Hz) or back to `0x57` and checks the readback (`ODR readback
+    0x%02X, expected 0x%02X`, `ESP_ERR_INVALID_RESPONSE`, `0x108`).
+  - Sampling (`0x4200_a7aa`): polls `DRDY_STATUS_REG` (`0x27`) bit 3
+    (`ZYXDA`, `andi 0x8` at `0x4200_a7d4`) up to 100 times with
+    `vTaskDelay(0)` between tries (else `ESP_ERR_TIMEOUT`, `0x107`), then
+    reads six bytes from `0x28 | 0x80`. Each axis is
+    `(int16_t)(H << 8 | L) >> 4` (`0x4200_a800`..`0x4200_a810`: 12-bit
+    left-justified, little-endian), converted to `float` with ROM
+    `__floatsisf`. The count is used as mg directly (the onboarding page
+    prints it with `%d mg`), which matches the datasheet's 1 mg/digit at
+    +/-2 g. The SC7A20H's interrupt pins are not used: no GPIO interrupt,
+    only status polling.
+  - Consumers: a cache task `accel_cache` (`0x4200_ac76`, created at
+    `0x4200_aa56`) reads a sample every `vTaskDelay(2)` into
+    `0x3fca_9294` (the getter `0x4200_aca0` copies it out; its callers
+    `0x4205_9252`/`0x4205_9a00`/`0x4205_9b72` are in the Lua
+    `badge.sensor.accel` bindings); other code (the onboarding detector,
+    several apps) calls the direct reader `0x4200_ac08`.
+  - Shake ("Shake it!", onboarding page 6). The page's tick `0x4203_2c2a`
+    calls the detector `0x4205_7292`, then shows `G-force %d mg` (the
+    magnitude) and `Peak %d mg` (its running maximum). The detector reads a
+    fresh sample (`0x4200_ac08` into `0x3fca_bffc`, at `0x4205_71d4`),
+    computes the magnitude `m = sqrtf(x^2 + y^2 + z^2)` (`0x4210_fdbe`),
+    seeds a baseline with the first `m` and then updates it as an EMA,
+    `b = 0.92 b + 0.08 m` (constants at `0x3c15_4d38` and `0x3c15_4aac`),
+    and reports a shake when `|m - b| > 1200.0` (`0x3c15_4cd4`, compared
+    with ROM `__gtsf2` after `__subsf3` and a sign-bit mask); a detection
+    starts a cooldown of 8 calls (`0x3fcb_ccd0`). Since `b` already
+    includes `m`, the trigger is `|m - b_old| > 1200 / 0.92`, about
+    1304 mg away from the resting magnitude. On the first detection the
+    page sets its done flag (`+0x11`) and its footer becomes `A / START:
+    next   B: back` (`0x4203_2cc2`); A or START then advances. At rest
+    (1000 mg), a shake therefore needs a magnitude above ~2304 mg, which
+    at +/-2 g full scale (2047 per axis) takes at least two axes near full
+    scale.
 
 ## USB-Serial-JTAG receive (Task 2)
 
@@ -316,4 +377,72 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
   is the only step bound. If wrong: a firmware that prints `READY` before
   it can read would lose payload bytes.
 
+## SC7A20H accelerometer on I2C0 (Task D-M5-2)
+
+Ruling R-T4-3 (binding): model the SC7A20H as an I2C device behind
+I2C0's address phase, plus a host motion input, so a rung (and later the
+browser) can shake the badge; onboarding is not bypassed (R-T4-2). This
+supersedes in part `milestone-4-decisions.md` "I2C0 with no device
+attached (Task D-M4-1)", whose "If wrong" anticipated it; the rest of that
+section (zero-latency transactions, the STOP after a NACK, what is not
+modeled) stands. Sources: the Silan *SC7A20H 说明书* v0.7 and ESP-IDF
+v5.5.3 `i2c_master.c`, cited in `peripherals/sc7a20h.rs` and
+`peripherals/i2c.rs`.
+
+- **Device model.** `peripherals/sc7a20h.rs`, a concrete field of the I2C0
+  controller (`i2c0.accel`; no `dyn`). It ACKs address `0x19` only (SDO
+  floating/high, the address the firmware uses); every other address still
+  NACKs. A write transfer's first byte is the sub-address (bit 7 =
+  auto-increment), later bytes write registers; reads return registers,
+  auto-incrementing when bit 7 was set; a repeated START or STOP ends the
+  transfer. Only the `rw` registers of the datasheet's register list store
+  writes. Transactions stay zero-latency (no clock stretching). If wrong:
+  firmware that relies on a register the model computes differently (FIFO,
+  interrupts, high-pass filter, self-test, `BDU` latching, the `0x61..0x66`
+  copies, the click-coefficient reset values) reads storage or 0; none is
+  reached by this firmware's `hal_accel`.
+- **Output encoding.** `OUT_*` = host mg / sensitivity (1, 2, 4, 8 mg/digit
+  for `FS` 00..11, datasheet section 6), clamped to the 12-bit range
+  -2048..2047, left-justified by 4; `BLE` swaps the bytes. The firmware
+  confirms the 12-bit left-justified format (`>> 4`) and uses the count as
+  mg. The datasheet's own conversion table says 1024 counts = 1.0 g (not
+  1000); the model follows the typical sensitivity, so a host value in mg
+  reads back as that many mg on the badge's screen. If wrong (the part is
+  really 1024 counts/g): every reading is 2.4% low, well inside the
+  datasheet's sensitivity tolerance, and the shake threshold still trips.
+- **Data ready, no time base.** `DRDY_STATUS_REG` reads `0x0F` (`ZYXDA` and
+  the per-axis bits, no overruns) whenever `ODR` != 0, and 0 in
+  power-down. The real part sets `ZYXDA` once per ODR period (10 ms at the
+  configured 100 Hz); every reader in this firmware waits at least
+  `vTaskDelay(2)` between samples or polls through the page's redraw tick,
+  so a sample is always due. If wrong (a reader polls faster than the ODR
+  and counts fresh samples): it sees a new sample on every read, where the
+  real part would make it wait.
+- **Stationary default: (0, 0, +1000) mg**, the badge lying face up, display
+  toward the viewer (+Z out of the screen). That is what the onboarding
+  page shows at rest (`G-force 1000 mg`). If wrong (the badge's Z axis
+  points the other way, or the sensor is mounted rotated): the rest reading
+  is (0, 0, -1000) or another axis; magnitudes, and so the shake detector
+  and the `G-force` line, are unchanged, but an app that reads orientation
+  (tilt, which side is up) would see the badge flipped.
+- **Host input.** `FirmwareRuntime::set_acceleration(x_mg, y_mg, z_mg)`
+  takes any `i32`, clamps to +/-16 g (the widest full scale) and never
+  panics; the output registers clamp again to the configured full scale.
+  `FirmwareRuntime::acceleration()` reads it back. The value survives
+  `reset()`, like held buttons (the badge is still held the same way).
+- **Shake pattern** (tests and the local walk): alternate (+2000, +2000,
+  +1000) and (-2000, -2000, +1000) mg, about 1,000,000 steps (62.5 ms) per
+  half-period, for six half-periods, then return to rest. Each half has a
+  magnitude of 3000 mg, 2000 mg from the 1000 mg baseline, well above the
+  traced ~1304 mg trigger (`ACCEL`). One axis alone cannot shake the badge
+  at +/-2 g full scale (2047 - 1000 < 1304), so the pattern uses two. If
+  wrong (the trigger was mis-traced higher): the page stays on "Shake to
+  continue"; the walk records the step at which the footer changes.
+
 ## Milestone 6 backlog
+
+- **Accelerometer in the browser (Task 6 / M6).** `emulator-wasm` has no
+  `set_acceleration` passthrough yet (Task D-M5-2 added only the Rust API,
+  by the brief): Task 6 adds the one-line wasm passthrough and the
+  frontend's motion input (a shake button, or `DeviceMotionEvent` on a
+  phone), so onboarding page 6 can be passed in the browser.

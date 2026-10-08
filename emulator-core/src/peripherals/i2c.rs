@@ -1,7 +1,10 @@
 //! The ESP32-C3's I2C controller, I2C0 (`DR_REG_I2C_EXT_BASE = 0x6001_3000`,
-//! `soc/reg_base.h`; `crate::mem::soc::I2C0_RANGE`), in master mode with
-//! **no device attached to the bus** (Milestone 4 Task D-M4-1; see
-//! `docs/milestone-4-decisions.md`).
+//! `soc/reg_base.h`; `crate::mem::soc::I2C0_RANGE`), in master mode, with
+//! **one device on the bus: the badge's SC7A20H accelerometer** at 7-bit
+//! address `0x19` ([`crate::peripherals::sc7a20h`], held as [`I2c::accel`]).
+//! The controller is Milestone 4 Task D-M4-1 (`docs/milestone-4-decisions.md`,
+//! which modeled an empty bus); the device is Milestone 5 Task D-M5-2
+//! (`docs/milestone-5-decisions.md`). Every other address is still NACKed.
 //!
 //! The firmware drives it through ESP-IDF v5.5.3's interrupt-driven master
 //! driver (`components/esp_driver_i2c/i2c_master.c`):
@@ -46,16 +49,24 @@
 //!   bus can stretch or delay it. Each executed command gets its done bit.
 //!   The list ends at STOP or END; an invalid op code, or running past
 //!   command 7, ends it too without further effect.
-//! - **No device: every ACK slot reads 1 (NACK).** With nobody pulling SDA
-//!   low, the ACK bit after each byte the master sends is high, so
-//!   `SR.RESP_REC` (the received ACK level) reads 1 after a WRITE byte. A
-//!   WRITE with `ack_en` set and `ack_exp` 0 therefore fails on its first
-//!   byte: the model raises `NACK_INT`, then sends the STOP the driver waits
-//!   for (bus released, `TRANS_COMPLETE_INT`, a judgment call: the
-//!   controller sees its own STOP bit), and stops; the failing WRITE and the
-//!   rest of the list stay not done. A READ (reachable only after a WRITE
-//!   without ACK check) samples the released SDA line: every byte is
-//!   `0xFF`.
+//! - **The bus: who drives the ACK slot and the data.** The first byte a
+//!   WRITE sends after an RSTART is an address byte. If its upper seven bits
+//!   are [`crate::peripherals::sc7a20h::ADDRESS`], the SC7A20H pulls SDA low
+//!   in the ACK slot (`SR.RESP_REC` = 0) and the transfer opens in the
+//!   direction of bit 0; later WRITE bytes go to the device (each ACKed),
+//!   READ bytes come from it, and the next RSTART or STOP ends the transfer.
+//!   (The master's own ACK/NACK after each READ byte is not consulted: the
+//!   device keeps answering, as an SC7A20H does until the STOP.)
+//! - **Any other address: every ACK slot reads 1 (NACK).** With nobody
+//!   pulling SDA low, the ACK bit after each byte the master sends is high,
+//!   so `SR.RESP_REC` reads 1. A WRITE with `ack_en` set and `ack_exp` 0
+//!   therefore fails on that byte: the model raises `NACK_INT`, then sends
+//!   the STOP the driver waits for (bus released, `TRANS_COMPLETE_INT`, a
+//!   judgment call: the controller sees its own STOP bit), and stops; the
+//!   failing WRITE and the rest of the list stay not done. A READ with
+//!   nobody addressed (reachable only after a WRITE without ACK check)
+//!   samples the released SDA line: every byte is `0xFF`. A WRITE that
+//!   finds the TX FIFO empty sends nothing a device sees (ACK level 1).
 //! - **Other interrupt bits** the list raises: `TRANS_START_INT` on each
 //!   RSTART, `BYTE_TRANS_DONE_INT` per byte sent (including a NACKed one)
 //!   or received, `TRANS_COMPLETE_INT` on STOP, `END_DETECT_INT` on END,
@@ -94,6 +105,7 @@
 //! Offsets [`I2c::handles`] does not name read 0, drop writes and are
 //! logged by the bus as unmapped.
 
+use super::sc7a20h::{self, Sc7a20h};
 use super::set_byte;
 use crate::mem::soc::SRC_I2C_EXT0;
 
@@ -282,6 +294,12 @@ pub struct I2c {
     rx: Fifo,
     bus_busy: bool,
     resp_rec: bool,
+    /// The SC7A20H accelerometer on the bus (Milestone 5 Task D-M5-2).
+    pub accel: Sc7a20h,
+    /// The next byte the master writes is an address byte (set by RSTART).
+    addr_phase: bool,
+    /// `Some(read)` while the SC7A20H is addressed, in that direction.
+    selected: Option<bool>,
 }
 
 impl Default for I2c {
@@ -302,6 +320,9 @@ impl I2c {
             rx: Fifo::new(),
             bus_busy: false,
             resp_rec: false,
+            accel: Sc7a20h::new(),
+            addr_phase: false,
+            selected: None,
         }
     }
 
@@ -442,7 +463,8 @@ impl I2c {
     }
 
     /// Runs the command list from `COMD0` until a STOP, an END, a NACK or
-    /// an invalid op code, with no device on the bus.
+    /// an invalid op code, against the bus (the SC7A20H at its address,
+    /// nobody elsewhere).
     fn run_commands(&mut self) {
         for n in 0..NUM_COMMANDS {
             let off = COMD0_REG + 4 * n;
@@ -452,17 +474,25 @@ impl I2c {
                 OP_RSTART => {
                     self.bus_busy = true;
                     self.raise(INT_TRANS_START);
+                    // A (repeated) START ends any transfer in progress; an
+                    // address byte follows.
+                    self.selected = None;
+                    self.addr_phase = true;
                 }
                 OP_WRITE => {
                     for _ in 0..byte_num {
-                        if self.tx.pop().is_none() {
-                            self.raise(INT_MST_TXFIFO_UDF);
-                        }
+                        let ack = match self.tx.pop() {
+                            Some(b) => self.bus_write(b),
+                            None => {
+                                self.raise(INT_MST_TXFIFO_UDF);
+                                RELEASED_ACK
+                            }
+                        };
                         self.raise(INT_BYTE_TRANS_DONE);
                         // SR.RESP_REC: the received ACK level, 1 = NACK.
-                        self.resp_rec = true;
+                        self.resp_rec = ack == RELEASED_ACK;
                         let ack_exp = u32::from(cmd & CMD_ACK_EXP != 0);
-                        if cmd & CMD_ACK_EN != 0 && ack_exp != RELEASED_ACK {
+                        if cmd & CMD_ACK_EN != 0 && ack_exp != ack {
                             // NACK_INT, then the STOP s_i2c_send_commands waits for.
                             self.raise(INT_NACK);
                             self.stop();
@@ -472,7 +502,12 @@ impl I2c {
                 }
                 OP_READ => {
                     for _ in 0..byte_num {
-                        if !self.rx.push(RELEASED_BYTE) {
+                        let b = if self.selected == Some(true) {
+                            self.accel.read()
+                        } else {
+                            RELEASED_BYTE
+                        };
+                        if !self.rx.push(b) {
                             self.raise(INT_RXFIFO_OVF);
                         }
                         self.raise(INT_BYTE_TRANS_DONE);
@@ -494,9 +529,39 @@ impl I2c {
         }
     }
 
-    /// A STOP condition: releases the bus, `TRANS_COMPLETE_INT`.
+    /// One byte the master sends; returns the ACK level the slave side
+    /// drives in the ninth clock (0 = ACK, [`RELEASED_ACK`] = nobody).
+    /// After a START the byte is an address: the SC7A20H ACKs
+    /// [`sc7a20h::ADDRESS`] and nothing else answers. Later bytes reach the
+    /// SC7A20H only while it is addressed for writing.
+    fn bus_write(&mut self, byte: u8) -> u32 {
+        if self.addr_phase {
+            self.addr_phase = false;
+            if byte >> 1 == sc7a20h::ADDRESS {
+                let read = byte & 1 == 1;
+                self.accel.start(read);
+                self.selected = Some(read);
+                return 0;
+            }
+            self.selected = None;
+            return RELEASED_ACK;
+        }
+        if self.selected == Some(false) {
+            self.accel.write(byte);
+            0
+        } else {
+            RELEASED_ACK
+        }
+    }
+
+    /// A STOP condition: releases the bus, ends the transfer,
+    /// `TRANS_COMPLETE_INT`.
     fn stop(&mut self) {
         self.bus_busy = false;
+        if self.selected.take().is_some() {
+            self.accel.stop();
+        }
+        self.addr_phase = false;
         self.raise(INT_TRANS_COMPLETE);
     }
 
@@ -591,12 +656,13 @@ mod tests {
     }
 
     /// `i2c_master_probe` (i2c_master.c): RSTART; WRITE 1 (address, ACK
-    /// check on, expected ACK 0); STOP. With no device: NACK, then STOP.
+    /// check on, expected ACK 0); STOP. No device at 0x18 (the SC7A20H
+    /// answers only 0x19): NACK, then STOP.
     #[test]
     fn probe_of_an_absent_address_nacks_and_releases_the_bus() {
         let mut i = master_ready();
         w(&mut i, comd(0), cmd(OP_RSTART, false, false, 0));
-        w(&mut i, DATA_REG, 0x19 << 1); // I2C_ADDRESS_TRANS_WRITE(0x19)
+        w(&mut i, DATA_REG, 0x18 << 1); // I2C_ADDRESS_TRANS_WRITE(0x18)
         w(&mut i, comd(1), cmd(OP_WRITE, true, false, 1));
         w(&mut i, comd(2), cmd(OP_STOP, false, false, 0));
         trans_start(&mut i);
@@ -702,19 +768,20 @@ mod tests {
         assert_eq!(r(&mut i, FIFO_ST_REG), 0);
     }
 
-    /// The firmware's accelerometer WHO_AM_I read as `s_i2c_send_commands`
-    /// builds it (observed at boot): RSTART; WRITE 2 (addr 0x19 W, reg
-    /// 0x0F) with ACK check; RSTART; WRITE 1 (addr 0x19 R) with ACK check;
-    /// READ 1 with NACK; STOP. With no device the address byte is NACKed.
+    /// A register read as `s_i2c_send_commands` builds it (the shape of the
+    /// firmware's WHO_AM_I read): RSTART; WRITE 2 (addr W, reg 0x0F) with
+    /// ACK check; RSTART; WRITE 1 (addr R) with ACK check; READ 1 with
+    /// NACK; STOP. Addressed to 0x18, where no device answers, the address
+    /// byte is NACKed.
     #[test]
     fn address_nack_with_no_device_raises_nack_and_stops() {
         let mut i = master_ready();
         w(&mut i, comd(0), cmd(OP_RSTART, false, false, 0));
-        w(&mut i, DATA_REG, 0x32);
+        w(&mut i, DATA_REG, 0x30);
         w(&mut i, DATA_REG, 0x0F);
         w(&mut i, comd(1), cmd(OP_WRITE, true, false, 2));
         w(&mut i, comd(2), cmd(OP_RSTART, false, false, 0));
-        w(&mut i, DATA_REG, 0x33);
+        w(&mut i, DATA_REG, 0x31);
         w(&mut i, comd(3), cmd(OP_WRITE, true, false, 1));
         w(&mut i, comd(4), cmd(OP_READ, false, true, 1));
         w(&mut i, comd(5), cmd(OP_STOP, false, false, 0));
@@ -749,7 +816,7 @@ mod tests {
     fn write_without_ack_check_then_read_completes_with_released_bus_bytes() {
         let mut i = master_ready();
         w(&mut i, comd(0), cmd(OP_RSTART, false, false, 0));
-        w(&mut i, DATA_REG, 0x33);
+        w(&mut i, DATA_REG, 0x31); // 0x18 R: nobody there
         w(&mut i, comd(1), cmd(OP_WRITE, false, false, 1));
         w(&mut i, comd(2), cmd(OP_READ, false, false, 2));
         w(&mut i, comd(3), cmd(OP_STOP, false, false, 0));
@@ -809,6 +876,129 @@ mod tests {
         // INT_RAW is R/SS/WTC (i2c_reg.h).
         w(&mut i, INT_RAW_REG, INT_TRANS_COMPLETE);
         assert_eq!(r(&mut i, INT_RAW_REG) & INT_TRANS_COMPLETE, 0);
+    }
+
+    /// `s_i2c_transaction_start` (i2c_master.c) resets both FIFOs before
+    /// building each transaction.
+    fn fifo_rst(i: &mut I2c) {
+        set_bits(i, FIFO_CONF_REG, FIFO_CONF_TX_FIFO_RST);
+        clear_bits(i, FIFO_CONF_REG, FIFO_CONF_TX_FIFO_RST);
+        set_bits(i, FIFO_CONF_REG, FIFO_CONF_RX_FIFO_RST);
+        clear_bits(i, FIFO_CONF_REG, FIFO_CONF_RX_FIFO_RST);
+    }
+
+    /// `i2c_master_transmit_receive(dev, &reg, 1, buf, n)` as
+    /// `s_i2c_send_commands` builds it for a 7-bit device (i2c_master.c,
+    /// v5.5.3): RSTART; WRITE 2 (addr W merged with the register byte, ACK
+    /// check); RSTART; WRITE 1 (addr R, ACK check); READ n-1 with ACK (only
+    /// when n > 1); READ 1 with NACK; STOP. Returns the RX FIFO contents as
+    /// the ISR's `i2c_ll_read_rxfifo` pops them.
+    fn transmit_receive(i: &mut I2c, addr: u8, reg: u8, n: u32) -> Vec<u8> {
+        fifo_rst(i);
+        let mut c = 0;
+        let mut push = |i: &mut I2c, v: u32| {
+            w(i, comd(c), v);
+            c += 1;
+        };
+        push(i, cmd(OP_RSTART, false, false, 0));
+        w(i, DATA_REG, u32::from(addr) << 1);
+        w(i, DATA_REG, u32::from(reg));
+        push(i, cmd(OP_WRITE, true, false, 2));
+        push(i, cmd(OP_RSTART, false, false, 0));
+        w(i, DATA_REG, (u32::from(addr) << 1) | 1);
+        push(i, cmd(OP_WRITE, true, false, 1));
+        if n > 1 {
+            push(i, cmd(OP_READ, false, false, n - 1));
+        }
+        push(i, cmd(OP_READ, false, true, 1));
+        push(i, cmd(OP_STOP, false, false, 0));
+        trans_start(i);
+        let cnt = (r(i, SR_REG) >> SR_RXFIFO_CNT_S) & 0x3F;
+        (0..cnt).map(|_| r(i, DATA_REG) as u8).collect()
+    }
+
+    /// `i2c_master_transmit(dev, {reg, val}, 2)`: RSTART; WRITE 3 (addr W,
+    /// reg, val; ACK check); STOP.
+    fn transmit_reg(i: &mut I2c, addr: u8, reg: u8, val: u8) {
+        fifo_rst(i);
+        w(i, comd(0), cmd(OP_RSTART, false, false, 0));
+        for b in [u32::from(addr) << 1, u32::from(reg), u32::from(val)] {
+            w(i, DATA_REG, b);
+        }
+        w(i, comd(1), cmd(OP_WRITE, true, false, 3));
+        w(i, comd(2), cmd(OP_STOP, false, false, 0));
+        trans_start(i);
+    }
+
+    /// The ISR's acknowledge: read `INT_STATUS`, write it to `INT_CLR`.
+    fn ack_isr(i: &mut I2c) -> u32 {
+        let st = r(i, INT_STATUS_REG);
+        w(i, INT_CLR_REG, st);
+        st
+    }
+
+    /// `hal_accel`'s probe (`0x4200_a98e`): WHO_AM_I (`0x0F`) from the
+    /// SC7A20H at 0x19 is ACKed and reads `0x11`.
+    #[test]
+    fn sc7a20h_acks_its_address_and_answers_who_am_i() {
+        let mut i = master_ready();
+        let rx = transmit_receive(&mut i, 0x19, 0x0F, 1);
+        let st = ack_isr(&mut i);
+        assert_eq!(st & INT_NACK, 0, "address ACKed");
+        assert_ne!(st & INT_TRANS_COMPLETE, 0);
+        assert_eq!(rx, [0x11]);
+        for n in 0..6 {
+            assert_ne!(r(&mut i, comd(n)) & CMD_DONE, 0, "command {n} done");
+        }
+        let sr = r(&mut i, SR_REG);
+        assert_eq!(sr & SR_RESP_REC, 0, "last ACK slot low");
+        assert_eq!(sr & SR_BUS_BUSY, 0);
+    }
+
+    /// Setup writes (`0x4200_a86e`), then the sample read (`0x4200_a7aa`):
+    /// STATUS (`0x27`) bit 3, then six bytes from `0x28 | 0x80`.
+    #[test]
+    fn sc7a20h_setup_writes_then_burst_read_of_the_axes() {
+        let mut i = master_ready();
+        transmit_reg(&mut i, 0x19, 0x20, 0x57);
+        assert_eq!(ack_isr(&mut i) & INT_NACK, 0);
+        transmit_reg(&mut i, 0x19, 0x23, 0x80);
+        ack_isr(&mut i);
+        assert_eq!(transmit_receive(&mut i, 0x19, 0x20, 1), [0x57]);
+        ack_isr(&mut i);
+        assert_eq!(transmit_receive(&mut i, 0x19, 0x27, 1)[0] & 0x08, 0x08);
+        ack_isr(&mut i);
+        i.accel.set_acceleration(-250, 2000, 1000);
+        let b = transmit_receive(&mut i, 0x19, 0x28 | 0x80, 6);
+        assert_eq!(b.len(), 6);
+        let axis = |k: usize| i32::from(i16::from_le_bytes([b[2 * k], b[2 * k + 1]])) >> 4;
+        assert_eq!([axis(0), axis(1), axis(2)], [-250, 2000, 1000]);
+    }
+
+    /// Any other address is still NACKed with the SC7A20H on the bus.
+    #[test]
+    fn other_addresses_still_nack_with_the_sc7a20h_attached() {
+        let mut i = master_ready();
+        let rx = transmit_receive(&mut i, 0x18, 0x0F, 1);
+        assert!(rx.is_empty());
+        let st = ack_isr(&mut i);
+        assert_ne!(st & INT_NACK, 0);
+        assert_eq!(r(&mut i, SR_REG) & SR_BUS_BUSY, 0);
+        // The SC7A20H still answers afterwards.
+        assert_eq!(transmit_receive(&mut i, 0x19, 0x0F, 1), [0x11]);
+    }
+
+    /// `i2c_master_probe(bus, 0x19)`: RSTART; WRITE 1 (addr W, ACK check);
+    /// STOP.
+    #[test]
+    fn probe_of_the_sc7a20h_address_is_acked() {
+        let mut i = master_ready();
+        w(&mut i, comd(0), cmd(OP_RSTART, false, false, 0));
+        w(&mut i, DATA_REG, 0x19 << 1);
+        w(&mut i, comd(1), cmd(OP_WRITE, true, false, 1));
+        w(&mut i, comd(2), cmd(OP_STOP, false, false, 0));
+        trans_start(&mut i);
+        assert_eq!(r(&mut i, INT_STATUS_REG), INT_TRANS_COMPLETE);
     }
 
     #[test]

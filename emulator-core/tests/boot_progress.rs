@@ -711,15 +711,16 @@ fn boot_reaches_hal_buttons_ready() {
     assert_reaches("hal_buttons: buttons ready", 10_000_000);
 }
 
-/// I2C0 is modeled with no device on the bus, so the accelerometer probe's
-/// address byte is NACKed, the driver's ISR sees `NACK_INT`, and `hal_accel`
-/// reports the failure (non-fatal; step ~6.09M) instead of blocking forever.
-/// The ROM soft-double helpers the next function calls then run for
-/// 1,000,000 steps without a fault or panic text. The physical badge, which
-/// has the accelerometer, prints its detection line instead.
+/// The SC7A20H accelerometer answers on I2C0 (address 0x19): `hal_accel`
+/// reads `WHO_AM_I` = 0x11 and prints the detection line the physical badge
+/// prints (step ~6.09M), then configures the sensor and starts its cache
+/// task, whose sample reads and ROM `__floatsisf` calls then run for
+/// 1,000,000 steps without a fault or panic text. (Until Milestone 5 Task
+/// D-M5-2 the bus had no device and this rung pinned `hal_accel`'s
+/// "accelerometer setup failed" line instead.)
 #[test]
-fn boot_reports_the_absent_accelerometer_after_i2c0_nacks() {
-    let needle = "hal_accel: accelerometer setup failed: ESP_ERR_INVALID_STATE";
+fn boot_detects_the_sc7a20h_accelerometer_on_i2c0() {
+    let needle = "hal_accel: SC7A20H detected (0x11)";
     let (mut rt, ok) = boot_until_console_contains(needle, 10_000_000);
     assert!(
         ok,

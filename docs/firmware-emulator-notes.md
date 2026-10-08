@@ -358,8 +358,8 @@ strapping pin).
 | `LCD_CS` | 2 | ST7789 SPI CS (not modeled — see Known Limitations) |
 | `LED_DIN` | 3 | WS2812 chain data (RMT) — unmodeled in v1 |
 | `LCD_RST` | 4 | ST7789 reset |
-| `I2C_SDA` | 5 | accelerometer — unmodeled in v1 |
-| `I2C_SCL` | 6 | accelerometer — unmodeled in v1 |
+| `I2C_SDA` | 5 | accelerometer (SC7A20H on I2C0, modeled from Milestone 5 Task D-M5-2; the pins themselves are not) |
+| `I2C_SCL` | 6 | accelerometer (as `I2C_SDA`) |
 | `HC165_DATA` | 7 | shift register serial data out → CPU (GPIO input) |
 | `PIN_START` | 9 | START button, direct GPIO, also BOOT strap |
 | `LCD_MOSI` | 10 | ST7789 SPI MOSI |
@@ -469,8 +469,9 @@ mapping from the firmware's side: each raw slot lights the matching
 on-screen label (see "Physical pin map").
 
 **What the self-test shows that the emulator does not model:** the
-accelerometer reads "0 mg" on every axis (no I2C device; the badge shows
-live values), the lights test drives the LEDs over RMT but the emulator
+accelerometer read "0 mg" on every axis until Milestone 5 Task D-M5-2 (no
+I2C device then; it now reads the host-set acceleration, (0, 0, +1000) mg
+at rest), the lights test drives the LEDs over RMT but the emulator
 does not show them, and the NFC test waits forever for a card (the summary
 lists NFC as skipped). "Hold HOME" exits the self-test back to the
 first-run screen, as A does after the summary.
@@ -527,9 +528,10 @@ complete list):
    frames were compared with the physical badge and match in orientation
    (the screen test's corner fiducials are all fully lit, so nothing is
    clipped), so the conditional Milestone 4 MADCTL task was skipped.
-3. **No I2C devices, no LED output, no NFC.** The accelerometer probe is
-   NACKed (the self-test reads 0 mg), RMT transmissions are consumed but
-   not shown, and NFC is not modeled.
+3. **No LED output, no NFC; one I2C device.** The SC7A20H accelerometer
+   answers on I2C0 (Milestone 5 Task D-M5-2; acceleration set by the host,
+   no browser input yet); any other I2C address is NACKed. RMT
+   transmissions are consumed but not shown, and NFC is not modeled.
 4. The dormant items from the history below: flagged ROM-stub guesses
    (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
    "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6)
@@ -2140,6 +2142,33 @@ the `system` config. Addresses from `esp32c3.rom.libgcc.ld` /
 own panic output and then as a fault at `software_reset_cpu`
 (`0x4000_0094`), the panic handler's restart; that is not a modeled
 restart.
+
+**The device.** Onboarding page 6 ("Shake it!") needed the accelerometer
+(Task 4 Finding 2; ruling R-T4-3). `peripherals/sc7a20h.rs` models the
+SC7A20H behind I2C0's address phase (`i2c0.accel`, address `0x19`; every
+other address still NACKs): register file, sub-address auto-increment,
+`WHO_AM_I` = `0x11`, `OUT_*` from a host acceleration in the configured
+full scale, `ZYXDA` always set while powered up. Host input:
+`FirmwareRuntime::set_acceleration(x_mg, y_mg, z_mg)`, default (0, 0,
++1000) mg (face up); no wasm passthrough yet (Task 6). Boot now prints
+`hal_accel: SC7A20H detected (0x11)` at step ~6.09M, as the physical badge
+does, and the rung `boot_reports_the_absent_accelerometer_after_i2c0_nacks`
+became `boot_detects_the_sc7a20h_accelerometer_on_i2c0` (same 10M budget,
+same 1M-step no-fault tail, which now covers the `accel_cache` task's
+reads). No pinned frame hash moved: the splash, first-run and self-test
+buttons frames do not show the accelerometer. What the firmware does with
+the sensor (registers, sampling, the shake detector's EMA and 1200 mg
+threshold) is traced in `milestone-5-decisions.md` (`ACCEL`); the device
+decisions (encoding, data ready, stationary default) follow it there.
+
+**The onboarding walk (local, fake hacker identity).** Page 6 now shows
+`G-force 1000 mg` at rest. The shake pattern (two axes at +/-2 g, Z at
++1 g, six ~62.5 ms half-periods) trips the detector: the footer becomes
+`A / START: next`, A advances, and pages 7 to 11 follow with A (page 11's
+A ticks "I agree"; START then finishes). Setup exits, writes the `system`
+config (ROM `atoi`, above) and launches My Badge's registered screen. The
+step counts and hashes are in the task report; the onboarding rung is held
+for the permission gate (R-M5-2) in `local/m5-held-rungs.rs`.
 
 ## Emulated flash chip: what it contains
 
