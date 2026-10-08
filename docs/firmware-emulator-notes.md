@@ -2234,3 +2234,15 @@ and `boot-probe`, which prints only the dump's partition table). Only two
 kinds of thing come from the boot log: generic ESP-IDF log lines (the
 `boot_progress` tests' needles) and the facts in "Ground truth from the
 physical badge" above.
+
+**Committed test identities (Milestone 5).**
+`frontend/public/firmware/test-identities/<role>.json` holds eleven
+obviously fake identity records, one per role in the firmware's role
+table. They were written by hand from the identity schema traced in
+`factory.bin` (`docs/milestone-5-decisions.md`, "Trace facts"), never
+derived from the flash dump or the boot log: "Test <Role>" names,
+`example.com` addresses, `test-` badge IDs, empty contact fields. The
+human partner relayed the Hack the North organizers' permission to commit
+them on 2026-10-08 (ruling R-M5-2). `frontend/test/test-identities.test.ts`
+keeps them obviously fake and within the firmware's field limits; a real
+attendee's identity never belongs there.

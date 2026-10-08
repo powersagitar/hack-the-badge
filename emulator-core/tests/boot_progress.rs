@@ -8,12 +8,18 @@
 //!   a fault an earlier fix removed;
 //! - a hot-PC escape: a former spin loop now runs a bounded number of times;
 //! - a framebuffer state, pinned by FNV-1a hash
-//!   ([`boots_to_first_real_frame`], [`boots_to_first_run_screen`]).
+//!   ([`boots_to_first_real_frame`], [`boots_to_first_run_screen`],
+//!   [`boots_to_launcher`]).
 //!
-//! The finish line is [`boots_to_first_run_screen`] plus
-//! [`first_run_screen_responds_to_start`]. Step numbers in the docs below
-//! are measured with today's emulator unless marked otherwise; a budget is a
-//! margin, not a pin. The stall-by-stall history behind each rung is in
+//! The finish line is [`boots_to_launcher`] plus
+//! [`launcher_responds_to_navigation`]: the badge is provisioned through
+//! its own console with a committed fake identity
+//! (`common::provision::identity_fixture`), walked through onboarding,
+//! and HOME opens the launcher. Milestone 4's finish line
+//! ([`boots_to_first_run_screen`] plus
+//! [`first_run_screen_responds_to_start`]) still holds on blank flash.
+//! Step numbers in the docs below are measured with today's emulator
+//! unless marked otherwise; a budget is a margin, not a pin. The stall-by-stall history behind each rung is in
 //! `docs/firmware-emulator-notes.md` ("History"); when boot moves, update
 //! the rung whose budget it affects.
 use emulator_core::runtime::FirmwareRuntime;
@@ -1056,5 +1062,323 @@ fn console_rejects_an_empty_identity() {
     );
     let (hash, _) = run_until_stable_frame(&mut rt, CONSOLE_DEADLINE, BOOT_STABLE_FOR, &[]);
     assert_eq!(hash, FIRST_RUN_HASH, "still unregistered");
+    assert_no_panic_text(&rt);
+}
+
+// ---------------------------------------------------------------------
+// Milestone 5: provisioning through the console, the onboarding app
+// ("Setup", 11 pages, a shake on page 6), My Badge's registered screen,
+// HOME to the launcher. The identities are the committed fake fixtures
+// (`provision::identity_fixture`, R-M5-2: permission relayed 2026-10-08).
+// Measured with every role (Task 4); the input sequence is the same for
+// every role. Frame comparison with the physical badge (2026-10-08, the
+// human partner's badge, role hacker): the registered screen, every
+// onboarding page, the launcher and the launcher after DOWN match. The
+// other roles' frames were not compared on hardware.
+// ---------------------------------------------------------------------
+
+/// Total-step deadline for provisioning from the first-run screen: the
+/// slowest role (workshop_lead) prints `PROV OK` at 30.19M (all roles
+/// 29.99M..30.19M, host-paced `put`); + 25%, rounded to 1,000,000.
+const PROVISION_DEADLINE: u64 = 38_000_000;
+/// How long after a press (or the shake) a response may take to start:
+/// page 7 settles about 9M steps after A (a transition animation), so a
+/// response's cap is [`AFTER_PRESS_STABLE_FOR`] plus this.
+const ONBOARDING_RESPONSE_MARGIN: u64 = 16_000_000;
+/// Raw slots from onboarding page 1 to page 6, each with the stable frame
+/// it leads to (role hacker).
+const TO_SHAKE_PAGE: &[(usize, u64)] = &[
+    (1, 0xe788_a781_9328_1b08), // A: page 2 "This is you"
+    (1, 0x9621_b8aa_8b04_0d38), // A: page 3 "Try every button"
+    (1, 0xa283_f1b3_a862_abff), // A lit
+    (2, 0x8522_bf8d_fccb_6084), // B
+    (7, 0xb9e7_b94d_dd89_9859), // UP
+    (5, 0x362f_6120_6bea_4a4f), // LEFT
+    (6, 0x16eb_495b_b805_251a), // RIGHT
+    (4, 0x8a7a_4dff_6454_46d3), // DOWN
+    (8, 0xc6fb_a44d_8132_2795), // Aux1
+    (3, 0x824a_fde3_f915_a562), // HOME (captured on page 3)
+    (0, 0x3a72_5bc1_0083_f74a), // START: all nine done
+    (1, 0xc1ad_004b_a5f7_7b78), // A: page 4 "Lights"
+    (1, 0x7598_def3_0e83_8832), // A: page 5 "Tap to unlock"
+    (1, 0x4a54_e5a4_0d66_9898), // A: page 6 "Shake it!", G-force 1000 mg
+];
+/// One half-period of the shake: 1,000,000 steps (62.5 ms of SYSTIMER
+/// time). Six half-periods, alternating (+2 g, +2 g, +1 g) and (-2 g,
+/// -2 g, +1 g), then rest at (0, 0, +1 g): the shake starts at 192.84M and
+/// the first shaken frame appears at 194.34M (Task D-M5-2).
+const SHAKE_HALF_STEPS: u32 = 1_000_000;
+/// Page 6 after the shake, back at rest: G-force 1000 mg, Peak 3000 mg,
+/// footer "A / START: next   B: back" (role hacker).
+const SHAKEN_AT_REST_HASH: u64 = 0xa80a_279b_127e_1bb1;
+/// Page 7 ("Badge Connect"), after A.
+const ONBOARDING_PAGE7_HASH: u64 = 0x110e_8782_bc4e_5ff0;
+/// Onboarding steps after the shake: (slot, expected stable hash for role
+/// hacker); `None` is page 8 ("Bump to connect"), which is animated: it
+/// cycles through about 14 frames (0.25M..2M steps each, never held for
+/// [`AFTER_PRESS_STABLE_FOR`]), so it has no stable frame to pin. The walk
+/// runs [`ANIMATED_PAGE_STEPS`] after that press and presses A.
+const AFTER_SHAKE_PAGES: &[(usize, Option<u64>)] = &[
+    (1, Some(ONBOARDING_PAGE7_HASH)), // A: page 7 "Badge Connect"
+    (1, None),                        // A: page 8 "Bump to connect", animated
+    (1, Some(0x0831_b6b6_75e6_fe01)), // A: page 9 "HEAT SAFETY"
+    (1, Some(0x21e9_c7e1_b054_39e3)), // A: page 10 "Go explore"
+    (1, Some(0x7dd4_5fd3_9362_faac)), // A: page 11 "Badge rules", unticked
+    (1, Some(0xe8c6_7af9_7ac7_968e)), // A: ticked, "Finished setup  Start"
+];
+/// How long the walk stays on the animated page 8 before pressing A: the
+/// same 9M-step settle as every other measured page.
+const ANIMATED_PAGE_STEPS: u32 = 9_000_000;
+/// Setup's last press (START) to My Badge's registered screen: first
+/// stable 4.3M..4.7M steps after the release, for every role.
+const REGISTERED_RESPONSE_STEPS: u64 = AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+/// The role on the human partner's physical badge (Task 5).
+const OWN_ROLE: &str = "hacker";
+/// Raw slot from the registered screen to the launcher: HOME alone. The
+/// launcher draws about 18M steps after the release (the console says
+/// `launched Launcher` about 9M earlier, while the registered frame is
+/// still on screen).
+const TO_LAUNCHER_SLOT: usize = 3;
+/// HOME's response: release to first stable launcher 18.0M..18.3M, then
+/// [`AFTER_PRESS_STABLE_FOR`] more to confirm, 26.3M; + 25%, rounded up.
+const LAUNCHER_RESPONSE_STEPS: u64 = 33_000_000;
+/// The launcher: a 4x4 icon grid titled "My Badge", first icon selected.
+/// The same for all 11 roles (measured).
+const LAUNCHER_HASH: u64 = 0xb694_a61f_ebfd_62ff;
+/// DOWN: moves the launcher's selection one row (My Badge to "Share").
+const NAV_SLOT: usize = 4;
+/// The launcher after one DOWN (first stable 5.5M steps after release).
+const LAUNCHER_AFTER_NAV_HASH: u64 = 0xa2b9_da1f_0e36_757c;
+
+/// (role, onboarding page 1 hash, registered My Badge screen hash), in
+/// `ROLE_TABLE` order. Both screens show the fake identity's name (and the
+/// role colour), so every role differs. Only hacker's were compared with
+/// the physical badge.
+const ROLE_ROWS: &[(&str, u64, u64)] = &[
+    ("hacker", 0xd364_7661_7b1a_89b5, 0xbd6d_7613_08a7_bf24),
+    ("organizer", 0x5dba_66e0_b019_1c24, 0x1974_c49f_a562_08a3),
+    ("sponsor", 0x997d_dc94_a332_cb23, 0x0bc2_dee2_1a99_c4c0),
+    ("judge", 0xa681_3acc_1906_5c12, 0x54f8_e3d0_65a3_04c1),
+    ("mentor", 0x2619_ad73_bf0d_7e86, 0x03a9_7611_bf45_9332),
+    ("volunteer", 0x05f0_cede_9341_fc3f, 0xfd95_a0e7_844f_4019),
+    ("media", 0x49ee_edbe_2a64_a1d6, 0x5092_210f_e8d8_f1d2),
+    ("staff", 0xc270_f7ca_eb37_28d3, 0xc68e_18b7_16ef_40ea),
+    ("general", 0xa6a3_0959_d158_ab93, 0x4574_d9ed_d13c_330a),
+    (
+        "workshop_lead",
+        0xf723_ec7a_d14b_c6e3,
+        0xf8e2_3246_19a6_4d76,
+    ),
+    ("visitor", 0x6e32_6aa6_bcd6_c3f1, 0x647a_71d4_5ab8_cf23),
+];
+
+fn role_row(role: &str) -> (u64, u64) {
+    let r = ROLE_ROWS.iter().find(|r| r.0 == role).expect("role row");
+    (r.1, r.2)
+}
+
+/// Press and release `slot`, held [`PRESS_HOLD_STEPS`], asserting no fault.
+fn press(rt: &mut FirmwareRuntime, slot: usize) {
+    rt.set_raw_button(slot, true);
+    let s = rt.run(PRESS_HOLD_STEPS);
+    assert_eq!(s.last_instruction_fault, None, "{s:?}");
+    rt.set_raw_button(slot, false);
+}
+
+/// [`press`], then the next stable frame other than `previous`.
+fn press_and_settle(rt: &mut FirmwareRuntime, slot: usize, previous: u64) -> (u64, u64) {
+    press(rt, slot);
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    run_until_stable_frame(rt, cap, AFTER_PRESS_STABLE_FOR, &[previous])
+}
+
+/// Shakes the badge (see [`SHAKE_HALF_STEPS`]) and puts it back at rest.
+fn shake(rt: &mut FirmwareRuntime) {
+    for k in 0..6 {
+        let s = if k % 2 == 0 { 1 } else { -1 };
+        rt.set_acceleration(s * 2000, s * 2000, 1000);
+        let summary = rt.run(SHAKE_HALF_STEPS);
+        assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
+    }
+    rt.set_acceleration(0, 0, 1000);
+}
+
+/// Provisions `role` from the stable first-run screen and returns the
+/// runtime on onboarding page 1 ("Welcome to Hack the North"), after
+/// asserting `PROV OK` and that page's hash.
+fn provisioned(role: &str) -> FirmwareRuntime {
+    let (page1, _) = role_row(role);
+    let mut rt = first_run_screen();
+    let text = provision::provision(
+        &mut rt,
+        &provision::identity_fixture(role),
+        PROVISION_DEADLINE,
+    )
+    .unwrap_or_else(|e| panic!("{role}: {e}"));
+    assert!(text.contains("PROV OK id=test-"), "{role}: {text}");
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[FIRST_RUN_HASH]);
+    assert_eq!(
+        hash, page1,
+        "{role}: onboarding page 1, stable at step {step}"
+    );
+    rt
+}
+
+/// Milestone 5 Task D-M5-2: with the SC7A20H on I2C0, a provisioned
+/// badge's onboarding app reaches "Shake it!" (page 6), reads the resting
+/// 1 g, detects a shake, offers "A / START: next", and A moves on to page
+/// 7.
+#[test]
+fn onboarding_shake_page_advances_after_a_shake() {
+    let mut rt = provisioned(OWN_ROLE);
+    let mut previous = role_row(OWN_ROLE).0;
+    for &(slot, expected) in TO_SHAKE_PAGE {
+        let (hash, step) = press_and_settle(&mut rt, slot, previous);
+        assert_eq!(hash, expected, "after slot {slot}, stable at step {step}");
+        previous = hash;
+    }
+    assert_eq!(rt.acceleration(), [0, 0, 1000], "face up at rest");
+    shake(&mut rt);
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
+    assert_eq!(
+        hash, SHAKEN_AT_REST_HASH,
+        "after the shake, stable at step {step}"
+    );
+    let (hash, step) = press_and_settle(&mut rt, 1, hash);
+    assert_eq!(hash, ONBOARDING_PAGE7_HASH, "page 7, stable at step {step}");
+    assert_no_panic_text(&rt);
+}
+
+/// Provisions `role`, then walks Setup (11 pages, a shake on page 6) to
+/// My Badge's registered screen. Page 1 and the registered screen are
+/// pinned for every role; the pages between only when `pin` (role hacker,
+/// the one compared with the physical badge; other roles reach the same
+/// pages, but their name-bearing frames differ).
+fn registered(role: &str, pin: bool) -> FirmwareRuntime {
+    let (page1, registered_hash) = role_row(role);
+    let mut rt = provisioned(role);
+    let mut previous = page1;
+    for &(slot, expected) in TO_SHAKE_PAGE {
+        let (hash, step) = press_and_settle(&mut rt, slot, previous);
+        if pin {
+            assert_eq!(
+                hash, expected,
+                "{role}: after slot {slot}, stable at step {step}"
+            );
+        }
+        previous = hash;
+    }
+    shake(&mut rt);
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
+    if pin {
+        assert_eq!(
+            hash, SHAKEN_AT_REST_HASH,
+            "{role}: after the shake, stable at step {step}"
+        );
+    }
+    previous = hash;
+    for &(slot, expected) in AFTER_SHAKE_PAGES {
+        match expected {
+            Some(expected) => {
+                let (hash, step) = press_and_settle(&mut rt, slot, previous);
+                if pin {
+                    assert_eq!(
+                        hash, expected,
+                        "{role}: after slot {slot}, stable at step {step}"
+                    );
+                }
+                previous = hash;
+            }
+            None => {
+                press(&mut rt, slot);
+                let s = rt.run(ANIMATED_PAGE_STEPS);
+                assert_eq!(s.last_instruction_fault, None, "{s:?}");
+            }
+        }
+    }
+    // START finishes Setup: My Badge's registered screen.
+    press(&mut rt, 0);
+    let cap = rt.total_steps() + REGISTERED_RESPONSE_STEPS;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
+    assert_eq!(
+        hash, registered_hash,
+        "{role}: registered screen, stable at step {step}"
+    );
+    assert_no_panic_text(&rt);
+    rt
+}
+
+macro_rules! provisions_role {
+    ($name:ident, $role:literal, $pin:expr) => {
+        /// Provisioning through the console and Setup register the badge
+        /// and land on My Badge's registered screen (see `registered`).
+        #[test]
+        fn $name() {
+            registered($role, $pin);
+        }
+    };
+}
+
+provisions_role!(provisions_hacker_through_the_console, "hacker", true);
+provisions_role!(provisions_organizer_through_the_console, "organizer", false);
+provisions_role!(provisions_sponsor_through_the_console, "sponsor", false);
+provisions_role!(provisions_judge_through_the_console, "judge", false);
+provisions_role!(provisions_mentor_through_the_console, "mentor", false);
+provisions_role!(provisions_volunteer_through_the_console, "volunteer", false);
+provisions_role!(provisions_media_through_the_console, "media", false);
+provisions_role!(provisions_staff_through_the_console, "staff", false);
+provisions_role!(provisions_general_through_the_console, "general", false);
+provisions_role!(
+    provisions_workshop_lead_through_the_console,
+    "workshop_lead",
+    false
+);
+provisions_role!(provisions_visitor_through_the_console, "visitor", false);
+
+/// [`registered`], then HOME to the stable launcher.
+fn launcher_for(role: &str, pin: bool) -> FirmwareRuntime {
+    let (_, registered_hash) = role_row(role);
+    let mut rt = registered(role, pin);
+    press(&mut rt, TO_LAUNCHER_SLOT);
+    let cap = rt.total_steps() + LAUNCHER_RESPONSE_STEPS;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[registered_hash]);
+    assert_eq!(
+        hash, LAUNCHER_HASH,
+        "{role}: launcher, stable at step {step}"
+    );
+    rt
+}
+
+/// Milestone 5 finish line: a provisioned badge reaches the app launcher.
+/// The input sequence and every pinned frame on the way were compared
+/// with the physical badge on 2026-10-08 (role hacker).
+#[test]
+fn boots_to_launcher() {
+    let rt = launcher_for(OWN_ROLE, true);
+    assert!(rt.console_output().contains("launched Launcher"));
+    assert_no_panic_text(&rt);
+}
+
+/// The launcher does not depend on the role (11 of 11 measured equal);
+/// the longest-name role is checked as a second sample. Not compared on
+/// hardware with this role.
+#[test]
+fn launcher_is_role_independent() {
+    let rt = launcher_for("workshop_lead", false);
+    assert_no_panic_text(&rt);
+}
+
+/// The launcher takes input: one [`NAV_SLOT`] press moves the selection,
+/// as on the badge (compared 2026-10-08).
+#[test]
+fn launcher_responds_to_navigation() {
+    let mut rt = launcher_for(OWN_ROLE, true);
+    let (hash, step) = press_and_settle(&mut rt, NAV_SLOT, LAUNCHER_HASH);
+    assert_eq!(hash, LAUNCHER_AFTER_NAV_HASH, "stable at step {step}");
     assert_no_panic_text(&rt);
 }

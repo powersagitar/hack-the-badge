@@ -85,6 +85,17 @@ export interface FirmwareEmulatorHandle {
   pc(): number;
   /** Steps run since construction or the last `reset()`. */
   totalSteps(): number;
+  /** Bytes a USB host sends to the badge's console; returns how many were accepted. */
+  serialInput(bytes: Uint8Array): number;
+  /** Serial input the firmware has not read yet. */
+  serialPending(): number;
+  /** Everything the firmware has printed to its console. */
+  consoleOutput(): string;
+  /**
+   * Sets the acceleration the badge's SC7A20H reports, in mg per axis
+   * (default: lying face up, `(0, 0, 1000)`); survives `reset()`.
+   */
+  setAcceleration(xMg: number, yMg: number, zMg: number): void;
   /** Releases the WASM-side emulator. Calling anything else afterwards throws. */
   dispose(): void;
 }
@@ -180,6 +191,22 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     totalSteps(): number {
       assertLive();
       return wasm.totalSteps;
+    },
+    serialInput(bytes: Uint8Array): number {
+      assertLive();
+      return wasm.serialInput(bytes);
+    },
+    serialPending(): number {
+      assertLive();
+      return wasm.serialPending();
+    },
+    consoleOutput(): string {
+      assertLive();
+      return wasm.consoleOutput();
+    },
+    setAcceleration(xMg: number, yMg: number, zMg: number): void {
+      assertLive();
+      wasm.setAcceleration(xMg, yMg, zMg);
     },
     dispose(): void {
       if (disposed) return;

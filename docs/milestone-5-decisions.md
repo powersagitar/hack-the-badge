@@ -439,10 +439,83 @@ v5.5.3 `i2c_master.c`, cited in `peripherals/sc7a20h.rs` and
   wrong (the trigger was mis-traced higher): the page stays on "Shake to
   continue"; the walk records the step at which the footer changes.
 
+## Permission gate, identity rungs and the WASM twin (Task 6)
+
+- **Gates.** On 2026-10-08 the human partner said "commit the
+  identities": the R-M5-2 go-ahead. The 11 fixtures went from `local/`
+  to `frontend/public/firmware/test-identities/` unchanged (the R-T1-1
+  versions). On the same date the human partner confirmed the frames
+  against the physical badge (Task 5), for role hacker only: onboarding
+  pages, the registered screen, the launcher and the launcher after DOWN.
+  No other role's frames were compared on hardware; the rung docs say
+  which frames were compared.
+- **R-T6-1 (amends the plan's Task 6 code).** The plan assumed `prov
+  apply` lands on My Badge's registered screen. It does not: provisioning
+  starts the onboarding app ("Setup", 11 pages, a shake on page 6), and
+  only finishing Setup (START on page 11) shows the registered screen;
+  HOME from there opens the launcher. The committed rungs are Task 4's
+  measured walk (`local/m5-held-rungs.rs`), fitted to the plan's
+  structure. Presses are held `PRESS_HOLD_STEPS` (1.6M); the shake is
+  `set_acceleration` (D-M5-2's pattern). Each response cap is relative to
+  the press (the walk is about 340M steps long), not a total-step budget.
+  If wrong: a firmware change to onboarding moves every hash after page 1.
+- **Rungs.** `provisions_<role>_through_the_console` (11, one per
+  `ROLE_TABLE` entry) pin onboarding page 1 and the registered screen for
+  every role (both show the name, so all differ); only hacker pins the
+  pages in between. `onboarding_shake_page_advances_after_a_shake`
+  (D-M5-2's held rung), `boots_to_launcher` (the finish line),
+  `launcher_is_role_independent` (workshop_lead; the launcher hash was
+  equal for 11 of 11 roles in Task 4, so one sample stands in for the
+  rest) and `launcher_responds_to_navigation` (DOWN, slot 4). Page 8
+  ("Bump to connect") is animated (about 14 frames, none held 8M steps),
+  so it is not pinned: the walk runs 9M steps there and presses A. If
+  wrong (a role's launcher differs after a firmware change): only
+  workshop_lead and hacker would catch it.
+- **Constants' origins.** `PROVISION_DEADLINE` 38M: the slowest role's
+  `PROV OK` (30.19M) + 25%. `LAUNCHER_RESPONSE_STEPS` 33M: HOME's release
+  to a confirmed stable launcher (26.3M) + 25%.
+  `ONBOARDING_RESPONSE_MARGIN` 16M: page 7's ~9M transition plus margin.
+  `ANIMATED_PAGE_STEPS` 9M: the walk's settle. No constant is 0.
+- **Suite time.** With these rungs `cargo test -p emulator-core --release
+  --test boot_progress` takes about 36 s wall (about 485 CPU-s; 54
+  tests). Each identity rung is 280M to 345M steps. Task 8's checkpoint
+  fixture is the planned fix; most of the time is in the walk after
+  provisioning, which a first-run checkpoint does not save.
+- **Fixture loader.** `common::provision::identity_fixture(role)` reads
+  the committed file; `$BADGE_TEST_IDENTITIES` (relative to the repo root)
+  overrides the directory, for trying a local variant.
+- **Frontend provisioner** (`frontend/src/runtime/provisioner.ts`). A
+  polled state machine mirroring `provision.rs`: wait for `badge> `, type
+  `put /littlefs/identity.json <size>\n`, wait for `READY`, send 64-byte
+  chunks at least `PUT_CHUNK_GAP_STEPS` (48,000) steps apart by
+  `handle.totalSteps()`, at most one per poll, wait for `OK <size>` and
+  the next prompt, type `prov apply\n`, and report the complete `PROV OK`
+  or `PROV FAIL` line (or a `put` error line). It replaces the plan's
+  fixed `PUT_SETTLE_STEPS` (R-T1-3, R-D1-1). `put` blocks until every
+  byte arrives, so a slower poller (the browser polls once per 500,000-step
+  frame) only takes longer. It does not walk onboarding; that is the
+  user's job in the browser. If wrong (`put` drains slower than one
+  packet per 48,000 steps): the driver drops payload bytes, `put` blocks,
+  and the provisioner stays in `typing`; it has no deadline of its own (the
+  caller's, as in the twin).
+- **WASM surface.** `serialInput`, `serialPending` and `setAcceleration`
+  (one-line passthroughs) in `emulator-wasm`; `bridge.ts`'s handle gains
+  those plus `consoleOutput`.
+- **WASM twin** (`frontend/test/cpu-wasm.test.ts`): boots hacker,
+  provisions it with the frontend provisioner (so the provisioner is
+  proven against the real firmware), walks the same onboarding sequence
+  (presses plus the shake through `setAcceleration`) and reaches
+  `LAUNCHER_HASH`, every intermediate hash checked; constants copied from
+  `boot_progress.rs`. About 35 s under `bun test`. The test's FNV-1a now
+  computes in 32-bit halves; BigInt per byte was too slow for ~1,400
+  samples (same hashes, checked by the existing splash and first-run
+  twins).
+
+
 ## Milestone 6 backlog
 
-- **Accelerometer in the browser (Task 6 / M6).** `emulator-wasm` has no
-  `set_acceleration` passthrough yet (Task D-M5-2 added only the Rust API,
-  by the brief): Task 6 adds the one-line wasm passthrough and the
-  frontend's motion input (a shake button, or `DeviceMotionEvent` on a
-  phone), so onboarding page 6 can be passed in the browser.
+- **Accelerometer in the browser (M6).** Task 6 added the one-line
+  `setAcceleration` passthrough (`emulator-wasm`, `bridge.ts`); the
+  frontend still needs a motion input (Task 7 or M6: a shake button, or
+  `DeviceMotionEvent` on a phone) so onboarding page 6 can be passed in
+  the browser.

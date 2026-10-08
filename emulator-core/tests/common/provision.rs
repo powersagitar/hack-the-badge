@@ -115,7 +115,10 @@ pub fn put_file(
     }
     // `put` returns to the REPL, which prints a fresh prompt; type only then.
     if wait_for_any(rt, marker, &[PROMPT], deadline).is_none() {
-        return Err(format!("no prompt after put:\n{}", console_since(rt, marker)));
+        return Err(format!(
+            "no prompt after put:\n{}",
+            console_since(rt, marker)
+        ));
     }
     Ok(console_since(rt, marker))
 }
@@ -153,4 +156,19 @@ pub fn provision(
     } else {
         Err(text)
     }
+}
+
+/// A committed test identity
+/// (`frontend/public/firmware/test-identities/<role>.json`: obviously fake,
+/// one per role, committed with the organizers' permission, R-M5-2). When
+/// `$BADGE_TEST_IDENTITIES` is set, the file is read from that directory
+/// instead (a relative path is taken from the repo root), for trying a
+/// local variant.
+pub fn identity_fixture(role: &str) -> Vec<u8> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let dir = std::env::var_os("BADGE_TEST_IDENTITIES")
+        .map(|d| root.join(d))
+        .unwrap_or_else(|| root.join("frontend/public/firmware/test-identities"));
+    std::fs::read(dir.join(format!("{role}.json")))
+        .unwrap_or_else(|e| panic!("fixture {role} in {}: {e}", dir.display()))
 }

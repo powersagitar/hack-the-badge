@@ -72,6 +72,10 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     totalSteps(): number {
       return 0;
     },
+    serialInput: () => 0,
+    serialPending: () => 0,
+    consoleOutput: () => "",
+    setAcceleration: () => {},
     dispose(): void {
       counters.disposeCalls++;
     },
