@@ -340,7 +340,8 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   shown; a frontend LED view would need symbol capture.
 - NFC is not modeled (the self-test waits for a card forever).
 - No USB-Serial-JTAG interrupt source; the console REPL the badge starts
-  after the launcher may install the interrupt-driven driver.
+  after the launcher may install the interrupt-driven driver. (Resolved in
+  Milestone 5 Task 2; see `milestone-5-decisions.md`.)
 - Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`),
   SYSTEM `0x600c_0058`/`+0x08`, RTC_CNTL `0x6000_80bc`. Harmless so far.
 - Zero-latency RMT, I2C0 and SPIMEM1 (see their sections above).

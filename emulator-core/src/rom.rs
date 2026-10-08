@@ -911,6 +911,12 @@
 //!
 //! ## Where this gets boot to
 //!
+//! **As of Milestone 5 Task 3**: 112 stubs: `strlcpy` (`0x4000_03f0`,
+//! [`STRLCPY`]), `strtol` (`0x4000_0454`, [`STRTOL`]) and `strrchr`
+//! (`0x4000_0408`, [`STRRCHR`]), each a real HLE observed faulting on the
+//! console REPL's first `prov show` / `put` (decision R-T3-1; addresses from
+//! `esp32c3.rom.libc.ld`, semantics from the ROM ELF's newlib code).
+//!
 //! **As of the end of Milestone 4**: 109 stubs and two guest-executed ROM
 //! routines (`qsort`, `strdup`), unchanged since Task D-M4-2. Boot reaches
 //! the first app's stable first-run screen and its START-launched
@@ -1438,6 +1444,25 @@ pub const STRCMP: u32 = 0x4000_036c;
 /// Task 5: first called by `esp_vfs_littlefs_register` after the littlefs
 /// format.
 pub const STRLCAT: u32 = 0x4000_03ec;
+
+/// ROM libc `strlcpy`'s fixed address (`esp32c3.rom.libc.ld`: `strlcpy =
+/// 0x400003f0;`, ROM ELF `__call_strlcpy`, a jump to newlib's `strlcpy` at
+/// `0x4005_8e4e`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strlcpy`]), Milestone 5 Task 3:
+/// the console REPL's first command (`0x4206_0074`, size 256) calls it.
+pub const STRLCPY: u32 = 0x4000_03f0;
+
+/// ROM libc `strtol`'s fixed address (`esp32c3.rom.libc.ld`: `strtol =
+/// 0x40000454;`, ROM ELF `__call_strtol`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strtol`]), Milestone 5 Task 3:
+/// the console's `put <path> <size>` parses its size with it.
+pub const STRTOL: u32 = 0x4000_0454;
+
+/// ROM libc `strrchr`'s fixed address (`esp32c3.rom.libc.ld`: `strrchr =
+/// 0x40000408;`, ROM ELF `__call_strrchr`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Strrchr`]), Milestone 5 Task 3:
+/// `put` looks for the last `/` of its path to create parent directories.
+pub const STRRCHR: u32 = 0x4000_0408;
 
 /// ROM libc `strcspn`'s fixed address (`esp32c3.rom.libc.ld`: `strcspn =
 /// 0x400003e4;`, ROM ELF `__call_strcspn`, newlib code at `0x4005_8d90`).
@@ -2138,6 +2163,9 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRNCPY, RomStub::strncpy("strncpy")),
     (STRCMP, RomStub::strcmp("strcmp")),
     (STRLCAT, RomStub::strlcat("strlcat")),
+    (STRLCPY, RomStub::strlcpy("strlcpy")),
+    (STRTOL, RomStub::strtol("strtol")),
+    (STRRCHR, RomStub::strrchr("strrchr")),
     (STRSPN, RomStub::strspn("strspn")),
     (STRCSPN, RomStub::strcspn("strcspn")),
     (STRCHR, RomStub::strchr("strchr")),
@@ -2477,6 +2505,9 @@ mod tests {
             (STRNCPY, RomStubEffect::Strncpy),
             (STRCMP, RomStubEffect::Strcmp),
             (STRLCAT, RomStubEffect::Strlcat),
+            (STRLCPY, RomStubEffect::Strlcpy),
+            (STRTOL, RomStubEffect::Strtol),
+            (STRRCHR, RomStubEffect::Strrchr),
             (STRSPN, RomStubEffect::Strspn),
             (STRCSPN, RomStubEffect::Strcspn),
             (STRCHR, RomStubEffect::Strchr),
@@ -3661,6 +3692,100 @@ mod tests {
         assert_eq!(info.rom_stub, Some(addr));
         assert_eq!(cpu.regs.pc, 0x4000_1000);
         cpu.regs.read(REG_A0)
+    }
+
+    #[test]
+    fn strlcpy_stub_is_bsd_strlcpy() {
+        let (src, dst) = (0x3fc9_0400, 0x3fc9_0420);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(src, 32);
+        bus.add_scratch_ram(dst, 32);
+        for (i, x) in b"xyz\0".iter().enumerate() {
+            bus.write8(src + i as u32, *x);
+        }
+        let mut call = |siz: u32| {
+            for i in 0..8 {
+                bus.write8(dst + i, 0x55);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, dst);
+            cpu.regs.write(REG_A1, src);
+            cpu.regs.write(REG_A2, siz);
+            cpu.regs.pc = STRLCPY;
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRLCPY));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            (cpu.regs.read(REG_A0), (0..8).map(|i| bus.read8(dst + i)).collect::<Vec<u8>>())
+        };
+        assert_eq!(call(16), (3, b"xyz\0\x55\x55\x55\x55".to_vec()), "fits");
+        assert_eq!(call(4), (3, b"xyz\0\x55\x55\x55\x55".to_vec()), "exact fit");
+        assert_eq!(call(3), (3, b"xy\0\x55\x55\x55\x55\x55".to_vec()), "truncated, terminated");
+        assert_eq!(call(1), (3, b"\0\x55\x55\x55\x55\x55\x55\x55".to_vec()), "only the NUL");
+        assert_eq!(call(0), (3, [0x55; 8].to_vec()), "siz 0 writes nothing");
+    }
+
+    #[test]
+    fn strtol_stub_parses_like_newlib_and_sets_endptr() {
+        let (s, endp) = (0x3fc9_0400, 0x3fc9_0440);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(s, 64);
+        bus.add_scratch_ram(endp, 8);
+        let mut call = |text: &[u8], base: u32, want_end: bool| {
+            for i in 0..32 {
+                bus.write8(s + i, 0);
+            }
+            for (i, x) in text.iter().enumerate() {
+                bus.write8(s + i as u32, *x);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, s);
+            cpu.regs.write(REG_A1, if want_end { endp } else { 0 });
+            cpu.regs.write(REG_A2, base);
+            cpu.regs.pc = STRTOL;
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(STRTOL));
+            let end = (0..4).fold(0u32, |a, k| a | (u32::from(bus.read8(endp + k)) << (8 * k)));
+            (cpu.regs.read(REG_A0) as i32, end.wrapping_sub(s))
+        };
+        assert_eq!(call(b"320", 10, true), (320, 3));
+        assert_eq!(call(b"  -12x", 10, true), (-12, 5));
+        assert_eq!(call(b"0x1F", 16, true), (31, 4));
+        assert_eq!(call(b"0x1F", 0, true), (31, 4));
+        assert_eq!(call(b"017", 0, true), (15, 3));
+        assert_eq!(call(b"abc", 10, true), (0, 0), "no digits: endptr = nptr");
+        assert_eq!(call(b"99999999999", 10, true).0, i32::MAX, "saturates");
+        assert_eq!(call(b"-99999999999", 10, true).0, i32::MIN, "saturates");
+        assert_eq!(call(b"7", 10, false).0, 7, "NULL endptr is allowed");
+    }
+
+    #[test]
+    fn strrchr_stub_finds_the_last_match_and_the_terminator() {
+        let s = 0x3fc9_0400;
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(s, 32);
+        for (i, x) in b"/a/b.json\0".iter().enumerate() {
+            bus.write8(s + i as u32, *x);
+        }
+        let mut call = |c: u32| {
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, s);
+            cpu.regs.write(REG_A1, c);
+            cpu.regs.pc = STRRCHR;
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(STRRCHR));
+            cpu.regs.read(REG_A0)
+        };
+        assert_eq!(call(u32::from(b'/')), s + 2);
+        assert_eq!(call(u32::from(b'z')), 0);
+        assert_eq!(call(0), s + 9, "the terminator counts");
     }
 
     #[test]

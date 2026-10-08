@@ -401,6 +401,11 @@ the firmware agreeing with the table, still not a press on real hardware.
 
 ### Current state (end of Milestone 4)
 
+Milestone 5 update: the USB console now starts (`hal_console: console
+started`, prompt `badge> ` by about step 16.8M) and the REPL answers
+`prov show`, `put` and `prov apply` (Tasks 2 and 3); the description below is
+unchanged otherwise.
+
 Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
 synthetic flash through the whole of `app_main` to the first app's
 screen, and that screen responds to buttons. From a cold boot:
@@ -2073,6 +2078,23 @@ press was no longer registered (button polling is busy while the console
 drains); the hold is now `PRESS_HOLD_STEPS` = 1,600,000 (100 ms emulated),
 ruling R-T2-1 in `milestone-5-decisions.md`; no hash changed. Console
 input is no longer an open limitation.
+
+### Milestone 5 Task 3: console rungs; three ROM string calls
+
+Typing at the `badge> ` prompt faulted the CPU on ROM calls the console had
+never reached: `strlcpy` (`0x4000_03f0`, the REPL's line copy, size 256),
+`strtol` (`0x4000_0454`, `put`'s size argument) and `strrchr`
+(`0x4000_0408`, `put` creating parent directories). Each is now a real
+bus-effect stub (`RomStubEffect::{Strlcpy,Strtol,Strrchr}`), addresses from
+`esp32c3.rom.libc.ld`, semantics checked against the ROM ELF's newlib code.
+`strtol` does not set `errno` (the ROM's reent struct is not modeled; the
+observed caller checks only `endptr`). With them, on blank flash the
+console starts at about step 16.86M, the prompt is up at 16.78M, `prov show`
+answers `provisioned=0`, and `put` / `prov apply` of `{}` print `READY`,
+`OK 2` and `PROV FAIL invalid or missing /littlefs/identity.json` by
+17.33M. Rungs: `boot_starts_the_console`,
+`console_answers_prov_show_on_the_first_run_screen`,
+`console_rejects_an_empty_identity` (driver: `tests/common/provision.rs`).
 
 ## Emulated flash chip: what it contains
 

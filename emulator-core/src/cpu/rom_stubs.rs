@@ -60,7 +60,7 @@
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
 //!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`Strchr`/`DivT`, the writing
-//!    `Strncpy`/`Strlcat`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    `Strncpy`/`Strlcat`/`Strlcpy`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
@@ -296,6 +296,35 @@ pub enum RomStubEffect {
     /// and the copy are capped at [`MAX_STUB_MEMORY_BYTES`]. Real: the ROM
     /// entry is a jump to newlib code, and the caller uses the string.
     Strlcat,
+    /// `size_t strlcpy(char *dst, const char *src, size_t siz)`: the BSD
+    /// `strlcpy` the ROM ships (ROM ELF `strlcpy` at `0x4005_8e4e`, OpenBSD's):
+    /// copies at most `siz = a2` - 1 bytes of `src = a1` to `dst = a0` through
+    /// the bus and NUL-terminates, unless `siz` is 0 (nothing is written).
+    /// Returns `strlen(src)` in `a0`, the length it tried to create. The scan
+    /// and the copy are capped at [`MAX_STUB_MEMORY_BYTES`]. Real, and a
+    /// bus-effect stub rather than a guest code blob because it needs no
+    /// callback into firmware, like `strlcat`: the console's line copy
+    /// (`0x4206_0074`) uses the result and the copied bytes.
+    Strlcpy,
+    /// `char *strrchr(const char *s, int c)`: newlib's `strrchr` (ROM slot
+    /// `__call_strrchr`, `esp32c3.rom.libc.ld` `strrchr = 0x40000408`).
+    /// Returns the address of the last byte of `s = a0` equal to `(char)c =
+    /// a1`, or 0 if none; the terminating NUL counts, so `c == 0` returns
+    /// the end of the string. Scan capped at [`MAX_STUB_MEMORY_BYTES`].
+    Strrchr,
+    /// `long strtol(const char *nptr, char **endptr, int base)`: newlib's
+    /// `strtol` (ROM slot `__call_strtol`, `esp32c3.rom.libc.ld`
+    /// `strtol = 0x40000454`). Skips C-locale whitespace, an optional sign,
+    /// and for base 0 or 16 a `0x`/`0X` prefix (base 0 then picks 8 for a
+    /// leading `0`, else 10); accepts digits and letters below `base`;
+    /// saturates at `LONG_MAX`/`LONG_MIN` on overflow. If no digit is
+    /// consumed `*endptr = nptr` and 0 is returned; otherwise `*endptr`
+    /// points past the last digit (written only when `endptr = a1` is
+    /// non-NULL). `errno` (ERANGE/EINVAL) is not set: the ROM keeps it in a
+    /// per-task reent struct the emulator does not model, and the observed
+    /// caller (`put`'s size parse) checks only `endptr`. Scan capped at
+    /// [`MAX_STUB_MEMORY_BYTES`].
+    Strtol,
     /// `size_t strspn(const char *s, const char *set)`: newlib's
     /// `strspn.c`: the length of the leading run of `s = a0` made only of
     /// bytes in NUL-terminated `set = a1`, in `a0`. Scans capped at
@@ -1372,6 +1401,30 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Strcmp,
+        }
+    }
+
+    /// A real high-level-emulated `strlcpy` -- see [`RomStubEffect::Strlcpy`].
+    pub const fn strlcpy(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strlcpy,
+        }
+    }
+
+    /// A real high-level-emulated `strtol` -- see [`RomStubEffect::Strtol`].
+    pub const fn strtol(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strtol,
+        }
+    }
+
+    /// A real high-level-emulated `strrchr` -- see [`RomStubEffect::Strrchr`].
+    pub const fn strrchr(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strrchr,
         }
     }
 

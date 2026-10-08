@@ -673,6 +673,109 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, diff as u32);
             }
+            RomStubEffect::Strlcpy => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let siz = self.regs.read(rom_stubs::REG_A2);
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                let mut slen: u32 = 0;
+                while slen < cap && bus.read8(src.wrapping_add(slen)) != 0 {
+                    slen += 1;
+                }
+                if siz > 0 {
+                    let n = slen.min(siz - 1);
+                    for i in 0..n {
+                        let byte = bus.read8(src.wrapping_add(i));
+                        bus.write8(dst.wrapping_add(i), byte);
+                    }
+                    bus.write8(dst.wrapping_add(n), 0);
+                }
+                self.regs.write(rom_stubs::REG_A0, slen);
+            }
+            RomStubEffect::Strtol => {
+                let nptr = self.regs.read(rom_stubs::REG_A0);
+                let endptr = self.regs.read(rom_stubs::REG_A1);
+                let base_arg = self.regs.read(rom_stubs::REG_A2);
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                let at = |bus: &mut B, i: u32| bus.read8(nptr.wrapping_add(i));
+                let mut i: u32 = 0;
+                while i < cap && matches!(at(bus, i), b' ' | b'\t'..=b'\r') {
+                    i += 1;
+                }
+                let mut neg = false;
+                match at(bus, i) {
+                    b'-' => {
+                        neg = true;
+                        i += 1;
+                    }
+                    b'+' => i += 1,
+                    _ => {}
+                }
+                let mut base = base_arg;
+                let valid_base = base == 0 || (2..=36).contains(&base);
+                let digit = |c: u8| match c {
+                    b'0'..=b'9' => u32::from(c - b'0'),
+                    b'a'..=b'z' => u32::from(c - b'a') + 10,
+                    b'A'..=b'Z' => u32::from(c - b'A') + 10,
+                    _ => 99,
+                };
+                if valid_base && (base == 0 || base == 16) && at(bus, i) == b'0'
+                    && matches!(at(bus, i + 1), b'x' | b'X')
+                    && digit(at(bus, i + 2)) < 16
+                {
+                    i += 2;
+                    base = 16;
+                } else if base == 0 {
+                    base = if at(bus, i) == b'0' { 8 } else { 10 };
+                }
+                let start = i;
+                let mut acc: u64 = 0;
+                let mut over = false;
+                while valid_base && i < cap {
+                    let d = digit(at(bus, i));
+                    if d >= base {
+                        break;
+                    }
+                    acc = acc * u64::from(base) + u64::from(d);
+                    if acc > 0x8000_0000 {
+                        over = true;
+                        acc = 0x8000_0000;
+                    }
+                    i += 1;
+                }
+                let consumed = i > start;
+                let value: i32 = if over || (!neg && acc > 0x7fff_ffff) {
+                    if neg { i32::MIN } else { i32::MAX }
+                } else if neg {
+                    (acc as i64).wrapping_neg() as i32
+                } else {
+                    acc as i32
+                };
+                if endptr != 0 {
+                    let end = if consumed { nptr.wrapping_add(i) } else { nptr };
+                    for (k, b) in end.to_le_bytes().iter().enumerate() {
+                        bus.write8(endptr.wrapping_add(k as u32), *b);
+                    }
+                }
+                self.regs
+                    .write(rom_stubs::REG_A0, if consumed { value as u32 } else { 0 });
+            }
+            RomStubEffect::Strrchr => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let c = self.regs.read(rom_stubs::REG_A1) as u8;
+                let mut found = 0;
+                for i in 0..=rom_stubs::MAX_STUB_MEMORY_BYTES {
+                    let addr = s.wrapping_add(i);
+                    let byte = bus.read8(addr);
+                    if byte == c {
+                        found = addr;
+                    }
+                    if byte == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, found);
+            }
             RomStubEffect::Strlcat => {
                 let dst = self.regs.read(rom_stubs::REG_A0);
                 let src = self.regs.read(rom_stubs::REG_A1);
