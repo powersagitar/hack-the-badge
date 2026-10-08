@@ -277,7 +277,8 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
     = `0x80` (`0x4200_aa92`: `BDU` 1, `BLE` 0, `FS` 00 = +/-2 g, no
     self-test), then `vTaskDelay(2)` (`0x4039_12f2` is `vTaskDelay`, per
     its assert string). Nothing else is written: no `CTRL_REG3`/`CTRL_REG6`
-    interrupt routing, no FIFO, no `CTRL_REG0` (`HR`). A separate setter
+    interrupt routing, no FIFO, and nothing at `0x1F` (a writable register
+  in the datasheet's list; what its bits select was not checked here). A separate setter
     (`0x4200_aae8`, used by apps) rewrites `CTRL_REG1` to `0x87` (ODR 1000,
     800 Hz) or back to `0x57` and checks the readback (`ODR readback
     0x%02X, expected 0x%02X`, `ESP_ERR_INVALID_RESPONSE`, `0x108`).
@@ -376,6 +377,55 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
   paces 64-byte packets, so the ring is drained as it fills. The deadline
   is the only step bound. If wrong: a firmware that prints `READY` before
   it can read would lose payload bytes.
+
+## Console rungs and the provisioning walk (Tasks 3 and 4)
+
+- **R-T1-3, the provisioning flow** (Tasks 3, 4 and 7): wait for the
+  `badge> ` prompt (input typed during linenoise's 500 ms probe is
+  discarded), type `put /littlefs/identity.json <size>\n`, wait for
+  `READY`, send the payload (host-paced, R-D1-1), wait for `OK <size>`
+  and the next prompt, then type `prov apply\n`. `tests/common/provision.rs`
+  and `frontend/src/runtime/provisioner.ts` implement the same flow. If
+  wrong: a firmware that changes its prompt or its `put` handshake breaks
+  both hosts the same way.
+- **R-T1-2, a spec deviation.** Spec criterion 3 expected `PROV FAIL
+  invalid or missing <field>`. The firmware's `%s` is always the path
+  (`APPLY_EFFECTS`), so `console_rejects_an_empty_identity` asserts `PROV
+  FAIL invalid or missing /littlefs/identity.json`; the failing field
+  appears only in `hal_identity`'s `E` log line. If wrong: none; the rung
+  asserts the firmware's own text.
+- **R-T1-1, `claim_id`.** The fixtures use `"100001"`: `badge_token`
+  (`0x4200_f03c`) requires all digits with a first digit other than `0`,
+  the only format check the firmware makes on it (off the provisioning
+  path). If wrong: none on this path; `claim_id` is only length-checked
+  when provisioning.
+- **ROM calls (R-T3-1).** Task 3 stubbed `strlcpy`, `strtol` and
+  `strrchr` (the REPL and `put`); Task 4 stubbed `strcasecmp`, the
+  `double` helpers `__gedf2`, `__ledf2`, `__fixdfsi`, `__adddf3` (the
+  identity load) and the `float` helpers `__mulsf3`, `__addsf3`,
+  `__unordsf2`, `__ltsf2` (onboarding page 6); Task D-M5-2 added
+  `__floatsisf`, `__subsf3`, `__gtsf2` and `atoi`. Each was observed
+  faulting before it was stubbed, has a unit test, and cites its
+  `esp32c3.rom.*.ld` address (`strtol` and `atoi` are in
+  `esp32c3.rom.newlib.ld`; Task 8 corrected the `strtol` citation, which
+  said `libc.ld`). Task 8 also matched `strtol` to the ROM's `_strtol_l`
+  (`0x4003_1dc4`, read from the ROM ELF): the `0x` prefix is taken
+  whatever follows (`"0xg"` parses nothing, `*endptr = nptr`), and an
+  invalid base returns 0 without writing `*endptr`. `errno` is still not
+  set. If wrong: a caller that checks `errno` would miss ERANGE/EINVAL.
+- **R-T4-2, onboarding is not bypassed.** `config system onboard_build
+  <n>` could mark onboarding done from the console, but the rungs walk
+  the eleven pages with buttons and a shake, as a browser user must. If
+  wrong: more modeling than the shortest path needed (the accelerometer).
+- **Task 4's measurements** (local walk, every role, before Task 6
+  committed it): `prov apply` to the onboarding app's first page takes
+  about 11.6M steps; each onboarding response settles 1.5M to 9M steps
+  after a press; the registered screen appears about 4.5M steps after
+  Setup's last START; the launcher draws about 18M steps after HOME (the
+  console says `launched Launcher` about 9M steps earlier). Role hacker
+  reaches the registered screen at about 278.3M steps, the launcher at
+  about 317.5M and the navigated launcher at about 345.7M. The launcher
+  frame is the same for all 11 roles.
 
 ## SC7A20H accelerometer on I2C0 (Task D-M5-2)
 
@@ -477,10 +527,9 @@ v5.5.3 `i2c_master.c`, cited in `peripherals/sc7a20h.rs` and
   `ONBOARDING_RESPONSE_MARGIN` 16M: page 7's ~9M transition plus margin.
   `ANIMATED_PAGE_STEPS` 9M: the walk's settle. No constant is 0.
 - **Suite time.** With these rungs `cargo test -p emulator-core --release
-  --test boot_progress` takes about 36 s wall (about 485 CPU-s; 54
-  tests). Each identity rung is 280M to 345M steps. Task 8's checkpoint
-  fixture is the planned fix; most of the time is in the walk after
-  provisioning, which a first-run checkpoint does not save.
+  --test boot_progress` took about 36 s wall (about 485 CPU-s; 54
+  tests), and the debug `cargo test --workspace` about 8 minutes. Each
+  identity rung is 280M to 345M steps. Task 8 addressed it (below).
 - **Fixture loader.** `common::provision::identity_fixture(role)` reads
   the committed file; `$BADGE_TEST_IDENTITIES` (relative to the repo root)
   overrides the directory, for trying a local variant.
@@ -497,7 +546,7 @@ v5.5.3 `i2c_master.c`, cited in `peripherals/sc7a20h.rs` and
   user's job in the browser. If wrong (`put` drains slower than one
   packet per 48,000 steps): the driver drops payload bytes, `put` blocks,
   and the provisioner stays in `typing`; it has no deadline of its own (the
-  caller's, as in the twin).
+  caller's: the twin's, or the browser runtime's, R-T7-1).
 - **WASM surface.** `serialInput`, `serialPending` and `setAcceleration`
   (one-line passthroughs) in `emulator-wasm`; `bridge.ts`'s handle gains
   those plus `consoleOutput`.
@@ -511,11 +560,207 @@ v5.5.3 `i2c_master.c`, cited in `peripherals/sc7a20h.rs` and
   samples (same hashes, checked by the existing splash and first-run
   twins).
 
+## Frontend provisioning controls (Task 7)
+
+In firmware mode the page shows a role picker (the 11 fixture roles,
+`test-identities.ts`), a "Provision test badge" button, a "Shake" button,
+a status line and the hint "After PROV OK, follow the on-badge setup with
+the button pad; on 'Shake it!' press Shake." (`shell.ts`
+`mountProvisionControls`, wired in `main.ts`). `firmware-runtime.ts`
+polls the provisioner once per frame.
+
+- **R-T7-1, provisioning timeout in emulated steps.** If the provisioner
+  is not `ok` or `failed` within `PROVISION_TIMEOUT_STEPS` = 60,000,000
+  steps after `provision()` (prompt at ~16.8M from boot plus `PROV OK`
+  ~13M later, with 2x margin), it is dropped and the state reads failed
+  "timed out". `reset()` and a second `provision()` abandon the one in
+  flight (Review Focus 5). Steps, not wall time, so a slow browser does
+  not time out early. If wrong: one constant.
+- **R-T7-2, the shake.** `shake()` replays the rungs' pattern (six
+  half-periods of +/-2000 mg on x and y, z at 1000, `SHAKE_HALF_STEPS` =
+  1,000,000 steps each, then rest at (0, 0, 1000)), scheduled off
+  `totalSteps()` in the frame loop. `reset()` cancels a shake and restores
+  the rest acceleration, since the Rust side keeps acceleration across a
+  reset. If wrong: the pattern changes in one place per host.
+- **R-T7-3, minimum press hold.** A browser press is held at least
+  `PRESS_HOLD_STEPS` = 1,600,000 emulated steps (R-T2-1); an earlier
+  release is deferred and applied by the frame loop. At 500,000 steps per
+  frame a quick tap would otherwise be shorter than 100 ms of emulated
+  time and missed. `reset()` sends a real release for any deferred one,
+  so no button stays down. If wrong: a release lags by up to one frame.
+- Not checked in a real browser (no browser driver in Task 7): the DOM
+  glue in `shell.ts`/`main.ts` is covered by typecheck and the production
+  build only. The Milestone 6 backlog lists the open UI minors.
+
+## Suite time (Task 8)
+
+Step 1 of the plan's Task 8 triggered (release `boot_progress` 34.8 s,
+over the plan's ~10 s threshold; debug `cargo test --workspace` 491 s).
+Ruling R-T8-1 set the design:
+
+- **Checkpoints.** `FirmwareRuntime`, `Cpu`, `FirmwareBus` and every
+  peripheral derive `Clone`; a clone is a full snapshot (the image is a
+  shared `Arc`, read-only). `runtime::tests::a_clone_runs_exactly_like_its_original`
+  pins it: from step 1,100,000 a clone and its original each run 100,000
+  more steps and end with equal `pc`, step count, framebuffer and
+  console. `boot_progress.rs` caches, in `OnceLock`s, the stable
+  first-run screen (`FIRST_RUN`), role hacker on onboarding page 6
+  (`OWN_SHAKE_PAGE`), and every role's registered screen (`REGISTERED`)
+  and launcher (`LAUNCHER`). Each state is reached once per test binary,
+  by the first rung that needs it, with every assertion of the walk; the
+  other rungs continue from a clone. Per-role rungs are still full walks
+  and nothing was loosened. A walk that fails leaves its `OnceLock`
+  empty, so every rung that needs it re-runs the walk and fails with its
+  own message. If wrong (a clone shares state with its original): the
+  clone test fails, and rungs could pass on state another rung left.
+- **Debug builds.** `[profile.dev.package.emulator-core] opt-level = 3`
+  in the workspace `Cargo.toml`. Debug assertions and overflow checks are
+  profile-wide and stay on. No rung is `#[ignore]`d or `cfg`-gated. If
+  wrong: a debug-only miscompile would hide behind optimization; the
+  release suite runs the same rungs anyway.
+- **Measured** (18 cores, same machine, before at `6db5824`, after at
+  `1bb8c55`):
+
+  | Suite | Before (wall / CPU) | After (wall / CPU) |
+  |---|---|---|
+  | `cargo test -p emulator-core --release --test boot_progress` | 34.8 s / 479 s | 33.8 s / 336 s |
+  | `cargo test --workspace` (debug) | 491 s / 6,663 s | 25.8 s / 241 s |
+
+  The release wall time is bound by one chain that no checkpoint can
+  split: role hacker's walk to the navigated launcher, about 345M steps
+  in sequence (`launcher_responds_to_navigation` waits on `LAUNCHER`,
+  which waits on `REGISTERED`, `OWN_SHAKE_PAGE` and `FIRST_RUN`). The
+  checkpoints cut the total work by 30%. The release profile is
+  `opt-level = "s"` (for the WASM build); the same suite at `opt-level =
+  3` took 23.0 s wall (measured with `--config`, not committed), which
+  is why the optimized debug build beats the release one. Changing the
+  release profile would also change the WASM binary, so it is in the
+  backlog instead.
+
+## Remarks
+
+- **Finish-line tests** (`emulator-core/tests/boot_progress.rs`):
+  `provisions_<role>_through_the_console` for all 11 roles (onboarding
+  page 1 and the registered screen pinned per role in `ROLE_ROWS`; role
+  hacker's registered screen `0xbd6d761308a7bf24`, and every onboarding
+  page between pinned for hacker), `boots_to_launcher`
+  (`LAUNCHER_HASH` `0xb694a61febfd62ff`), `launcher_is_role_independent`
+  (the same hash for workshop_lead) and `launcher_responds_to_navigation`
+  (DOWN, `0xa2b9da1f0e36757c`), plus
+  `onboarding_shake_page_advances_after_a_shake` (shaken page 6
+  `0xa80a279b127e1bb1`, page 7 `0x110e8782bc4e5ff0`). The console rungs
+  `boot_starts_the_console`,
+  `console_answers_prov_show_on_the_first_run_screen`,
+  `put_accepts_a_payload_larger_than_the_rx_ring` and
+  `console_rejects_an_empty_identity` use no identity. Milestone 4's
+  finish line is unchanged on blank flash: splash `0x5599c270ab0429fa`,
+  first-run screen `0x8c5027cec0f79490`, self-test buttons
+  `0x7f325d838835baaa` (now after a 1.6M-step hold, R-T2-1). The WASM
+  twin reaches `LAUNCHER_HASH` for role hacker through the
+  wasm-bindgen build.
+- **Permission and comparison dates.** The organizers' permission to
+  commit the fake identities was relayed on 2026-10-08 ("commit the
+  identities", R-M5-2). The human partner compared the registered screen,
+  the onboarding pages, the launcher and the launcher after DOWN with the
+  physical badge on 2026-10-08 ("frames are correct"), for role hacker
+  only.
+- **Spec deviations.** Criterion 3's failure text names the path, not a
+  field (R-T1-2). Criterion 4's registered screen comes only after the
+  onboarding app (R-T6-1); the rungs walk it. Criterion 9's controls also
+  include a Shake button (R-T7-2), which the onboarding needs.
+- **Time.** Step counts are not real time: idle time is compressed (WFI
+  fast-forward), `TICKS_PER_STEP` = 1, and I2C, RMT and SPIMEM1 complete
+  at once. Host pacing (`PUT_CHUNK_GAP_STEPS`, `PRESS_HOLD_STEPS`,
+  `SHAKE_HALF_STEPS`) is in steps for the same reason.
 
 ## Milestone 6 backlog
 
-- **Accelerometer in the browser (M6).** Task 6 added the one-line
-  `setAcceleration` passthrough (`emulator-wasm`, `bridge.ts`); the
-  frontend still needs a motion input (Task 7 or M6: a shake button, or
-  `DeviceMotionEvent` on a phone) so onboarding page 6 can be passed in
-  the browser.
+### Apps and UI
+
+- Launching and playing a built-in app (Snake, Dice) from the launcher
+  (the plan's Task 9 stretch, if it does not land in Milestone 5). Dice
+  likely reads the accelerometer.
+- A console pane in the frontend: the firmware's REPL is reachable
+  (`serialInput`, `consoleOutput`), but the page only shows the
+  provisioner's status.
+- Motion input beyond the Shake button (`DeviceMotionEvent` on a phone).
+- Task 7 review minors: a fetch error message lingers and can be masked
+  by a stale provision state (clear it on a successful `provision()` and
+  on reset, `main.ts`); two fast clicks start concurrent fetches and the
+  last to resolve wins, not the last click; deferred releases are only
+  flushed by the frame loop, so switching to Lua mode within 100 ms of a
+  press leaves the firmware button held until resume or reset (flush in
+  `stop()`); the provisioning controls have not been tried in a real
+  browser.
+- Only role hacker's frames were compared with hardware; onboarding page 8
+  ("Bump to connect") is animated and not pinned.
+
+### Peripherals and timing
+
+- RMT transmissions are consumed but not decoded, so the LEDs (including
+  `prov apply`'s green flashes and role colour) are never shown.
+- NFC is not modeled (the self-test waits for a card forever).
+- The ~6,000,000-step busy phase after START on the first-run screen
+  (hot PCs `0x420b_ead4`, `0x420b_b6a4`) is not traced.
+- SC7A20H: data ready is always set (no ODR time base); 1 mg/digit is
+  the typical sensitivity where the datasheet's table says 1024 counts/g;
+  the face-up rest orientation is an assumption (Task D-M5-2's "If
+  wrong" notes).
+- I2C0: an `OP_WRITE` command with an empty TX FIFO leaves the address
+  phase armed (malformed command lists only; untested).
+- USB-Serial-JTAG: where the `put` task spends its ~20-24k steps per
+  64-byte packet is not identified (a per-byte VFS read is the suspect);
+  if it is an emulator gap, `PUT_CHUNK_GAP_STEPS` could shrink.
+  `PACKET_STEPS` uses the ESP-IDF default 160 MHz CPU clock, while the
+  physical badge's boot log reports 80 MHz (notes, "Ground truth"); at 80
+  MHz a packet is ~4,105 steps. Revisit with a cycle model.
+- `R_M5_3`'s closure follows direct calls only (indirect VFS, littlefs
+  and cJSON pointers were not followed).
+- ROM stubs: `strtol`/`atoi` do not set `errno`; the 8 MiB
+  `MAX_STUB_MEMORY_BYTES` cap of the string stubs (`strcasecmp` among
+  them) has no test.
+- Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`),
+  SYSTEM `0x600c_0058`/`+0x08`, RTC_CNTL `0x6000_80bc`. Harmless so far.
+
+### Build and tests
+
+- The release profile is `opt-level = "s"`; at `opt-level = 3` the
+  release `boot_progress` suite runs in 23.0 s instead of 33.8 s, and the
+  WASM build would likely speed up the same way. Needs a WASM size and
+  browser-speed check before changing.
+- The release suite's wall time is one ~345M-step chain (Task 8); only a
+  faster emulator shortens it.
+
+### Carried from Milestones 3 and 4 (untouched)
+
+- ST7789 `MADCTL` (`0x20`, then `0x60`) is unmodeled; orientation is
+  human-confirmed for every pinned frame so far.
+- Every log timestamp up to `main_task: Calling app_main()` reads `I (0)`
+  (likely the unmodeled performance-counter CSR).
+- GPIO0 (the display D/C pin) is routed as SPI2 `FSPIWP`/`FSPIHD`; routing
+  is stored only.
+- eFuse block unmodeled: boot logs chip revision v0.0, the badge is v0.4.
+- `CPU_FREQ_MHZ` stub returns 160; the real CPU runs at 80 MHz.
+- `TICKS_PER_STEP = 1` is about 10x the real SYSTIMER/CPU ratio; no
+  real-time calibration.
+- Flagged ROM-stub guesses: `rom_i2c_readReg*` returning 0,
+  `Cache_Get_*` returning 0 (notes, history item 5).
+- Edge-type interrupts are simplified: `CPU_INT_TYPE_REG` and
+  `CPU_INT_CLEAR_REG` are plain storage.
+- GDMA: DMA spans that cross into an adjacent RAM region are rejected;
+  the RX in-link walk, CPU FIFO push/pop, the `OUT_DSCR*` pre-fetch
+  registers and transfer timing are not modeled; a trailing zero-length
+  `suc_eof` descriptor is never visited; `RESTART` with nothing to
+  restart leaves the channel active.
+- `boot_until_console_contains` checks in 250,000-step chunks, so rung
+  budgets are looser than they read; stable-frame steps are quantized
+  the same way.
+- Zero-latency RMT, I2C0 and SPIMEM1.
+- Small duplications: the `memcpy`/`memset` and `memcmp`/`strncmp` stub
+  arms, and the `header_with_speed_size` test helper in `image.rs` and
+  `rom.rs`.
+
+Resolved from the Milestone 4 backlog in Milestone 5: the provisioned
+identity (and with it the launcher), the USB-Serial-JTAG interrupt
+source, console input, the SC7A20H accelerometer (and a browser Shake
+control), and the shared-checkpoint fixture.

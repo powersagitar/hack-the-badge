@@ -69,8 +69,9 @@
 //!
 //! A host-side queue ([`UsbSerialJtag::host_send`]) feeds the 64-byte OUT
 //! FIFO one full-speed bulk packet at a time: a packet loads when the FIFO
-//! is empty and [`PACKET_STEPS`] CPU steps (as [`PACKET_TICKS`]) have passed since the previous load, and
-//! latches `SERIAL_OUT_RECV_PKT_INT_RAW` (bit 2 of RAW/ST/ENA/CLR,
+//! is empty and [`PACKET_STEPS`] CPU steps (as [`PACKET_TICKS`]) have
+//! passed since the previous load, and latches
+//! `SERIAL_OUT_RECV_PKT_INT_RAW` (bit 2 of RAW/ST/ENA/CLR,
 //! `usb_serial_jtag_reg.h`). `hal/esp32c3/include/hal/usb_serial_jtag_ll.h`'s
 //! `usb_serial_jtag_ll_read_rxfifo` loops while
 //! `ep1_conf.serial_out_ep_data_avail`, reading `ep1.rdwr_byte`; a `lw` of
@@ -405,11 +406,9 @@ mod tests {
     fn packet_pacing_is_a_bus_packet_time_in_cpu_steps() {
         // 51.3 us of full-speed bus x 160 MHz CPU = 8,208, rounded to the
         // brief's 8,210 steps; ticks and steps coincide (TICKS_PER_STEP = 1).
+        // The load at PACKET_TICKS is checked by behaviour in
+        // `next_packet_waits_for_an_empty_fifo_and_one_packet_time`.
         assert_eq!(PACKET_STEPS, 8_210);
-        assert_eq!(
-            PACKET_TICKS,
-            PACKET_STEPS * crate::peripherals::systimer::TICKS_PER_STEP
-        );
     }
 
     #[test]

@@ -32,6 +32,11 @@ pub enum Outcome {
     Timeout(String),
 }
 
+/// The console text after byte `marker`, or all of it if `marker` is past
+/// the end. Offsets are stable only until the 256 KiB console ring
+/// (`CONSOLE_CAPACITY`) wraps, far above what boot and provisioning print;
+/// after a wrap the fallback rescans the whole (newest) text, so an old
+/// match could be seen again.
 fn console_since(rt: &FirmwareRuntime, marker: usize) -> String {
     let text = rt.console_output();
     text.get(marker..).unwrap_or(&text).to_string()

@@ -30,6 +30,17 @@
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
 //!
+//! ## Other host input (Milestone 5)
+//!
+//! - [`FirmwareRuntime::serial_input`] queues bytes a USB host sends to the
+//!   badge's console (USB-Serial-JTAG OUT, paced 64-byte packets; see
+//!   `crate::peripherals::usb_serial_jtag`); [`FirmwareRuntime::serial_pending`]
+//!   reports what the firmware has not read yet. Provisioning types the
+//!   firmware's own `put` / `prov apply` commands through it.
+//! - [`FirmwareRuntime::set_acceleration`] sets what the SC7A20H
+//!   accelerometer on I2C0 reports (`crate::peripherals::sc7a20h`); the
+//!   onboarding app's "Shake it!" page needs a shake.
+//!
 //! ## Checkpoints
 //!
 //! A `FirmwareRuntime` is `Clone`, and a clone is a complete, independent
@@ -106,8 +117,10 @@ impl FirmwareRuntime {
     }
 
     /// Re-boots from the same image: a fresh `Cpu`/`FirmwareBus` pair (so RAM,
-    /// peripheral state and the reconstructed framebuffer all start over),
-    /// with the currently-held buttons re-applied.
+    /// peripheral state, the emulated flash and the reconstructed
+    /// framebuffer all start over), with the currently-held buttons and the
+    /// host-set acceleration ([`FirmwareRuntime::set_acceleration`])
+    /// re-applied. Queued serial input is dropped with the old bus.
     ///
     /// Can only fail if the image stopped parsing, which can't happen for an
     /// image that already parsed once — but the error is propagated rather

@@ -88,6 +88,10 @@
 //!    that firmware console output accumulates into); `FirmwareBus::write_byte`
 //!    passes `&mut self.console` straight through, another instance of the
 //!    "no trait object" ruling's direct concrete-field access.
+//!    Since Milestone 5 it also receives: a host queue feeds paced 64-byte
+//!    OUT packets (`PACKET_STEPS`), its `INT_ST` drives interrupt source 26
+//!    ([`FirmwareBus::pending_sources`]), and the idle fast-forward stops
+//!    at the next host packet ([`FirmwareBus::ticks_until_next_event`]).
 //! 9. **TIMG0** ([`crate::mem::soc::TIMG0_RANGE`]): routed to
 //!    [`FirmwareBus::timg0`], same ruling — see `crate::peripherals::timg`
 //!    for the RTC slow-clock calibration model `rtc_clk_cal_internal()`

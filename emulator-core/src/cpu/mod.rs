@@ -735,6 +735,9 @@ impl Cpu {
                     _ => {}
                 }
                 let mut base = base_arg;
+                // An invalid base returns 0 and leaves `*endptr` alone (the
+                // ROM's `_strtol_l`, 0x4003_1dc4, also sets `errno` = EINVAL;
+                // `errno` is not modeled).
                 let valid_base = base == 0 || (2..=36).contains(&base);
                 let digit = |c: u8| match c {
                     b'0'..=b'9' => u32::from(c - b'0'),
@@ -743,8 +746,9 @@ impl Cpu {
                     _ => 99,
                 };
                 if valid_base && (base == 0 || base == 16) && at(bus, i) == b'0'
+                    // Taken whatever follows, as the ROM does: "0xg" parses no
+                    // digit, so `*endptr` = `nptr`.
                     && matches!(at(bus, i + 1), b'x' | b'X')
-                    && digit(at(bus, i + 2)) < 16
                 {
                     i += 2;
                     base = 16;
@@ -774,7 +778,7 @@ impl Cpu {
                 } else {
                     acc as i32
                 };
-                if endptr != 0 {
+                if endptr != 0 && valid_base {
                     let end = if consumed { nptr.wrapping_add(i) } else { nptr };
                     for (k, b) in end.to_le_bytes().iter().enumerate() {
                         bus.write8(endptr.wrapping_add(k as u32), *b);

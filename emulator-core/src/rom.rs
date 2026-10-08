@@ -936,7 +936,8 @@
 //! [`STRLCPY`]), `strtol` (`0x4000_0454`, [`STRTOL`]) and `strrchr`
 //! (`0x4000_0408`, [`STRRCHR`]), each a real HLE observed faulting on the
 //! console REPL's first `prov show` / `put` (decision R-T3-1; addresses from
-//! `esp32c3.rom.libc.ld`, semantics from the ROM ELF's newlib code).
+//! `esp32c3.rom.libc.ld`, `strtol`'s from `esp32c3.rom.newlib.ld`;
+//! semantics from the ROM ELF's newlib code).
 //!
 //! **As of the end of Milestone 4**: 109 stubs and two guest-executed ROM
 //! routines (`qsort`, `strdup`), unchanged since Task D-M4-2. Boot reaches
@@ -1481,7 +1482,7 @@ pub const STRLCPY: u32 = 0x4000_03f0;
 /// identity's `role` against the role tables with it.
 pub const STRCASECMP: u32 = 0x4000_03d0;
 
-/// ROM libc `strtol`'s fixed address (`esp32c3.rom.libc.ld`: `strtol =
+/// ROM newlib `strtol`'s fixed address (`esp32c3.rom.newlib.ld`: `strtol =
 /// 0x40000454;`, ROM ELF `__call_strtol`). Real HLE
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strtol`]), Milestone 5 Task 3:
 /// the console's `put <path> <size>` parses its size with it.
@@ -3810,6 +3811,9 @@ mod tests {
             for i in 0..32 {
                 bus.write8(s + i, 0);
             }
+            for k in 0..4 {
+                bus.write8(endp + k, 0x55);
+            }
             for (i, x) in text.iter().enumerate() {
                 bus.write8(s + i as u32, *x);
             }
@@ -3833,6 +3837,14 @@ mod tests {
         assert_eq!(call(b"99999999999", 10, true).0, i32::MAX, "saturates");
         assert_eq!(call(b"-99999999999", 10, true).0, i32::MIN, "saturates");
         assert_eq!(call(b"7", 10, false).0, 7, "NULL endptr is allowed");
+        assert_eq!(call(b"+5", 10, true), (5, 2), "plus sign");
+        assert_eq!(call(b" \t\n", 10, true), (0, 0), "whitespace only: endptr = nptr");
+        // The ROM takes `0x` whatever follows (`_strtol_l`, 0x4003_1dc4).
+        assert_eq!(call(b"0x", 16, true), (0, 0), "bare 0x: no digit");
+        assert_eq!(call(b"0xg", 0, true), (0, 0), "0x then no hex digit");
+        let untouched = 0x5555_5555u32.wrapping_sub(s);
+        assert_eq!(call(b"12", 1, true), (0, untouched), "invalid base");
+        assert_eq!(call(b"12", 37, true), (0, untouched), "invalid base");
     }
 
     /// ROM `atoi` = `strtol(s, NULL, 10)`: base 10 only, `a1`/`a2` ignored,
@@ -3885,18 +3897,20 @@ mod tests {
         for (i, x) in b"/a/b.json\0".iter().enumerate() {
             bus.write8(s + i as u32, *x);
         }
-        let mut call = |c: u32| {
+        let mut call = |at: u32, c: u32| {
             cpu.regs.write(REG_RA, 0x4000_1000);
-            cpu.regs.write(REG_A0, s);
+            cpu.regs.write(REG_A0, at);
             cpu.regs.write(REG_A1, c);
             cpu.regs.pc = STRRCHR;
             let info = cpu.step(&mut bus);
             assert_eq!(info.rom_stub, Some(STRRCHR));
             cpu.regs.read(REG_A0)
         };
-        assert_eq!(call(u32::from(b'/')), s + 2);
-        assert_eq!(call(u32::from(b'z')), 0);
-        assert_eq!(call(0), s + 9, "the terminator counts");
+        assert_eq!(call(s, u32::from(b'/')), s + 2);
+        assert_eq!(call(s, u32::from(b'z')), 0);
+        assert_eq!(call(s, 0), s + 9, "the terminator counts");
+        assert_eq!(call(s + 9, u32::from(b'/')), 0, "empty string: no match");
+        assert_eq!(call(s + 9, 0), s + 9, "empty string: its terminator");
     }
 
     #[test]
@@ -4015,6 +4029,13 @@ mod tests {
         // Only A..Z fold (the ROM's C-locale ctype): '@' and '[' do not.
         assert_eq!(call(b"[\0", b"{\0"), i32::from(b'[') - i32::from(b'{'));
         assert_eq!(call(b"\xC9\0", b"\xE9\0"), 0xC9 - 0xE9, "no Latin-1 folding");
+        // A bad pointer never panics: unmapped memory reads 0, an empty string.
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, 0x1000_0000);
+        cpu.regs.write(REG_A1, b);
+        cpu.regs.pc = STRCASECMP;
+        assert_eq!(cpu.step(&mut bus).rom_stub, Some(STRCASECMP));
+        assert_eq!(cpu.regs.read(REG_A0) as i32, -i32::from(b'\xE9'), "\"\" vs \"\\xE9\"");
     }
 
     #[test]

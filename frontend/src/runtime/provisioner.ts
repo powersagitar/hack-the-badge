@@ -58,7 +58,14 @@ export function createProvisioner(handle: FirmwareEmulatorHandle, identityJson: 
   const payload = encoder.encode(identityJson);
   type Phase = "prompt" | "ready" | "payload" | "putReply" | "applyReply" | "done";
   let phase: Phase = "prompt";
-  /** Console offset where the current command's output starts. */
+  /**
+   * Console offset where the current command's output starts. Offsets stay
+   * valid only while the console has not wrapped: it keeps the newest 256 KiB
+   * (`CONSOLE_CAPACITY`, emulator-core `console.rs`), far above what boot
+   * and provisioning print (an idle badge holds about 2.3 KB). Past a wrap,
+   * `since()` is a shifted window: it may re-see older output or, with the
+   * buffer full, show nothing new, and the caller's timeout fires.
+   */
   let marker = 0;
   let sent = 0;
   let lastChunkAt = 0;

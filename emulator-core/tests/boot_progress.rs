@@ -11,15 +11,21 @@
 //!   ([`boots_to_first_real_frame`], [`boots_to_first_run_screen`],
 //!   [`boots_to_launcher`]).
 //!
-//! The finish line is [`boots_to_launcher`] plus
-//! [`launcher_responds_to_navigation`]: the badge is provisioned through
-//! its own console with a committed fake identity
-//! (`common::provision::identity_fixture`), walked through onboarding,
-//! and HOME opens the launcher. Milestone 4's finish line
-//! ([`boots_to_first_run_screen`] plus
+//! The finish line (Milestone 5) is provisioning plus the launcher: every
+//! `provisions_<role>_through_the_console` rung (the badge is provisioned
+//! through its own USB console with a committed fake identity,
+//! `common::provision::identity_fixture`, and walked through onboarding to
+//! My Badge's registered screen), [`boots_to_launcher`] (HOME opens the
+//! launcher) and [`launcher_responds_to_navigation`]. Milestone 4's finish
+//! line ([`boots_to_first_run_screen`] plus
 //! [`first_run_screen_responds_to_start`]) still holds on blank flash.
-//! Step numbers in the docs below are measured with today's emulator
-//! unless marked otherwise; a budget is a margin, not a pin. The stall-by-stall history behind each rung is in
+//!
+//! Rungs that share a long walk continue from a checkpoint (a
+//! `FirmwareRuntime` clone cached in a `OnceLock`; see "Checkpoints"
+//! below), so each walk runs once per test binary; every rung still
+//! asserts its whole walk. Step numbers in the docs below are measured
+//! with today's emulator unless marked otherwise; a budget is a margin, not
+//! a pin. The stall-by-stall history behind each rung is in
 //! `docs/firmware-emulator-notes.md` ("History"); when boot moves, update
 //! the rung whose budget it affects.
 use emulator_core::runtime::FirmwareRuntime;
@@ -909,9 +915,10 @@ const FIRST_RUN_MAX_STEPS: u64 = 17_500_000;
 /// screen and it holds. The emulated flash has no identity
 /// (`/littlefs/identity.json`), so the app registry's first app, My Badge,
 /// shows its unregistered first-run screen; on an unprovisioned badge it
-/// keeps HOME for itself, so the app launcher is not reachable from here
-/// (the notes' "Current state"). Compared by eye with the physical badge
-/// after a factory reset on 2026-10-07: content and orientation match.
+/// keeps HOME for itself, so the app launcher is reached only after
+/// provisioning ([`boots_to_launcher`]). Compared by eye with the physical
+/// badge after a factory reset on 2026-10-07: content and orientation
+/// match.
 #[test]
 fn boots_to_first_run_screen() {
     let rt = first_run_screen();
@@ -982,8 +989,8 @@ fn boot_starts_the_console() {
 const CONSOLE_DEADLINE: u64 = 23_000_000;
 
 /// [`put_accepts_a_payload_larger_than_the_rx_ring`]: total-step deadline.
-/// Measured (Milestone 5 Task D-M5-1): finished at 17.88M (50,000-step sampling, host-paced chunks); that + 25%, rounded
-/// to 1,000,000.
+/// Measured (Milestone 5 Task D-M5-1): finished at 17.88M (50,000-step
+/// sampling, host-paced chunks); that + 25%, rounded to 1,000,000.
 const RING_TEST_DEADLINE: u64 = 23_000_000;
 
 // ---------------------------------------------------------------------

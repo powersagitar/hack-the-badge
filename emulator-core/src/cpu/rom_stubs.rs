@@ -326,17 +326,19 @@ pub enum RomStubEffect {
     /// the end of the string. Scan capped at [`MAX_STUB_MEMORY_BYTES`].
     Strrchr,
     /// `long strtol(const char *nptr, char **endptr, int base)`: newlib's
-    /// `strtol` (ROM slot `__call_strtol`, `esp32c3.rom.libc.ld`
+    /// `strtol` (ROM slot `__call_strtol`, `esp32c3.rom.newlib.ld`
     /// `strtol = 0x40000454`). Skips C-locale whitespace, an optional sign,
-    /// and for base 0 or 16 a `0x`/`0X` prefix (base 0 then picks 8 for a
-    /// leading `0`, else 10); accepts digits and letters below `base`;
+    /// and for base 0 or 16 a `0x`/`0X` prefix, taken whatever follows it
+    /// (ROM ELF `_strtol_l` at `0x4003_1dc4`; base 0 otherwise picks 8 for
+    /// a leading `0`, else 10); accepts digits and letters below `base`;
     /// saturates at `LONG_MAX`/`LONG_MIN` on overflow. If no digit is
     /// consumed `*endptr = nptr` and 0 is returned; otherwise `*endptr`
     /// points past the last digit (written only when `endptr = a1` is
-    /// non-NULL). `errno` (ERANGE/EINVAL) is not set: the ROM keeps it in a
-    /// per-task reent struct the emulator does not model, and the observed
-    /// caller (`put`'s size parse) checks only `endptr`. Scan capped at
-    /// [`MAX_STUB_MEMORY_BYTES`].
+    /// non-NULL). An invalid base (1 or above 36) returns 0 and leaves
+    /// `*endptr` unwritten. `errno` (ERANGE/EINVAL) is not set: the ROM
+    /// keeps it in a per-task reent struct the emulator does not model, and
+    /// the observed caller (`put`'s size parse) checks only `endptr`. Scan
+    /// capped at [`MAX_STUB_MEMORY_BYTES`].
     Strtol,
     /// `int atoi(const char *s)`: the ROM's newlib `atoi` (slot
     /// `__call_atoi`, `esp32c3.rom.newlib.ld` `atoi = 0x4000044c`), whose
@@ -747,8 +749,9 @@ impl Int32UnaryOp {
 /// `unsigned int` uses `a0` alone.
 ///
 /// Semantics: GCC's libgcc soft-fp (`libgcc/soft-fp/{floatunsidf,adddf3,
-/// muldf3,divdf3,fixunsdfsi,fixdfsi,gedf2,ledf2}.c` over `op-common.h`), configured for RISC-V without
-/// an FPU by `libgcc/config/riscv/sfp-machine.h`: round to nearest
+/// muldf3,divdf3,fixunsdfsi,fixdfsi,gedf2,ledf2}.c` over `op-common.h`),
+/// configured for RISC-V without an FPU by
+/// `libgcc/config/riscv/sfp-machine.h`: round to nearest
 /// (`FP_INIT_ROUNDMODE _frm = FP_RND_NEAREST` without `__riscv_flen`), full
 /// subnormal support, and every NaN result the canonical quiet NaN
 /// (`_FP_NANSIGN_D 0`, `_FP_NANFRAC_D _FP_QNANBIT_D, 0`,
@@ -1849,6 +1852,16 @@ mod tests {
         assert_eq!(Gt.apply(f(0.0), f(-0.0)), 0);
         assert_eq!(Gt.apply(f(-1.0), f(1200.0)) as i32, -1);
         assert_eq!(Gt.apply(f(1.0), nan) as i32, -2);
+        // Signed zero, overflow to infinity, infinities and subnormals.
+        assert_eq!(Add.apply(f(-0.0), f(-0.0)), f(-0.0));
+        assert_eq!(Sub.apply(f(-0.0), f(0.0)), f(-0.0));
+        assert_eq!(Mul.apply(f(f32::MAX), f(2.0)), f(f32::INFINITY));
+        assert_eq!(Add.apply(f(f32::MAX), f(f32::MAX)), f(f32::INFINITY));
+        assert_eq!(Gt.apply(f(f32::INFINITY), f(f32::MAX)), 1);
+        assert_eq!(Lt.apply(f(f32::NEG_INFINITY), f(f32::NEG_INFINITY)), 0);
+        let sub = f32::from_bits(1); // the smallest subnormal
+        assert_eq!(Add.apply(f(sub), f(sub)), 2, "subnormals are kept");
+        assert_eq!(Gt.apply(f(sub), f(0.0)), 1);
         // __floatsisf: signed, exact below 2^24, round-to-nearest-even above.
         assert_eq!(FloatSi.apply(1000, 0xDEAD), f(1000.0));
         assert_eq!(FloatSi.apply(-2048i32 as u32, 0), f(-2048.0));
@@ -1911,6 +1924,15 @@ mod tests {
         assert_eq!(FixSi.apply(d(f64::NEG_INFINITY), 0), int(i32::MIN));
         assert_eq!(FixSi.apply(SOFT_FP_CANONICAL_NAN, 0), int(i32::MAX));
         assert_eq!(FixSi.apply(0xFFF8_0000_0000_0000, 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(d(-0.9), 0), int(0), "(-1, 1) truncates to 0");
+        assert_eq!(FixSi.apply(d(0.9), 0), int(0));
+        assert_eq!(FixSi.apply(d(-2_147_483_648.0), 0), int(i32::MIN), "-2^31 exact");
+        // Signed zero, overflow to infinity and infinities in compares.
+        assert_eq!(Add.apply(d(-0.0), d(-0.0)), d(-0.0));
+        assert_eq!(Add.apply(d(-0.0), d(0.0)), d(0.0));
+        assert_eq!(Mul.apply(d(f64::MAX), d(2.0)), d(f64::INFINITY));
+        assert_eq!(Ge.apply(d(f64::INFINITY), d(f64::INFINITY)), int(0));
+        assert_eq!(Le.apply(d(f64::NEG_INFINITY), d(f64::MIN)), int(-1));
         // __gedf2 / __ledf2: -1/0/1, and the unordered results -2 / 2.
         for (op, nan) in [(Ge, -2), (Le, 2)] {
             assert_eq!(op.apply(d(1.0), d(2.0)), int(-1));
