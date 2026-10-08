@@ -320,9 +320,9 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   "handles HOME" hook (`0x4201_3920`) always says yes, and its button
   handler (`0x4201_4130`) reacts only to START while unprovisioned; with
   the flag set, HOME goes to the launcher (`0x4203_8cba`). So a synthetic
-  identity in the littlefs `storage` partition (its format to be read from
-  the firmware, never from the physical badge's dump) would get there; it
-  needs a data-handling ruling first. Then the planned launcher rungs:
+  identity in the littlefs `storage` partition (its format read from the
+  firmware; see `milestone-5-decisions.md`, ruling R-M5-1) would get
+  there; it needs a data-handling ruling first. Then the planned launcher rungs:
   `boots_to_launcher` and a DOWN/RIGHT navigation rung (whichever moves
   the selection).
 - Launching and playing a built-in app (Snake, Dice) comes after the

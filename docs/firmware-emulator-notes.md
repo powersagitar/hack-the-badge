@@ -2012,6 +2012,52 @@ writes as byte-split words (all failed before the change). Decisions are in
   `boot_progress.rs`'s and `rom_stub_boot.rs`'s docs is in this log; the
   test docs now say only what each rung asserts.
 
+### Milestone 5 Task 1: the provisioning path
+
+A trace of `factory.bin` only (no emulator change): segments disassembled
+from the image, ROM names from Espressif's ROM ELF, and single-stepped
+scratch runs of the blank-flash boot. Every fact, with its firmware
+address, is in `milestone-5-decisions.md`'s "Trace facts"; in short:
+
+- **The provisioned flag** (`0x3fca_92b2`, byte +2 of the 0x1B4-byte
+  identity record at `0x3fca_92b0`) is set only by `hal_identity`'s
+  parser (`0x4200_e64e`), when `/littlefs/identity.json` passes every
+  check, and reaches RAM through the loader (`0x4200_e8a6`), which runs
+  at boot and from `prov apply`. NVS `badge_upload/credential` plays no
+  part in it.
+- **Validation:** 1..4096 bytes of JSON; `badge_id` and `display_name`
+  required non-empty; ten string fields with fixed maximum lengths (63,
+  39, 23, 19 or 31 bytes); `version`, `attendee_id` and
+  `provisioned_unix` accepted as numbers or decimal strings with no range
+  check (`version` is never compared); `role` matched case-insensitively
+  against an 11-entry table (`hacker` .. `visitor`), falling back to
+  `hacker`; optional `role_color`.
+- **The console does start in the emulator.** `app_main` calls
+  `hal_console_start()` unconditionally after the first app launch, and
+  it completes (REPL up, `app_main` returns at step 16,552,541). Its
+  output, and everything printed after the USB-Serial-JTAG driver is
+  installed, sits in the driver's 256-byte TX ring buffer: only the
+  driver's ISR moves it to the FIFO, and that interrupt source is not
+  modeled. Nothing blocks; once the buffer is full, writes are refused at
+  once. Task 2's interrupt source should release it.
+- **The REPL** runs in linenoise's dumb mode (its 500 ms terminal probe
+  gets no answer and discards input received meanwhile); `\r` or `\n`
+  ends a line. `put <path> <size>` prints `READY`, then `read()`s exactly
+  `<size>` bytes from stdin in 256-byte chunks; bytes beyond the driver's
+  256-byte RX ring buffer are dropped by its ISR, so the payload is sent
+  after `READY`.
+- **`prov apply`** loads and validates the file, resets onboarding
+  (`system.onboard_build = -1`, the `tutorial=reset` in its output),
+  prints `PROV OK id=..` (with the BLE address) and a summary line, and
+  sets the LEDs; it neither switches apps nor restarts. My Badge's tick
+  notices the new identity, redraws, and hands over to the onboarding app
+  ("Setup") while onboarding is pending.
+- **R-M5-3:** no signature, HMAC or hash check and no MAC/eFuse binding
+  on the path; the only MAC read is the printed BLE address.
+- **Local fixtures** (one per role, `local/m5-identities/`, gitignored
+  until the R-M5-2 gate) were written by hand from the traced schema and
+  cross-checked against the structure of a registered badge's record.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
