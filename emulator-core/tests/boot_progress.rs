@@ -20,6 +20,9 @@ use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+mod common;
+use common::provision::{self, Outcome};
+
 fn factory() -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/factory.bin"),
@@ -932,9 +935,10 @@ const SELF_TEST_BUTTONS_HASH: u64 = 0x7f32_5d83_8835_baaa;
 const PRESS_HOLD_STEPS: u32 = 1_600_000;
 
 /// [`first_run_screen_responds_to_start`]'s cap: the self-test frame is
-/// first sampled at step 22,350,000; that + [`AFTER_PRESS_STABLE_FOR`] +
-/// 1,000,000, rounded up to a 250,000 multiple.
-const SELF_TEST_MAX_STEPS: u64 = 31_500_000;
+/// first sampled at step 22,850,000 (with the 1.6M-step hold); that +
+/// [`AFTER_PRESS_STABLE_FOR`] + 1,000,000, rounded up to a 250,000
+/// multiple.
+const SELF_TEST_MAX_STEPS: u64 = 32_000_000;
 
 /// Button input reaches the firmware: from the stable first-run screen, a
 /// press and release of slot 0 (START) starts My Badge's hardware
@@ -962,5 +966,70 @@ fn first_run_screen_responds_to_start() {
         run_until_stable_frame(&mut rt, SELF_TEST_MAX_STEPS, AFTER_PRESS_STABLE_FOR, &[]);
     assert_ne!(hash, FIRST_RUN_HASH, "START changed nothing");
     assert_eq!(hash, SELF_TEST_BUTTONS_HASH, "stable at step {step}");
+    assert_no_panic_text(&rt);
+}
+
+/// Milestone 5 Task 3: `app_main` reaches `hal_console_start()` on blank
+/// flash, as on the physical badge (the line follows `app_reg: launched My
+/// Badge`); the console runs the interrupt-driven USB-Serial-JTAG driver,
+/// so this needs Task 2's interrupt source. First printed at step
+/// 16,860,000 (10,000-step sampling); budget = that + 25%, rounded to
+/// 1,000,000.
+#[test]
+fn boot_starts_the_console() {
+    assert_reaches("hal_console: console started", 21_000_000);
+}
+
+/// [`console_answers_prov_show_on_the_first_run_screen`] and later
+/// provisioning rungs: total-step deadline. Measured (Milestone 5 Task 3):
+/// the prompt appears at 16.78M, `put` is READY at 17.24M, `prov apply`
+/// answers by 17.33M, and the stable-frame check after it ends near
+/// 18.4M; that + 25%, rounded to 1,000,000.
+const CONSOLE_DEADLINE: u64 = 23_000_000;
+
+/// Boots to the stable first-run screen (blank flash).
+fn first_run_screen() -> FirmwareRuntime {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
+    let (hash, _) = run_until_stable_frame(
+        &mut rt,
+        FIRST_RUN_MAX_STEPS,
+        BOOT_STABLE_FOR,
+        &[SPLASH_HASH],
+    );
+    assert_eq!(hash, FIRST_RUN_HASH);
+    rt
+}
+
+/// The console takes input on the first-run screen: `prov show` reports an
+/// unprovisioned badge, as the registration desk would see it.
+#[test]
+fn console_answers_prov_show_on_the_first_run_screen() {
+    let mut rt = first_run_screen();
+    assert!(
+        provision::wait_for_any(&mut rt, 0, &[provision::PROMPT], CONSOLE_DEADLINE).is_some(),
+        "no prompt"
+    );
+    match provision::type_line(&mut rt, "prov show", CONSOLE_DEADLINE) {
+        Outcome::Done(text) => assert!(text.contains("provisioned=0"), "{text}"),
+        Outcome::Timeout(text) => panic!("no prompt after `prov show`:\n{text}"),
+    }
+    assert_no_panic_text(&rt);
+}
+
+/// The whole `put` / `prov apply` path, with a record the firmware must
+/// reject: an empty JSON object. Nothing identity-shaped is involved. The
+/// firmware's message names the file path, not the failing field (Task 1,
+/// `APPLY_EFFECTS`: the `%s` is always `/littlefs/identity.json`).
+#[test]
+fn console_rejects_an_empty_identity() {
+    let mut rt = first_run_screen();
+    let err = provision::provision(&mut rt, b"{}", CONSOLE_DEADLINE)
+        .expect_err("`{}` must not provision");
+    assert!(
+        err.contains("PROV FAIL invalid or missing /littlefs/identity.json"),
+        "{err}"
+    );
+    let (hash, _) = run_until_stable_frame(&mut rt, CONSOLE_DEADLINE, BOOT_STABLE_FOR, &[]);
+    assert_eq!(hash, FIRST_RUN_HASH, "still unregistered");
     assert_no_panic_text(&rt);
 }

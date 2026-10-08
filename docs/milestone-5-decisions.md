@@ -271,9 +271,26 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
 - **R-T2-1 (press hold):** `first_run_screen_responds_to_start` now holds
   START for `PRESS_HOLD_STEPS` = 1,600,000 steps (100 ms of emulated time),
   not 100,000. Why: with the console draining, the firmware's button
-  polling falls outside a 6.25 ms window; the old hold registered only
-  because the undrained console left the firmware idle. The expected
+  polling falls outside a 6.25 ms window; the old hold registered, likely
+  only because the undrained console left the firmware idle (unmeasured). The expected
   `SELF_TEST_BUTTONS_HASH` is unchanged. If wrong: the test no longer
   models a realistic press, and a slow poll could still miss it.
+  `SELF_TEST_MAX_STEPS` followed: the self-test frame is first sampled at
+  22,850,000 with the 1.6M hold, so the cap is 22.85M + 8M + 1M rounded up
+  to 250,000 = 32,000,000 (was 31,500,000 from the 100k-hold figure).
+- **R-T3-1 (ROM calls on the console path):** a ROM call that faults gets a
+  real stub in the task that hits it (Global Constraints). Task 3 added
+  `strlcpy`, `strtol` and `strrchr` (notes, "Milestone 5 Task 3"). If wrong:
+  `strtol` ignoring `errno` would matter to a caller that checks it.
+- **`put` payload timing (replaces `PUT_SETTLE_STEPS`):** the helper waits
+  for `READY` in the console output before sending the payload (R-T1-3);
+  there is no fixed sleep. `READY` is matched as a substring, so it works
+  whether or not the firmware terminates the line (the capture shows
+  `READY\r\n`). The payload (up to ~320 bytes) exceeds the driver's
+  256-byte RX ring buffer, whose ISR drops what does not fit; `put` reads
+  with raw `read()` only after printing `READY`, and the emulated host
+  paces 64-byte packets, so the ring is drained as it fills. The deadline
+  is the only step bound. If wrong: a firmware that prints `READY` before
+  it can read would lose payload bytes.
 
 ## Milestone 6 backlog
