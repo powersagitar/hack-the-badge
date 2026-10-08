@@ -29,6 +29,14 @@
 //! total (9) — which is exactly the number of names in `frontend/src/badge/input.ts`'s
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
+//!
+//! ## Checkpoints
+//!
+//! A `FirmwareRuntime` is `Clone`, and a clone is a complete, independent
+//! snapshot (CPU, bus, every peripheral, the flash chip; the image is
+//! shared read-only). The boot rungs reach a shared state once and continue
+//! from clones (`tests/boot_progress.rs`); pinned by
+//! `tests::a_clone_runs_exactly_like_its_original`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +78,7 @@ pub struct RunSummary {
 }
 
 /// The real-firmware emulator: CPU + bus + the image they were built from.
+#[derive(Clone)]
 pub struct FirmwareRuntime {
     image: Arc<[u8]>,
     cpu: Cpu,
@@ -476,6 +485,34 @@ mod tests {
             Err(other) => panic!("unexpected parse error: {other:?}"),
             Ok(_) => panic!("an all-zero blob must not parse as an app image"),
         }
+    }
+
+    /// A clone is a full checkpoint (the boot rungs share them,
+    /// `tests/boot_progress.rs`): from a real-firmware state just before the
+    /// first pixels land (~1.13M steps), a clone and its original each run
+    /// 100,000 more steps and end identical, and the original's run does not
+    /// leak into the clone.
+    #[test]
+    fn a_clone_runs_exactly_like_its_original() {
+        let image = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../frontend/public/firmware/factory.bin"),
+        )
+        .expect("factory.bin");
+        let mut original = FirmwareRuntime::from_image(&image).expect("boot");
+        original.run(1_100_000);
+        let mut clone = original.clone();
+        original.run(100_000);
+        assert_eq!(clone.total_steps(), 1_100_000, "the clone did not move");
+        clone.run(100_000);
+        assert_eq!(clone.pc(), original.pc());
+        assert_eq!(clone.total_steps(), original.total_steps());
+        assert_eq!(clone.framebuffer(), original.framebuffer());
+        assert_eq!(clone.console_output(), original.console_output());
+        assert!(
+            original.framebuffer().iter().any(|px| *px != 0),
+            "the window drew pixels, so the framebuffers compared are not blank"
+        );
     }
 
     /// Bit-bangs a 74HC165 `LOAD` pulse through the real GPIO registers, the

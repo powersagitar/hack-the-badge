@@ -199,6 +199,7 @@ pub struct UnmappedAccess {
 
 /// A RAM-copied window: `[load_addr, load_addr + data.len())` is backed by a
 /// real, mutable, growable-at-construction-time buffer.
+#[derive(Clone)]
 struct RamRegion {
     load_addr: u32,
     data: Vec<u8>,
@@ -290,6 +291,7 @@ impl RomDataBlob {
 /// image. See the module-level docs for the ordered-sequence-of-named-
 /// regions read/write dispatch (XIP, RAM, ROM code, then one concrete field
 /// per peripheral, then a never-panic catch-all).
+#[derive(Clone)]
 pub struct FirmwareBus {
     /// The flash MMU table (`crate::peripherals::mmu`): every DBUS/IBUS
     /// access translates through it to [`FirmwareBus::flash_chip`].

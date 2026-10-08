@@ -4,3 +4,11 @@ members = ["emulator-core", "emulator-wasm"]
 
 [profile.release]
 opt-level = "s"
+
+# Debug builds (`cargo test --workspace`) optimize the emulator core: the
+# boot rungs run hundreds of millions of emulated instructions, which an
+# unoptimized core turns into minutes. Debug assertions and overflow checks
+# stay on (they are profile-wide, not overridden here), so the debug suite
+# still checks what a debug build checks; only the code generation changes.
+[profile.dev.package.emulator-core]
+opt-level = 3

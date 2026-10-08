@@ -54,6 +54,7 @@ pub struct StepInfo {
 }
 
 /// The RV32IMC CPU core.
+#[derive(Clone)]
 pub struct Cpu {
     pub regs: Registers,
     pub csr: Csrs,

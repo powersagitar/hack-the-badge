@@ -25,6 +25,7 @@
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 mod common;
 use common::provision::{self, Outcome};
@@ -913,14 +914,7 @@ const FIRST_RUN_MAX_STEPS: u64 = 17_500_000;
 /// after a factory reset on 2026-10-07: content and orientation match.
 #[test]
 fn boots_to_first_run_screen() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
-    let (hash, step) = run_until_stable_frame(
-        &mut rt,
-        FIRST_RUN_MAX_STEPS,
-        BOOT_STABLE_FOR,
-        &[SPLASH_HASH],
-    );
-    assert_eq!(hash, FIRST_RUN_HASH, "stable at step {step}");
+    let rt = first_run_screen();
     assert!(
         rt.console_output().contains("app_reg: launched My Badge"),
         "console:\n{}",
@@ -955,14 +949,7 @@ const SELF_TEST_MAX_STEPS: u64 = 32_000_000;
 #[test]
 fn first_run_screen_responds_to_start() {
     const START: usize = 0;
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
-    let (hash, _) = run_until_stable_frame(
-        &mut rt,
-        FIRST_RUN_MAX_STEPS,
-        BOOT_STABLE_FOR,
-        &[SPLASH_HASH],
-    );
-    assert_eq!(hash, FIRST_RUN_HASH);
+    let mut rt = first_run_screen();
 
     rt.set_raw_button(START, true);
     let summary = rt.run(PRESS_HOLD_STEPS);
@@ -999,17 +986,38 @@ const CONSOLE_DEADLINE: u64 = 23_000_000;
 /// to 1,000,000.
 const RING_TEST_DEADLINE: u64 = 23_000_000;
 
-/// Boots to the stable first-run screen (blank flash).
+// ---------------------------------------------------------------------
+// Checkpoints. A `FirmwareRuntime` clone is a full snapshot (pinned by
+// `runtime::tests::a_clone_runs_exactly_like_its_original`), so a state
+// several rungs share is reached once per test binary, with every
+// assertion on the way, and each rung continues from its own clone. A
+// failed walk leaves its `OnceLock` empty, so every rung that needs it
+// re-runs the walk and fails with the walk's own message: nothing is
+// skipped or loosened. Rungs start from: blank-flash boot ([`FIRST_RUN`]),
+// role hacker's onboarding page 6 ([`OWN_SHAKE_PAGE`]), each role's
+// registered screen ([`REGISTERED`]) and launcher ([`LAUNCHER`]).
+// ---------------------------------------------------------------------
+
+/// The stable first-run screen on blank flash ([`first_run_screen`]).
+static FIRST_RUN: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// Boots to the stable first-run screen (blank flash), asserting
+/// [`FIRST_RUN_HASH`] within [`FIRST_RUN_MAX_STEPS`]: a clone of the
+/// [`FIRST_RUN`] checkpoint.
 fn first_run_screen() -> FirmwareRuntime {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
-    let (hash, _) = run_until_stable_frame(
-        &mut rt,
-        FIRST_RUN_MAX_STEPS,
-        BOOT_STABLE_FOR,
-        &[SPLASH_HASH],
-    );
-    assert_eq!(hash, FIRST_RUN_HASH);
-    rt
+    FIRST_RUN
+        .get_or_init(|| {
+            let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
+            let (hash, step) = run_until_stable_frame(
+                &mut rt,
+                FIRST_RUN_MAX_STEPS,
+                BOOT_STABLE_FOR,
+                &[SPLASH_HASH],
+            );
+            assert_eq!(hash, FIRST_RUN_HASH, "stable at step {step}");
+            rt
+        })
+        .clone()
 }
 
 /// The console takes input on the first-run screen: `prov show` reports an
@@ -1226,19 +1234,55 @@ fn provisioned(role: &str) -> FirmwareRuntime {
     rt
 }
 
+/// Whether `role`'s intermediate onboarding frames are pinned: only role
+/// hacker's, the one compared with the physical badge (other roles reach
+/// the same pages, but their name-bearing frames differ).
+fn pinned(role: &str) -> bool {
+    role == OWN_ROLE
+}
+
+/// Provisions `role`, then walks Setup from page 1 to page 6 ("Shake it!",
+/// at rest), pinning each frame when [`pinned`].
+fn walk_to_shake_page(role: &str) -> (FirmwareRuntime, u64) {
+    let (page1, _) = role_row(role);
+    let mut rt = provisioned(role);
+    let mut previous = page1;
+    for &(slot, expected) in TO_SHAKE_PAGE {
+        let (hash, step) = press_and_settle(&mut rt, slot, previous);
+        if pinned(role) {
+            assert_eq!(
+                hash, expected,
+                "{role}: after slot {slot}, stable at step {step}"
+            );
+        }
+        previous = hash;
+    }
+    (rt, previous)
+}
+
+/// Role hacker on onboarding page 6, at rest ([`walk_to_shake_page`]).
+static OWN_SHAKE_PAGE: OnceLock<(FirmwareRuntime, u64)> = OnceLock::new();
+
+/// [`walk_to_shake_page`]: the runtime and page 6's hash. Role hacker's
+/// comes from the [`OWN_SHAKE_PAGE`] checkpoint (two rungs continue from
+/// it); other roles walk.
+fn shake_page(role: &str) -> (FirmwareRuntime, u64) {
+    if role == OWN_ROLE {
+        OWN_SHAKE_PAGE
+            .get_or_init(|| walk_to_shake_page(role))
+            .clone()
+    } else {
+        walk_to_shake_page(role)
+    }
+}
+
 /// Milestone 5 Task D-M5-2: with the SC7A20H on I2C0, a provisioned
 /// badge's onboarding app reaches "Shake it!" (page 6), reads the resting
 /// 1 g, detects a shake, offers "A / START: next", and A moves on to page
 /// 7.
 #[test]
 fn onboarding_shake_page_advances_after_a_shake() {
-    let mut rt = provisioned(OWN_ROLE);
-    let mut previous = role_row(OWN_ROLE).0;
-    for &(slot, expected) in TO_SHAKE_PAGE {
-        let (hash, step) = press_and_settle(&mut rt, slot, previous);
-        assert_eq!(hash, expected, "after slot {slot}, stable at step {step}");
-        previous = hash;
-    }
+    let (mut rt, previous) = shake_page(OWN_ROLE);
     assert_eq!(rt.acceleration(), [0, 0, 1000], "face up at rest");
     shake(&mut rt);
     let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
@@ -1254,27 +1298,14 @@ fn onboarding_shake_page_advances_after_a_shake() {
 
 /// Provisions `role`, then walks Setup (11 pages, a shake on page 6) to
 /// My Badge's registered screen. Page 1 and the registered screen are
-/// pinned for every role; the pages between only when `pin` (role hacker,
-/// the one compared with the physical badge; other roles reach the same
-/// pages, but their name-bearing frames differ).
-fn registered(role: &str, pin: bool) -> FirmwareRuntime {
-    let (page1, registered_hash) = role_row(role);
-    let mut rt = provisioned(role);
-    let mut previous = page1;
-    for &(slot, expected) in TO_SHAKE_PAGE {
-        let (hash, step) = press_and_settle(&mut rt, slot, previous);
-        if pin {
-            assert_eq!(
-                hash, expected,
-                "{role}: after slot {slot}, stable at step {step}"
-            );
-        }
-        previous = hash;
-    }
+/// pinned for every role; the pages between only when [`pinned`].
+fn walk_to_registered(role: &str) -> FirmwareRuntime {
+    let (_, registered_hash) = role_row(role);
+    let (mut rt, mut previous) = shake_page(role);
     shake(&mut rt);
     let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
     let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
-    if pin {
+    if pinned(role) {
         assert_eq!(
             hash, SHAKEN_AT_REST_HASH,
             "{role}: after the shake, stable at step {step}"
@@ -1285,7 +1316,7 @@ fn registered(role: &str, pin: bool) -> FirmwareRuntime {
         match expected {
             Some(expected) => {
                 let (hash, step) = press_and_settle(&mut rt, slot, previous);
-                if pin {
+                if pinned(role) {
                     assert_eq!(
                         hash, expected,
                         "{role}: after slot {slot}, stable at step {step}"
@@ -1312,37 +1343,57 @@ fn registered(role: &str, pin: bool) -> FirmwareRuntime {
     rt
 }
 
+/// Each role's registered screen ([`walk_to_registered`]), by
+/// [`ROLE_ROWS`] index.
+static REGISTERED: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] = [const { OnceLock::new() }; ROLE_ROWS.len()];
+/// Each role's launcher ([`walk_to_launcher`]), by [`ROLE_ROWS`] index.
+static LAUNCHER: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] = [const { OnceLock::new() }; ROLE_ROWS.len()];
+
+fn role_index(role: &str) -> usize {
+    ROLE_ROWS
+        .iter()
+        .position(|r| r.0 == role)
+        .expect("role row")
+}
+
+/// [`walk_to_registered`], from the [`REGISTERED`] checkpoint.
+fn registered(role: &str) -> FirmwareRuntime {
+    REGISTERED[role_index(role)]
+        .get_or_init(|| walk_to_registered(role))
+        .clone()
+}
+
 macro_rules! provisions_role {
-    ($name:ident, $role:literal, $pin:expr) => {
+    ($name:ident, $role:literal) => {
         /// Provisioning through the console and Setup register the badge
-        /// and land on My Badge's registered screen (see `registered`).
+        /// and land on My Badge's registered screen (see
+        /// `walk_to_registered`).
         #[test]
         fn $name() {
-            registered($role, $pin);
+            registered($role);
         }
     };
 }
 
-provisions_role!(provisions_hacker_through_the_console, "hacker", true);
-provisions_role!(provisions_organizer_through_the_console, "organizer", false);
-provisions_role!(provisions_sponsor_through_the_console, "sponsor", false);
-provisions_role!(provisions_judge_through_the_console, "judge", false);
-provisions_role!(provisions_mentor_through_the_console, "mentor", false);
-provisions_role!(provisions_volunteer_through_the_console, "volunteer", false);
-provisions_role!(provisions_media_through_the_console, "media", false);
-provisions_role!(provisions_staff_through_the_console, "staff", false);
-provisions_role!(provisions_general_through_the_console, "general", false);
+provisions_role!(provisions_hacker_through_the_console, "hacker");
+provisions_role!(provisions_organizer_through_the_console, "organizer");
+provisions_role!(provisions_sponsor_through_the_console, "sponsor");
+provisions_role!(provisions_judge_through_the_console, "judge");
+provisions_role!(provisions_mentor_through_the_console, "mentor");
+provisions_role!(provisions_volunteer_through_the_console, "volunteer");
+provisions_role!(provisions_media_through_the_console, "media");
+provisions_role!(provisions_staff_through_the_console, "staff");
+provisions_role!(provisions_general_through_the_console, "general");
 provisions_role!(
     provisions_workshop_lead_through_the_console,
-    "workshop_lead",
-    false
+    "workshop_lead"
 );
-provisions_role!(provisions_visitor_through_the_console, "visitor", false);
+provisions_role!(provisions_visitor_through_the_console, "visitor");
 
 /// [`registered`], then HOME to the stable launcher.
-fn launcher_for(role: &str, pin: bool) -> FirmwareRuntime {
+fn walk_to_launcher(role: &str) -> FirmwareRuntime {
     let (_, registered_hash) = role_row(role);
-    let mut rt = registered(role, pin);
+    let mut rt = registered(role);
     press(&mut rt, TO_LAUNCHER_SLOT);
     let cap = rt.total_steps() + LAUNCHER_RESPONSE_STEPS;
     let (hash, step) =
@@ -1354,12 +1405,19 @@ fn launcher_for(role: &str, pin: bool) -> FirmwareRuntime {
     rt
 }
 
+/// [`walk_to_launcher`], from the [`LAUNCHER`] checkpoint.
+fn launcher_for(role: &str) -> FirmwareRuntime {
+    LAUNCHER[role_index(role)]
+        .get_or_init(|| walk_to_launcher(role))
+        .clone()
+}
+
 /// Milestone 5 finish line: a provisioned badge reaches the app launcher.
 /// The input sequence and every pinned frame on the way were compared
 /// with the physical badge on 2026-10-08 (role hacker).
 #[test]
 fn boots_to_launcher() {
-    let rt = launcher_for(OWN_ROLE, true);
+    let rt = launcher_for(OWN_ROLE);
     assert!(rt.console_output().contains("launched Launcher"));
     assert_no_panic_text(&rt);
 }
@@ -1369,7 +1427,7 @@ fn boots_to_launcher() {
 /// hardware with this role.
 #[test]
 fn launcher_is_role_independent() {
-    let rt = launcher_for("workshop_lead", false);
+    let rt = launcher_for("workshop_lead");
     assert_no_panic_text(&rt);
 }
 
@@ -1377,7 +1435,7 @@ fn launcher_is_role_independent() {
 /// as on the badge (compared 2026-10-08).
 #[test]
 fn launcher_responds_to_navigation() {
-    let mut rt = launcher_for(OWN_ROLE, true);
+    let mut rt = launcher_for(OWN_ROLE);
     let (hash, step) = press_and_settle(&mut rt, NAV_SLOT, LAUNCHER_HASH);
     assert_eq!(hash, LAUNCHER_AFTER_NAV_HASH, "stable at step {step}");
     assert_no_panic_text(&rt);

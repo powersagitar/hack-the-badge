@@ -257,6 +257,7 @@ struct Transmitter {
 }
 
 /// The RMT peripheral. See the module doc.
+#[derive(Clone)]
 pub struct Rmt {
     /// Word storage for `0x00..=DATE_REG`, indexed by `offset / 4`. STATUS,
     /// `INT_ST`, `INT_CLR` and the WT bits are computed instead.

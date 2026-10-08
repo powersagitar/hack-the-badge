@@ -149,7 +149,7 @@ pub const HOST_QUEUE_CAPACITY: usize = 1 << 20;
 const FORCED_RAW: u32 = SERIAL_IN_EMPTY_INT_RAW | SOF_INT_RAW;
 
 /// The USB-Serial-JTAG peripheral. See the module doc for what's modeled.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct UsbSerialJtag {
     /// Plain word storage for every register offset not given real
     /// behavior above, keyed by word-aligned offset.

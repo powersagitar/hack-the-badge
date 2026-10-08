@@ -285,6 +285,7 @@ impl Fifo {
 }
 
 /// The I2C0 controller. See the module doc.
+#[derive(Clone)]
 pub struct I2c {
     /// Word storage for `0x00..REGS_END`, indexed by `offset / 4`. SR,
     /// FIFO_ST, INT_STATUS, the RAM windows and the WT bits are computed
