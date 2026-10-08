@@ -911,6 +911,17 @@
 //!
 //! ## Where this gets boot to
 //!
+//! **As of Milestone 5 Task D-M5-2**: 125 stubs. With the SC7A20H
+//! accelerometer answering on I2C0, `hal_accel`'s sample read converts
+//! each axis with `__floatsisf` (`0x4000_0800`), the onboarding's shake
+//! detector (`0x4205_7292`) compares against its moving baseline with
+//! `__subsf3` (`0x4000_0898`) and `__gtsf2` (`0x4000_0824`)
+//! (`LIBGCC_SOFT_FLOAT_FAMILY`), and finishing the onboarding app reads an
+//! integer config value with ROM newlib `atoi` (`0x4000_044c`, [`ATOI`],
+//! `hal_config` at `0x4200_b2fe`). Each was observed faulting and is a
+//! real HLE; addresses from `esp32c3.rom.libgcc.ld` /
+//! `esp32c3.rom.newlib.ld`.
+//!
 //! **As of Milestone 5 Task 4**: 121 stubs. Provisioning and the
 //! onboarding app that follows it reach ROM calls the blank-flash boot never
 //! made, each observed faulting and now a real HLE: `strcasecmp`
@@ -1475,6 +1486,14 @@ pub const STRCASECMP: u32 = 0x4000_03d0;
 /// ([`crate::cpu::rom_stubs::RomStubEffect::Strtol`]), Milestone 5 Task 3:
 /// the console's `put <path> <size>` parses its size with it.
 pub const STRTOL: u32 = 0x4000_0454;
+
+/// ROM newlib `atoi`'s fixed address (`esp32c3.rom.newlib.ld`: `atoi =
+/// 0x4000044c;`, ROM ELF `__call_atoi`, body at `0x4003_1dac` =
+/// `strtol(s, NULL, 10)`). Real HLE
+/// ([`crate::cpu::rom_stubs::RomStubEffect::Atoi`]), Milestone 5 Task
+/// D-M5-2: `hal_config`'s integer read (`0x4200_b2fe`) calls it when the
+/// onboarding app finishes and writes the `system` config.
+pub const ATOI: u32 = 0x4000_044c;
 
 /// ROM libc `strrchr`'s fixed address (`esp32c3.rom.libc.ld`: `strrchr =
 /// 0x40000408;`, ROM ELF `__call_strrchr`). Real HLE
@@ -2184,6 +2203,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRLCPY, RomStub::strlcpy("strlcpy")),
     (STRCASECMP, RomStub::strcasecmp("strcasecmp")),
     (STRTOL, RomStub::strtol("strtol")),
+    (ATOI, RomStub::atoi("atoi")),
     (STRRCHR, RomStub::strrchr("strrchr")),
     (STRSPN, RomStub::strspn("strspn")),
     (STRCSPN, RomStub::strcspn("strcspn")),
@@ -2268,13 +2288,18 @@ const LIBGCC_SOFT_DOUBLE_FAMILY: &[(u32, &str, SoftDoubleOp)] = &[
 
 /// libgcc's soft-float `float` helpers (`esp32c3.rom.libgcc.ld`), real
 /// implementations -- see [`SoftFloatOp`]. Milestone 5 Task 4: the
-/// onboarding app's sixth page ("Shake it!") calls these. The others are
-/// left to fault loudly until something calls them.
+/// onboarding app's sixth page ("Shake it!") calls these; Task D-M5-2
+/// added `__floatsisf` (`hal_accel`'s sample conversion) and `__subsf3` /
+/// `__gtsf2` (the shake detector). The others are left to fault loudly
+/// until something calls them.
 const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
     (0x4000_0854, "__mulsf3", SoftFloatOp::Mul),
     (0x4000_0838, "__ltsf2", SoftFloatOp::Lt),
     (0x4000_08c8, "__unordsf2", SoftFloatOp::Unord),
     (0x4000_0770, "__addsf3", SoftFloatOp::Add),
+    (0x4000_0800, "__floatsisf", SoftFloatOp::FloatSi),
+    (0x4000_0898, "__subsf3", SoftFloatOp::Sub),
+    (0x4000_0824, "__gtsf2", SoftFloatOp::Gt),
 ];
 
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM
@@ -2552,6 +2577,7 @@ mod tests {
             (STRLCPY, RomStubEffect::Strlcpy),
             (STRCASECMP, RomStubEffect::Strcasecmp),
             (STRTOL, RomStubEffect::Strtol),
+            (ATOI, RomStubEffect::Atoi),
             (STRRCHR, RomStubEffect::Strrchr),
             (STRSPN, RomStubEffect::Strspn),
             (STRCSPN, RomStubEffect::Strcspn),
@@ -3807,6 +3833,46 @@ mod tests {
         assert_eq!(call(b"99999999999", 10, true).0, i32::MAX, "saturates");
         assert_eq!(call(b"-99999999999", 10, true).0, i32::MIN, "saturates");
         assert_eq!(call(b"7", 10, false).0, 7, "NULL endptr is allowed");
+    }
+
+    /// ROM `atoi` = `strtol(s, NULL, 10)`: base 10 only, `a1`/`a2` ignored,
+    /// saturating like `strtol`, 0 when there is no digit.
+    #[test]
+    fn atoi_stub_is_strtol_base_10_without_endptr() {
+        let (s, guard) = (0x3fc9_0400, 0x3fc9_0440);
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(s, 64);
+        bus.add_scratch_ram(guard, 8);
+        let mut call = |text: &[u8]| {
+            for i in 0..32 {
+                bus.write8(s + i, 0);
+            }
+            for (i, x) in text.iter().enumerate() {
+                bus.write8(s + i as u32, *x);
+            }
+            for k in 0..4 {
+                bus.write8(guard + k, 0x55);
+            }
+            cpu.regs.write(REG_RA, 0x4000_1000);
+            cpu.regs.write(REG_A0, s);
+            cpu.regs.write(REG_A1, guard); // garbage: atoi has one argument
+            cpu.regs.write(REG_A2, 16);
+            cpu.regs.pc = ATOI;
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            assert_eq!(info.rom_stub, Some(ATOI));
+            assert_eq!(cpu.regs.pc, 0x4000_1000);
+            assert_eq!(bus.read8(guard), 0x55, "no endptr write");
+            cpu.regs.read(REG_A0) as i32
+        };
+        assert_eq!(call(b"-1"), -1);
+        assert_eq!(call(b" +42abc"), 42);
+        assert_eq!(call(b"0x1F"), 0, "base 10: stops at x");
+        assert_eq!(call(b"017"), 17, "base 10: no octal");
+        assert_eq!(call(b""), 0);
+        assert_eq!(call(b"99999999999"), i32::MAX, "saturates");
     }
 
     #[test]

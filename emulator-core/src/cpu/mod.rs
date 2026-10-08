@@ -711,10 +711,13 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, slen);
             }
-            RomStubEffect::Strtol => {
+            RomStubEffect::Strtol | RomStubEffect::Atoi => {
+                // ROM `atoi` is `strtol(s, NULL, 10)` (ROM ELF `atoi` at
+                // 0x4003_1dac: `li a2, 10; li a1, 0; j strtol`).
+                let atoi = stub.effect == RomStubEffect::Atoi;
                 let nptr = self.regs.read(rom_stubs::REG_A0);
-                let endptr = self.regs.read(rom_stubs::REG_A1);
-                let base_arg = self.regs.read(rom_stubs::REG_A2);
+                let endptr = if atoi { 0 } else { self.regs.read(rom_stubs::REG_A1) };
+                let base_arg = if atoi { 10 } else { self.regs.read(rom_stubs::REG_A2) };
                 let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
                 let at = |bus: &mut B, i: u32| bus.read8(nptr.wrapping_add(i));
                 let mut i: u32 = 0;

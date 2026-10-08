@@ -338,6 +338,12 @@ pub enum RomStubEffect {
     /// caller (`put`'s size parse) checks only `endptr`. Scan capped at
     /// [`MAX_STUB_MEMORY_BYTES`].
     Strtol,
+    /// `int atoi(const char *s)`: the ROM's newlib `atoi` (slot
+    /// `__call_atoi`, `esp32c3.rom.newlib.ld` `atoi = 0x4000044c`), whose
+    /// body (ROM ELF `0x4003_1dac`) is `strtol(s, NULL, 10)`: exactly
+    /// [`RomStubEffect::Strtol`] with `endptr = NULL` and base 10 (so an
+    /// out-of-range value saturates to `INT_MAX`/`INT_MIN`).
+    Atoi,
     /// `size_t strspn(const char *s, const char *set)`: newlib's
     /// `strspn.c`: the length of the leading run of `s = a0` made only of
     /// bytes in NUL-terminated `set = a1`, in `a0`. Scans capped at
@@ -808,6 +814,18 @@ pub enum SoftFloatOp {
     /// by order (`-0.0 == +0.0`), 2 if either is a NaN, so `< 0` is false
     /// for unordered operands. The `int` result is returned in `a0`.
     Lt,
+    /// `float __floatsisf(int a)`: `a0` read as a signed 32-bit integer,
+    /// rounded to the nearest `float` (ties to even; `|a| > 2^24` can
+    /// round), which Rust's `i32 as f32` gives bit for bit. `a1` is
+    /// ignored.
+    FloatSi,
+    /// `float __subsf3(float a, float b)`: `a - b`, IEEE round-to-nearest.
+    Sub,
+    /// `int __gtsf2(float a, float b)` (libgcc builds it from the same
+    /// source as `__gesf2`): soft-fp `FP_CMP_S(r, A, B, -2, 2)`: -1, 0 or 1
+    /// by order, -2 if either is a NaN, so `> 0` is false for unordered
+    /// operands. The `int` result is returned in `a0`.
+    Gt,
 }
 
 /// The canonical quiet `float` NaN RISC-V soft-fp returns (see
@@ -831,6 +849,9 @@ impl SoftFloatOp {
             SoftFloatOp::Add => canonical(x + y),
             SoftFloatOp::Unord => u32::from(x.is_nan() || y.is_nan()),
             SoftFloatOp::Lt => soft_fp_cmp(x.partial_cmp(&y), 2) as u32,
+            SoftFloatOp::FloatSi => (a as i32 as f32).to_bits(),
+            SoftFloatOp::Sub => canonical(x - y),
+            SoftFloatOp::Gt => soft_fp_cmp(x.partial_cmp(&y), -2) as u32,
         }
     }
 }
@@ -1538,6 +1559,14 @@ impl RomStub {
         }
     }
 
+    /// A real high-level-emulated `atoi` -- see [`RomStubEffect::Atoi`].
+    pub const fn atoi(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Atoi,
+        }
+    }
+
     /// A real high-level-emulated `strrchr` -- see [`RomStubEffect::Strrchr`].
     pub const fn strrchr(name: &'static str) -> Self {
         Self {
@@ -1811,6 +1840,23 @@ mod tests {
         assert_eq!(Lt.apply(f(-0.0), f(0.0)), 0);
         assert_eq!(Lt.apply(f(3.0), f(2.0)), 1);
         assert_eq!(Lt.apply(nan, f(2.0)), 2);
+        // __subsf3.
+        assert_eq!(Sub.apply(f(1000.0), f(0.1)), f(1000.0f32 - 0.1));
+        assert_eq!(Sub.apply(f(1.0), f(1.0)), 0, "+0.0");
+        assert_eq!(Sub.apply(f(f32::INFINITY), f(f32::INFINITY)), nan);
+        // __gtsf2: -1/0/1, -2 for unordered.
+        assert_eq!(Gt.apply(f(1300.0), f(1200.0)), 1);
+        assert_eq!(Gt.apply(f(0.0), f(-0.0)), 0);
+        assert_eq!(Gt.apply(f(-1.0), f(1200.0)) as i32, -1);
+        assert_eq!(Gt.apply(f(1.0), nan) as i32, -2);
+        // __floatsisf: signed, exact below 2^24, round-to-nearest-even above.
+        assert_eq!(FloatSi.apply(1000, 0xDEAD), f(1000.0));
+        assert_eq!(FloatSi.apply(-2048i32 as u32, 0), f(-2048.0));
+        assert_eq!(FloatSi.apply(0, 0), 0, "+0.0");
+        assert_eq!(FloatSi.apply(16_777_217, 0), f(16_777_216.0), "tie to even");
+        assert_eq!(FloatSi.apply(16_777_219, 0), f(16_777_220.0), "tie to even");
+        assert_eq!(FloatSi.apply(i32::MIN as u32, 0), 0xCF00_0000, "-2^31");
+        assert_eq!(FloatSi.apply(i32::MAX as u32, 0), 0x4F00_0000, "rounds to 2^31");
     }
 
     #[test]

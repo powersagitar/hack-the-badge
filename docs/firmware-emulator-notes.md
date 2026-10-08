@@ -2125,6 +2125,22 @@ host (`provision::put_file`) additionally sends 64-byte chunks
 `put_accepts_a_payload_larger_than_the_rx_ring` (600 synthetic bytes, `OK
 600` at about step 17.9M). Decisions: `milestone-5-decisions.md`.
 
+### Milestone 5 Task D-M5-2: the SC7A20H accelerometer; onboarding completes
+
+**ROM calls.** With an accelerometer answering on I2C0 (below), four more
+ROM calls were observed faulting, each now a real stub (R-T3-1):
+`__floatsisf` (`0x4000_0800`, `hal_accel`'s axis conversion
+`0x4200_a812`, reached at boot by the `accel_cache` task), `__subsf3`
+(`0x4000_0898`) and `__gtsf2` (`0x4000_0824`, the shake detector
+`0x4205_7292` on onboarding page 6), and ROM newlib `atoi`
+(`0x4000_044c`; ROM body `strtol(s, NULL, 10)` at `0x4003_1dac`), which
+`hal_config` (`0x4200_b2fe`) calls when the finished onboarding app writes
+the `system` config. Addresses from `esp32c3.rom.libgcc.ld` /
+`esp32c3.rom.newlib.ld`. A faulting ROM call shows up in the firmware's
+own panic output and then as a fault at `software_reset_cpu`
+(`0x4000_0094`), the panic handler's restart; that is not a modeled
+restart.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
