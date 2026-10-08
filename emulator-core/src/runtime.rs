@@ -233,6 +233,18 @@ impl FirmwareRuntime {
     pub fn console_output(&self) -> String {
         self.bus.console.text()
     }
+
+    /// Bytes a USB host sends to the badge's console (USB-Serial-JTAG OUT).
+    /// Returns how many were accepted; see
+    /// `crate::peripherals::usb_serial_jtag::HOST_QUEUE_CAPACITY`.
+    pub fn serial_input(&mut self, bytes: &[u8]) -> usize {
+        self.bus.usb_serial_jtag.host_send(bytes)
+    }
+
+    /// Serial input the firmware has not read yet.
+    pub fn serial_pending(&self) -> usize {
+        self.bus.usb_serial_jtag.host_pending()
+    }
 }
 
 #[cfg(test)]

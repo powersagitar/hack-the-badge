@@ -923,6 +923,14 @@ fn boots_to_first_run_screen() {
 /// yet).
 const SELF_TEST_BUTTONS_HASH: u64 = 0x7f32_5d83_8835_baaa;
 
+/// How long a button press is held in the input tests: a human press,
+/// 100 ms of emulated time at SYSTIMER's 16 MHz (`TICKS_PER_STEP` = 1). The
+/// old 100,000-step (6.25 ms) hold only registered because the undrained
+/// console left the firmware idle; once the USB-Serial-JTAG ISR drains the
+/// TX ring buffer, button polling falls outside such a short window
+/// (Milestone 5 ruling R-T2-1).
+const PRESS_HOLD_STEPS: u32 = 1_600_000;
+
 /// [`first_run_screen_responds_to_start`]'s cap: the self-test frame is
 /// first sampled at step 22,350,000; that + [`AFTER_PRESS_STABLE_FOR`] +
 /// 1,000,000, rounded up to a 250,000 multiple.
@@ -946,7 +954,7 @@ fn first_run_screen_responds_to_start() {
     assert_eq!(hash, FIRST_RUN_HASH);
 
     rt.set_raw_button(START, true);
-    let summary = rt.run(100_000);
+    let summary = rt.run(PRESS_HOLD_STEPS);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     rt.set_raw_button(START, false);
 

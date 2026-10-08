@@ -172,7 +172,7 @@ use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::system::System;
-use crate::peripherals::systimer::SysTimer;
+use crate::peripherals::systimer::{SysTimer, TICKS_PER_STEP};
 use crate::peripherals::timg::Timg;
 use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
@@ -533,6 +533,7 @@ impl FirmwareBus {
         p |= self.gdma.pending_sources();
         p |= self.i2c0.pending_sources();
         p |= self.rmt.pending_sources();
+        p |= self.usb_serial_jtag.pending_sources();
         p
     }
 
@@ -554,6 +555,28 @@ impl FirmwareBus {
     /// so this returns nothing.
     pub fn tick_peripherals(&mut self) {
         self.systimer.advance();
+        self.usb_serial_jtag.advance(TICKS_PER_STEP);
+    }
+
+    /// How far an idle (WFI) core may fast-forward: to the next SYSTIMER
+    /// alarm or the next USB host packet, whichever is first; at least one
+    /// step's worth of ticks.
+    pub fn ticks_until_next_event(&self) -> u64 {
+        [
+            self.systimer.ticks_until_next_alarm(),
+            self.usb_serial_jtag.ticks_until_next_packet(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0)
+        .max(TICKS_PER_STEP)
+    }
+
+    /// Advances every timed peripheral by `ticks` during an idle fast-forward.
+    pub fn advance_idle(&mut self, ticks: u64) {
+        self.systimer.advance_by(ticks);
+        self.usb_serial_jtag.advance(ticks);
     }
 
     /// Adds a fresh, zero-initialized, real read/write RAM region
@@ -1804,5 +1827,31 @@ mod tests {
             .any(|a| RMT_RANGE.contains(&a.addr)));
         bus.read32(base);
         assert!(bus.unmapped_log().iter().any(|a| a.addr == base));
+    }
+
+    #[test]
+    fn idle_fast_forward_stops_at_the_next_host_packet() {
+        use crate::peripherals::usb_serial_jtag::PACKET_TICKS;
+        let mut bus = bus_with(vec![]);
+        // No alarm armed and no host input: one step's worth.
+        assert_eq!(bus.ticks_until_next_event(), TICKS_PER_STEP);
+        bus.usb_serial_jtag.host_send(&[b'a'; 65]);
+        assert_eq!(bus.ticks_until_next_event(), 1, "first packet is due now");
+        bus.advance_idle(1);
+        // Firmware drains the packet; the next one is a packet time away.
+        for _ in 0..64 {
+            bus.read8(USB_SERIAL_JTAG_RANGE.start);
+        }
+        assert_eq!(
+            bus.ticks_until_next_event(),
+            PACKET_TICKS,
+            "no SYSTIMER alarm is armed on a fresh bus"
+        );
+        bus.advance_idle(PACKET_TICKS);
+        assert_eq!(
+            bus.read8(USB_SERIAL_JTAG_RANGE.start + 4) & 0b100,
+            0b100,
+            "DATA_AVAIL"
+        );
     }
 }

@@ -254,4 +254,26 @@ Tasks 3, 4, 6 and 7 read these instead of re-deriving them.
   (`crypto_sign_seed_keypair`, referenced at `0x4205_5126`, tag `solana`)
   is an app's wallet generator, unreachable from these roots.
 
+## USB-Serial-JTAG receive (Task 2)
+
+- **Pacing:** the host delivers one 64-byte OUT packet when the FIFO is
+  empty and `PACKET_TICKS` = 821 (~51.3 us of full-speed bus time at 16
+  ticks/us) have passed since the last. If wrong: input arrives faster or
+  slower than a real host; a faster model would overflow the driver's
+  256-byte ring buffer.
+- **Host queue cap:** 1 MiB (`HOST_QUEUE_CAPACITY`); excess is refused and
+  reported by `serial_input`'s return value. If wrong: a client sending
+  more is refused where a real host would block.
+- `INT_RAW` R/WTC semantics and the forced SOF/SERIAL_IN_EMPTY bits are
+  unchanged; `INT_ST`/`INT_ENA`/`INT_CLR` are real, and source 26 now
+  exists (resolves M4's "No USB-Serial-JTAG interrupt source yet"). No USB
+  bus reset, JTAG or EP2.
+- **R-T2-1 (press hold):** `first_run_screen_responds_to_start` now holds
+  START for `PRESS_HOLD_STEPS` = 1,600,000 steps (100 ms of emulated time),
+  not 100,000. Why: with the console draining, the firmware's button
+  polling falls outside a 6.25 ms window; the old hold registered only
+  because the undrained console left the firmware idle. The expected
+  `SELF_TEST_BUTTONS_HASH` is unchanged. If wrong: the test no longer
+  models a realistic press, and a slow poll could still miss it.
+
 ## Milestone 6 backlog

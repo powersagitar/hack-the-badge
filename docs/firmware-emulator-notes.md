@@ -2058,6 +2058,22 @@ address, is in `milestone-5-decisions.md`'s "Trace facts"; in short:
   until the R-M5-2 gate) were written by hand from the traced schema and
   cross-checked against the structure of a registered badge's record.
 
+### Milestone 5 Task 2: USB-Serial-JTAG receive and interrupt source
+
+USB-Serial-JTAG gained a receive direction (host queue, paced 64-byte OUT
+packets, real INT_ST/INT_ENA/INT_CLR) and interrupt source 26; the idle
+fast-forward now also stops at the next host packet
+(`FirmwareBus::ticks_until_next_event`). `FirmwareRuntime::serial_input`
+and `serial_pending` expose it. Console outcome (boot-probe, 20M steps):
+the driver's ISR now drains the TX ring buffer, so `hal_console: console
+started`, `main_task: Returned from app_main()` and the `badge> ` prompt
+(after the REPL banner) all appear by 20M steps; no interrupt storm, no
+fault. Side effect: `first_run_screen_responds_to_start`'s 100,000-step
+press was no longer registered (button polling is busy while the console
+drains); the hold is now `PRESS_HOLD_STEPS` = 1,600,000 (100 ms emulated),
+ruling R-T2-1 in `milestone-5-decisions.md`; no hash changed. Console
+input is no longer an open limitation.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
