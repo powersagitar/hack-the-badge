@@ -1,7 +1,8 @@
 # Milestone 6 — A calibrated clock and playable Snake
 
-Status: design approved in conversation (2026-10-09); written spec awaiting
-review. Implementation plan: to be written after spec approval.
+Status: design approved in conversation and written spec
+approved by the human partner (2026-10-09). Implementation plan:
+`docs/superpowers/plans/2026-10-09-milestone6-playable-snake.md`.
 
 ## Goal
 
@@ -20,12 +21,30 @@ Milestone 6 replaces that ratio with one calibrated clock used everywhere,
 proves Snake against the physical badge (frames and speed), and paces the
 browser to wall-clock time.
 
+### Found while planning (2026-10-09): the CPU frequency is not fixed
+
+A throwaway probe logged every ROM `ets_update_cpu_frequency` call (its
+argument is the new frequency in MHz) over 30M steps of blank-flash boot
+plus the self-test. The firmware runs ESP-IDF power management with
+dynamic frequency scaling between **40 MHz and 80 MHz**: 40 at step 844
+(the XTAL clock), 80 at step 404,380, then a 40/80 pair around every
+idle (about 600 steps at 40, then 2,600 or more at 80), 1,419 switches
+each way. It never selects 160 MHz; "160MHz" in `factory.bin` is the
+chip's description text, and the emulator's `cpu freq: 160000000 Hz` log
+line comes only from the stub's constant. So the clock follows the
+firmware's own frequency switches instead of being fixed (Part 1). The
+writes behind them are the SYSTEM clock registers `SYSTEM_CPU_PER_CONF_REG`
+(`0x600c_0008`) and `SYSTEM_SYSCLK_CONF_REG` (`0x600c_0058`), today
+unmapped (the Milestone 5 backlog lists both addresses).
+
 ### Success criteria
 
 1. A chip-agnostic clock model drives all emulated time; `TICKS_PER_STEP`
-   is gone. The ESP32-C3 configuration is an 80 MHz CPU against the 16 MHz
-   SYSTIMER at one cycle per step (CPI 1) unless calibration says
-   otherwise.
+   is gone. The CPU frequency is the one the firmware selects through the
+   SYSTEM clock registers (40 MHz XTAL or 80 MHz PLL on this firmware),
+   against the 16 MHz SYSTIMER, at one cycle per step (CPI 1) unless
+   calibration says otherwise. The console prints `cpu_start: cpu freq:
+   80000000 Hz`, as on the physical badge.
 2. Every existing `boot_progress` rung passes with re-pinned step budgets.
    Every frame hash that moved is listed for the human; none is silently
    re-pinned.
@@ -57,11 +76,14 @@ spirit as `cpu/`: it knows ratios, and chip setup supplies the
 ESP32-C3 numbers.
 
 - `Clock { cpu_hz, timer_hz, cycles_per_step, remainder }`. ESP32-C3:
-  `cpu_hz = 80_000_000`, `timer_hz = 16_000_000`, `cycles_per_step = 1`.
+  `timer_hz = 16_000_000`, `cycles_per_step = 1`, and `cpu_hz` set by the
+  bus whenever the firmware changes the CPU clock (below); the reset
+  value is the 40 MHz XTAL clock.
 - Each step adds `cycles_per_step` CPU cycles. Cycles convert to whole
   SYSTIMER ticks as `cycles * timer_hz / cpu_hz` with the remainder
-  carried, so there is no drift. At the ESP32-C3 values that is exactly
-  one tick every five steps.
+  carried, so there is no drift. At 80 MHz that is exactly one tick every
+  five steps; at 40 MHz one every two and a half. A frequency change
+  keeps the elapsed time exact (the remainder is rescaled, not dropped).
 - `cycles_per_step` is the only calibration knob. If calibration (Part 2)
   needs a non-integer value it becomes a rational
   (numerator/denominator); it never becomes a per-instruction table in
@@ -77,19 +99,44 @@ Integration, all through the clock:
   `boot::step_with_interrupts` computes the ticks to the next event and
   charges the matching time to the clock, so steps, cycles and ticks stay
   consistent. `TICKS_PER_STEP` is deleted.
-- The ROM `CPU_FREQ_MHZ` stub returns `cpu_hz / 1_000_000` (80, was 160).
+- The CPU frequency comes from a register model of SYSTEM's clock
+  registers (`peripherals/system.rs`, which today holds only the
+  `FROM_CPU` registers): `SYSTEM_SYSCLK_CONF_REG` (`SOC_CLK_SEL`,
+  `PRE_DIV_CNT`) and `SYSTEM_CPU_PER_CONF_REG` (`CPUPERIOD_SEL`,
+  `PLL_FREQ_SEL`), with field layouts and the frequency rule taken from
+  ESP-IDF v5.5.3's `soc/esp32c3/register/soc/system_reg.h` and
+  `hal/esp32c3/include/hal/clk_tree_ll.h`, and the rule of
+  `rtc_clk_cpu_freq_get_config` in
+  `esp_hw_support/port/esp32c3/rtc_clk.c` (never guessed): XTAL is
+  40 MHz / (`PRE_DIV_CNT` + 1), PLL is 80 or 160 MHz by `CPUPERIOD_SEL`,
+  RC_FAST is 20 MHz. The derived frequency is applied to the clock once
+  per step, after the instruction, so the byte-split halves of one
+  register write are never seen separately. An invalid encoding
+  (`SOC_CLK_SEL` = 3, `CPUPERIOD_SEL` >= 2, a zero result) leaves the
+  frequency unchanged and never panics. Reset values are the header's
+  defaults, then a boot-time initializer sets `PRE_DIV_CNT` = 0 (XTAL / 1,
+  40 MHz) as the skipped ROM and bootloader leave it: the ROM's own
+  `s_ticks_per_us` starts at 40.
+- The ROM `ets_get_cpu_frequency`/`ets_update_cpu_frequency` pair becomes
+  stateful, as in the real ROM (a stored ticks-per-µs value the setter
+  writes and the getter returns), starting at 40 (the XTAL value the ROM
+  leaves). `CPU_FREQ_MHZ` = 160 is deleted. This makes the console print
+  `cpu freq: 80000000 Hz`. The stored value is the firmware's own
+  bookkeeping; the clock's rate comes from the registers only.
 - The `mpccr` cycle counter (CSR `0x7e2`) counts the clock's cycles: still
   one per working step at CPI 1, and still not counting idle fast-forward
   time, as today.
-- USB-Serial-JTAG `PACKET_STEPS` is derived from 51.3 µs at the clock rate
-  (about 4,105 steps at 80 MHz, was 8,210). `PUT_CHUNK_GAP_STEPS` (a host
-  property) is re-measured under the new clock, not just scaled.
+- USB-Serial-JTAG packet timing becomes time, not steps: one OUT packet
+  is 51.3 µs, 821 SYSTIMER ticks (`PACKET_TICKS`, derived from the bus
+  time); `PACKET_STEPS` is deleted. At 80 MHz that is about 4,105 steps
+  (was 8,210). `PUT_CHUNK_GAP_STEPS` (a host property) is re-measured
+  under the new clock, not just scaled.
 - `SysTimer`'s own unit tests keep testing ticks; the step-to-tick
   conversion is tested in `clock.rs`.
 
-Expected cost: timer-driven waits now take 5x the steps unless they idle in
-WFI (fast-forwarded, nearly free). Every rung's budget is re-pinned in one
-task. Pinned frame hashes should mostly survive, but frames whose content
+Expected cost: timer-driven waits now take 5x the steps at 80 MHz (2.5x at
+40 MHz) unless they idle in WFI (fast-forwarded, nearly free). Every
+rung's budget is re-pinned in one task. Pinned frame hashes should mostly survive, but frames whose content
 depends on timing (animations, the Dice roll's timing) may move; each moved
 frame is listed for the human. If the release suite gets much slower than
 about 42 s, the figure goes in the notes and the opt-level-3 backlog item
@@ -153,10 +200,13 @@ The frame loop in `frontend/src/runtime/firmware-runtime.ts`:
   runs in slow motion rather than bursting.
 - The firmware status line shows the achieved speed ratio ("1.0x",
   "0.4x").
-- `PRESS_HOLD_STEPS` (1.6M steps, a value from the old 1:1 clock) becomes
-  a hold in emulated time, 20 ms (1.6M steps at 80 MHz), so a press means
-  the same at any pacing. The provisioner's chunk gap stays in steps (a
-  host pacing property), taking Part 1's re-measured value.
+- `PRESS_HOLD_STEPS` (1.6M steps, chosen as 100 ms at 16 MHz under the
+  old 1:1 clock) becomes a hold in emulated time, 100 ms, so a press
+  means the same at any pacing. The shake's half-period (1M steps,
+  62.5 ms under the old clock) becomes 62.5 ms of emulated time the same
+  way. The Rust rungs and the WASM twin use the same time-based holds.
+  The provisioner's chunk gap stays in steps (a host pacing property),
+  taking Part 1's re-measured value.
 - Deferred button releases are flushed in `stop()` (a Milestone 5 Task 7
   review minor in this same loop, which pacing makes easier to hit).
 
@@ -170,17 +220,24 @@ items not done here carried forward).
 
 ## Task order
 
-1. Clock module and unit tests; no behaviour change yet (the old 1:1
-   ratio must be expressible, and the suite passes unchanged).
-2. Switch to 80 MHz: `CPU_FREQ_MHZ`, `mpccr`, `PACKET_STEPS`, re-measured
-   chunk gap; re-pin every rung; list frame-hash changes for the human.
-3. `launcher_opens_snake` and `snake_hits_wall_game_over`, pinned
+1. Clock module, `emulated_time_us` and `run_until`, wired into the bus
+   at the old 1:1 ratio, plus their WASM passthroughs and bridge methods
+   (Task 3's WASM twin needs them); no behaviour change (the suite passes
+   unchanged).
+2. SYSTEM clock registers and the stateful ROM frequency pair (the
+   clock does not follow them yet); `cpu freq: 80000000 Hz` rung;
+   step-exact rungs re-pinned.
+3. The switch: the clock follows the SYSTEM registers; USB packet time
+   in ticks; time-based holds and shake in the rungs, the provisioning
+   helper and the WASM twin; re-measured chunk gap; every rung re-pinned;
+   frame-hash changes listed for the human.
+4. `launcher_opens_snake` and `snake_hits_wall_game_over`, pinned
    provisionally.
-4. Human gate: badge video and photos; calibrate CPI if needed; compare
+5. Human gate: badge video and photos; calibrate CPI if needed; compare
    the pinned frames.
-5. `snake_moves_on_its_own` (speed tolerance) and `snake_steers`.
-6. `run_until` and its WASM passthrough.
-7. Browser pacing, time-based holds, the `stop()` flush.
+6. `snake_moves_on_its_own` (speed tolerance) and `snake_steers`.
+7. Browser pacing, time-based holds, the speed readout, the `stop()`
+   flush.
 8. Stretch: `snake_eats`.
 9. Docs, then the final whole-branch review.
 
@@ -195,14 +252,14 @@ items not done here carried forward).
   fake wall clock (the clamp, the dropped debt, the speed ratio, the
   time-based hold); the WASM twin (`test/cpu-wasm.test.ts`) gains a
   `run_until` check; `bun run typecheck`.
-- Human: the badge comparison (Task 4) and playing Snake in a real browser
+- Human: the badge comparison (Task 5) and playing Snake in a real browser
   (closing check).
 
 ## Risks
 
 - Some boot phase may busy-wait on SYSTIMER instead of idling in WFI,
-  making it 5x more expensive in steps. Task 2 measures this; the response
-  is to accept the cost or turn on `opt-level = 3` (a backlog item with its
+  making it up to 5x more expensive in steps. Task 3 measures this; the
+  response is to accept the cost or turn on `opt-level = 3` (a backlog item with its
   own WASM size and browser-speed check).
 - Snake may need something beyond timing. It follows the ruling path in
   Part 2.
