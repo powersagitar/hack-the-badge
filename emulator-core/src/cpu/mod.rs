@@ -726,8 +726,16 @@ impl Cpu {
                 // 0x4003_1dac: `li a2, 10; li a1, 0; j strtol`).
                 let atoi = stub.effect == RomStubEffect::Atoi;
                 let nptr = self.regs.read(rom_stubs::REG_A0);
-                let endptr = if atoi { 0 } else { self.regs.read(rom_stubs::REG_A1) };
-                let base_arg = if atoi { 10 } else { self.regs.read(rom_stubs::REG_A2) };
+                let endptr = if atoi {
+                    0
+                } else {
+                    self.regs.read(rom_stubs::REG_A1)
+                };
+                let base_arg = if atoi {
+                    10
+                } else {
+                    self.regs.read(rom_stubs::REG_A2)
+                };
                 let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
                 let at = |bus: &mut B, i: u32| bus.read8(nptr.wrapping_add(i));
                 let mut i: u32 = 0;
@@ -781,7 +789,11 @@ impl Cpu {
                 }
                 let consumed = i > start;
                 let value: i32 = if over || (!neg && acc > 0x7fff_ffff) {
-                    if neg { i32::MIN } else { i32::MAX }
+                    if neg {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
                 } else if neg {
                     (acc as i64).wrapping_neg() as i32
                 } else {
@@ -2822,7 +2834,10 @@ mod tests {
         use rom_stubs::SoftFloatOp;
         let mut cpu = Cpu::new();
         let mut table = RomStubTable::new();
-        table.insert(ROM_STUB_ADDR, RomStub::soft_float("__mulsf3", SoftFloatOp::Mul));
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::soft_float("__mulsf3", SoftFloatOp::Mul),
+        );
         cpu.set_rom_stubs(table);
         cpu.regs.write(10, 1.5f32.to_bits());
         cpu.regs.write(11, 4.0f32.to_bits());

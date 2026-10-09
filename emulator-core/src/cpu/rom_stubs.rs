@@ -1831,7 +1831,10 @@ mod tests {
         // __mulsf3 / __addsf3: IEEE round-to-nearest in single precision.
         assert_eq!(Mul.apply(f(0.1), f(3.0)), f(0.1f32 * 3.0));
         assert_eq!(Add.apply(f(0.1), f(0.2)), f(0.1f32 + 0.2));
-        assert_eq!(Mul.apply(f(f32::MIN_POSITIVE), f(0.5)), f(f32::MIN_POSITIVE / 2.0));
+        assert_eq!(
+            Mul.apply(f(f32::MIN_POSITIVE), f(0.5)),
+            f(f32::MIN_POSITIVE / 2.0)
+        );
         assert_eq!(Mul.apply(f(f32::INFINITY), f(0.0)), nan);
         assert_eq!(Add.apply(0xFFC0_0001, f(1.0)), nan, "NaN in, canonical out");
         // __unordsf2.
@@ -1869,7 +1872,11 @@ mod tests {
         assert_eq!(FloatSi.apply(16_777_217, 0), f(16_777_216.0), "tie to even");
         assert_eq!(FloatSi.apply(16_777_219, 0), f(16_777_220.0), "tie to even");
         assert_eq!(FloatSi.apply(i32::MIN as u32, 0), 0xCF00_0000, "-2^31");
-        assert_eq!(FloatSi.apply(i32::MAX as u32, 0), 0x4F00_0000, "rounds to 2^31");
+        assert_eq!(
+            FloatSi.apply(i32::MAX as u32, 0),
+            0x4F00_0000,
+            "rounds to 2^31"
+        );
     }
 
     #[test]
@@ -1914,7 +1921,10 @@ mod tests {
         assert_eq!(FixUnsSi.apply(0xFFF8_0000_0000_0000, 0), 0);
         // __adddf3.
         assert_eq!(Add.apply(d(0.1), d(0.2)), d(0.1 + 0.2));
-        assert_eq!(Add.apply(d(f64::INFINITY), d(f64::NEG_INFINITY)), SOFT_FP_CANONICAL_NAN);
+        assert_eq!(
+            Add.apply(d(f64::INFINITY), d(f64::NEG_INFINITY)),
+            SOFT_FP_CANONICAL_NAN
+        );
         // __fixdfsi: truncation toward zero, signed saturation, NaN by sign.
         let int = |x: i32| u64::from(x as u32);
         assert_eq!(FixSi.apply(d(-3.9), 0), int(-3));
@@ -1926,7 +1936,11 @@ mod tests {
         assert_eq!(FixSi.apply(0xFFF8_0000_0000_0000, 0), int(i32::MIN));
         assert_eq!(FixSi.apply(d(-0.9), 0), int(0), "(-1, 1) truncates to 0");
         assert_eq!(FixSi.apply(d(0.9), 0), int(0));
-        assert_eq!(FixSi.apply(d(-2_147_483_648.0), 0), int(i32::MIN), "-2^31 exact");
+        assert_eq!(
+            FixSi.apply(d(-2_147_483_648.0), 0),
+            int(i32::MIN),
+            "-2^31 exact"
+        );
         // Signed zero, overflow to infinity and infinities in compares.
         assert_eq!(Add.apply(d(-0.0), d(-0.0)), d(-0.0));
         assert_eq!(Add.apply(d(-0.0), d(0.0)), d(0.0));

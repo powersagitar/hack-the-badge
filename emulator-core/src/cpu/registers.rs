@@ -197,10 +197,7 @@ impl Csrs {
             csr_addr::MCAUSE => self.mcause,
             csr_addr::MTVAL => self.mtval,
             csr_addr::MSCRATCH => self.mscratch,
-            _ => self
-                .cycle_counter
-                .and_then(|c| c.read(addr))
-                .unwrap_or(0),
+            _ => self.cycle_counter.and_then(|c| c.read(addr)).unwrap_or(0),
         }
     }
 

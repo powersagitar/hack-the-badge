@@ -3790,12 +3790,23 @@ mod tests {
             assert!(!info.trap_taken);
             assert_eq!(info.rom_stub, Some(STRLCPY));
             assert_eq!(cpu.regs.pc, 0x4000_1000);
-            (cpu.regs.read(REG_A0), (0..8).map(|i| bus.read8(dst + i)).collect::<Vec<u8>>())
+            (
+                cpu.regs.read(REG_A0),
+                (0..8).map(|i| bus.read8(dst + i)).collect::<Vec<u8>>(),
+            )
         };
         assert_eq!(call(16), (3, b"xyz\0\x55\x55\x55\x55".to_vec()), "fits");
         assert_eq!(call(4), (3, b"xyz\0\x55\x55\x55\x55".to_vec()), "exact fit");
-        assert_eq!(call(3), (3, b"xy\0\x55\x55\x55\x55\x55".to_vec()), "truncated, terminated");
-        assert_eq!(call(1), (3, b"\0\x55\x55\x55\x55\x55\x55\x55".to_vec()), "only the NUL");
+        assert_eq!(
+            call(3),
+            (3, b"xy\0\x55\x55\x55\x55\x55".to_vec()),
+            "truncated, terminated"
+        );
+        assert_eq!(
+            call(1),
+            (3, b"\0\x55\x55\x55\x55\x55\x55\x55".to_vec()),
+            "only the NUL"
+        );
         assert_eq!(call(0), (3, [0x55; 8].to_vec()), "siz 0 writes nothing");
     }
 
@@ -3838,7 +3849,11 @@ mod tests {
         assert_eq!(call(b"-99999999999", 10, true).0, i32::MIN, "saturates");
         assert_eq!(call(b"7", 10, false).0, 7, "NULL endptr is allowed");
         assert_eq!(call(b"+5", 10, true), (5, 2), "plus sign");
-        assert_eq!(call(b" \t\n", 10, true), (0, 0), "whitespace only: endptr = nptr");
+        assert_eq!(
+            call(b" \t\n", 10, true),
+            (0, 0),
+            "whitespace only: endptr = nptr"
+        );
         // The ROM takes `0x` whatever follows (`_strtol_l`, 0x4003_1dc4).
         assert_eq!(call(b"0x", 16, true), (0, 0), "bare 0x: no digit");
         assert_eq!(call(b"0xg", 0, true), (0, 0), "0x then no hex digit");
@@ -4028,14 +4043,22 @@ mod tests {
         assert_eq!(call(b"judge\0", b"Judges\0"), -i32::from(b's'), "prefix");
         // Only A..Z fold (the ROM's C-locale ctype): '@' and '[' do not.
         assert_eq!(call(b"[\0", b"{\0"), i32::from(b'[') - i32::from(b'{'));
-        assert_eq!(call(b"\xC9\0", b"\xE9\0"), 0xC9 - 0xE9, "no Latin-1 folding");
+        assert_eq!(
+            call(b"\xC9\0", b"\xE9\0"),
+            0xC9 - 0xE9,
+            "no Latin-1 folding"
+        );
         // A bad pointer never panics: unmapped memory reads 0, an empty string.
         cpu.regs.write(REG_RA, 0x4000_1000);
         cpu.regs.write(REG_A0, 0x1000_0000);
         cpu.regs.write(REG_A1, b);
         cpu.regs.pc = STRCASECMP;
         assert_eq!(cpu.step(&mut bus).rom_stub, Some(STRCASECMP));
-        assert_eq!(cpu.regs.read(REG_A0) as i32, -i32::from(b'\xE9'), "\"\" vs \"\\xE9\"");
+        assert_eq!(
+            cpu.regs.read(REG_A0) as i32,
+            -i32::from(b'\xE9'),
+            "\"\" vs \"\\xE9\""
+        );
     }
 
     #[test]

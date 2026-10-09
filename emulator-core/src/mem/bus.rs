@@ -169,6 +169,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::console::Console;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
 use crate::peripherals::gdma::{self, Gdma};
@@ -179,7 +180,6 @@ use crate::peripherals::mmu::FlashMmu;
 use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
-use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::system::System;
 use crate::peripherals::systimer::{SysTimer, TICKS_PER_STEP};
 use crate::peripherals::timg::Timg;

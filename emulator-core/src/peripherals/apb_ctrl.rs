@@ -114,7 +114,10 @@ mod tests {
         assert_eq!(a.read_byte(RND_DATA_REG + 1), first.to_le_bytes()[1]);
         let mut b = ApbCtrl::new();
         read_word(&mut b, RND_DATA_REG);
-        assert_eq!(read_word(&mut a, RND_DATA_REG), read_word(&mut b, RND_DATA_REG));
+        assert_eq!(
+            read_word(&mut a, RND_DATA_REG),
+            read_word(&mut b, RND_DATA_REG)
+        );
     }
 
     #[test]
@@ -124,7 +127,10 @@ mod tests {
             a.write_byte(RND_DATA_REG + i, 0);
         }
         let mut b = a.clone();
-        assert_eq!(read_word(&mut a, RND_DATA_REG), read_word(&mut b, RND_DATA_REG));
+        assert_eq!(
+            read_word(&mut a, RND_DATA_REG),
+            read_word(&mut b, RND_DATA_REG)
+        );
         assert!(ApbCtrl::handles(0x0B3));
         assert!(!ApbCtrl::handles(0x0AC));
         assert!(!ApbCtrl::handles(0x0B4));

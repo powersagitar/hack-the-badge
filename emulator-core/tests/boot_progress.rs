@@ -1352,9 +1352,11 @@ fn walk_to_registered(role: &str) -> FirmwareRuntime {
 
 /// Each role's registered screen ([`walk_to_registered`]), by
 /// [`ROLE_ROWS`] index.
-static REGISTERED: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] = [const { OnceLock::new() }; ROLE_ROWS.len()];
+static REGISTERED: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] =
+    [const { OnceLock::new() }; ROLE_ROWS.len()];
 /// Each role's launcher ([`walk_to_launcher`]), by [`ROLE_ROWS`] index.
-static LAUNCHER: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] = [const { OnceLock::new() }; ROLE_ROWS.len()];
+static LAUNCHER: [OnceLock<FirmwareRuntime>; ROLE_ROWS.len()] =
+    [const { OnceLock::new() }; ROLE_ROWS.len()];
 
 fn role_index(role: &str) -> usize {
     ROLE_ROWS
@@ -1491,6 +1493,9 @@ fn launcher_opens_dice() {
         rt.console_output()
     );
     let (hash, step) = press_and_settle(&mut rt, 1, DICE_OPEN_HASH);
-    assert_eq!(hash, DICE_ROLLED_HASH, "after A (roll), stable at step {step}");
+    assert_eq!(
+        hash, DICE_ROLLED_HASH,
+        "after A (roll), stable at step {step}"
+    );
     assert_no_panic_text(&rt);
 }
