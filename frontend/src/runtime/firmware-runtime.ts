@@ -31,9 +31,9 @@
  * risk — see the Task 6 brief). `DEFAULT_CYCLES_PER_FRAME` is a documented
  * guess, not a measurement:
  *
- * - The real badge runs its CPU at 80 MHz (per its own boot log; the
- *   emulator's ROM-stub `CPU_FREQ_MHZ` = 160 in `emulator-core/src/rom.rs`
- *   is a separate, documented flagged guess). At 60 fps that's ~1.33M
+ * - The real badge runs its CPU at 80 MHz (per its own boot log; since
+ *   Milestone 6 Task 2 the emulator's stateful ROM `ets_get_cpu_frequency`
+ *   in `emulator-core/src/rom.rs` reports 80 MHz too). At 60 fps that's ~1.33M
  *   instructions of real time per frame — more than is safe to spend
  *   synchronously inside one `requestAnimationFrame` callback.
  * - The prior session measured ~40M steps/s for `cargo test --release`

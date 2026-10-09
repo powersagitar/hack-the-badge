@@ -544,9 +544,10 @@ plan text), plus the full Milestone 4 backlog, are in
    answers on I2C0; any other I2C address is NACKed. RMT transmissions
    are consumed but not shown, and NFC is not modeled.
 4. The dormant items from the history below: flagged ROM-stub guesses
-   (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
-   "Ground truth from the physical badge"; the USB packet pacing,
-   `PACKET_STEPS`, also assumes 160 MHz), `TICKS_PER_STEP = 1` (item 6)
+   (item 5; the USB packet pacing, `PACKET_STEPS`, assumes 160 MHz against
+   the badge's real 80 MHz, see "Ground truth from the physical badge"; the
+   `CPU_FREQ_MHZ` = 160 stub is gone since Milestone 6 Task 2),
+   `TICKS_PER_STEP = 1` (item 6)
    and simplified edge interrupts (item 9). Item 7 (the bootloader's
    extra DROM page) is resolved: the MMU seeds entry 127.
 5. **The eFuse block is not modeled**, so the emulated boot logs
@@ -557,8 +558,11 @@ plan text), plus the full Milestone 4 backlog, are in
    timestamp is the CPU cycle counter (`mpccr`, CSR `0x7E2`) and that CSR
    read 0. With the counter modeled (one count per step) the early lines
    read `W (2)`/`I (2)`, then `I (5)` from `cpu_start: Pro cpu start user
-   code` through `Calling app_main()`. They are not the badge's values:
-   one count per step is not the real cycle rate (backlog).
+   code` through `Calling app_main()`. Since Milestone 6 Task 2 the
+   timestamp divides by the stateful ROM frequency (80, not 160), so they
+   read `W (10)`/`I (10)` through `flash io: dio`, then `I (11)` from
+   `sleep_gpio` through `Calling app_main()`. They are not the badge's
+   values: one count per step is not the real cycle rate (backlog).
 
 ### Ground truth from the physical badge
 
@@ -567,8 +571,8 @@ committed; see the "Data-handling note"). None of these facts is personal
 data:
 
 - ESP32-C3, chip revision v0.4; 40 MHz crystal; CPU at 80 MHz (the
-  emulator's `CPU_FREQ_MHZ` stub returns 160, a flagged guess left alone
-  because nothing has stalled on it).
+  emulated boot logs `cpu freq: 80000000 Hz` too since Milestone 6 Task 2;
+  before, a constant `ets_get_cpu_frequency` stub made it 160).
 - 4 MiB flash, JEDEC ID `0x46 0x40 0x16`.
 - Console: USB-Serial-JTAG.
 - Partition table: `nvs` 0x9000/0x4000, `phy_init` 0xd000/0x1000,
@@ -1881,7 +1885,8 @@ writes as byte-split words (all failed before the change). Decisions are in
   The framebuffer is still the splash (2,340 values, hash unchanged).
   Other unmapped accesses: SPIMEM1 `+0xA4` (`SPI_MEM_SUS_STATUS_REG`, read
   by `spi_flash_hal_check_status`; now named in `Spimem1::handles`),
-  IO_MUX `0x6000_9000`, SYSTEM `0x600c_0000` (`+0x08`, `+0x58`), RTC_CNTL
+  IO_MUX `0x6000_9000`, SYSTEM `0x600c_0000` (`+0x08`, `+0x58`; modeled
+  since Milestone 6 Task 2), RTC_CNTL
   `0x6000_80bc`, and ASSIST_DEBUG `0x600c_e0xx`. Next task: model I2C0
   enough for the accelerometer probe, or trace why `hal_accel` waits.
 
@@ -1937,7 +1942,8 @@ writes as byte-split words (all failed before the change). Decisions are in
   same as at the Task 5 stall: IRAM `0x4038_f930..` (FreeRTOS critical
   sections) plus the idle hooks and the 74HC165 button scan, so the rest
   of the system runs normally. Other unmapped accesses are unchanged
-  (ASSIST_DEBUG `0x600c_e0xx`, SYSTEM `0x600c_0058`). SPIMEM1: 471
+  (ASSIST_DEBUG `0x600c_e0xx`, SYSTEM `0x600c_0058`, the latter modeled
+  since Milestone 6 Task 2). SPIMEM1: 471
   transactions, nothing unmodeled. Next task: model RMT TX.
 
 ### Milestone 4 Task D-M4-2: RMT TX; the first app launches
@@ -2080,8 +2086,9 @@ screen, and that screen responds to buttons. From a cold boot:
 - No fault, no panic text and no unmodeled SPIMEM1 command on the way.
   The idle hot PCs are the FreeRTOS idle set (IRAM `0x4038_f930..`, the
   idle hooks, the 74HC165 scan): the firmware is waiting for input. The
-  unmapped-access tail is ASSIST_DEBUG (`0x600c_e0xx`), SYSTEM
-  `0x600c_0058`/`+0x08` and RTC_CNTL `0x6000_80bc`.
+  unmapped-access tail is ASSIST_DEBUG (`0x600c_e0xx`) and RTC_CNTL
+  `0x6000_80bc` (SYSTEM `0x600c_0058`/`+0x08` were in it too until
+  Milestone 6 Task 2 modeled them).
 - **Human comparison, 2026-10-07:** the human partner compared the dumped
   first-run frame and the self-test frames with the physical badge after a
   factory reset (spec Part 3: the emulated flash holds no identity, so
@@ -2368,6 +2375,39 @@ no rung number, step count or frame hash moved. The WFI rung now checks
 the step count (1,827,060; the 12 fast-forward steps are charged as idle,
 not as steps). Task 3 makes the clock follow the firmware's SYSTEM clock
 registers.
+
+### Milestone 6 Task 2: SYSTEM clock registers and the stateful ROM frequency pair
+
+- **Probe facts (while planning):** ROM `ets_update_cpu_frequency`
+  (`0x4000_0588`, argument = MHz) is called with 40 early, 80 once the
+  firmware switches to the PLL, then 40/80 around every idle (about 600
+  steps at 40, 2,600+ at 80; 1,419 calls each way in 30M steps on blank
+  flash with the START self-test); never 160. The console printed
+  `cpu_start: cpu freq: 160000000 Hz` only because the old
+  `ets_get_cpu_frequency` stub returned a constant 160; the badge logs
+  80 MHz. In the rev3 ROM ELF the pair is `lui a5,0x3fcdf; sw a0,0x64c(a5);
+  ret` (`0x400462e8`) and the same with `lw a0` (`0x400462f2`), over the
+  `.data_ets_delay` variable `s_ticks_per_us` at `0x3fcd_f64c` (initial
+  value 40).
+- **Done:** `peripherals/system.rs` models `SYSTEM_CPU_PER_CONF_REG`
+  (`+0x08`) and `SYSTEM_SYSCLK_CONF_REG` (`+0x58`) from ESP-IDF v5.5.3's
+  `system_reg.h`, and `System::cpu_hz()` derives the frequency they
+  select as `rtc_clk_cpu_freq_get_config` does (`None` for an encoding
+  that function aborts on). The two addresses no longer reach the
+  unmapped log. `rom.rs` replaces the two stubs with guest code (one-`jal`
+  slots to transcribed bodies in the free ROM range), seeds
+  `s_ticks_per_us` = 40 and `SYSCLK_CONF` = 0 (XTAL / 1, 40 MHz) as the
+  skipped ROM and bootloader leave them, and drops `CPU_FREQ_MHZ`. The
+  emulated clock does not read `cpu_hz()` yet (Task 3).
+- **What moved:** boot now prints `cpu_start: cpu freq: 80000000 Hz`
+  (new rung `boot_reports_the_badges_80_mhz_cpu_clock`). Cycle-scaled
+  busy-waits count 80 per microsecond instead of 160, so step-exact pins
+  after the first one move later by tens to a few thousand steps (qsort's
+  return 408,740 → 408,791, the first yield 528,152 → 528,260, `MD5Init`
+  5,558,963 → 5,560,993), and the early log timestamps read `I (10)` and
+  `I (11)` instead of `I (5)`. With timestamps stripped the console is
+  otherwise unchanged, and no frame hash moved. The full old → new table
+  is in `docs/milestone-6-decisions.md`, "Measurements".
 
 ## Emulated flash chip: what it contains
 

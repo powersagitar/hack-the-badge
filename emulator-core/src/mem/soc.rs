@@ -137,6 +137,12 @@ pub const SYSTIMER_RANGE: Range<u32> = 0x6002_3000..0x6002_4000;
 /// ("Clock source divider is fixed: 2.5").
 pub const SYSTIMER_HZ: u64 = 16_000_000;
 
+/// The badge's 40 MHz crystal (`docs/firmware-emulator-notes.md`, "Ground
+/// truth from the physical badge"); also the value the bootloader stores in
+/// `RTC_XTAL_FREQ_REG` (`crate::rom`). The XTAL source of
+/// `crate::peripherals::system::System::cpu_hz` divides it.
+pub const XTAL_HZ: u64 = 40_000_000;
+
 /// `INTERRUPT_CORE0` (the ESP32-C3's non-PLIC interrupt matrix) registers
 /// (`DR_REG_INTERRUPT_CORE0_BASE == DR_REG_INTERRUPT_BASE`, confirmed via
 /// ESP-IDF v5.5.3's `soc/reg_base.h`). Same one-4KiB-page rationale as

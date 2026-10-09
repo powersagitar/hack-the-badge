@@ -273,7 +273,9 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       the lowest; while the core waits in WFI that loop
                       fast-forwards SYSTIMER to its next alarm, Task 6),
                       SYSTEM's FROM_CPU software-interrupt registers
-                      (system.rs; the rest of SYSTEM is unmapped),
+                      and its CPU_PER_CONF/SYSCLK_CONF clock registers
+                      with System::cpu_hz (system.rs, Milestone 6 Task
+                      2; the rest of SYSTEM is unmapped),
                       SYSCON/APB_CTRL's RNG data register (apb_ctrl.rs:
                       a fixed-seed xorshift32, one value per word read,
                       for esp_random(); Task D-M5-3), GPIO
@@ -347,7 +349,9 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       paired with cpu/rom_stubs.rs's generic mechanism
                       above. Also the guest-executed ROM code blobs
                       (`ESP32C3_ROM_CODE`: the one-`jal` jump-table slot
-                      plus body of qsort (insertion sort) and of strdup,
+                      plus body of qsort (insertion sort), of strdup,
+                      and of the ets_get/update_cpu_frequency pair
+                      over the ROM .data s_ticks_per_us (Milestone 6),
                       in ROM ranges no linker-script symbol points into;
                       strdup reaches the firmware's `_malloc_r` through
                       the ROM `.bss` `syscall_table_ptr` word at

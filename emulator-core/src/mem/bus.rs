@@ -49,7 +49,9 @@
 //!    `crate::peripherals` and `crate::peripherals::systimer`. Then
 //!    **SYSTEM** ([`crate::mem::soc::SYSTEM_RANGE`], Milestone 3 Task 4):
 //!    only the four `SYSTEM_CPU_INTR_FROM_CPU_<n>_REG` software-interrupt
-//!    registers (`crate::peripherals::system::System::handles`) are routed
+//!    registers and (Milestone 6 Task 2) the CPU-clock registers
+//!    `SYSTEM_CPU_PER_CONF_REG` and `SYSTEM_SYSCLK_CONF_REG`
+//!    (`crate::peripherals::system::System::handles`) are routed
 //!    to [`FirmwareBus::system`]; every other SYSTEM offset falls through to
 //!    the logged catch-all below, as before.
 //!    **SYSCON / APB_CTRL** ([`crate::mem::soc::APB_CTRL_RANGE`], Milestone 5
@@ -328,7 +330,8 @@ pub struct FirmwareBus {
     /// same ruling.
     pub intc: InterruptController,
     /// The SYSTEM peripheral (`crate::peripherals::system`), same ruling —
-    /// only the `FROM_CPU_0..3` software-interrupt registers are modeled.
+    /// only the `FROM_CPU_0..3` software-interrupt registers and the two
+    /// CPU-clock registers (`CPU_PER_CONF`, `SYSCLK_CONF`) are modeled.
     pub system: System,
     /// SYSCON / APB_CTRL (`crate::peripherals::apb_ctrl`), same ruling --
     /// only the RNG data register (`APB_CTRL_RND_DATA_REG`) is modeled.
@@ -1199,6 +1202,21 @@ mod tests {
         assert!(bus.unmapped_log().is_empty(), "RND_DATA is mapped");
         assert_eq!(bus.read32(0x6002_60AC), 0);
         assert!(bus.unmapped_log().iter().any(|x| x.addr == 0x6002_60AC));
+    }
+
+    #[test]
+    fn system_clock_registers_are_routed() {
+        use crate::peripherals::system::{CPU_PER_CONF_REG, SYSCLK_CONF_REG};
+        let mut bus = bus_with(vec![]);
+        bus.write32(SYSTEM_RANGE.start + SYSCLK_CONF_REG, 1 << 10);
+        assert_eq!(bus.read32(SYSTEM_RANGE.start + SYSCLK_CONF_REG), 1 << 10);
+        bus.write32(SYSTEM_RANGE.start + CPU_PER_CONF_REG, 0x0d);
+        assert_eq!(bus.read32(SYSTEM_RANGE.start + CPU_PER_CONF_REG), 0x0d);
+        assert_eq!(bus.system.cpu_hz(), Some(160_000_000));
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "both clock registers are mapped"
+        );
     }
 
     #[test]
