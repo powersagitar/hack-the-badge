@@ -13,7 +13,34 @@ the code, this file and the code win.
 
 ## Rulings
 
-(None yet.)
+- **R-T1-1, the fractional-tick test.** The plan's
+  `frequency_change_keeps_the_fractional_tick` expected the two steps
+  after an 80 → 40 MHz switch (3/5 tick pending) to tick `[0, 1]`. That
+  is arithmetically wrong: a 40 MHz step is 16/40 = 2/5 tick, so
+  3/5 + 2/5 completes the tick on the first step, and the plan's own
+  `Clock` returns 1 there. The test now asserts the next four steps tick
+  `[1, 0, 0, 1]` with `total_ticks() == 2`. That catches both failure
+  modes: a dropped remainder gives `[0, 0, 1, 0]`, and a remainder kept
+  without rescaling gives `[1, 1, ...]`. If wrong: a frequency switch
+  could lose or invent time without a test noticing.
+- **R-T1-3, the WFI rung's metric.**
+  `boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`
+  now measures `clock.idle_ticks()` (1,827,072 at step 5,550,000) instead
+  of SYSTIMER's lead over the step count (1,827,060). The two differ by
+  the 12 fast-forward steps: their whole jump is now charged as idle time,
+  not one tick of it as a step. The `>= 1,500,000` threshold is
+  unchanged. If wrong: the rung would no longer prove that the
+  fast-forward is what put time ahead of the steps.
+- **R-T1-5, time conversions saturate.** `Clock::ticks_at_us` and
+  `Clock::elapsed_us` compute in `u128` and saturate to `u64::MAX`
+  rather than truncating with `as`. Above about 1.15e18 µs the tick count
+  exceeds `u64` at 16 MHz, and the browser can reach that through
+  `runUntil`'s `f64`. A truncated target wrapped to a small value
+  (2^62 µs became 0 ticks, so `run_until` ran nothing), and a
+  chip-agnostic `timer_hz` below 1 MHz could do the same to `elapsed_us`.
+  A saturated target is never reached, so `run_until` runs to its step
+  cap. If wrong: a far-future target from the browser would silently run
+  zero steps.
 
 ## Measurements
 

@@ -88,14 +88,17 @@ impl Clock {
         self.idle_ticks
     }
 
-    /// Emulated time in whole microseconds.
+    /// Emulated time in whole microseconds, saturating at `u64::MAX`.
     pub fn elapsed_us(&self) -> u64 {
-        (u128::from(self.total_ticks) * 1_000_000 / u128::from(self.timer_hz)) as u64
+        u64::try_from(u128::from(self.total_ticks) * 1_000_000 / u128::from(self.timer_hz))
+            .unwrap_or(u64::MAX)
     }
 
-    /// The first tick count whose time is at least `us` microseconds.
+    /// The first tick count whose time is at least `us` microseconds,
+    /// saturating at `u64::MAX` (a target that far off is never reached).
     pub fn ticks_at_us(&self, us: u64) -> u64 {
-        (u128::from(us) * u128::from(self.timer_hz)).div_ceil(1_000_000) as u64
+        u64::try_from((u128::from(us) * u128::from(self.timer_hz)).div_ceil(1_000_000))
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -176,6 +179,16 @@ mod tests {
         assert_eq!(c.ticks_at_us(0), 0);
         assert_eq!(c.ticks_at_us(1), 16);
         assert_eq!(c.ticks_at_us(100_000), 1_600_000);
+        // Saturates instead of wrapping (2^62 us is 2^66 ticks).
+        assert_eq!(c.ticks_at_us(1 << 62), u64::MAX);
+        assert_eq!(c.ticks_at_us(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn elapsed_us_saturates_with_a_slow_timer() {
+        let mut c = Clock::new(1, 1, 1);
+        c.advance_idle(u64::MAX);
+        assert_eq!(c.elapsed_us(), u64::MAX);
     }
 
     #[test]
