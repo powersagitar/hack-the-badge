@@ -559,9 +559,11 @@ plan text), plus the full Milestone 4 backlog, are in
    read 0. With the counter modeled (one count per step) the early lines
    read `W (2)`/`I (2)`, then `I (5)` from `cpu_start: Pro cpu start user
    code` through `Calling app_main()`. Since Milestone 6 Task 2 the
-   timestamp divides by the stateful ROM frequency (80, not 160), so they
-   read `W (10)`/`I (10)` through `flash io: dio`, then `I (11)` from
-   `sleep_gpio` through `Calling app_main()`. They are not the badge's
+   timestamp divides by the stateful ROM frequency (80, not 160) and the
+   app's `rtc_clk_init()` rescales the counter from the bootloader's 80
+   MHz, so they read `W (10)` for `rtc_init`, `I (5)` from `cpu_start:
+   Unicore app` through `sleep_gpio: Configure ...`, then `I (6)` from
+   `sleep_gpio: Enable ...` through `Calling app_main()`. They are not the badge's
    values: one count per step is not the real cycle rate (backlog).
 
 ### Ground truth from the physical badge
@@ -2396,16 +2398,23 @@ registers.
   that function aborts on). The two addresses no longer reach the
   unmapped log. `rom.rs` replaces the two stubs with guest code (one-`jal`
   slots to transcribed bodies in the free ROM range), seeds
-  `s_ticks_per_us` = 40 and `SYSCLK_CONF` = 0 (XTAL / 1, 40 MHz) as the
-  skipped ROM and bootloader leave them, and drops `CPU_FREQ_MHZ`. The
+  `s_ticks_per_us` = 80 and `SYSCLK_CONF` = `1 << 10` (PLL, 80 MHz with
+  `CPU_PER_CONF` at reset), and drops `CPU_FREQ_MHZ`. Those seeds are what
+  the skipped 2nd-stage bootloader leaves: its `rtc_clk_init()` switches
+  to `CPU_CLK_FREQ_MHZ_BTLD` = 80 on the PLL and calls
+  `esp_rom_set_cpu_ticks_per_us(80)` (`bootloader_clock_init.c:40,58,83`,
+  `soc.h:139`, `rtc_clk.c:186-192`). The rev3 ELF's `s_ticks_per_us`
+  initial value 40 is only the mask ROM's own, and the review's fix round
+  replaced the first commit's XTAL / 1 seeds (ruling R-T2-4). The
   emulated clock does not read `cpu_hz()` yet (Task 3).
 - **What moved:** boot now prints `cpu_start: cpu freq: 80000000 Hz`
   (new rung `boot_reports_the_badges_80_mhz_cpu_clock`). Cycle-scaled
   busy-waits count 80 per microsecond instead of 160, so step-exact pins
-  after the first one move later by tens to a few thousand steps (qsort's
-  return 408,740 → 408,791, the first yield 528,152 → 528,260, `MD5Init`
-  5,558,963 → 5,560,993), and the early log timestamps read `I (10)` and
-  `I (11)` instead of `I (5)`. With timestamps stripped the console is
+  after the first one move by tens to a few thousand steps (qsort's return
+  408,740 → 408,767, the first yield 528,152 → 528,092, `MD5Init`
+  5,558,963 → 5,560,533), and the early log timestamps move (`I (2)` →
+  `I (5)` for the first `cpu_start` lines, `I (5)` → `I (6)` from
+  `sleep_gpio: Enable` through `Calling app_main()`). With timestamps stripped the console is
   otherwise unchanged, and no frame hash moved. The full old → new table
   is in `docs/milestone-6-decisions.md`, "Measurements".
 

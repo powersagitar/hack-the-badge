@@ -126,8 +126,9 @@
 //!    to a body transcribed from the rev3 ROM ELF (setter `0x400462e8`:
 //!    `lui a5,0x3fcdf; sw a0,0x64c(a5); ret`; getter `0x400462f2`: the same
 //!    with `lw a0`), which store and load the ROM's `.data` variable
-//!    `s_ticks_per_us` ([`ROM_TICKS_PER_US`], seeded to its ELF initial value
-//!    40 by [`esp32c3_rom_ram_initializers`]). The pair must be stateful:
+//!    `s_ticks_per_us` ([`ROM_TICKS_PER_US`]; the rev3 ELF initial value is
+//!    40, but [`esp32c3_rom_ram_initializers`] seeds the 80 the skipped
+//!    2nd-stage bootloader leaves). The pair must be stateful:
 //!    the firmware's dynamic frequency scaling calls the setter with 40 and
 //!    80 thousands of times (around every idle), callers convert CPU cycles
 //!    to microseconds with the getter's value, and `cpu_start`'s `cpu
@@ -1823,9 +1824,16 @@ pub const ETS_UPDATE_CPU_FREQUENCY: u32 = 0x4000_0588;
 /// The ROM's `s_ticks_per_us` (`.data_ets_delay` in `esp32c3_rev3_rom.elf`):
 /// the CPU ticks per microsecond the setter stores and the getter returns.
 pub const ROM_TICKS_PER_US: u32 = 0x3fcd_f64c;
-/// `s_ticks_per_us`'s initial value in the rev3 ROM ELF (`0x28`): 40, the
-/// XTAL clock the ROM runs at.
-pub const ROM_TICKS_PER_US_INIT: u32 = 40;
+/// `s_ticks_per_us` as the 2nd-stage bootloader leaves it for the app: 80.
+/// Its rev3 ROM ELF initial value is 40 (`0x28`, the XTAL clock the mask
+/// ROM runs at), but the bootloader's `bootloader_clock_configure()`
+/// (`components/bootloader_support/src/bootloader_clock_init.c:40,58,83`)
+/// calls `rtc_clk_init()` with `cpu_freq_mhz = CPU_CLK_FREQ_MHZ_BTLD`
+/// (80, `components/soc/esp32c3/include/soc/soc.h:139`), whose
+/// `rtc_clk_cpu_freq_to_pll_mhz()` (`esp_hw_support/port/esp32c3/rtc_clk.c:186-192`)
+/// calls `esp_rom_set_cpu_ticks_per_us(80)`. See
+/// [`esp32c3_rom_ram_initializers`], item 4.
+pub const ROM_TICKS_PER_US_AT_APP_ENTRY: u32 = 80;
 const _: () = assert!(ROM_TICKS_PER_US & 0x800 == 0, "lui needs no +1 carry");
 
 /// `void ets_update_cpu_frequency(uint32_t ticks_per_us)`, as the rev3 ROM
@@ -2085,16 +2093,26 @@ pub const BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE: u32 = (40 << 16) | 40;
 ///    the bus into the RTC_CNTL model's plain register storage
 ///    ([`crate::peripherals::rtc_cntl::STORE4_REG`]), which is where the
 ///    real bootloader's `WRITE_PERI_REG` lands too.
-/// 4. The mask ROM's `.data` copy of `s_ticks_per_us` (module doc, entry
-///    6): [`ROM_TICKS_PER_US`] = [`ROM_TICKS_PER_US_INIT`] (40), the rev3
-///    ELF's initial value, read by `ets_get_cpu_frequency` before the
-///    firmware's first `ets_update_cpu_frequency`.
-/// 5. `SYSTEM_SYSCLK_CONF_REG` (Milestone 6 Task 2): `0`, the CPU on XTAL
-///    with `PRE_DIV_CNT` 0, i.e. 40 MHz, matching item 4. Like item 3 this
-///    is a peripheral register: the write goes through the bus into
-///    [`crate::peripherals::system::System`]. Its header reset value
-///    (`PRE_DIV_CNT` 1, 20 MHz) is what the chip has before the ROM and
-///    bootloader run, and the shortcut boot skips both.
+/// 4. and 5. The 2nd-stage bootloader's CPU clock setup (Milestone 6
+///    Task 2, ruling R-T2-4): `bootloader_clock_configure()`
+///    (`components/bootloader_support/src/bootloader_clock_init.c:40,58,83`)
+///    calls `rtc_clk_init()` with `cpu_freq_mhz = CPU_CLK_FREQ_MHZ_BTLD`,
+///    80 (`components/soc/esp32c3/include/soc/soc.h:139`), which runs
+///    `rtc_clk_cpu_freq_to_pll_mhz(80)` (`components/esp_hw_support/port/esp32c3/rtc_clk.c:186-192`):
+///    `CPUPERIOD_SEL` 0, `PRE_DIV_CNT` 0 (`clk_ll_cpu_set_divider(1)`),
+///    `SOC_CLK_SEL` 1 (PLL), and `esp_rom_set_cpu_ticks_per_us(80)`. So the
+///    app starts at 80 MHz on the PLL:
+///    - item 4: the ROM `.data` variable `s_ticks_per_us` (module doc, entry
+///      6), [`ROM_TICKS_PER_US`] = [`ROM_TICKS_PER_US_AT_APP_ENTRY`] (80),
+///      not the rev3 ELF's mask-ROM initial value 40;
+///    - item 5: `SYSTEM_SYSCLK_CONF_REG` = `1 << 10` (PLL, `PRE_DIV_CNT`
+///      0). `SYSTEM_CPU_PER_CONF_REG`'s reset value (`0x0c`) already has
+///      `CPUPERIOD_SEL` 0, so it needs no seed. Like item 3 this is a
+///      peripheral register: the write goes through the bus into
+///      [`crate::peripherals::system::System`]. The app's own
+///      `rtc_clk_init()` (`rtc_clk_init.c:56-66`) reads these registers as
+///      `freq_before` to rescale the cycle counter, so they must say what
+///      the bootloader left.
 pub fn esp32c3_rom_ram_initializers(header: &ImageHeader) -> Vec<RamInitializer> {
     let chip_size = header
         .flash_size_bytes()
@@ -2128,16 +2146,19 @@ pub fn esp32c3_rom_ram_initializers(header: &ImageHeader) -> Vec<RamInitializer>
             addr: RTC_XTAL_FREQ_REG,
             bytes: BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE.to_le_bytes().to_vec(),
         },
-        // 4. The ROM's .data `s_ticks_per_us` (rev3 ELF initial value).
+        // 4. The bootloader's esp_rom_set_cpu_ticks_per_us(80): s_ticks_per_us
+        //    (bootloader_clock_init.c:40,58,83 -> rtc_clk_init(80 MHz, soc.h:139
+        //    CPU_CLK_FREQ_MHZ_BTLD) -> rtc_clk.c:186-192).
         RamInitializer {
             addr: ROM_TICKS_PER_US,
-            bytes: ROM_TICKS_PER_US_INIT.to_le_bytes().to_vec(),
+            bytes: ROM_TICKS_PER_US_AT_APP_ENTRY.to_le_bytes().to_vec(),
         },
-        // 5. SYSTEM_SYSCLK_CONF_REG as the skipped ROM/bootloader leave it:
-        //    XTAL / 1 (PRE_DIV_CNT 0), 40 MHz, matching s_ticks_per_us = 40.
+        // 5. SYSTEM_SYSCLK_CONF_REG as the same rtc_clk_cpu_freq_to_pll_mhz(80)
+        //    leaves it: SOC_CLK_SEL 1 (PLL), PRE_DIV_CNT 0; with CPU_PER_CONF's
+        //    reset CPUPERIOD_SEL 0 that is 80 MHz, matching item 4.
         RamInitializer {
             addr: SYSTEM_RANGE.start + SYSCLK_CONF_REG,
-            bytes: 0u32.to_le_bytes().to_vec(),
+            bytes: (1u32 << 10).to_le_bytes().to_vec(),
         },
     ]
 }
@@ -3220,10 +3241,11 @@ mod tests {
             (0x3fcd_f5d8, 0),           // dummy_len_plus[3], sig_matrix (ROM .data)
             // RTC_XTAL_FREQ_REG, as clk_ll_xtal_store_freq_mhz(40) left it (Task D12)
             (0x6000_80b8, 0x0028_0028),
-            // s_ticks_per_us, the rev3 ROM ELF's .data initial value (M6 Task 2)
-            (0x3fcd_f64c, 40),
-            // SYSTEM_SYSCLK_CONF_REG: XTAL / 1 (M6 Task 2)
-            (0x600c_0058, 0),
+            // s_ticks_per_us, as the bootloader's rtc_clk_init(80 MHz) left it
+            // (M6 Task 2, R-T2-4)
+            (0x3fcd_f64c, 80),
+            // SYSTEM_SYSCLK_CONF_REG: PLL, PRE_DIV_CNT 0 (M6 Task 2, R-T2-4)
+            (0x600c_0058, 1 << 10),
         ]
         .into_iter()
         .collect();
@@ -4980,13 +5002,31 @@ mod tests {
     }
 
     #[test]
-    fn s_ticks_per_us_starts_at_the_rom_value() {
+    fn the_cpu_clock_starts_where_the_bootloader_leaves_it() {
         let inits = esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f));
         let init = inits
             .iter()
             .find(|i| i.addr == ROM_TICKS_PER_US)
             .expect("s_ticks_per_us is initialized");
-        assert_eq!(init.bytes, 40u32.to_le_bytes());
+        assert_eq!(init.bytes, 80u32.to_le_bytes(), "80 ticks per us");
+        let sysclk = inits
+            .iter()
+            .find(|i| i.addr == SYSTEM_RANGE.start + SYSCLK_CONF_REG)
+            .expect("SYSCLK_CONF is initialized");
+        assert_eq!(
+            sysclk.bytes,
+            (1u32 << 10).to_le_bytes(),
+            "PLL, PRE_DIV_CNT 0"
+        );
+        let mut system = crate::peripherals::system::System::new();
+        for (i, b) in sysclk.bytes.iter().enumerate() {
+            system.write_byte(SYSCLK_CONF_REG + i as u32, *b);
+        }
+        assert_eq!(
+            system.cpu_hz(),
+            Some(80_000_000),
+            "with CPU_PER_CONF at reset"
+        );
     }
 
     #[test]

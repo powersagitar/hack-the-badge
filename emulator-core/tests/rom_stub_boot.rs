@@ -39,9 +39,9 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
         boot_from_factory_image_with_rom_stubs(&image).expect("real factory.bin should boot");
 
     // Past the first real log line's `ets_get_cpu_frequency`/`ets_printf`
-    // calls (steps ~400,698/~400,720), so every ROM call asserted below is
+    // calls (steps ~400,689/~400,711), so every ROM call asserted below is
     // reached, and well short of boot's first trap (the FROM_CPU_0 yield
-    // interrupt on step 528,260).
+    // interrupt on step 528,092).
     const STEP_BUDGET: usize = 420_000;
 
     // The ordered list of distinct ROM stubs hit (first-hit order), plus a
@@ -174,28 +174,28 @@ fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
 /// (step-exact by design: any earlier change moves them; the notes'
 /// history has how each was reached):
 ///
-/// 1. Fault-free through step 528,259, where vPortYield writes
+/// 1. Fault-free through step 528,091, where vPortYield writes
 ///    `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (modeled, not unmapped) and asserts
 ///    `FROM_CPU_0`.
 /// 2. The next step takes it as an interrupt on CPU line 4 (the firmware
 ///    routes `ETS_FROM_CPU_INTR0_SOURCE` there at priority 1, threshold 1).
-/// 3. No exception to step 584,379, `spi_hal_init()`'s `SPI_UPDATE` poll;
+/// 3. No exception to step 583,919, `spi_hal_init()`'s `SPI_UPDATE` poll;
 ///    on the way the ROM `gpio_matrix_out`/`gpio_matrix_in` stubs route
 ///    SPI2 onto the display pads (MOSI on GPIO10, SCLK on GPIO1) and
 ///    `SPI_UPDATE` already reads back 0.
-/// 4. The poll exits at once; no exception to step 594,962, the call into
+/// 4. The poll exits at once; no exception to step 594,502, the call into
 ///    ROM `__bswapsi2` from `spi_ll_set_command()` (`a0 = 0`).
-/// 5. Step 594,963 is the `__bswapsi2` stub; it returns to its caller.
+/// 5. Step 594,503 is the `__bswapsi2` stub; it returns to its caller.
 /// 6. No exception to the FreeRTOS idle task's `wfi` (`0x4038_b8bc`,
 ///    `esp_cpu_wait_for_intr()`); one SPI2 transaction has completed,
 ///    nothing is drawn, and neither (emulator-only) XTAL warning printed.
-/// 7. Step 598,557: the `wfi` retires and parks the core.
-/// 8. Step 598,558 fast-forwards SYSTIMER by 89,602 ticks to the FreeRTOS
+/// 7. Step 598,097: the `wfi` retires and parks the core.
+/// 8. Step 598,098 fast-forwards SYSTIMER by 89,894 ticks to the FreeRTOS
 ///    tick (alarm 0 on counter 1, CPU line 5) and takes it.
-/// 9. No exception to step 5,560,992: 42 tick periods have elapsed, LVGL
+/// 9. No exception to step 5,560,532: 42 tick periods have elapsed, LVGL
 ///    flushes frames over SPI2 through GDMA channel 0, and the framebuffer
 ///    holds the boot splash (at least 2,000 distinct colors; 2,340).
-/// 10. Step 5,560,993 is ROM `MD5Init`, called by `load_partitions()`
+/// 10. Step 5,560,533 is ROM `MD5Init`, called by `load_partitions()`
 ///     with its stack `md5_context_t` (`0x3fcb_fd30`); it returns to
 ///     `0x420f_a6ea`.
 ///
@@ -232,7 +232,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     // Phase 1: fault-free up to and including vPortYield's write of the
     // cross-core software-interrupt register, which lands in the modeled
     // SYSTEM peripheral (not the unmapped catch-all) and asserts the source.
-    let summary = rt.run(528_259);
+    let summary = rt.run(528_091);
     assert_eq!(
         summary.traps, 0,
         "expected a fault-free run; got {summary:?}"
@@ -258,8 +258,8 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
 
     // Phase 3: main_task runs app_main, which routes SPI2 through the GPIO
     // matrix via the two ROM stubs and reaches spi_hal_init's UPDATE poll
-    // after step 584,379 -- with no exception on the way (only interrupts).
-    let summary = rt.run(584_379 - 528_260);
+    // after step 583,919 -- with no exception on the way (only interrupts).
+    let summary = rt.run(583_919 - 528_092);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(rt.pc(), *SPI_UPDATE_POLL.start());
     let gpio = &rt.bus().gpio;
@@ -279,7 +279,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
 
     // Phase 4: the poll exits at once and boot runs, fault-free, up to the
     // call into ROM __bswapsi2 from spi_ll_set_command() (cmd = 0).
-    let summary = rt.run(594_962 - 584_379);
+    let summary = rt.run(594_502 - 583_919);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(rt.pc(), ROM_BSWAPSI2);
     assert_eq!(rt.cpu().regs.read(1), SPI_LL_SET_COMMAND_RA, "ra");
@@ -287,7 +287,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     assert!(!SPI_UPDATE_POLL.contains(&rt.pc()));
     assert_ne!(rt.pc(), OLD_SPIN_PC);
 
-    // Phase 5: the 594,963rd step is the __bswapsi2 stub: it returns to
+    // Phase 5: the 594,503rd step is the __bswapsi2 stub: it returns to
     // spi_ll_set_command() with the byte-swapped a0 (0).
     let summary = rt.run(1);
     assert_eq!(summary.traps, 0, "{summary:?}");
@@ -297,7 +297,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
 
     // Phase 6: no exception up to the idle task's wfi. One SPI2 transaction
     // has completed; nothing has been drawn; neither XTAL warning printed.
-    let summary = rt.run(598_556 - 594_963);
+    let summary = rt.run(598_096 - 594_503);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
         rt.cpu().csr.mcause & 0x8000_0000,
@@ -308,7 +308,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     assert_eq!(rt.pc(), ESP_CPU_WAIT_FOR_INTR_WFI);
     let console = rt.console_output();
     assert!(
-        console.contains("I (11) main_task: Calling app_main()"),
+        console.contains("I (6) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     assert!(
@@ -330,7 +330,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     );
     assert!(rt.framebuffer().iter().all(|px| *px == 0));
 
-    // Phase 7: the 598,557th step: the idle task's wfi retires and parks
+    // Phase 7: the 598,097th step: the idle task's wfi retires and parks
     // the core (no trap; it used to be an ILLEGAL_INSTRUCTION here).
     assert!(!rt.cpu().is_waiting());
     let summary = rt.run(1);
@@ -338,7 +338,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     assert!(rt.cpu().is_waiting(), "wfi parks the core");
     assert_eq!(rt.pc(), ESP_CPU_WAIT_FOR_INTR_WFI + 4);
 
-    // Phase 8: the 598,558th step fast-forwards SYSTIMER straight to the
+    // Phase 8: the 598,098th step fast-forwards SYSTIMER straight to the
     // FreeRTOS tick (alarm 0, routed to CPU line 5) and takes it, with mepc
     // the instruction after the wfi.
     let jump = rt
@@ -346,7 +346,7 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
         .systimer
         .ticks_until_next_alarm()
         .expect("the FreeRTOS tick is armed");
-    assert_eq!(jump, 89_602, "ticks to the next alarm");
+    assert_eq!(jump, 89_894, "ticks to the next alarm");
     let elapsed_before = rt.bus().systimer.elapsed_ticks();
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "{summary:?}");
@@ -361,8 +361,8 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     // LVGL task`, which moved MD5Init from step 5,555,258 to 5,558,994;
     // Milestone 5 Task D-M5-3's cycle counter moved it to 5,558,963;
     // Milestone 6 Task 2's stateful ROM CPU frequency, 80 not 160 ticks
-    // per microsecond, to 5,560,993.)
-    let summary = rt.run(5_560_992 - 598_558);
+    // per microsecond, to 5,560,533.)
+    let summary = rt.run(5_560_532 - 598_098);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
         rt.cpu().csr.mcause & 0x8000_0000,
@@ -393,11 +393,11 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     // log lines (`LVGL: Starting LVGL task`) now reach the console too.
     let console = rt.console_output();
     assert!(
-        console.contains("I (11) main_task: Calling app_main()"),
+        console.contains("I (6) main_task: Calling app_main()"),
         "console:\n{console}"
     );
 
-    // Phase 10: the 5,560,993rd step is the ROM MD5Init stub, called by
+    // Phase 10: the 5,560,533rd step is the ROM MD5Init stub, called by
     // load_partitions() with its stack md5_context_t; it returns.
     assert_eq!(rt.pc(), ROM_MD5_INIT);
     assert_eq!(rt.cpu().regs.read(10), 0x3fcb_fd30, "a0 = &context");
@@ -449,5 +449,5 @@ fn rom_spiflash_legacy_data_is_seeded_and_no_null_legacy_data_access_remains() {
     assert!(bus
         .console
         .text()
-        .contains("I (11) sleep_gpio: Enable automatic switching of GPIO sleep configuration"));
+        .contains("I (6) sleep_gpio: Enable automatic switching of GPIO sleep configuration"));
 }
