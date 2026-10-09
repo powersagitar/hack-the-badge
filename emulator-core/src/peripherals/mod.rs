@@ -19,7 +19,11 @@
 //!   `FROM_CPU` software-interrupt registers (Milestone 3 Task 4) — the
 //!   level sources FreeRTOS's `vPortYield` raises to request a context
 //!   switch.
-//! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
+//! - [`apb_ctrl`]: [`apb_ctrl::ApbCtrl`], SYSCON/APB_CTRL's hardware RNG
+//!   data register (`APB_CTRL_RND_DATA_REG`) as a fixed-seed xorshift32,
+//!   one value per word read, for `esp_random()` (Milestone 5 Task
+//!   D-M5-3).
+//! - [`rtc_cntl`]:[`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
 //!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
 //!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
 //!   from `systimer`'s monotonic `elapsed_ticks()` scaled to the RTC slow
@@ -77,6 +81,7 @@
 //! mirroring how `FirmwareBus` already distinguishes XIP vs. RAM-copied
 //! regions by a manual range check, not a generic abstraction.
 
+pub mod apb_ctrl;
 pub mod console;
 pub mod flash;
 pub mod gdma;

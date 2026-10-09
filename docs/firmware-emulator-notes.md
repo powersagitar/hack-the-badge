@@ -457,8 +457,10 @@ hacker; step counts are emulated steps, not time):
   hardware.
 - No fault, no panic text on the way. Still unmodeled on this path: the
   LEDs (`prov apply`'s green flashes and role colour are sent over RMT
-  but not shown), NFC, and the built-in apps behind the launcher, which
-  have not been opened yet.
+  but not shown) and NFC. Of the built-in apps behind the launcher, Dice
+  opens and rolls (Task D-M5-3 modeled what its `esp_random()` needs;
+  not yet pinned by a rung or compared with the badge); Snake launches
+  but ends in "Game over" before any input (backlog).
 
 **Resolved in Milestone 5** (details in the history below and in
 [`milestone-5-decisions.md`](milestone-5-decisions.md)):
@@ -474,6 +476,9 @@ hacker; step counts are emulated steps, not time):
   `__floatsisf`, `__subsf3`, `__gtsf2`.
 - The frontend's provisioning controls (Task 7) and shared test
   checkpoints (Task 8).
+- The CPU cycle counter (`mpccr`) and the RNG data register
+  (`APB_CTRL_RND_DATA_REG`), which `esp_random()` spins on (Task D-M5-3).
+  Early log timestamps are no longer `I (0)`.
 
 **Resolved in Milestone 4** (details in the history below and in
 [`milestone-4-decisions.md`](milestone-4-decisions.md)):
@@ -538,14 +543,13 @@ plan text), plus the full Milestone 4 backlog, are in
 5. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
-6. **Every log timestamp up to `main_task: Calling app_main()` reads
-   `I (0)`** (likewise `W (0)`/`E (0)`). Later lines carry non-zero
-   timestamps (`I (120)`, `E (470)`, ...), which on ESP-IDF come from the
-   FreeRTOS tick count once the scheduler runs. On real hardware the log
-   timestamp is milliseconds since boot and advances line by line. The
-   likely cause (not traced) is that the early timestamp comes from the
-   CPU cycle counter, and the ESP32-C3's performance-counter CSR is not
-   modeled. Cosmetic; no test depends on it.
+6. **Resolved (Task D-M5-3): early log timestamps.** They used to read
+   `I (0)` up to `main_task: Calling app_main()`, because the early
+   timestamp is the CPU cycle counter (`mpccr`, CSR `0x7E2`) and that CSR
+   read 0. With the counter modeled (one count per step) the early lines
+   read `W (2)`/`I (2)`, then `I (5)` from `cpu_start: Pro cpu start user
+   code` through `Calling app_main()`. They are not the badge's values:
+   one count per step is not the real cycle rate (backlog).
 
 ### Ground truth from the physical badge
 
@@ -1208,8 +1212,9 @@ predicted these blockers would surface once TIMG unblocks further boot
    leaves it ("ROM writable `.data`" above), so neither XTAL warning prints.
    Those warnings were the first callers of `ets_get_cpu_frequency`/
    `ets_printf`, so without them the whole timeline is earlier (296 steps
-   at ROM `qsort`'s return, 629 steps by the first yield, now taken on step
-   528,149). Step numbers in the history paragraphs above are as measured
+   at ROM `qsort`'s return, 629 steps by the first yield, then taken on step
+   528,149; on step 528,152 since Milestone 5 Task D-M5-3's cycle
+   counter). Step numbers in the history paragraphs above are as measured
    in their own tasks. Boot then runs with no exception through one SPI2
    transaction (`TRANS_DONE` raw and enabled; the SPI2 source is routed to
    CPU line 6, which is not enabled yet), and `app_main`'s task blocks.
@@ -1627,7 +1632,7 @@ list):
    advances line by line. The likely cause (not traced) is that the early
    timestamp comes from the CPU cycle counter, and the ESP32-C3's
    performance-counter CSR is not modeled. Cosmetic; no test depends on
-   it.
+   it. (Resolved by Milestone 5 Task D-M5-3, below.)
 
 ### Milestone 4 Task 2: flash MMU
 
@@ -2291,6 +2296,46 @@ screen and launcher), with every assertion kept; debug builds optimize
 `emulator-core`. Release: 33.8 s wall (the ~345M-step hacker chain is
 the floor), 30% less CPU; debug `cargo test --workspace`: 25.8 s.
 Decisions and numbers: `milestone-5-decisions.md`, "Suite time".
+
+### Milestone 5 Task D-M5-3: the cycle counter and the RNG (`esp_random()`)
+
+From the launcher (role hacker), Snake (DOWN x3, RIGHT x2, A) never
+launched, and Dice (DOWN x3, RIGHT x3, A) opened but hung on its first
+roll. Both hung in the same loop at `0x4038_97ac..0x4038_97ca`, which is
+`esp_random()` (ESP-IDF v5.5.3 `components/esp_hw_support/hw_random.c`,
+the non-`SOC_LP_TIMER_SUPPORTED` branch). It XORs reads of `WDEV_RND_REG`
+until `esp_cpu_get_cycle_count()` has advanced by
+`cpu/apb ratio * APB_CYCLE_WAIT_NUM` (2 * 16) since the last call. That
+count is `CSR_PCCR_MACHINE` (`0x7e2`, `riscv/rv_utils.h:41-43, 107-116`),
+an unimplemented CSR that read 0, so the loop never ended. The only
+unmapped access in the window was `0x6002_60B0` reads.
+
+- **Cycle counter** (`cpu/registers.rs`, `CycleCounter`): it is
+  chip-agnostic, and chip setup places it (`mem::soc::ESP32C3_CYCLE_COUNTER`:
+  counter `0x7e2`, controls `0x7e0` PCER and `0x7e1` PCMR), installed by
+  `boot::boot_from_factory_image`. It counts once per step that does work
+  (instruction, ROM stub, trap entry), before the instruction runs. A
+  write sets it. WFI-parked and fast-forwarded steps do not count.
+  Nothing for the ESP32-C3 in ESP-IDF v5.5.3, the app or the ROM ELF
+  writes PCER/PCMR, so they are stored only and the counter always
+  counts. The firmware rescales the count at its CPU frequency switch
+  (`esp_cpu_set_cycle_count`, `0x420012a2`), so the counter runs about
+  404k counts ahead of the step count from step ~0.6M on.
+- **RNG** (`peripherals/apb_ctrl.rs`, `FirmwareBus::apb_ctrl`):
+  `APB_CTRL_RND_DATA_REG` (`0x6002_60B0`, `apb_ctrl_reg.h:431-437`) is a
+  deterministic xorshift32 seeded with `0x9E37_79B9`. Each word read (byte
+  lane 0) returns the next value. Other SYSCON offsets stay catch-all.
+- **Effects on the ratchet:** the early log timestamps went from `I (0)`
+  to `I (2)`/`I (5)`, and the timestamp division adds 3 steps before the
+  first yield (taken on step 528,152, was 528,149). `rom_stub_boot.rs`'s
+  step-exact phases moved too (the SPI_UPDATE poll 583,989 → 583,976,
+  `__bswapsi2` 593,018 → 593,005, the idle `wfi` 596,609 → 596,596, its
+  fast-forward 91,439 → 91,455 ticks, `MD5Init` 5,558,994 → 5,558,963).
+  Every rung was re-pinned exactly (ruling R-T9-4). No frame hash moved.
+- **Dice** now opens (first stable frame `0x9be3a4205d54f3ff`, unchanged)
+  and rolls: A gives "2", A again gives "6", and a shake gives "3".
+  Decisions and the old → new table are in `milestone-5-decisions.md`,
+  "Cycle counter and RNG".
 
 ## Emulated flash chip: what it contains
 

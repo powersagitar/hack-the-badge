@@ -98,6 +98,9 @@ pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), Image
     let mut cpu = Cpu::new();
     cpu.regs.pc = parsed.header.entry_addr;
     cpu.regs.write(2, initial_stack_pointer());
+    // The ESP32-C3 CPU's performance counter (`mpccr`), which the CPU has
+    // whether or not ROM stubs are installed (Task D-M5-3).
+    cpu.csr.set_cycle_counter(crate::mem::soc::ESP32C3_CYCLE_COUNTER);
 
     Ok((cpu, bus))
 }
@@ -327,6 +330,9 @@ mod tests {
         let info = cpu.step(&mut bus);
         assert!(!info.trap_taken);
         assert_eq!(cpu.regs.pc, 0x4200_0024);
+        // The ESP32-C3 performance counter (`mpccr`, 0x7E2) is installed
+        // and counted that step.
+        assert_eq!(cpu.csr.read(0x7e2), 1);
     }
 
     #[test]

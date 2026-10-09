@@ -52,6 +52,10 @@
 //!    registers (`crate::peripherals::system::System::handles`) are routed
 //!    to [`FirmwareBus::system`]; every other SYSTEM offset falls through to
 //!    the logged catch-all below, as before.
+//!    **SYSCON / APB_CTRL** ([`crate::mem::soc::APB_CTRL_RANGE`], Milestone 5
+//!    Task D-M5-3): only `APB_CTRL_RND_DATA_REG`
+//!    (`crate::peripherals::apb_ctrl::ApbCtrl::handles`) is routed to
+//!    [`FirmwareBus::apb_ctrl`]; the rest of the page stays catch-all.
 //! 5. **INTERRUPT_CORE0** ([`crate::mem::soc::INTERRUPT_CORE0_RANGE`]):
 //!    routed to [`FirmwareBus::intc`], same ruling — see
 //!    `crate::peripherals::intc`. One register
@@ -175,6 +179,7 @@ use crate::peripherals::mmu::FlashMmu;
 use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
+use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::system::System;
 use crate::peripherals::systimer::{SysTimer, TICKS_PER_STEP};
 use crate::peripherals::timg::Timg;
@@ -182,7 +187,7 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
+    is_xip_addr, APB_CTRL_RANGE, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
     IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
     MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
     SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
@@ -321,6 +326,9 @@ pub struct FirmwareBus {
     /// The SYSTEM peripheral (`crate::peripherals::system`), same ruling —
     /// only the `FROM_CPU_0..3` software-interrupt registers are modeled.
     pub system: System,
+    /// SYSCON / APB_CTRL (`crate::peripherals::apb_ctrl`), same ruling --
+    /// only the RNG data register (`APB_CTRL_RND_DATA_REG`) is modeled.
+    pub apb_ctrl: ApbCtrl,
     /// The GPIO peripheral (`crate::peripherals::gpio`), same ruling —
     /// includes the emulated 74HC165 button shift register.
     pub gpio: Gpio,
@@ -454,6 +462,7 @@ impl FirmwareBus {
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             system: System::new(),
+            apb_ctrl: ApbCtrl::new(),
             gpio: Gpio::new(),
             spi: Spi::new(),
             gdma: Gdma::new(),
@@ -703,6 +712,9 @@ impl FirmwareBus {
         if SYSTEM_RANGE.contains(&addr) && System::handles(addr - SYSTEM_RANGE.start) {
             return self.system.read_byte(addr - SYSTEM_RANGE.start);
         }
+        if APB_CTRL_RANGE.contains(&addr) && ApbCtrl::handles(addr - APB_CTRL_RANGE.start) {
+            return self.apb_ctrl.read_byte(addr - APB_CTRL_RANGE.start);
+        }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
             let offset = addr - INTERRUPT_CORE0_RANGE.start;
             if !InterruptController::handles(offset) {
@@ -809,6 +821,10 @@ impl FirmwareBus {
         }
         if SYSTEM_RANGE.contains(&addr) && System::handles(addr - SYSTEM_RANGE.start) {
             self.system.write_byte(addr - SYSTEM_RANGE.start, val);
+            return;
+        }
+        if APB_CTRL_RANGE.contains(&addr) && ApbCtrl::handles(addr - APB_CTRL_RANGE.start) {
+            self.apb_ctrl.write_byte(addr - APB_CTRL_RANGE.start, val);
             return;
         }
         if INTERRUPT_CORE0_RANGE.contains(&addr) {
@@ -1165,6 +1181,18 @@ mod tests {
             });
         }
         FirmwareBus::from_segments(Arc::from(flash.into_boxed_slice()), &descriptors)
+    }
+
+    #[test]
+    fn rng_data_register_is_routed_and_its_neighbours_stay_catch_all() {
+        let mut bus = bus_with(vec![]);
+        let a = bus.read32(0x6002_60B0); // APB_CTRL_RND_DATA_REG
+        let b = bus.read32(0x6002_60B0);
+        assert_ne!(a, b, "each word read is a fresh value");
+        assert!(a != 0 && b != 0);
+        assert!(bus.unmapped_log().is_empty(), "RND_DATA is mapped");
+        assert_eq!(bus.read32(0x6002_60AC), 0);
+        assert!(bus.unmapped_log().iter().any(|x| x.addr == 0x6002_60AC));
     }
 
     #[test]

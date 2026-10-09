@@ -9,6 +9,8 @@
 //! [`Cpu::set_pending_interrupts`] (`crate::boot::step_with_interrupts`,
 //! level delivery);
 //! [`Cpu::raise_interrupt`] is the one-shot variant unit tests use.
+//! The optional cycle counter ([`CycleCounter`]) is generic too: chip
+//! setup supplies its CSR addresses ([`Csrs::set_cycle_counter`]).
 
 mod decode;
 // The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
@@ -26,7 +28,9 @@ pub mod rom_stubs;
 #[cfg(test)]
 pub(crate) use decode::decode_32;
 pub use decode::{AluOp, BranchKind, CsrOp, CsrSrc, Instruction, LoadKind, MulDivOp, StoreKind};
-pub use registers::{csr_addr, exception_code, mstatus_bits, Csrs, Registers};
+pub use registers::{
+    csr_addr, exception_code, mstatus_bits, Csrs, CycleCounter, CycleCounterCsrs, Registers,
+};
 pub use rom_stubs::{RomStub, RomStubTable};
 
 use crate::mem::Bus;
@@ -318,6 +322,11 @@ impl Cpu {
             }
             self.waiting = false;
         }
+
+        // Every step past this point does work (trap entry, ROM stub or
+        // instruction): one cycle-counter count, before the instruction
+        // runs (see `registers::CycleCounter`).
+        self.csr.tick_cycle_counter();
 
         if self.pending_interrupts != 0 && self.csr.mstatus & mstatus_bits::MIE != 0 {
             let line = select_interrupt_line(self.pending_interrupts, &self.interrupt_priorities);
@@ -1801,6 +1810,38 @@ mod tests {
         assert!(info.trap_taken && !cpu.is_waiting());
         assert_eq!(cpu.csr.mcause, 0x8000_0000 | 3);
         assert_eq!(cpu.csr.mepc, 4, "mepc is the instruction after WFI");
+    }
+
+    fn csr_op(funct3: u32, rd: u32, csr: u32, rs1: u32) -> u32 {
+        (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
+    }
+
+    #[test]
+    fn cycle_counter_counts_each_working_step_but_not_wfi_parking() {
+        const CTR: u32 = 0x7e2;
+        let mut cpu = Cpu::new();
+        cpu.csr.set_cycle_counter(CycleCounterCsrs {
+            counter: CTR as u16,
+            controls: [0x7e0, 0x7e1],
+        });
+        let mut bus = TestBus::with_program(&[
+            addi(6, 0, 100),
+            csr_op(0b010, 5, CTR, 0), // csrrs x5, ctr, x0
+            csr_op(0b001, 0, CTR, 6), // csrrw x0, ctr, x6
+            csr_op(0b010, 7, CTR, 0), // csrrs x7, ctr, x0
+            WFI,
+        ]);
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs.read(5), 2, "counted before the read executes");
+        assert_eq!(cpu.regs.read(7), 101, "the written value, then one count");
+        cpu.step(&mut bus); // WFI retires: one count
+        assert!(cpu.is_waiting());
+        for _ in 0..10 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.csr.read(CTR as u16), 102, "parked steps do not count");
     }
 
     #[test]

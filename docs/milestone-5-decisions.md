@@ -637,6 +637,61 @@ Ruling R-T8-1 set the design:
   release profile would also change the WASM binary, so it is in the
   backlog instead.
 
+## Cycle counter and RNG (Task D-M5-3)
+
+From the launcher, Snake and Dice both hang in `esp_random()`, which spins
+on the CPU cycle counter (CSR `0x7e2`, unimplemented, read 0) while
+reading the RNG data register (`0x6002_60B0`, unmapped, read 0). The trace
+is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
+
+- **R-T9-1, the cycle counter.**
+  - Placement: the core gets a chip-agnostic counter
+    (`cpu::CycleCounter`). Chip setup places its CSRs
+    (`mem::soc::ESP32C3_CYCLE_COUNTER`: `0x7e2` counter, `0x7e0`/`0x7e1`
+    stored controls, from `riscv/rv_utils.h:41-43`). The core stays
+    ESP32-C3-unaware.
+  - Rate: one count per step that does work, matching
+    `TICKS_PER_STEP = 1`. There is no cycle model, and the 160 vs 80 MHz
+    question is in the backlog.
+  - Enables: no ESP-IDF v5.5.3 source for the ESP32-C3, no app code and
+    no ROM code writes PCER/PCMR, so there is nothing to re-create at
+    boot. The counter always counts, and the controls are stored only.
+  - If wrong (hardware resets with counting off and something unseen
+    enables it): nothing would differ while the firmware never clears
+    them. If the firmware cleared PCMR, the emulator would keep counting
+    where hardware stops.
+- **R-T9-2, the RNG.**
+  - `APB_CTRL_RND_DATA_REG` (`apb_ctrl_reg.h:431-437`) is a
+    deterministic xorshift32 (13/17/5) with the fixed seed `0x9E37_79B9`.
+  - It advances once per word read (byte lane 0), and it is cloned with
+    the bus, so checkpoints replay the same values.
+  - If wrong: it is not entropy. Every run rolls the same Dice sequence,
+    which is the point for pinned rungs. A browser-supplied seed is
+    backlog.
+- **R-T9-3:** the Task 9 app is Dice. Snake is dropped from Milestone 5
+  (backlog).
+- **R-T9-4, re-pin.** The counter moved early-boot rungs. Their old values
+  were the documented `I (0)` limitation, not ground truth. Every rung was
+  re-pinned to its new exact value, and none was loosened:
+
+  | Rung (file) | Old | New |
+  |---|---|---|
+  | 10 `boot_progress.rs` console rungs (heap_init, spi_flash, sleep_gpio, main_task lines) and 3 `rom_stub_boot.rs` console checks | `I (0) <line>` | `I (5) <line>` |
+  | `first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line`, `boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash` phase 1-2: yield written / taken | 528,148 / 528,149 | 528,151 / 528,152 |
+  | `boot_no_longer_faults_at_the_pre_task_d10_...`: the step before the yield | 528,147 | 528,150 |
+  | `rom_stub_boot.rs` phase 3: `spi_hal_init()` SPI_UPDATE poll | 583,989 | 583,976 |
+  | phase 4-5: `__bswapsi2` call / stub step | 593,017 / 593,018 | 593,004 / 593,005 |
+  | phase 6-8: idle `wfi` reached / retires / fast-forward step | 596,608 / 596,609 / 596,610 | 596,595 / 596,596 / 596,597 |
+  | phase 8: SYSTIMER jump to the FreeRTOS tick | 91,439 ticks | 91,455 ticks |
+  | phase 9-10: `MD5Init` | 5,558,994 | 5,558,963 |
+
+  - Why +3 steps before the yield: `esp_log_early_timestamp()` divides a
+    now non-zero count.
+  - Why the later phases come earlier: the firmware's CPU-frequency
+    switch rescales the counter (`esp_cpu_set_cycle_count`, `0x420012a2`)
+    and the cycle-based paths after it change length.
+  - Frame hashes, from the boot splash to the launcher, did not move.
+
 ## Remarks
 
 - **Finish-line tests** (`emulator-core/tests/boot_progress.rs`):
@@ -677,9 +732,15 @@ Ruling R-T8-1 set the design:
 
 ### Apps and UI
 
-- Launching and playing a built-in app (Snake, Dice) from the launcher
-  (the plan's Task 9 stretch, if it does not land in Milestone 5). Dice
-  likely reads the accelerometer.
+- Snake (dropped from Milestone 5, R-T9-3): with the cycle counter it
+  launches (DOWN x3, RIGHT x2, A), but its first frame already shows the
+  snake at the right wall, and "Game over / A to restart" follows about
+  2M steps later with no input. The likely cause is the game timer
+  (SYSTIMER time) outrunning LVGL rendering, which runs about 10x slow in
+  emulated time (one instruction per 16 MHz tick). Needs a CPU-speed or
+  time model before it can be a rung.
+- RNG: a browser-supplied seed for `APB_CTRL_RND_DATA_REG` (today fixed,
+  R-T9-2).
 - A console pane in the frontend: the firmware's REPL is reachable
   (`serialInput`, `consoleOutput`), but the page only shows the
   provisioner's status.
@@ -735,12 +796,13 @@ Ruling R-T8-1 set the design:
 
 - ST7789 `MADCTL` (`0x20`, then `0x60`) is unmodeled; orientation is
   human-confirmed for every pinned frame so far.
-- Every log timestamp up to `main_task: Calling app_main()` reads `I (0)`
-  (likely the unmodeled performance-counter CSR).
 - GPIO0 (the display D/C pin) is routed as SPI2 `FSPIWP`/`FSPIHD`; routing
   is stored only.
 - eFuse block unmodeled: boot logs chip revision v0.0, the badge is v0.4.
-- `CPU_FREQ_MHZ` stub returns 160; the real CPU runs at 80 MHz.
+- `CPU_FREQ_MHZ` stub returns 160; the real CPU runs at 80 MHz. The
+  cycle counter (Task D-M5-3) counts one per step, so cycle-based delays
+  and log timestamps run on the same compressed clock; PCER/PCMR do not
+  gate it.
 - `TICKS_PER_STEP = 1` is about 10x the real SYSTIMER/CPU ratio; no
   real-time calibration.
 - Flagged ROM-stub guesses: `rom_i2c_readReg*` returning 0,

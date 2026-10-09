@@ -199,7 +199,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       natively; the primary iteration loop for this half of
                       the codebase.
   src/cpu/            Generic RV32IMC decode/execute core (registers, CSRs,
-                      M-mode trap entry/mret, WFI wait state). Deliberately
+                      M-mode trap entry/mret, WFI wait state, and an
+                      optional free-running cycle counter whose CSR
+                      addresses chip setup supplies: ESP32-C3 `mpccr`
+                      0x7e2, Task D-M5-3; one count per working step). Deliberately
                       knows nothing about ESP32-C3 specifics — see
                       cpu/mod.rs's module doc. cpu/rom_stubs.rs is the
                       chip-agnostic *mechanism*
@@ -264,7 +267,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       the lowest; while the core waits in WFI that loop
                       fast-forwards SYSTIMER to its next alarm, Task 6),
                       SYSTEM's FROM_CPU software-interrupt registers
-                      (system.rs; the rest of SYSTEM is unmapped), GPIO
+                      (system.rs; the rest of SYSTEM is unmapped),
+                      SYSCON/APB_CTRL's RNG data register (apb_ctrl.rs:
+                      a fixed-seed xorshift32, one value per word read,
+                      for esp_random(); Task D-M5-3), GPIO
                       (including the GPIO matrix's FUNCn_IN/OUT_SEL_CFG
                       routing registers, stored but not yet consulted,
                       Task D11) + an emulated

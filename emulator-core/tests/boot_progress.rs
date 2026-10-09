@@ -106,19 +106,19 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 }
 
 /// The SYSTEM `FROM_CPU_0` software interrupt reaches the core: the first
-/// trap of the whole boot is vPortYield's request (written on step 528,148),
+/// trap of the whole boot is vPortYield's request (written on step 528,151),
 /// taken on the next step as an interrupt on CPU line 4 (where the firmware
 /// routes `ETS_FROM_CPU_INTR0_SOURCE`), and no exception follows through
 /// step 571,712. The scheduler-start spin at `0x4200_0cd2` is gone.
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(528_148);
+    let summary = rt.run(528_151);
     assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "the yield must be taken on the next step");
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004);
-    let summary = rt.run(571_712 - 528_149);
+    let summary = rt.run(571_712 - 528_152);
     assert_eq!(
         summary.last_instruction_fault, None,
         "no exception through step 571,712 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
@@ -135,11 +135,11 @@ fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
 /// (step ~555,000; both are in the physical badge's log too).
 #[test]
 fn boot_reaches_main_task_calling_app_main() {
-    let (rt, ok) = boot_until_console_contains("I (0) main_task: Calling app_main()", 750_000);
+    let (rt, ok) = boot_until_console_contains("I (5) main_task: Calling app_main()", 750_000);
     let console = rt.console_output();
     assert!(ok, "pc=0x{:08x}\nconsole:\n{console}", rt.pc());
     assert!(
-        console.contains("I (0) main_task: Started on CPU0"),
+        console.contains("I (5) main_task: Started on CPU0"),
         "console:\n{console}"
     );
 }
@@ -166,7 +166,7 @@ fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site
     );
     let console = rt.console_output();
     assert!(
-        console.contains("I (0) main_task: Calling app_main()"),
+        console.contains("I (5) main_task: Calling app_main()"),
         "console:
 {console}"
     );
@@ -305,7 +305,7 @@ fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
 #[test]
 fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
     let (rt, ok) = boot_until_console_contains(
-        "I (0) heap_init: Initializing. RAM available for dynamic allocation:",
+        "I (5) heap_init: Initializing. RAM available for dynamic allocation:",
         420_000,
     );
     assert!(
@@ -327,7 +327,7 @@ fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
 #[test]
 fn boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers() {
     assert_reaches(
-        "I (0) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
+        "I (5) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
         500_000,
     );
 }
@@ -348,7 +348,7 @@ fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site
         rt.console_output()
     );
     assert!(
-        rt.console_output().contains("I (0) heap_init: At 50000020"),
+        rt.console_output().contains("I (5) heap_init: At 50000020"),
         "heap_init's last region line should be present"
     );
 }
@@ -359,7 +359,7 @@ fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site
 /// response`.
 #[test]
 fn boot_reaches_spi_flash_detected_chip_generic() {
-    let (rt, ok) = boot_until_console_contains("I (0) spi_flash: detected chip: generic", 500_000);
+    let (rt, ok) = boot_until_console_contains("I (5) spi_flash: detected chip: generic", 500_000);
     assert!(
         ok,
         "flash-chip detection should succeed; pc=0x{:08x}\nconsole:\n{}",
@@ -388,18 +388,18 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
     );
     assert!(
         rt.console_output()
-            .contains("I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
+            .contains("I (5) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
         "the sleep_gpio lines after flash detection should be present"
     );
 }
 
 /// `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get` and
 /// `esprv_intc_int_set_threshold` are real stubs: zero traps through step
-/// 528,147, the step before FreeRTOS's first yield request.
+/// 528,150, the step before FreeRTOS's first yield request.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(528_147);
+    let summary = rt.run(528_150);
     assert_eq!(
         summary.traps,
         0,
@@ -416,7 +416,7 @@ fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_
 /// out.
 #[test]
 fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
-    let needle = "I (0) sleep_gpio: Enable automatic switching of GPIO sleep configuration";
+    let needle = "I (5) sleep_gpio: Enable automatic switching of GPIO sleep configuration";
     let (rt, ok) = boot_until_console_contains(needle, 500_000);
     let console = rt.console_output();
     assert!(
@@ -424,7 +424,7 @@ fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
         "never printed {needle:?}; pc=0x{:08x}\nconsole:\n{console}",
         rt.pc()
     );
-    assert!(console.contains("I (0) spi_flash: flash io: dio"));
+    assert!(console.contains("I (5) spi_flash: flash io: dio"));
     assert!(!console.contains("Detected size"), "console:\n{console}");
 }
 
@@ -434,7 +434,7 @@ fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
 const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
 
 /// SPI2's `SPI_UPDATE` reads back 0 at once, so the `spi_hal_init()` poll
-/// (first reached on step 583,989) runs but does not spin: over steps
+/// (first reached on step 583,976) runs but does not spin: over steps
 /// 583,000..596,000 each poll address is hit fewer than [`SPIN_THRESHOLD`]
 /// times and no exception is taken.
 #[test]
@@ -468,7 +468,7 @@ const ROM_BSWAPSI2: u32 = 0x4000_0788;
 const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
 
 /// ROM `__bswapsi2` is a real stub: over steps 590,000..596,608 it is
-/// entered exactly once (step 593,018, from `spi_ll_set_command()`),
+/// entered exactly once (step 593,005, from `spi_ll_set_command()`),
 /// returns to its caller, and no exception is taken.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
@@ -500,7 +500,7 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
     rt.run(596_000);
     let console = rt.console_output();
     assert!(
-        console.contains("I (0) main_task: Calling app_main()"),
+        console.contains("I (5) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     assert!(
@@ -542,7 +542,7 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
     );
     let console = rt.console_output();
     assert!(
-        console.contains("I (0) main_task: Calling app_main()"),
+        console.contains("I (5) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
