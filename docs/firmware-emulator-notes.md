@@ -457,10 +457,17 @@ hacker; step counts are emulated steps, not time):
   hardware.
 - No fault, no panic text on the way. Still unmodeled on this path: the
   LEDs (`prov apply`'s green flashes and role colour are sent over RMT
-  but not shown) and NFC. Of the built-in apps behind the launcher, Dice
-  opens and rolls (Task D-M5-3 modeled what its `esp_random()` needs;
-  not yet pinned by a rung or compared with the badge); Snake launches
-  but ends in "Game over" before any input (backlog).
+  but not shown) and NFC. Snake launches but ends in "Game over" before
+  any input (backlog).
+- **A built-in app: Dice** (Task 9 stretch, rung `launcher_opens_dice`).
+  From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
+  (`launched Dice`; first stable frame `0x9be3a4205d54f3ff`, "d20", "--").
+  A rolls: "2" (`0x692c6023de06d917`). The value comes from `esp_random()`
+  over the emulator's fixed-seed RNG (Task D-M5-3), so it is
+  deterministic and not the badge's roll. The human partner compared the
+  open and rolled frames and the roll animation with the physical badge
+  on 2026-10-08: the pictures match, and the animation matches but plays
+  a bit faster (emulated time; see the decisions' Remarks).
 
 **Resolved in Milestone 5** (details in the history below and in
 [`milestone-5-decisions.md`](milestone-5-decisions.md)):

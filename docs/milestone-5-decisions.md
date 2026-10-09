@@ -723,6 +723,16 @@ is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
   field (R-T1-2). Criterion 4's registered screen comes only after the
   onboarding app (R-T6-1); the rungs walk it. Criterion 9's controls also
   include a Shake button (R-T7-2), which the onboarding needs.
+- **Dice (Task 9 stretch).** `launcher_opens_dice` (role hacker): DOWN x3,
+  RIGHT x3, A; open frame `0x9be3a4205d54f3ff`, A roll `0x692c6023de06d917`
+  ("2", from the fixed-seed RNG, R-T9-2). The human partner compared the
+  open and rolled frames with the physical badge on 2026-10-08 ("pictures
+  match"), and watched the roll animation in the browser: "animation
+  matches but plays a bit faster". That is an observation, not acted on;
+  it is the same emulated-time compression as below. The navigation
+  frames between the launcher and Dice are pinned but were not compared.
+  The rung adds about 110M steps to hacker's chain, and the release
+  `boot_progress` suite went from 33.4 s to 42.1 s wall.
 - **Time.** Step counts are not real time: idle time is compressed (WFI
   fast-forward), `TICKS_PER_STEP` = 1, and I2C, RMT and SPIMEM1 complete
   at once. Host pacing (`PUT_CHUNK_GAP_STEPS`, `PRESS_HOLD_STEPS`,

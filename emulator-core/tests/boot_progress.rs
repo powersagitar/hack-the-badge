@@ -1447,3 +1447,50 @@ fn launcher_responds_to_navigation() {
     assert_eq!(hash, LAUNCHER_AFTER_NAV_HASH, "stable at step {step}");
     assert_no_panic_text(&rt);
 }
+
+/// Milestone 5 stretch (Task 9): from the launcher, the navigation to Dice
+/// (bottom row, last column) with each selection's stable frame (role
+/// hacker): three DOWNs, three RIGHTs.
+const TO_DICE: &[(usize, u64)] = &[
+    (4, LAUNCHER_AFTER_NAV_HASH), // DOWN: "Share"
+    (4, 0xf742_d1dd_3346_b879),   // DOWN: third row
+    (4, 0xd14b_7793_6c29_cffc),   // DOWN: bottom row, first column
+    (6, 0xb670_7637_46f5_fcaa),   // RIGHT
+    (6, 0x4ba3_86cb_3694_4ff3),   // RIGHT: "Snake"
+    (6, 0x3043_c575_7906_740d),   // RIGHT: "Dice"
+];
+/// Dice's first stable frame: title "Dice", "d20", "--", footer
+/// "L/R: die   A or SHAKE: roll" (stable about 3.3M steps after A's
+/// release).
+const DICE_OPEN_HASH: u64 = 0x9be3_a420_5d54_f3ff;
+/// Dice after one A: a d20 roll showing "2". The value comes from
+/// `esp_random()`, i.e. the emulator's fixed-seed RNG
+/// (`peripherals::apb_ctrl::RNG_SEED`, Task D-M5-3), so it is not the
+/// badge's roll.
+const DICE_ROLLED_HASH: u64 = 0x692c_6023_de06_d917;
+
+/// Milestone 5 stretch: a built-in app opens from the launcher. A on Dice
+/// launches it (`launched Dice`), its first frame is pinned, and A rolls.
+/// The open frame and the roll were compared with the physical badge on
+/// 2026-10-08 (layout, not the rolled value); the navigation frames on the
+/// way were not.
+#[test]
+fn launcher_opens_dice() {
+    let mut rt = launcher_for(OWN_ROLE);
+    let mut previous = LAUNCHER_HASH;
+    for &(slot, expected) in TO_DICE {
+        let (hash, step) = press_and_settle(&mut rt, slot, previous);
+        assert_eq!(hash, expected, "after slot {slot}, stable at step {step}");
+        previous = hash;
+    }
+    let (hash, step) = press_and_settle(&mut rt, 1, previous);
+    assert_eq!(hash, DICE_OPEN_HASH, "Dice opened, stable at step {step}");
+    assert!(
+        rt.console_output().contains("app_reg: launched Dice"),
+        "console:\n{}",
+        rt.console_output()
+    );
+    let (hash, step) = press_and_settle(&mut rt, 1, DICE_OPEN_HASH);
+    assert_eq!(hash, DICE_ROLLED_HASH, "after A (roll), stable at step {step}");
+    assert_no_panic_text(&rt);
+}

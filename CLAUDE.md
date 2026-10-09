@@ -36,10 +36,12 @@ ESP32-C3 device), in two complementary modes:
    Every role's walk is a rung (`provisions_<role>_through_the_console`).
    The registered, onboarding, launcher and navigation frames were
    compared with the physical badge on 2026-10-08 (role hacker) and match.
-   No built-in app (Snake, Dice) has been opened yet; that is the next
-   step. Read `docs/firmware-emulator-notes.md`'s "Known limitations"
+   From the launcher, Dice opens and rolls (`launcher_opens_dice`; its
+   frames and roll animation were compared with the badge on 2026-10-08;
+   the roll value comes from the emulator's fixed-seed RNG). Snake
+   launches but is not playable yet (backlog). Read `docs/firmware-emulator-notes.md`'s "Known limitations"
    (current state, open limitations, and the stall-by-stall history)
-   before assuming a built-in app works in this mode. Design decisions
+   before assuming any other built-in app works in this mode. Design decisions
    (some override the plan text, e.g. interrupt threshold `>=`) are in
    `docs/milestone-3-decisions.md`, `docs/milestone-4-decisions.md` and
    `docs/milestone-5-decisions.md`; the last has the Milestone 6
@@ -92,12 +94,14 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   real-firmware boot ratchet: each test boots `factory.bin` and asserts a
   console line, a no-fault point, or a framebuffer state. The finish line
   is provisioning plus the launcher: `provisions_<role>_through_the_console`
-  (11 roles), `boots_to_launcher` and `launcher_responds_to_navigation`
+  (11 roles), `boots_to_launcher` and `launcher_responds_to_navigation`,
+  plus the stretch rung `launcher_opens_dice`
   (Milestone 4's `boots_to_first_run_screen` and
   `first_run_screen_responds_to_start` still hold on blank flash). The
   identity walks are 280M to 345M emulated steps each, so the suite
   shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s) and takes
-  about 34 s on 18 cores (one ~345M-step chain is the floor). The debug
+  about 42 s on 18 cores (one chain of about 450M steps, hacker's walk to Dice, is
+  the floor). The debug
   `cargo test --workspace` runs the same rungs in about 26 s, because the
   dev profile builds `emulator-core` at `opt-level = 3` (root
   `Cargo.toml`). When boot moves, update the rung whose budget it
