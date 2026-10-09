@@ -628,8 +628,9 @@ Ruling R-T8-1 set the design:
 
   The release wall time is bound by one chain that no checkpoint can
   split: role hacker's walk to the navigated launcher, about 345M steps
-  in sequence (`launcher_responds_to_navigation` waits on `LAUNCHER`,
-  which waits on `REGISTERED`, `OWN_SHAKE_PAGE` and `FIRST_RUN`). The
+  in sequence at the time of this measurement (about 450M after Task 9,
+  release suite about 42 s). `launcher_responds_to_navigation` waits on
+  `LAUNCHER`, which waits on `REGISTERED`, `OWN_SHAKE_PAGE` and `FIRST_RUN`. The
   checkpoints cut the total work by 30%. The release profile is
   `opt-level = "s"` (for the WASM build); the same suite at `opt-level =
   3` took 23.0 s wall (measured with `--config`, not committed), which
@@ -745,7 +746,8 @@ is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
 - Snake (dropped from Milestone 5, R-T9-3): with the cycle counter it
   launches (DOWN x3, RIGHT x2, A), but its first frame already shows the
   snake at the right wall, and "Game over / A to restart" follows about
-  2M steps later with no input. The likely cause is the game timer
+  2M steps later with no input (observed with RND_DATA reading 0, before
+  the PRNG; not re-checked). The likely cause is the game timer
   (SYSTIMER time) outrunning LVGL rendering, which runs about 10x slow in
   emulated time (one instruction per 16 MHz tick). Needs a CPU-speed or
   time model before it can be a rung.
@@ -754,6 +756,8 @@ is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
 - A console pane in the frontend: the firmware's REPL is reachable
   (`serialInput`, `consoleOutput`), but the page only shows the
   provisioner's status.
+- `serialInput` copies the whole JS array before the 1 MiB cap is applied;
+  cap or chunk it on the JS side when a console pane lands.
 - Motion input beyond the Shake button (`DeviceMotionEvent` on a phone).
 - Task 7 review minors: a fetch error message lingers and can be masked
   by a stale provision state (clear it on a successful `provision()` and
@@ -761,8 +765,11 @@ is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
   last to resolve wins, not the last click; deferred releases are only
   flushed by the frame loop, so switching to Lua mode within 100 ms of a
   press leaves the firmware button held until resume or reset (flush in
-  `stop()`); the provisioning controls have not been tried in a real
-  browser.
+  `stop()`). The provisioning controls were exercised in a real browser
+  by the human's 2026-10-08 run, which reached Dice from the launcher; on
+  this firmware that requires provisioning (an unprovisioned My Badge
+  keeps HOME) and the onboarding shake page, so it used Provision and
+  Shake (the Task 7 Step 5 check).
 - Only role hacker's frames were compared with hardware; onboarding page 8
   ("Bump to connect") is animated and not pinned.
 
@@ -796,10 +803,12 @@ is in the notes ("Milestone 5 Task D-M5-3"). Rulings:
 ### Build and tests
 
 - The release profile is `opt-level = "s"`; at `opt-level = 3` the
-  release `boot_progress` suite runs in 23.0 s instead of 33.8 s, and the
-  WASM build would likely speed up the same way. Needs a WASM size and
+  release `boot_progress` suite ran in 23.0 s instead of 33.8 s (measured
+  before Task 9; the suite is now about 42 s and the `opt-level = 3`
+  figure was not re-measured), and the WASM build would likely speed up
+  the same way. Needs a WASM size and
   browser-speed check before changing.
-- The release suite's wall time is one ~345M-step chain (Task 8); only a
+- The release suite's wall time is one ~450M-step chain (Task 8); only a
   faster emulator shortens it.
 
 ### Carried from Milestones 3 and 4 (untouched)

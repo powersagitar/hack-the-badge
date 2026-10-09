@@ -223,7 +223,7 @@ describe("createFirmwareRuntime", () => {
     expect(fake.counters.resetCalls).toBe(1);
   });
 
-  test("isExitRequested is always false (no launcher concept in real-firmware mode)", () => {
+  test("isExitRequested is always false (no Lua-style exit-to-launcher in real-firmware mode)", () => {
     const { handle } = makeFakeHandle();
     const { ctx } = makeStubCtx();
     const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });

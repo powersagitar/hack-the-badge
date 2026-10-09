@@ -408,7 +408,7 @@ committed fake identity, through the onboarding app to the app launcher,
 which responds to navigation. From a cold boot (release build, role
 hacker; step counts are emulated steps, not time):
 
-- The boot splash is final from step 5,535,126 (`boots_to_first_real_frame`,
+- The boot splash is final from about step 5.54M (`boots_to_first_real_frame`,
   hash `0x5599c270ab0429fa`). My Badge's first-run screen ("Not
   registered yet") is stable from the 15,500,000-step sample
   (`boots_to_first_run_screen`, `0x8c5027cec0f79490`), and START still
@@ -528,8 +528,10 @@ plan text), plus the full Milestone 4 backlog, are in
 **Open limitations (Milestone 6 candidates)** (the Milestone 6 backlog in
 `milestone-5-decisions.md` is the complete list):
 
-1. **The built-in apps behind the launcher are untried.** Launching one
-   (Snake, Dice) is the next step.
+1. **Only one built-in app is playable.** Dice opens from the launcher and
+   rolls (`launcher_opens_dice`). Snake launches but reaches "Game over"
+   with no input (Milestone 6 backlog; observed with `RND_DATA` reading 0,
+   before the PRNG, and not re-checked).
 2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
@@ -2046,7 +2048,7 @@ Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
 synthetic flash through the whole of `app_main` to the first app's
 screen, and that screen responds to buttons. From a cold boot:
 
-- The boot splash is final from step 5,535,126 (`boots_to_first_real_frame`,
+- The boot splash is final from about step 5.54M (`boots_to_first_real_frame`,
   hash `0x5599c270ab0429fa`, 2,340 distinct RGB565 values; unchanged by
   the flash MMU).
 - `load_partitions()` accepts the synthesized partition table through the

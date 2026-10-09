@@ -12,7 +12,7 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestones 2–4): the badge's *built-in* apps (Snake,
+2. **Real-firmware mode** (Milestones 2–5): the badge's *built-in* apps (Snake,
    Dice, etc.) are native RISC-V machine code baked into one monolithic
    ESP-IDF app image — not extractable as Lua files (confirmed by
    flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
@@ -21,7 +21,7 @@ ESP32-C3 device), in two complementary modes:
    minimal peripheral set) written in Rust and compiled to WebAssembly.
    **Current state (end of Milestone 5):** boot runs through the ESP-IDF
    startup log, FreeRTOS and `app_main` (the boot splash is final from
-   step 5,535,126, `boots_to_first_real_frame`), formats and mounts
+   about step 5.54M, `boots_to_first_real_frame`), formats and mounts
    littlefs on the blank `storage` partition, and launches My Badge, which
    on blank flash shows its unregistered **first-run screen**
    (`boots_to_first_run_screen`; START opens the hardware self-test,
@@ -36,13 +36,15 @@ ESP32-C3 device), in two complementary modes:
    Every role's walk is a rung (`provisions_<role>_through_the_console`).
    The registered, onboarding, launcher and navigation frames were
    compared with the physical badge on 2026-10-08 (role hacker) and match.
-   From the launcher, Dice opens and rolls (`launcher_opens_dice`; its
-   frames and roll animation were compared with the badge on 2026-10-08;
-   the roll value comes from the emulator's fixed-seed RNG). Snake
-   launches but is not playable yet (backlog). Read `docs/firmware-emulator-notes.md`'s "Known limitations"
-   (current state, open limitations, and the stall-by-stall history)
-   before assuming any other built-in app works in this mode. Design decisions
-   (some override the plan text, e.g. interrupt threshold `>=`) are in
+   From the launcher, Dice opens and rolls (`launcher_opens_dice`; the
+   open and roll frames and the roll animation were compared with the badge on
+   2026-10-08, the six navigation frames between the launcher and Dice are
+   pinned but not compared; the roll value comes from the emulator's
+   fixed-seed RNG). Snake launches but is not playable yet (backlog). Read
+   `docs/firmware-emulator-notes.md`'s "Known limitations" (current state,
+   open limitations, and the stall-by-stall history) before assuming any
+   other built-in app works in this mode. Design decisions (some override
+   the plan text, e.g. interrupt threshold `>=`) are in
    `docs/milestone-3-decisions.md`, `docs/milestone-4-decisions.md` and
    `docs/milestone-5-decisions.md`; the last has the Milestone 6
    backlog.

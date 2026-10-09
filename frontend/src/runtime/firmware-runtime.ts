@@ -168,7 +168,7 @@ export interface FirmwareRuntime {
   /** Re-boots the firmware from the same image, keeping held buttons. */
   reset(): void;
   /**
-   * Real-firmware mode has no launcher/exit concept in this milestone (that's
+   * Real-firmware mode has no Lua-style exit-to-launcher (that's
    * a Lua-sandbox-mode-only affordance — see `badge.app.exit()` in
    * `lifecycle.ts`). Always `false`; exists so `shell.ts`/`main.ts` can treat
    * both runtimes uniformly without a type-level special case.

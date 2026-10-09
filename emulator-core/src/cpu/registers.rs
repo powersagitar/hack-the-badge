@@ -102,7 +102,8 @@ impl CycleCounterCsrs {
 /// 16 MHz SYSTIMER tick); there is no per-instruction cycle model.
 ///
 /// The count advances *before* the step's instruction executes, so a CSR
-/// write to the counter is what the next instruction reads (RISC-V
+/// write to the counter replaces the count including the writing step's
+/// own tick: the next step's read sees the written value + 1 (RISC-V
 /// privileged spec v1.12, section 3.1.11: a write to a counter is seen
 /// after the writing instruction's own increment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
