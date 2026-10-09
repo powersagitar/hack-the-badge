@@ -19,6 +19,10 @@
 //!   `FROM_CPU` software-interrupt registers (Milestone 3 Task 4) — the
 //!   level sources FreeRTOS's `vPortYield` raises to request a context
 //!   switch.
+//! - [`apb_ctrl`]: [`apb_ctrl::ApbCtrl`], SYSCON/APB_CTRL's hardware RNG
+//!   data register (`APB_CTRL_RND_DATA_REG`) as a fixed-seed xorshift32,
+//!   one value per word read, for `esp_random()` (Milestone 5 Task
+//!   D-M5-3).
 //! - [`rtc_cntl`]: [`rtc_cntl::RtcCntl`], the RTC_CNTL peripheral's RTC timer
 //!   (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) that
 //!   `rtc_cntl_ll_get_rtc_time()` reads at boot — derives its latched value
@@ -58,11 +62,13 @@
 //!   commands reach that chip (RDID, RDSR, reads, and the dedicated
 //!   write-enable, sector-erase and page-program bits). `FirmwareBus`
 //!   holds them as `flash_chip` and `spimem1`.
-//! - [`i2c`]: [`i2c::I2c`], the I2C0 controller in master mode with no
-//!   device on the bus (Milestone 4 Task D-M4-1): the command list runs on
-//!   `TRANS_START`, every address phase NACKs, and `INT_STATUS` drives
-//!   `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds it as
-//!   `i2c0`.
+//! - [`i2c`]: [`i2c::I2c`], the I2C0 controller in master mode (Milestone 4
+//!   Task D-M4-1): the command list runs on `TRANS_START`, and `INT_STATUS`
+//!   drives `SRC_I2C_EXT0` for the `esp_driver_i2c` ISR. `FirmwareBus` holds
+//!   it as `i2c0`. One device answers on its bus (Milestone 5 Task D-M5-2):
+//!   [`sc7a20h::Sc7a20h`], the accelerometer at `0x19`, a concrete field of
+//!   the controller (`i2c0.accel`), with a host-set acceleration; every
+//!   other address NACKs.
 //! - [`rmt`]: [`rmt::Rmt`], the RMT controller as a TX engine that completes
 //!   each transmission in zero time (Milestone 4 Task D-M4-2): `TX_START`
 //!   consumes the channel's RMT RAM symbols, pausing at each enabled
@@ -75,6 +81,7 @@
 //! mirroring how `FirmwareBus` already distinguishes XIP vs. RAM-copied
 //! regions by a manual range check, not a generic abstraction.
 
+pub mod apb_ctrl;
 pub mod console;
 pub mod flash;
 pub mod gdma;
@@ -84,6 +91,7 @@ pub mod intc;
 pub mod mmu;
 pub mod rmt;
 pub mod rtc_cntl;
+pub mod sc7a20h;
 pub mod spi;
 pub mod system;
 pub mod systimer;

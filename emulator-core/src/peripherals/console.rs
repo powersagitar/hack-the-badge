@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 pub const CONSOLE_CAPACITY: usize = 256 * 1024;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Console {
     buf: VecDeque<u8>,
 }

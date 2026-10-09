@@ -358,8 +358,8 @@ strapping pin).
 | `LCD_CS` | 2 | ST7789 SPI CS (not modeled — see Known Limitations) |
 | `LED_DIN` | 3 | WS2812 chain data (RMT) — unmodeled in v1 |
 | `LCD_RST` | 4 | ST7789 reset |
-| `I2C_SDA` | 5 | accelerometer — unmodeled in v1 |
-| `I2C_SCL` | 6 | accelerometer — unmodeled in v1 |
+| `I2C_SDA` | 5 | accelerometer (SC7A20H on I2C0, modeled from Milestone 5 Task D-M5-2; the pins themselves are not) |
+| `I2C_SCL` | 6 | accelerometer (as `I2C_SDA`) |
 | `HC165_DATA` | 7 | shift register serial data out → CPU (GPIO input) |
 | `PIN_START` | 9 | START button, direct GPIO, also BOOT strap |
 | `LCD_MOSI` | 10 | ST7789 SPI MOSI |
@@ -399,76 +399,93 @@ the firmware agreeing with the table, still not a press on real hardware.
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 4)
+### Current state (end of Milestone 5)
 
 Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
-synthetic flash through the whole of `app_main` to the first app's
-screen, and that screen responds to buttons. From a cold boot:
+synthetic flash through `app_main` to My Badge's first-run screen, and
+from there, provisioned through the firmware's own USB console with a
+committed fake identity, through the onboarding app to the app launcher,
+which responds to navigation. From a cold boot (release build, role
+hacker; step counts are emulated steps, not time):
 
-- The boot splash is final from step 5,535,126 (`boots_to_first_real_frame`,
-  hash `0x5599c270ab0429fa`, 2,340 distinct RGB565 values; unchanged by
-  the flash MMU).
-- `load_partitions()` accepts the synthesized partition table through the
-  flash MMU, `esp_littlefs` formats and mounts the blank `storage`
-  partition, the hardware abstraction layer starts (buttons, the absent
-  accelerometer, the RMT LED driver, the sleep manager), and the app
-  registry launches its first app, `app_reg: launched My Badge` (step
-  ~12.29M).
-- My Badge finds no identity (`hal_identity: no identity at
-  /littlefs/identity.json — badge is unprovisioned`) and draws its
-  first-run screen: "Not registered yet", "This badge hasn't been linked
-  to an attendee. Bring it to a registration desk.", "Press START for
-  hardware self-test". The framebuffer leaves the splash at ~13.36M,
-  changes 9 more times as the screen draws in, and is stable from the
-  15,500,000-step sample on (45 distinct values, hash
-  `0x8c5027cec0f79490`; unchanged with no input to at least step
-  46,500,000). `boots_to_first_run_screen` pins it (250,000-step samples,
-  stable for 1,000,000 steps, found at step 16,500,000; cap 17,500,000).
-- Pressing START (slot 0, held 100,000 steps) starts My Badge's hardware
-  self-test. The firmware computes for about 6,000,000 steps without
-  drawing (hot PCs `0x420b_ead4`, `0x420b_b6a4`; not traced), then shows
-  the self-test's "Press every button" screen: stable from the 22,350,000-step
-  sample, 48 distinct values, hash `0x7f325d838835baaa`.
-  `first_run_screen_responds_to_start` pins it with an 8,000,000-step
-  stability window (a 1,000,000-step window mistakes the busy phase for
-  "START did nothing").
-- The WASM twins in `frontend/test/cpu-wasm.test.ts` reach the same splash
-  and first-run hashes through the wasm-bindgen build.
-- No fault, no panic text and no unmodeled SPIMEM1 command on the way.
-  The idle hot PCs are the FreeRTOS idle set (IRAM `0x4038_f930..`, the
-  idle hooks, the 74HC165 scan): the firmware is waiting for input. The
-  unmapped-access tail is ASSIST_DEBUG (`0x600c_e0xx`), SYSTEM
-  `0x600c_0058`/`+0x08` and RTC_CNTL `0x6000_80bc`.
-- **Human comparison, 2026-10-07:** the human partner compared the dumped
-  first-run frame and the self-test frames with the physical badge after a
-  factory reset (spec Part 3: the emulated flash holds no identity, so
-  the reference is a badge without one) and confirmed they match, in content
-  and in orientation. So the frames pinned are what blank-flash boot shows
-  and what a factory-reset badge shows.
-- To look at the frame:
-  `cargo run -p emulator-core --release --example boot-probe -- --steps 16500000 --dump-frame first-run.png`
-  writes a PNG under the gitignored `local/`.
+- The boot splash is final from about step 5.54M (`boots_to_first_real_frame`,
+  hash `0x5599c270ab0429fa`). My Badge's first-run screen ("Not
+  registered yet") is stable from the 15,500,000-step sample
+  (`boots_to_first_run_screen`, `0x8c5027cec0f79490`), and START still
+  opens the hardware self-test (`first_run_screen_responds_to_start`,
+  `0x7f325d838835baaa`, now with a 1.6M-step press). Both were compared
+  with a factory-reset badge (Milestone 4, 2026-10-07); Milestone 4's end
+  state, in the history below, has the details.
+- **The console starts.** `app_main` starts the USB console REPL after
+  the first app launches, as on the badge (`hal_console: console
+  started`, rung `boot_starts_the_console`); its interrupt-driven
+  USB-Serial-JTAG driver needs interrupt source 26 and the RX direction,
+  both modeled since Task 2. The `badge> ` prompt is up at about step
+  16.78M, and `prov show` answers `provisioned=0` on blank flash.
+- **Provisioning through the console.** A host (the Rust test helper
+  `tests/common/provision.rs`, or the browser's
+  `frontend/src/runtime/provisioner.ts`) types the firmware's own
+  commands: `put /littlefs/identity.json <size>`, the JSON after `READY`
+  in 64-byte chunks 48,000 steps apart (the firmware's driver drops what
+  does not fit its 256-byte RX ring), then `prov apply`. The fixtures are
+  `frontend/public/firmware/test-identities/<role>.json`, one per role in
+  the firmware's role table. `PROV OK` prints at 29.99M to 30.19M steps,
+  depending on the role. An empty record is rejected (`PROV FAIL invalid
+  or missing /littlefs/identity.json`) and the badge stays unregistered.
+- **Onboarding.** `prov apply` resets onboarding, and My Badge hands over
+  to the onboarding app ("Setup", 11 pages). Page 1 shows the identity's
+  name. Page 3 wants every button pressed; page 6 ("Shake it!") reads the
+  SC7A20H accelerometer on I2C0 (modeled since Task D-M5-2; host input
+  `FirmwareRuntime::set_acceleration`, at rest (0, 0, +1000) mg) and
+  passes after a two-axis shake (the walk shakes at about step 192.8M);
+  page 8 is animated; page 11 needs "I agree" ticked, then START.
+- **Registered screen and launcher.** Setup ends on My Badge's registered
+  screen (role hacker at about step 278.3M; every role's frame differs,
+  since it shows the name). HOME opens the launcher, a 4x4 icon grid
+  (stable at about 317.5M; the same frame for all 11 roles), and DOWN
+  moves the selection to the next row (about 345.7M). Rungs:
+  `provisions_<role>_through_the_console` (11),
+  `onboarding_shake_page_advances_after_a_shake`, `boots_to_launcher`,
+  `launcher_is_role_independent` and `launcher_responds_to_navigation`.
+  The WASM twin reaches the same launcher through the wasm-bindgen build,
+  and the browser offers the same path (role picker, "Provision test
+  badge", "Shake"; the user walks onboarding with the button pad).
+- **Human comparison, 2026-10-08:** the human partner compared the
+  registered screen, the onboarding pages, the launcher and the launcher
+  after DOWN with the physical badge, for role hacker, and confirmed they
+  match ("frames are correct"). No other role's frames were compared on
+  hardware.
+- No fault, no panic text on the way. Still unmodeled on this path: the
+  LEDs (`prov apply`'s green flashes and role colour are sent over RMT
+  but not shown) and NFC. Snake launches but ends in "Game over" before
+  any input (backlog).
+- **A built-in app: Dice** (Task 9 stretch, rung `launcher_opens_dice`).
+  From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
+  (`launched Dice`; first stable frame `0x9be3a4205d54f3ff`, "d20", "--").
+  A rolls: "2" (`0x692c6023de06d917`). The value comes from `esp_random()`
+  over the emulator's fixed-seed RNG (Task D-M5-3), so it is
+  deterministic and not the badge's roll. The human partner compared the
+  open and rolled frames and the roll animation with the physical badge
+  on 2026-10-08: the pictures match, and the animation matches but plays
+  a bit faster (emulated time; see the decisions' Remarks).
 
-**Why the app launcher is not reached.** It is firmware logic, not an
-emulator gap. On a HOME press the app manager first asks the current app
-whether it handles HOME itself; My Badge always says yes, and its button
-handler checks the provisioned flag. Unprovisioned (as on blank flash), it
-reacts only to START (the self-test); provisioned, HOME takes it to the
-launcher. Every other button on the first-run screen does nothing, on the
-emulator and on the badge. The input path was traced end to end on a HOME
-hold (scan, debouncer, event queue, timer callback, app manager). So the
-launcher needs a provisioned identity in emulated flash, which is
-synthetic data and needs its own ruling (Milestone 5 backlog,
-`milestone-4-decisions.md`). The self-test also confirms the button slot
-mapping from the firmware's side: each raw slot lights the matching
-on-screen label (see "Physical pin map").
+**Resolved in Milestone 5** (details in the history below and in
+[`milestone-5-decisions.md`](milestone-5-decisions.md)):
 
-**What the self-test shows that the emulator does not model:** the
-accelerometer reads "0 mg" on every axis (no I2C device; the badge shows
-live values), the lights test drives the LEDs over RMT but the emulator
-does not show them, and the NFC test waits forever for a card (the summary
-lists NFC as skipped). "Hold HOME" exits the self-test back to the
-first-run screen, as A does after the summary.
+- The provisioned identity, through the firmware's console (Tasks 1, 3
+  and 6; fake identities committed with the organizers' permission).
+- USB-Serial-JTAG receive, interrupt source 26 and packet pacing against
+  CPU throughput (Tasks 2 and D-M5-1).
+- The SC7A20H accelerometer on I2C0 (Task D-M5-2).
+- ROM stubs: `strlcpy`, `strtol`, `strrchr`, `strcasecmp`, `atoi`, and
+  the libgcc soft-fp helpers `__gedf2`, `__ledf2`, `__fixdfsi`,
+  `__adddf3`, `__mulsf3`, `__addsf3`, `__unordsf2`, `__ltsf2`,
+  `__floatsisf`, `__subsf3`, `__gtsf2`.
+- The frontend's provisioning controls (Task 7) and shared test
+  checkpoints (Task 8).
+- The CPU cycle counter (`mpccr`) and the RNG data register
+  (`APB_CTRL_RND_DATA_REG`), which `esp_random()` spins on (Task D-M5-3).
+  Early log timestamps are no longer `I (0)`.
 
 **Resolved in Milestone 4** (details in the history below and in
 [`milestone-4-decisions.md`](milestone-4-decisions.md)):
@@ -507,40 +524,41 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 5 candidates)**, the first one being the
-next blocker (the Milestone 5 backlog in `milestone-4-decisions.md` is the
-complete list):
 
-1. **No identity in emulated flash**, so My Badge stays on its first-run
-   screen and the app launcher (and every built-in app behind it) is out
-   of reach; see "Why the app launcher is not reached" above.
+**Open limitations (Milestone 6 candidates)** (the Milestone 6 backlog in
+`milestone-5-decisions.md` is the complete list):
+
+1. **Only one built-in app is playable.** Dice opens from the launcher and
+   rolls (`launcher_opens_dice`). Snake launches but reaches "Game over"
+   with no input (Milestone 6 backlog; observed with `RND_DATA` reading 0,
+   before the PRNG, and not re-checked).
 2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
    hardcodes the unrotated 320x240 order. The pinned hashes are of *this*
-   framebuffer order. The splash, the first-run screen and the self-test
-   frames were compared with the physical badge and match in orientation
-   (the screen test's corner fiducials are all fully lit, so nothing is
-   clipped), so the conditional Milestone 4 MADCTL task was skipped.
-3. **No I2C devices, no LED output, no NFC.** The accelerometer probe is
-   NACKed (the self-test reads 0 mg), RMT transmissions are consumed but
-   not shown, and NFC is not modeled.
+   framebuffer order. Every frame compared with the physical badge so far
+   (splash, first-run, self-test, onboarding, registered screen, launcher)
+   matches in orientation, so the conditional Milestone 4 MADCTL task was
+   skipped.
+3. **No LED output, no NFC; one I2C device.** The SC7A20H accelerometer
+   answers on I2C0; any other I2C address is NACKed. RMT transmissions
+   are consumed but not shown, and NFC is not modeled.
 4. The dormant items from the history below: flagged ROM-stub guesses
    (item 5, and `CPU_FREQ_MHZ` = 160 against the badge's real 80 MHz; see
-   "Ground truth from the physical badge"), `TICKS_PER_STEP = 1` (item 6)
+   "Ground truth from the physical badge"; the USB packet pacing,
+   `PACKET_STEPS`, also assumes 160 MHz), `TICKS_PER_STEP = 1` (item 6)
    and simplified edge interrupts (item 9). Item 7 (the bootloader's
    extra DROM page) is resolved: the MMU seeds entry 127.
 5. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
-6. **Every log timestamp up to `main_task: Calling app_main()` reads
-   `I (0)`** (likewise `W (0)`/`E (0)`). Later lines carry non-zero
-   timestamps (`I (120)`, `E (470)`, ...), which on ESP-IDF come from the
-   FreeRTOS tick count once the scheduler runs. On real hardware the log
-   timestamp is milliseconds since boot and advances line by line. The
-   likely cause (not traced) is that the early timestamp comes from the
-   CPU cycle counter, and the ESP32-C3's performance-counter CSR is not
-   modeled. Cosmetic; no test depends on it.
+6. **Resolved (Task D-M5-3): early log timestamps.** They used to read
+   `I (0)` up to `main_task: Calling app_main()`, because the early
+   timestamp is the CPU cycle counter (`mpccr`, CSR `0x7E2`) and that CSR
+   read 0. With the counter modeled (one count per step) the early lines
+   read `W (2)`/`I (2)`, then `I (5)` from `cpu_start: Pro cpu start user
+   code` through `Calling app_main()`. They are not the badge's values:
+   one count per step is not the real cycle rate (backlog).
 
 ### Ground truth from the physical badge
 
@@ -1203,8 +1221,9 @@ predicted these blockers would surface once TIMG unblocks further boot
    leaves it ("ROM writable `.data`" above), so neither XTAL warning prints.
    Those warnings were the first callers of `ets_get_cpu_frequency`/
    `ets_printf`, so without them the whole timeline is earlier (296 steps
-   at ROM `qsort`'s return, 629 steps by the first yield, now taken on step
-   528,149). Step numbers in the history paragraphs above are as measured
+   at ROM `qsort`'s return, 629 steps by the first yield, then taken on step
+   528,149; on step 528,152 since Milestone 5 Task D-M5-3's cycle
+   counter). Step numbers in the history paragraphs above are as measured
    in their own tasks. Boot then runs with no exception through one SPI2
    transaction (`TRANS_DONE` raw and enabled; the SPI2 source is routed to
    CPU line 6, which is not enabled yet), and `app_main`'s task blocks.
@@ -1336,6 +1355,8 @@ predicted these blockers would surface once TIMG unblocks further boot
    USB-Serial-JTAG interrupt the emulator does not raise) is not yet
    checked. Until it is, a missing console line is not proof the firmware
    did not log it.
+   (Resolved: Milestone 4 Task 4 found the cause, the missing SOF frames;
+   Milestone 5 Task 2 added the USB-Serial-JTAG interrupt source, 26.)
 
    **Task 11 (Milestone 3 finish line).** No emulator change. The
    splash is final from step 5,535,126 on, and
@@ -1474,7 +1495,7 @@ limitations" at the top of this section.
 
 ### Milestone 3's end state, with Milestone 4's interim updates
 
-Superseded by "Current state (end of Milestone 4)" above; kept as the
+Superseded by "Milestone 4's end state" below; kept as the
 record of where Milestone 3 ended, the updates each Milestone 4 task made
 to it, and Milestone 3's open-limitations list.
 
@@ -1594,6 +1615,7 @@ list):
    a USB-Serial-JTAG interrupt the emulator does not raise) is not traced.
    Until it is, a missing console line is not proof the firmware did not
    log it.
+   (The interrupt source, 26, was added in Milestone 5 Task 2.)
 3. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
@@ -1619,7 +1641,7 @@ list):
    advances line by line. The likely cause (not traced) is that the early
    timestamp comes from the CPU cycle counter, and the ESP32-C3's
    performance-counter CSR is not modeled. Cosmetic; no test depends on
-   it.
+   it. (Resolved by Milestone 5 Task D-M5-3, below.)
 
 ### Milestone 4 Task 2: flash MMU
 
@@ -1714,6 +1736,8 @@ the interrupt-driven `usb_serial_jtag` driver (the VFS write never got as
 far as its `tx_func`, and the physical badge starts its console REPL, the
 usual installer of that driver, only after the launcher), newlib locks, and
 log level or line buffering (the bytes never reached the VFS write's loop).
+(Milestone 5 Task 1 later found the console REPL starts on blank flash
+too, and Task 2 added the interrupt source its driver needs.)
 
 The `pm` and `coexist` `esp_log_write` calls before step ~501,800 are also
 dropped, because the flag starts false until the init function runs. That is
@@ -1976,15 +2000,16 @@ writes as byte-split words (all failed before the change). Decisions are in
   and timestamps). Task 7 found that My Badge branches on whether the
   badge is provisioned (an identity at `/littlefs/identity.json`); a
   factory-reset physical badge shows this same first-run screen
-  (human-confirmed, see "Current state"). What a provisioned badge
-  shows was not compared.
+  (human-confirmed, see "Milestone 4's end state"). What a provisioned
+  badge shows was compared in Milestone 5.
 
 ### Milestone 4 Task 7: the finish line (first-run screen)
 
 - **Found** (release scratch runs over `FirmwareRuntime`, frames dumped
   under `local/`): the first stable non-splash frame is My Badge's
-  first-run screen (see "Current state" for steps and hashes). No input
-  path or emulator gap stops boot: the firmware waits for input.
+  first-run screen (see "Milestone 4's end state" below for steps and
+  hashes). No input path or emulator gap stops boot: the firmware waits
+  for input.
 - **Buttons on the first-run screen:** HOME, B, A, DOWN, LEFT, RIGHT, UP
   and AUX1, each held 100,000 steps (HOME, B and A also for 1M, 4M and
   30M), leave the frame and the console unchanged, with no fault. A
@@ -2002,8 +2027,8 @@ writes as byte-split words (all failed before the change). Decisions are in
   (same hash). Hold HOME also exits to the first-run screen. No path leads
   to the launcher.
 - **Human gate (2026-10-07):** match after a factory reset, content and
-  orientation (see "Current state"). The MADCTL task was therefore
-  skipped.
+  orientation (see "Milestone 4's end state" below). The MADCTL task
+  was therefore skipped.
 - **Rungs:** `boots_to_first_run_screen` and
   `first_run_screen_responds_to_start` in `boot_progress.rs`, sharing
   `run_until_stable_frame` with `boots_to_first_real_frame`; the WASM twin
@@ -2011,6 +2036,315 @@ writes as byte-split words (all failed before the change). Decisions are in
   finish-line test". The per-rung task history that used to live in
   `boot_progress.rs`'s and `rom_stub_boot.rs`'s docs is in this log; the
   test docs now say only what each rung asserts.
+
+### Milestone 4's end state
+
+The "Current state" section as Milestone 4 left it (blank flash, no
+identity), kept as written. Milestone 5 changed two details: the START
+press in `first_run_screen_responds_to_start` is held 1,600,000 steps
+(ruling R-T2-1), and the accelerometer answers (Task D-M5-2).
+
+Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
+synthetic flash through the whole of `app_main` to the first app's
+screen, and that screen responds to buttons. From a cold boot:
+
+- The boot splash is final from about step 5.54M (`boots_to_first_real_frame`,
+  hash `0x5599c270ab0429fa`, 2,340 distinct RGB565 values; unchanged by
+  the flash MMU).
+- `load_partitions()` accepts the synthesized partition table through the
+  flash MMU, `esp_littlefs` formats and mounts the blank `storage`
+  partition, the hardware abstraction layer starts (buttons, the absent
+  accelerometer, the RMT LED driver, the sleep manager), and the app
+  registry launches its first app, `app_reg: launched My Badge` (step
+  ~12.29M).
+- My Badge finds no identity (`hal_identity: no identity at
+  /littlefs/identity.json — badge is unprovisioned`) and draws its
+  first-run screen: "Not registered yet", "This badge hasn't been linked
+  to an attendee. Bring it to a registration desk.", "Press START for
+  hardware self-test". The framebuffer leaves the splash at ~13.36M,
+  changes 9 more times as the screen draws in, and is stable from the
+  15,500,000-step sample on (45 distinct values, hash
+  `0x8c5027cec0f79490`; unchanged with no input to at least step
+  46,500,000). `boots_to_first_run_screen` pins it (250,000-step samples,
+  stable for 1,000,000 steps, found at step 16,500,000; cap 17,500,000).
+- Pressing START (slot 0, held 100,000 steps) starts My Badge's hardware
+  self-test. The firmware computes for about 6,000,000 steps without
+  drawing (hot PCs `0x420b_ead4`, `0x420b_b6a4`; not traced), then shows
+  the self-test's "Press every button" screen: stable from the 22,350,000-step
+  sample, 48 distinct values, hash `0x7f325d838835baaa`.
+  `first_run_screen_responds_to_start` pins it with an 8,000,000-step
+  stability window (a 1,000,000-step window mistakes the busy phase for
+  "START did nothing").
+- The WASM twins in `frontend/test/cpu-wasm.test.ts` reach the same splash
+  and first-run hashes through the wasm-bindgen build.
+- No fault, no panic text and no unmodeled SPIMEM1 command on the way.
+  The idle hot PCs are the FreeRTOS idle set (IRAM `0x4038_f930..`, the
+  idle hooks, the 74HC165 scan): the firmware is waiting for input. The
+  unmapped-access tail is ASSIST_DEBUG (`0x600c_e0xx`), SYSTEM
+  `0x600c_0058`/`+0x08` and RTC_CNTL `0x6000_80bc`.
+- **Human comparison, 2026-10-07:** the human partner compared the dumped
+  first-run frame and the self-test frames with the physical badge after a
+  factory reset (spec Part 3: the emulated flash holds no identity, so
+  the reference is a badge without one) and confirmed they match, in content
+  and in orientation. So the frames pinned are what blank-flash boot shows
+  and what a factory-reset badge shows.
+- To look at the frame:
+  `cargo run -p emulator-core --release --example boot-probe -- --steps 16500000 --dump-frame first-run.png`
+  writes a PNG under the gitignored `local/`.
+
+**Why the app launcher is not reached.** It is firmware logic, not an
+emulator gap. On a HOME press the app manager first asks the current app
+whether it handles HOME itself; My Badge always says yes, and its button
+handler checks the provisioned flag. Unprovisioned (as on blank flash), it
+reacts only to START (the self-test); provisioned, HOME takes it to the
+launcher. Every other button on the first-run screen does nothing, on the
+emulator and on the badge. The input path was traced end to end on a HOME
+hold (scan, debouncer, event queue, timer callback, app manager). So the
+launcher needs a provisioned identity in emulated flash, which is
+synthetic data and needs its own ruling (Milestone 5 backlog,
+`milestone-4-decisions.md`). The self-test also confirms the button slot
+mapping from the firmware's side: each raw slot lights the matching
+on-screen label (see "Physical pin map").
+
+**What the self-test shows that the emulator does not model:** the
+accelerometer read "0 mg" on every axis until Milestone 5 Task D-M5-2 (no
+I2C device then; it now reads the host-set acceleration, (0, 0, +1000) mg
+at rest), the lights test drives the LEDs over RMT but the emulator
+does not show them, and the NFC test waits forever for a card (the summary
+lists NFC as skipped). "Hold HOME" exits the self-test back to the
+first-run screen, as A does after the summary.
+
+### Milestone 5 Task 1: the provisioning path
+
+A trace of `factory.bin` only (no emulator change): segments disassembled
+from the image, ROM names from Espressif's ROM ELF, and single-stepped
+scratch runs of the blank-flash boot. Every fact, with its firmware
+address, is in `milestone-5-decisions.md`'s "Trace facts"; in short:
+
+- **The provisioned flag** (`0x3fca_92b2`, byte +2 of the 0x1B4-byte
+  identity record at `0x3fca_92b0`) is set only by `hal_identity`'s
+  parser (`0x4200_e64e`), when `/littlefs/identity.json` passes every
+  check, and reaches RAM through the loader (`0x4200_e8a6`), which runs
+  at boot and from `prov apply`. NVS `badge_upload/credential` plays no
+  part in it.
+- **Validation:** 1..4096 bytes of JSON; `badge_id` and `display_name`
+  required non-empty; ten string fields with fixed maximum lengths (63,
+  39, 23, 19 or 31 bytes); `version`, `attendee_id` and
+  `provisioned_unix` accepted as numbers or decimal strings with no range
+  check (`version` is never compared); `role` matched case-insensitively
+  against an 11-entry table (`hacker` .. `visitor`), falling back to
+  `hacker`; optional `role_color`.
+- **The console does start in the emulator.** `app_main` calls
+  `hal_console_start()` unconditionally after the first app launch, and
+  it completes (REPL up, `app_main` returns at step 16,552,541). Its
+  output, and everything printed after the USB-Serial-JTAG driver is
+  installed, sits in the driver's 256-byte TX ring buffer: only the
+  driver's ISR moves it to the FIFO, and that interrupt source is not
+  modeled. Nothing blocks; once the buffer is full, writes are refused at
+  once. Task 2's interrupt source should release it.
+- **The REPL** runs in linenoise's dumb mode (its 500 ms terminal probe
+  gets no answer and discards input received meanwhile); `\r` or `\n`
+  ends a line. `put <path> <size>` prints `READY`, then `read()`s exactly
+  `<size>` bytes from stdin in 256-byte chunks; bytes beyond the driver's
+  256-byte RX ring buffer are dropped by its ISR, so the payload is sent
+  after `READY`.
+- **`prov apply`** loads and validates the file, resets onboarding
+  (`system.onboard_build = -1`, the `tutorial=reset` in its output),
+  prints `PROV OK id=..` (with the BLE address) and a summary line, and
+  sets the LEDs; it neither switches apps nor restarts. My Badge's tick
+  notices the new identity, redraws, and hands over to the onboarding app
+  ("Setup") while onboarding is pending.
+- **R-M5-3:** no signature, HMAC or hash check and no MAC/eFuse binding
+  on the path; the only MAC read is the printed BLE address.
+- **Local fixtures** (one per role, `local/m5-identities/`, gitignored
+  until the R-M5-2 gate) were written by hand from the traced schema and
+  cross-checked against the structure of a registered badge's record.
+
+### Milestone 5 Task 2: USB-Serial-JTAG receive and interrupt source
+
+USB-Serial-JTAG gained a receive direction (host queue, paced 64-byte OUT
+packets, real INT_ST/INT_ENA/INT_CLR) and interrupt source 26; the idle
+fast-forward now also stops at the next host packet
+(`FirmwareBus::ticks_until_next_event`). `FirmwareRuntime::serial_input`
+and `serial_pending` expose it. Console outcome (boot-probe, 20M steps):
+the driver's ISR now drains the TX ring buffer, so `hal_console: console
+started`, `main_task: Returned from app_main()` and the `badge> ` prompt
+(after the REPL banner) all appear by 20M steps; no interrupt storm, no
+fault. Side effect: `first_run_screen_responds_to_start`'s 100,000-step
+press was no longer registered (button polling is busy while the console
+drains); the hold is now `PRESS_HOLD_STEPS` = 1,600,000 (100 ms emulated),
+ruling R-T2-1 in `milestone-5-decisions.md`; no hash changed. Console
+input is no longer an open limitation.
+
+### Milestone 5 Task 3: console rungs; three ROM string calls
+
+Typing at the `badge> ` prompt faulted the CPU on ROM calls the console had
+never reached: `strlcpy` (`0x4000_03f0`, the REPL's line copy, size 256),
+`strtol` (`0x4000_0454`, `put`'s size argument) and `strrchr`
+(`0x4000_0408`, `put` creating parent directories). Each is now a real
+bus-effect stub (`RomStubEffect::{Strlcpy,Strtol,Strrchr}`), addresses from
+`esp32c3.rom.libc.ld` (`strtol`'s from `esp32c3.rom.newlib.ld`),
+semantics checked against the ROM ELF's newlib code (Task 8 aligned
+`strtol`'s `0x` prefix and invalid-base cases with the ROM's `_strtol_l`).
+`strtol` does not set `errno` (the ROM's reent struct is not modeled; the
+observed caller checks only `endptr`). With them, on blank flash the
+console starts at about step 16.86M, the prompt is up at 16.78M, `prov show`
+answers `provisioned=0`, and `put` / `prov apply` of `{}` print `READY`,
+`OK 2` and `PROV FAIL invalid or missing /littlefs/identity.json` by
+17.33M. Rungs: `boot_starts_the_console`,
+`console_answers_prov_show_on_the_first_run_screen`,
+`console_rejects_an_empty_identity` (driver: `tests/common/provision.rs`).
+
+### Milestone 5 Task 4: ROM calls behind provisioning and onboarding
+
+Provisioning a (local, fake) identity and walking the onboarding app that
+`prov apply` switches to faulted on nine ROM calls in turn, each now a real
+stub (decision R-T3-1): `strcasecmp` (`0x4000_03d0`, the role lookup
+`0x4200_e41a`; semantics from the ROM ELF's `strcasecmp` at `0x4005_8afa`,
+C-locale ASCII folding), the soft-fp `double` helpers `__gedf2`
+(`0x4000_0818`), `__ledf2` (`0x4000_0828`), `__fixdfsi` (`0x4000_07dc`) and
+`__adddf3` (`0x4000_076c`), hit during `prov apply`'s identity load, and
+the `float` helpers `__mulsf3` (`0x4000_0854`), `__addsf3` (`0x4000_0770`),
+`__unordsf2` (`0x4000_08c8`) and `__ltsf2` (`0x4000_0838`), hit on the
+onboarding's "Shake it!" page
+(`RomStubEffect::{Strcasecmp,SoftDouble,SoftFloat}`; addresses from
+`esp32c3.rom.libc.ld` / `esp32c3.rom.libgcc.ld`). No boot rung pinned
+them then (the path needs an identity, and identity-using tests waited
+for the R-M5-2 permission gate); the Task 6 identity rungs run them.
+
+### Milestone 5 Task D-M5-1: USB OUT packet pacing against CPU throughput
+
+A payload larger than the driver's 256-byte RX ring was dropped: OUT
+packets arrived every 821 steps (the packet time at SYSTIMER's 16 MHz)
+while the `put` task needs ~20-24k steps to drain one. The model now paces
+in CPU steps: `PACKET_STEPS` = 8,210 (51.3 us x 160 MHz), with
+`PACKET_TICKS` derived so the idle fast-forward stays consistent. That
+alone fixes payloads up to ~320 bytes (the identity size class); the test
+host (`provision::put_file`) additionally sends 64-byte chunks
+`PUT_CHUNK_GAP_STEPS` = 48,000 steps apart. Rung:
+`put_accepts_a_payload_larger_than_the_rx_ring` (600 synthetic bytes, `OK
+600` at about step 17.9M). Decisions: `milestone-5-decisions.md`.
+
+### Milestone 5 Task D-M5-2: the SC7A20H accelerometer; onboarding completes
+
+**ROM calls.** With an accelerometer answering on I2C0 (below), four more
+ROM calls were observed faulting, each now a real stub (R-T3-1):
+`__floatsisf` (`0x4000_0800`, `hal_accel`'s axis conversion
+`0x4200_a812`, reached at boot by the `accel_cache` task), `__subsf3`
+(`0x4000_0898`) and `__gtsf2` (`0x4000_0824`, the shake detector
+`0x4205_7292` on onboarding page 6), and ROM newlib `atoi`
+(`0x4000_044c`; ROM body `strtol(s, NULL, 10)` at `0x4003_1dac`), which
+`hal_config` (`0x4200_b2fe`) calls when the finished onboarding app writes
+the `system` config. Addresses from `esp32c3.rom.libgcc.ld` /
+`esp32c3.rom.newlib.ld`. A faulting ROM call shows up in the firmware's
+own panic output and then as a fault at `software_reset_cpu`
+(`0x4000_0094`), the panic handler's restart; that is not a modeled
+restart.
+
+**The device.** Onboarding page 6 ("Shake it!") needed the accelerometer
+(Task 4 Finding 2; ruling R-T4-3). `peripherals/sc7a20h.rs` models the
+SC7A20H behind I2C0's address phase (`i2c0.accel`, address `0x19`; every
+other address still NACKs): register file, sub-address auto-increment,
+`WHO_AM_I` = `0x11`, `OUT_*` from a host acceleration in the configured
+full scale, `ZYXDA` always set while powered up. Host input:
+`FirmwareRuntime::set_acceleration(x_mg, y_mg, z_mg)`, default (0, 0,
++1000) mg (face up); no wasm passthrough yet (Task 6). Boot now prints
+`hal_accel: SC7A20H detected (0x11)` at step ~6.09M, as the physical badge
+does, and the rung `boot_reports_the_absent_accelerometer_after_i2c0_nacks`
+became `boot_detects_the_sc7a20h_accelerometer_on_i2c0` (same 10M budget,
+same 1M-step no-fault tail, which now covers the `accel_cache` task's
+reads). No pinned frame hash moved: the splash, first-run and self-test
+buttons frames do not show the accelerometer. What the firmware does with
+the sensor (registers, sampling, the shake detector's EMA and 1200 mg
+threshold) is traced in `milestone-5-decisions.md` (`ACCEL`); the device
+decisions (encoding, data ready, stationary default) follow it there.
+
+**The onboarding walk (local, fake hacker identity).** Page 6 now shows
+`G-force 1000 mg` at rest. The shake pattern (two axes at +/-2 g, Z at
++1 g, six ~62.5 ms half-periods) trips the detector: the footer becomes
+`A / START: next`, A advances, and pages 7 to 11 follow with A (page 11's
+A ticks "I agree"; START then finishes). Setup exits, writes the `system`
+config (ROM `atoi`, above) and launches My Badge's registered screen. The
+step counts and hashes are in the task report; the onboarding rung is held
+for the permission gate (R-M5-2) in `local/m5-held-rungs.rs`. Task 6
+committed it.
+
+### Milestone 5 Task 6: identity rungs (the finish line)
+
+The human partner relayed the organizers' permission on 2026-10-08
+(ruling R-M5-2), so the eleven fake fixtures moved from `local/` to
+`frontend/public/firmware/test-identities/` unchanged, with every rung
+that uses them: `provisions_<role>_through_the_console` (all 11 roles),
+`onboarding_shake_page_advances_after_a_shake`, `boots_to_launcher`,
+`launcher_is_role_independent` and `launcher_responds_to_navigation`
+(steps and hashes in "Current state" and `milestone-5-decisions.md`).
+The plan expected `prov apply` to land on the registered screen; it
+starts the onboarding app instead, so the rungs walk it (R-T6-1). The
+WASM twin provisions role hacker through the frontend provisioner and
+reaches the same launcher hash. `emulator-wasm` gained one-line
+`serialInput`, `serialPending` and `setAcceleration` passthroughs. The
+human partner compared role hacker's frames with the physical badge the
+same day: they match.
+
+### Milestone 5 Task 7: provisioning from the browser
+
+Firmware mode gained a role picker, "Provision test badge" and "Shake"
+buttons, a status line and a hint. The browser runtime polls the
+provisioner each frame, gives up after 60,000,000 emulated steps
+(R-T7-1), replays the rungs' shake pattern (R-T7-2) and holds every
+button press at least 1,600,000 steps (R-T7-3). The user walks the
+onboarding pages with the button pad. Not yet tried in a real browser.
+
+### Milestone 5 Task 8: shared checkpoints
+
+The identity rungs made `boot_progress` slow (34.8 s release, about 8
+minutes in a debug build). `FirmwareRuntime` is now `Clone`, and the
+rungs continue from checkpoints reached once per test binary (the
+first-run screen, hacker's onboarding page 6, each role's registered
+screen and launcher), with every assertion kept; debug builds optimize
+`emulator-core`. Release: 33.8 s wall (the ~345M-step hacker chain is
+the floor), 30% less CPU; debug `cargo test --workspace`: 25.8 s.
+Decisions and numbers: `milestone-5-decisions.md`, "Suite time".
+
+### Milestone 5 Task D-M5-3: the cycle counter and the RNG (`esp_random()`)
+
+From the launcher (role hacker), Snake (DOWN x3, RIGHT x2, A) never
+launched, and Dice (DOWN x3, RIGHT x3, A) opened but hung on its first
+roll. Both hung in the same loop at `0x4038_97ac..0x4038_97ca`, which is
+`esp_random()` (ESP-IDF v5.5.3 `components/esp_hw_support/hw_random.c`,
+the non-`SOC_LP_TIMER_SUPPORTED` branch). It XORs reads of `WDEV_RND_REG`
+until `esp_cpu_get_cycle_count()` has advanced by
+`cpu/apb ratio * APB_CYCLE_WAIT_NUM` (2 * 16) since the last call. That
+count is `CSR_PCCR_MACHINE` (`0x7e2`, `riscv/rv_utils.h:41-43, 107-116`),
+an unimplemented CSR that read 0, so the loop never ended. The only
+unmapped access in the window was `0x6002_60B0` reads.
+
+- **Cycle counter** (`cpu/registers.rs`, `CycleCounter`): it is
+  chip-agnostic, and chip setup places it (`mem::soc::ESP32C3_CYCLE_COUNTER`:
+  counter `0x7e2`, controls `0x7e0` PCER and `0x7e1` PCMR), installed by
+  `boot::boot_from_factory_image`. It counts once per step that does work
+  (instruction, ROM stub, trap entry), before the instruction runs. A
+  write sets it. WFI-parked and fast-forwarded steps do not count.
+  Nothing for the ESP32-C3 in ESP-IDF v5.5.3, the app or the ROM ELF
+  writes PCER/PCMR, so they are stored only and the counter always
+  counts. The firmware rescales the count at its CPU frequency switch
+  (`esp_cpu_set_cycle_count`, `0x420012a2`), so the counter runs about
+  404k counts ahead of the step count from step ~0.6M on.
+- **RNG** (`peripherals/apb_ctrl.rs`, `FirmwareBus::apb_ctrl`):
+  `APB_CTRL_RND_DATA_REG` (`0x6002_60B0`, `apb_ctrl_reg.h:431-437`) is a
+  deterministic xorshift32 seeded with `0x9E37_79B9`. Each word read (byte
+  lane 0) returns the next value. Other SYSCON offsets stay catch-all.
+- **Effects on the ratchet:** the early log timestamps went from `I (0)`
+  to `I (2)`/`I (5)`, and the timestamp division adds 3 steps before the
+  first yield (taken on step 528,152, was 528,149). `rom_stub_boot.rs`'s
+  step-exact phases moved too (the SPI_UPDATE poll 583,989 → 583,976,
+  `__bswapsi2` 593,018 → 593,005, the idle `wfi` 596,609 → 596,596, its
+  fast-forward 91,439 → 91,455 ticks, `MD5Init` 5,558,994 → 5,558,963).
+  Every rung was re-pinned exactly (ruling R-T9-4). No frame hash moved.
+- **Dice** now opens (first stable frame `0x9be3a4205d54f3ff`, unchanged)
+  and rolls: A gives "2", A again gives "6", and a shake gives "3".
+  Decisions and the old → new table are in `milestone-5-decisions.md`,
+  "Cycle counter and RNG".
 
 ## Emulated flash chip: what it contains
 
@@ -2076,3 +2410,15 @@ and `boot-probe`, which prints only the dump's partition table). Only two
 kinds of thing come from the boot log: generic ESP-IDF log lines (the
 `boot_progress` tests' needles) and the facts in "Ground truth from the
 physical badge" above.
+
+**Committed test identities (Milestone 5).**
+`frontend/public/firmware/test-identities/<role>.json` holds eleven
+obviously fake identity records, one per role in the firmware's role
+table. They were written by hand from the identity schema traced in
+`factory.bin` (`docs/milestone-5-decisions.md`, "Trace facts"), never
+derived from the flash dump or the boot log: "Test <Role>" names,
+`example.com` addresses, `test-` badge IDs, empty contact fields. The
+human partner relayed the Hack the North organizers' permission to commit
+them on 2026-10-08 (ruling R-M5-2). `frontend/test/test-identities.test.ts`
+keeps them obviously fake and within the firmware's field limits; a real
+attendee's identity never belongs there.

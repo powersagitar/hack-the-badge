@@ -171,6 +171,7 @@ const COUNTER_MASK_48: u64 = (1u64 << 48) - 1;
 /// the module doc). Every other register is generic word storage, logged as
 /// "unmapped" via [`RtcCntl::handles`] when accessed -- see
 /// `crate::mem::bus::FirmwareBus`.
+#[derive(Clone)]
 pub struct RtcCntl {
     /// Word-granular storage for every register in `0x00..REGS_END`,
     /// including `TIME_UPDATE_REG`'s non-trigger bits (`TIMER_SYS_RST`/

@@ -29,6 +29,25 @@
 //! total (9) — which is exactly the number of names in `frontend/src/badge/input.ts`'s
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
+//!
+//! ## Other host input (Milestone 5)
+//!
+//! - [`FirmwareRuntime::serial_input`] queues bytes a USB host sends to the
+//!   badge's console (USB-Serial-JTAG OUT, paced 64-byte packets; see
+//!   `crate::peripherals::usb_serial_jtag`); [`FirmwareRuntime::serial_pending`]
+//!   reports what the firmware has not read yet. Provisioning types the
+//!   firmware's own `put` / `prov apply` commands through it.
+//! - [`FirmwareRuntime::set_acceleration`] sets what the SC7A20H
+//!   accelerometer on I2C0 reports (`crate::peripherals::sc7a20h`); the
+//!   onboarding app's "Shake it!" page needs a shake.
+//!
+//! ## Checkpoints
+//!
+//! A `FirmwareRuntime` is `Clone`, and a clone is a complete, independent
+//! snapshot (CPU, bus, every peripheral, the flash chip; the image is
+//! shared read-only). The boot rungs reach a shared state once and continue
+//! from clones (`tests/boot_progress.rs`); pinned by
+//! `tests::a_clone_runs_exactly_like_its_original`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +89,7 @@ pub struct RunSummary {
 }
 
 /// The real-firmware emulator: CPU + bus + the image they were built from.
+#[derive(Clone)]
 pub struct FirmwareRuntime {
     image: Arc<[u8]>,
     cpu: Cpu,
@@ -97,14 +117,17 @@ impl FirmwareRuntime {
     }
 
     /// Re-boots from the same image: a fresh `Cpu`/`FirmwareBus` pair (so RAM,
-    /// peripheral state and the reconstructed framebuffer all start over),
-    /// with the currently-held buttons re-applied.
+    /// peripheral state, the emulated flash and the reconstructed
+    /// framebuffer all start over), with the currently-held buttons and the
+    /// host-set acceleration ([`FirmwareRuntime::set_acceleration`])
+    /// re-applied. Queued serial input is dropped with the old bus.
     ///
     /// Can only fail if the image stopped parsing, which can't happen for an
     /// image that already parsed once — but the error is propagated rather
     /// than unwrapped so this stays panic-free across the WASM boundary.
     pub fn reset(&mut self) -> Result<(), ImageParseError> {
         let (cpu, bus) = boot_from_factory_image_with_rom_stubs(&self.image)?;
+        let accel = self.acceleration();
         self.cpu = cpu;
         self.bus = bus;
         self.total_steps = 0;
@@ -112,6 +135,8 @@ impl FirmwareRuntime {
         for (slot, pressed) in held.iter().enumerate() {
             self.apply_button(slot, *pressed);
         }
+        let [x, y, z] = accel;
+        self.bus.i2c0.accel.set_acceleration(x, y, z);
         Ok(())
     }
 
@@ -232,6 +257,34 @@ impl FirmwareRuntime {
     /// `crate::peripherals::console::Console::text`.
     pub fn console_output(&self) -> String {
         self.bus.console.text()
+    }
+
+    /// Bytes a USB host sends to the badge's console (USB-Serial-JTAG OUT).
+    /// Returns how many were accepted; see
+    /// `crate::peripherals::usb_serial_jtag::HOST_QUEUE_CAPACITY`.
+    pub fn serial_input(&mut self, bytes: &[u8]) -> usize {
+        self.bus.usb_serial_jtag.host_send(bytes)
+    }
+
+    /// Serial input the firmware has not read yet.
+    pub fn serial_pending(&self) -> usize {
+        self.bus.usb_serial_jtag.host_pending()
+    }
+
+    /// Sets the acceleration the SC7A20H accelerometer reports, in mg per
+    /// axis (`crate::peripherals::sc7a20h`): any value is accepted and
+    /// clamped to ±16 g, and the output registers further clamp to the
+    /// full scale the firmware configured. The default is the badge lying
+    /// face up, (0, 0, +1000). Survives [`FirmwareRuntime::reset`] the way
+    /// held buttons do: the badge is still being held the same way.
+    pub fn set_acceleration(&mut self, x_mg: i32, y_mg: i32, z_mg: i32) {
+        self.bus.i2c0.accel.set_acceleration(x_mg, y_mg, z_mg);
+    }
+
+    /// The acceleration the SC7A20H currently reports, in mg (after the
+    /// ±16 g clamp).
+    pub fn acceleration(&self) -> [i32; 3] {
+        self.bus.i2c0.accel.acceleration()
     }
 }
 
@@ -418,6 +471,17 @@ mod tests {
     }
 
     #[test]
+    fn acceleration_defaults_face_up_is_clamped_and_survives_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
+        assert_eq!(rt.acceleration(), [0, 0, 1000], "face up");
+        rt.set_acceleration(i32::MAX, -2000, i32::MIN); // must not panic
+        assert_eq!(rt.acceleration(), [16_000, -2000, -16_000]);
+        assert_eq!(rt.bus().i2c0.accel.acceleration(), [16_000, -2000, -16_000]);
+        rt.reset().expect("reset");
+        assert_eq!(rt.acceleration(), [16_000, -2000, -16_000]);
+    }
+
+    #[test]
     fn run_traced_tallies_pc_before_each_step_into_the_histogram() {
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).expect("should boot");
         let mut hist = HashMap::new();
@@ -434,6 +498,34 @@ mod tests {
             Err(other) => panic!("unexpected parse error: {other:?}"),
             Ok(_) => panic!("an all-zero blob must not parse as an app image"),
         }
+    }
+
+    /// A clone is a full checkpoint (the boot rungs share them,
+    /// `tests/boot_progress.rs`): from a real-firmware state just before the
+    /// first pixels land (~1.13M steps), a clone and its original each run
+    /// 100,000 more steps and end identical, and the original's run does not
+    /// leak into the clone.
+    #[test]
+    fn a_clone_runs_exactly_like_its_original() {
+        let image = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../frontend/public/firmware/factory.bin"),
+        )
+        .expect("factory.bin");
+        let mut original = FirmwareRuntime::from_image(&image).expect("boot");
+        original.run(1_100_000);
+        let mut clone = original.clone();
+        original.run(100_000);
+        assert_eq!(clone.total_steps(), 1_100_000, "the clone did not move");
+        clone.run(100_000);
+        assert_eq!(clone.pc(), original.pc());
+        assert_eq!(clone.total_steps(), original.total_steps());
+        assert_eq!(clone.framebuffer(), original.framebuffer());
+        assert_eq!(clone.console_output(), original.console_output());
+        assert!(
+            original.framebuffer().iter().any(|px| *px != 0),
+            "the window drew pixels, so the framebuffers compared are not blank"
+        );
     }
 
     /// Bit-bangs a 74HC165 `LOAD` pulse through the real GPIO registers, the

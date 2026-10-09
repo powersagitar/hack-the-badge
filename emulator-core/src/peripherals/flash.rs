@@ -474,6 +474,7 @@ const UNMODELED_LOG_CAPACITY: usize = 16;
 
 /// The SPI1 flash controller (`SPIMEM1`). See the module doc's "SPIMEM1"
 /// section for exactly what is modeled and where each behavior comes from.
+#[derive(Clone)]
 pub struct Spimem1 {
     /// Word storage for every register in `0..SPIMEM_REGS_END`, W0..W15
     /// included.

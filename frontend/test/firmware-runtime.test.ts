@@ -4,7 +4,11 @@ import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import {
   createFirmwareRuntime,
   DEFAULT_CYCLES_PER_FRAME,
+  PRESS_HOLD_STEPS,
+  PROVISION_TIMEOUT_STEPS,
   RAW_SLOT_BY_BUTTON,
+  SHAKE_HALF_STEPS,
+  shakeAcceleration,
   stepFirmwareFrame,
 } from "../src/runtime/firmware-runtime";
 
@@ -72,6 +76,10 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     totalSteps(): number {
       return 0;
     },
+    serialInput: () => 0,
+    serialPending: () => 0,
+    consoleOutput: () => "",
+    setAcceleration: () => {},
     dispose(): void {
       counters.disposeCalls++;
     },
@@ -190,11 +198,13 @@ describe("createFirmwareRuntime", () => {
   });
 
   test("injectButton maps a button name to its raw slot and press/release state", () => {
-    const { handle, buttonCalls } = makeFakeHandle();
+    let stepsNow = 0;
+    const { handle, buttonCalls } = makeFakeHandle({ totalSteps: () => stepsNow });
     const { ctx } = makeStubCtx();
     const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
 
     runtime.injectButton("UP", "pressed");
+    stepsNow = PRESS_HOLD_STEPS;
     runtime.injectButton("UP", "released");
     runtime.injectButton("AUX1", "pressed");
 
@@ -213,7 +223,7 @@ describe("createFirmwareRuntime", () => {
     expect(fake.counters.resetCalls).toBe(1);
   });
 
-  test("isExitRequested is always false (no launcher concept in real-firmware mode)", () => {
+  test("isExitRequested is always false (no Lua-style exit-to-launcher in real-firmware mode)", () => {
     const { handle } = makeFakeHandle();
     const { ctx } = makeStubCtx();
     const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
@@ -238,5 +248,196 @@ describe("createFirmwareRuntime", () => {
     expect(canceled).toBe(1);
     expect(fake.counters.disposeCalls).toBe(1);
     expect(() => runtime.start()).toThrow();
+  });
+});
+
+/** A fake console handle, a settable step counter and a manual frame scheduler. */
+function rig() {
+  let consoleText = "";
+  let steps = 0;
+  const typed: string[] = [];
+  const accel: Array<[number, number, number]> = [];
+  const fake = makeFakeHandle({
+    serialInput(bytes: Uint8Array): number {
+      typed.push(new TextDecoder().decode(bytes));
+      return bytes.length;
+    },
+    serialPending: () => 0,
+    consoleOutput: () => consoleText,
+    totalSteps: () => steps,
+    setAcceleration: (x, y, z) => {
+      accel.push([x, y, z]);
+    },
+  });
+  const queued: Array<(t: number) => void> = [];
+  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().ctx, {
+    scheduleFrame: (cb) => queued.push(cb),
+    cancelFrame: () => {},
+  });
+  const frame = () => queued.shift()?.(0);
+  return {
+    rt,
+    typed,
+    accel,
+    frame,
+    buttonCalls: fake.buttonCalls,
+    print: (s: string) => (consoleText += s),
+    setSteps: (n: number) => (steps = n),
+  };
+}
+
+describe("FirmwareRuntime provisioning", () => {
+  test("provision() types once the prompt appears, polled by the frame loop", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.provision('{"a":1}');
+    rt.start();
+    frame();
+    expect(typed).toEqual([]);
+    expect(rt.provisionState()?.kind).toBe("waiting");
+    print("badge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
+  test("reset abandons an in-flight provisioner", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.provision('{"a":1}');
+    rt.start();
+    print("badge> ");
+    frame();
+    expect(typed.length).toBe(1);
+    rt.reset();
+    expect(rt.provisionState()).toBeNull();
+    print("OK 7\r\nbadge> ");
+    frame();
+    frame();
+    expect(typed.length).toBe(1);
+  });
+
+  test("a second provision() replaces the first", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.provision('{"a":1}');
+    rt.provision('{"b":22}');
+    rt.start();
+    print("badge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 8\n"]);
+  });
+
+  test("a provisioner that never finishes times out in emulated steps", () => {
+    const { rt, frame, setSteps } = rig();
+    setSteps(1000);
+    rt.provision('{"a":1}');
+    rt.start();
+    setSteps(1000 + PROVISION_TIMEOUT_STEPS - 1);
+    frame();
+    expect(rt.provisionState()?.kind).toBe("waiting");
+    setSteps(1000 + PROVISION_TIMEOUT_STEPS + 1);
+    frame();
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: "timed out" });
+    frame();
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: "timed out" });
+  });
+});
+
+describe("shakeAcceleration", () => {
+  test("alternates six half-periods then rests", () => {
+    expect(SHAKE_HALF_STEPS).toBe(1_000_000);
+    expect(shakeAcceleration(0)).toEqual([2000, 2000, 1000]);
+    expect(shakeAcceleration(SHAKE_HALF_STEPS - 1)).toEqual([2000, 2000, 1000]);
+    expect(shakeAcceleration(SHAKE_HALF_STEPS)).toEqual([-2000, -2000, 1000]);
+    expect(shakeAcceleration(5 * SHAKE_HALF_STEPS)).toEqual([-2000, -2000, 1000]);
+    expect(shakeAcceleration(6 * SHAKE_HALF_STEPS)).toBeNull();
+  });
+});
+
+describe("FirmwareRuntime shake", () => {
+  test("is scheduled from the frame loop off totalSteps, then rests", () => {
+    const { rt, accel, frame, setSteps } = rig();
+    setSteps(500);
+    rt.start();
+    rt.shake();
+    frame();
+    expect(accel).toEqual([[2000, 2000, 1000]]);
+    frame(); // unchanged half-period: no repeated call
+    expect(accel.length).toBe(1);
+    setSteps(500 + SHAKE_HALF_STEPS);
+    frame();
+    expect(accel.at(-1)).toEqual([-2000, -2000, 1000]);
+    setSteps(500 + 6 * SHAKE_HALF_STEPS);
+    frame();
+    expect(accel.at(-1)).toEqual([0, 0, 1000]);
+    expect(accel.length).toBe(3);
+    const n = accel.length;
+    setSteps(500 + 20 * SHAKE_HALF_STEPS);
+    frame();
+    expect(accel.length).toBe(n);
+  });
+
+  test("reset cancels a shake and restores rest acceleration", () => {
+    const { rt, accel, frame, setSteps } = rig();
+    rt.start();
+    rt.shake();
+    frame();
+    rt.reset();
+    expect(accel.at(-1)).toEqual([0, 0, 1000]);
+    const n = accel.length;
+    setSteps(SHAKE_HALF_STEPS);
+    frame();
+    expect(accel.length).toBe(n);
+  });
+});
+
+describe("FirmwareRuntime press hold", () => {
+  test("a release before PRESS_HOLD_STEPS is deferred to the frame loop", () => {
+    const { rt, buttonCalls, frame, setSteps } = rig();
+    rt.start();
+    setSteps(100);
+    rt.injectButton("A", "pressed");
+    setSteps(200);
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([[RAW_SLOT_BY_BUTTON.A, true]]);
+    setSteps(100 + PRESS_HOLD_STEPS - 1);
+    frame();
+    expect(buttonCalls.length).toBe(1);
+    setSteps(100 + PRESS_HOLD_STEPS);
+    frame();
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.A, true],
+      [RAW_SLOT_BY_BUTTON.A, false],
+    ]);
+  });
+
+  test("a release after the hold has elapsed is immediate", () => {
+    const { rt, buttonCalls, setSteps } = rig();
+    rt.injectButton("B", "pressed");
+    setSteps(PRESS_HOLD_STEPS);
+    rt.injectButton("B", "released");
+    expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.B, false]);
+  });
+
+  test("a re-press before the deferred release cancels it", () => {
+    const { rt, buttonCalls, frame, setSteps } = rig();
+    rt.start();
+    rt.injectButton("A", "pressed");
+    setSteps(10);
+    rt.injectButton("A", "released");
+    setSteps(20);
+    rt.injectButton("A", "pressed");
+    setSteps(20 + PRESS_HOLD_STEPS + 5);
+    frame();
+    expect(buttonCalls.every(([, p]) => p)).toBe(true);
+  });
+
+  test("reset clears pending releases", () => {
+    const { rt, buttonCalls, frame, setSteps } = rig();
+    rt.start();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.reset();
+    const n = buttonCalls.length;
+    setSteps(PRESS_HOLD_STEPS * 2);
+    frame();
+    expect(buttonCalls.length).toBe(n);
   });
 });

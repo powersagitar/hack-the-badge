@@ -60,7 +60,7 @@
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
 //!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`Strchr`/`DivT`, the writing
-//!    `Strncpy`/`Strlcat`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    `Strncpy`/`Strlcat`/`Strlcpy`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
 //!    memory).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
@@ -172,6 +172,10 @@ pub enum RomStubEffect {
     /// See [`SoftDoubleOp`]. Real, not fabricated, for the same reason as
     /// [`RomStubEffect::Int64`] (Milestone 4 Task D-M4-1).
     SoftDouble(SoftDoubleOp),
+    /// One of libgcc's soft-float `float` helpers: reads `a0` (and `a1`),
+    /// writes the result to `a0`. See [`SoftFloatOp`]. Real, for the same
+    /// reason as [`RomStubEffect::SoftDouble`].
+    SoftFloat(SoftFloatOp),
     /// `void *memcpy(void *dst, const void *src, size_t n)`: copies `n = a2`
     /// bytes from `src = a1` to `dst = a0`, through the bus, one byte at a
     /// time (this project's whole `Bus` interface is byte/half/word
@@ -286,6 +290,15 @@ pub enum RomStubEffect {
     /// (same convention as [`RomStubEffect::Strncmp`]). Scan capped at
     /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller branches on the result.
     Strcmp,
+    /// `int strcasecmp(const char *s1, const char *s2)`: as
+    /// [`RomStubEffect::Strcmp`], but each byte is first lowered by the ROM's
+    /// C-locale `tolower` (ROM ELF `strcasecmp` at `0x4005_8afa` inlines it:
+    /// `_ctype_[c + 1] & 3 == _U` adds 0x20; the table marks only `A`..`Z`
+    /// upper case). Returns the lowered `s1[i] - s2[i]` of the last pair
+    /// examined, stopping at a difference or at `s2`'s NUL. Scan capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: the firmware matches role names with
+    /// it.
+    Strcasecmp,
     /// `size_t strlcat(char *dst, const char *src, size_t siz)`: the BSD
     /// `strlcat` newlib ships (`newlib/libc/string/strlcat.c`, OpenBSD's):
     /// finds `dst = a0`'s NUL within its first `siz = a2` bytes, appends
@@ -296,6 +309,43 @@ pub enum RomStubEffect {
     /// and the copy are capped at [`MAX_STUB_MEMORY_BYTES`]. Real: the ROM
     /// entry is a jump to newlib code, and the caller uses the string.
     Strlcat,
+    /// `size_t strlcpy(char *dst, const char *src, size_t siz)`: the BSD
+    /// `strlcpy` the ROM ships (ROM ELF `strlcpy` at `0x4005_8e4e`, OpenBSD's):
+    /// copies at most `siz = a2` - 1 bytes of `src = a1` to `dst = a0` through
+    /// the bus and NUL-terminates, unless `siz` is 0 (nothing is written).
+    /// Returns `strlen(src)` in `a0`, the length it tried to create. The scan
+    /// and the copy are capped at [`MAX_STUB_MEMORY_BYTES`]. Real, and a
+    /// bus-effect stub rather than a guest code blob because it needs no
+    /// callback into firmware, like `strlcat`: the console's line copy
+    /// (`0x4206_0074`) uses the result and the copied bytes.
+    Strlcpy,
+    /// `char *strrchr(const char *s, int c)`: newlib's `strrchr` (ROM slot
+    /// `__call_strrchr`, `esp32c3.rom.libc.ld` `strrchr = 0x40000408`).
+    /// Returns the address of the last byte of `s = a0` equal to `(char)c =
+    /// a1`, or 0 if none; the terminating NUL counts, so `c == 0` returns
+    /// the end of the string. Scan capped at [`MAX_STUB_MEMORY_BYTES`].
+    Strrchr,
+    /// `long strtol(const char *nptr, char **endptr, int base)`: newlib's
+    /// `strtol` (ROM slot `__call_strtol`, `esp32c3.rom.newlib.ld`
+    /// `strtol = 0x40000454`). Skips C-locale whitespace, an optional sign,
+    /// and for base 0 or 16 a `0x`/`0X` prefix, taken whatever follows it
+    /// (ROM ELF `_strtol_l` at `0x4003_1dc4`; base 0 otherwise picks 8 for
+    /// a leading `0`, else 10); accepts digits and letters below `base`;
+    /// saturates at `LONG_MAX`/`LONG_MIN` on overflow. If no digit is
+    /// consumed `*endptr = nptr` and 0 is returned; otherwise `*endptr`
+    /// points past the last digit (written only when `endptr = a1` is
+    /// non-NULL). An invalid base (1 or above 36) returns 0 and leaves
+    /// `*endptr` unwritten. `errno` (ERANGE/EINVAL) is not set: the ROM
+    /// keeps it in a per-task reent struct the emulator does not model, and
+    /// the observed caller (`put`'s size parse) checks only `endptr`. Scan
+    /// capped at [`MAX_STUB_MEMORY_BYTES`].
+    Strtol,
+    /// `int atoi(const char *s)`: the ROM's newlib `atoi` (slot
+    /// `__call_atoi`, `esp32c3.rom.newlib.ld` `atoi = 0x4000044c`), whose
+    /// body (ROM ELF `0x4003_1dac`) is `strtol(s, NULL, 10)`: exactly
+    /// [`RomStubEffect::Strtol`] with `endptr = NULL` and base 10 (so an
+    /// out-of-range value saturates to `INT_MAX`/`INT_MIN`).
+    Atoi,
     /// `size_t strspn(const char *s, const char *set)`: newlib's
     /// `strspn.c`: the length of the leading run of `s = a0` made only of
     /// bytes in NUL-terminated `set = a1`, in `a0`. Scans capped at
@@ -698,9 +748,10 @@ impl Int32UnaryOp {
 /// aligned register pair, low word first (`(a0, a1)`, then `(a2, a3)`); an
 /// `unsigned int` uses `a0` alone.
 ///
-/// Semantics: GCC's libgcc soft-fp (`libgcc/soft-fp/{floatunsidf,muldf3,
-/// divdf3,fixunsdfsi}.c` over `op-common.h`), configured for RISC-V without
-/// an FPU by `libgcc/config/riscv/sfp-machine.h`: round to nearest
+/// Semantics: GCC's libgcc soft-fp (`libgcc/soft-fp/{floatunsidf,adddf3,
+/// muldf3,divdf3,fixunsdfsi,fixdfsi,gedf2,ledf2}.c` over `op-common.h`),
+/// configured for RISC-V without an FPU by
+/// `libgcc/config/riscv/sfp-machine.h`: round to nearest
 /// (`FP_INIT_ROUNDMODE _frm = FP_RND_NEAREST` without `__riscv_flen`), full
 /// subnormal support, and every NaN result the canonical quiet NaN
 /// (`_FP_NANSIGN_D 0`, `_FP_NANFRAC_D _FP_QNANBIT_D, 0`,
@@ -713,6 +764,8 @@ pub enum SoftDoubleOp {
     /// `double __floatunsidf(unsigned int i)`: exact (every `u32` is
     /// representable).
     FloatUnsSi,
+    /// `double __adddf3(double a, double b)`.
+    Add,
     /// `double __muldf3(double a, double b)`.
     Mul,
     /// `double __divdf3(double a, double b)`.
@@ -724,6 +777,97 @@ pub enum SoftDoubleOp {
     /// negative: 0). Only that NaN case differs from Rust's saturating
     /// `as u32`, which maps every NaN to 0.
     FixUnsSi,
+    /// `int __gedf2(double a, double b)` (also the body of `__gtdf2`):
+    /// soft-fp `FP_CMP_D(r, A, B, -2, 2)`, i.e. -1 if `a < b`, 0 if equal
+    /// (`-0.0 == +0.0`), 1 if `a > b`, and -2 if either is a NaN, so a
+    /// caller's `>= 0` / `> 0` test is false for unordered operands. The
+    /// `int` result is returned in `a0` (sign-extended to the register).
+    Ge,
+    /// `int __ledf2(double a, double b)` (also the body of `__ltdf2`):
+    /// soft-fp `FP_CMP_D(r, A, B, 2, 2)`; as [`SoftDoubleOp::Ge`] except
+    /// that a NaN operand gives 2, so `<= 0` / `< 0` is false for unordered
+    /// operands.
+    Le,
+    /// `int __fixdfsi(double a)`: truncates toward zero. `_FP_TO_INT(...,
+    /// rsigned = 1)` saturates an out-of-range `a` (including +/-inf) to
+    /// `INT_MAX` or `INT_MIN` by its sign, and treats a NaN the same way by
+    /// its sign bit (sign clear: `INT_MAX`). Rust's saturating `as i32`
+    /// matches except for NaN, which it maps to 0. The `int` result is
+    /// returned in `a0`.
+    FixSi,
+}
+
+/// A libgcc soft-float `float` helper (`esp32c3.rom.libgcc.ld`). RV32
+/// ilp32 psABI: a `float` argument is one register (`a0`, then `a1`), and a
+/// `float` result is `a0`. Semantics as [`SoftDoubleOp`]'s (same soft-fp
+/// configuration: round to nearest, subnormals kept, every NaN result the
+/// canonical quiet NaN `0x7FC0_0000`, `_FP_NANFRAC_S _FP_QNANBIT_S`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftFloatOp {
+    /// `float __mulsf3(float a, float b)`: IEEE round-to-nearest, which
+    /// Rust's `f32` multiply gives bit for bit for every non-NaN result.
+    Mul,
+    /// `float __addsf3(float a, float b)`.
+    Add,
+    /// `int __unordsf2(float a, float b)`: soft-fp
+    /// `FP_CMP_UNORD_S(r, A, B, 1)`: 1 if either operand is a NaN, else 0.
+    Unord,
+    /// `int __ltsf2(float a, float b)` (libgcc builds it from the same
+    /// source as `__lesf2`): soft-fp `FP_CMP_S(r, A, B, 2, 2)`: -1, 0 or 1
+    /// by order (`-0.0 == +0.0`), 2 if either is a NaN, so `< 0` is false
+    /// for unordered operands. The `int` result is returned in `a0`.
+    Lt,
+    /// `float __floatsisf(int a)`: `a0` read as a signed 32-bit integer,
+    /// rounded to the nearest `float` (ties to even; `|a| > 2^24` can
+    /// round), which Rust's `i32 as f32` gives bit for bit. `a1` is
+    /// ignored.
+    FloatSi,
+    /// `float __subsf3(float a, float b)`: `a - b`, IEEE round-to-nearest.
+    Sub,
+    /// `int __gtsf2(float a, float b)` (libgcc builds it from the same
+    /// source as `__gesf2`): soft-fp `FP_CMP_S(r, A, B, -2, 2)`: -1, 0 or 1
+    /// by order, -2 if either is a NaN, so `> 0` is false for unordered
+    /// operands. The `int` result is returned in `a0`.
+    Gt,
+}
+
+/// The canonical quiet `float` NaN RISC-V soft-fp returns (see
+/// [`SoftFloatOp`]).
+pub const SOFT_FP_CANONICAL_NAN_F32: u32 = 0x7FC0_0000;
+
+impl SoftFloatOp {
+    /// Applies this operation to `a` (`a0`) and `b` (`a1`), returning the
+    /// result bits for `a0`.
+    pub fn apply(self, a: u32, b: u32) -> u32 {
+        let canonical = |x: f32| {
+            if x.is_nan() {
+                SOFT_FP_CANONICAL_NAN_F32
+            } else {
+                x.to_bits()
+            }
+        };
+        let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+        match self {
+            SoftFloatOp::Mul => canonical(x * y),
+            SoftFloatOp::Add => canonical(x + y),
+            SoftFloatOp::Unord => u32::from(x.is_nan() || y.is_nan()),
+            SoftFloatOp::Lt => soft_fp_cmp(x.partial_cmp(&y), 2) as u32,
+            SoftFloatOp::FloatSi => (a as i32 as f32).to_bits(),
+            SoftFloatOp::Sub => canonical(x - y),
+            SoftFloatOp::Gt => soft_fp_cmp(x.partial_cmp(&y), -2) as u32,
+        }
+    }
+}
+
+/// soft-fp's `FP_CMP` result: -1, 0 or 1 by order, `unordered` if either
+/// operand is a NaN (`partial_cmp` gives `None`).
+fn soft_fp_cmp(order: Option<std::cmp::Ordering>, unordered: i32) -> i32 {
+    match order {
+        Some(std::cmp::Ordering::Less) => -1,
+        Some(std::cmp::Ordering::Equal) => 0,
+        Some(std::cmp::Ordering::Greater) => 1,
+        None => unordered,
+    }
 }
 
 /// The canonical quiet NaN RISC-V soft-fp returns (see [`SoftDoubleOp`]).
@@ -731,9 +875,12 @@ pub const SOFT_FP_CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
 impl SoftDoubleOp {
     /// `true` if the result is a `double` (`(a0, a1)`), `false` if it is
-    /// an `unsigned int` (`a0` only; `a1` is left untouched).
+    /// an `int` or `unsigned int` (`a0` only; `a1` is left untouched).
     pub fn returns_double(self) -> bool {
-        !matches!(self, SoftDoubleOp::FixUnsSi)
+        !matches!(
+            self,
+            SoftDoubleOp::FixUnsSi | SoftDoubleOp::FixSi | SoftDoubleOp::Ge | SoftDoubleOp::Le
+        )
     }
 
     /// Applies this operation. `a` is the `(a0, a1)` pair (for
@@ -751,6 +898,7 @@ impl SoftDoubleOp {
         let (x, y) = (f64::from_bits(a), f64::from_bits(b));
         match self {
             SoftDoubleOp::FloatUnsSi => f64::from(a as u32).to_bits(),
+            SoftDoubleOp::Add => canonical(x + y),
             SoftDoubleOp::Mul => canonical(x * y),
             SoftDoubleOp::Div => canonical(x / y),
             SoftDoubleOp::FixUnsSi => {
@@ -766,6 +914,20 @@ impl SoftDoubleOp {
                     u64::from(x as u32)
                 }
             }
+            SoftDoubleOp::FixSi => {
+                let r = if x.is_nan() {
+                    if x.is_sign_negative() {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
+                } else {
+                    x as i32
+                };
+                u64::from(r as u32)
+            }
+            SoftDoubleOp::Ge => u64::from(soft_fp_cmp(x.partial_cmp(&y), -2) as u32),
+            SoftDoubleOp::Le => u64::from(soft_fp_cmp(x.partial_cmp(&y), 2) as u32),
         }
     }
 }
@@ -1375,6 +1537,47 @@ impl RomStub {
         }
     }
 
+    /// A real high-level-emulated `strcasecmp` -- see
+    /// [`RomStubEffect::Strcasecmp`].
+    pub const fn strcasecmp(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strcasecmp,
+        }
+    }
+
+    /// A real high-level-emulated `strlcpy` -- see [`RomStubEffect::Strlcpy`].
+    pub const fn strlcpy(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strlcpy,
+        }
+    }
+
+    /// A real high-level-emulated `strtol` -- see [`RomStubEffect::Strtol`].
+    pub const fn strtol(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strtol,
+        }
+    }
+
+    /// A real high-level-emulated `atoi` -- see [`RomStubEffect::Atoi`].
+    pub const fn atoi(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Atoi,
+        }
+    }
+
+    /// A real high-level-emulated `strrchr` -- see [`RomStubEffect::Strrchr`].
+    pub const fn strrchr(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Strrchr,
+        }
+    }
+
     /// A real high-level-emulated `strlcat` -- see [`RomStubEffect::Strlcat`].
     pub const fn strlcat(name: &'static str) -> Self {
         Self {
@@ -1479,6 +1682,14 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Int64(op),
+        }
+    }
+
+    /// A real libgcc soft-float `float` helper — see [`SoftFloatOp`].
+    pub const fn soft_float(name: &'static str, op: SoftFloatOp) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::SoftFloat(op),
         }
     }
 
@@ -1613,6 +1824,62 @@ mod tests {
     }
 
     #[test]
+    fn soft_float_ops_match_libgcc_soft_fp() {
+        use SoftFloatOp::*;
+        let f = |x: f32| x.to_bits();
+        let nan = SOFT_FP_CANONICAL_NAN_F32;
+        // __mulsf3 / __addsf3: IEEE round-to-nearest in single precision.
+        assert_eq!(Mul.apply(f(0.1), f(3.0)), f(0.1f32 * 3.0));
+        assert_eq!(Add.apply(f(0.1), f(0.2)), f(0.1f32 + 0.2));
+        assert_eq!(
+            Mul.apply(f(f32::MIN_POSITIVE), f(0.5)),
+            f(f32::MIN_POSITIVE / 2.0)
+        );
+        assert_eq!(Mul.apply(f(f32::INFINITY), f(0.0)), nan);
+        assert_eq!(Add.apply(0xFFC0_0001, f(1.0)), nan, "NaN in, canonical out");
+        // __unordsf2.
+        assert_eq!(Unord.apply(f(1.0), f(2.0)), 0);
+        assert_eq!(Unord.apply(nan, f(2.0)), 1);
+        assert_eq!(Unord.apply(f(2.0), 0xFFC0_0000), 1);
+        // __ltsf2: -1/0/1, 2 for unordered.
+        assert_eq!(Lt.apply(f(1.0), f(2.0)) as i32, -1);
+        assert_eq!(Lt.apply(f(-0.0), f(0.0)), 0);
+        assert_eq!(Lt.apply(f(3.0), f(2.0)), 1);
+        assert_eq!(Lt.apply(nan, f(2.0)), 2);
+        // __subsf3.
+        assert_eq!(Sub.apply(f(1000.0), f(0.1)), f(1000.0f32 - 0.1));
+        assert_eq!(Sub.apply(f(1.0), f(1.0)), 0, "+0.0");
+        assert_eq!(Sub.apply(f(f32::INFINITY), f(f32::INFINITY)), nan);
+        // __gtsf2: -1/0/1, -2 for unordered.
+        assert_eq!(Gt.apply(f(1300.0), f(1200.0)), 1);
+        assert_eq!(Gt.apply(f(0.0), f(-0.0)), 0);
+        assert_eq!(Gt.apply(f(-1.0), f(1200.0)) as i32, -1);
+        assert_eq!(Gt.apply(f(1.0), nan) as i32, -2);
+        // Signed zero, overflow to infinity, infinities and subnormals.
+        assert_eq!(Add.apply(f(-0.0), f(-0.0)), f(-0.0));
+        assert_eq!(Sub.apply(f(-0.0), f(0.0)), f(-0.0));
+        assert_eq!(Mul.apply(f(f32::MAX), f(2.0)), f(f32::INFINITY));
+        assert_eq!(Add.apply(f(f32::MAX), f(f32::MAX)), f(f32::INFINITY));
+        assert_eq!(Gt.apply(f(f32::INFINITY), f(f32::MAX)), 1);
+        assert_eq!(Lt.apply(f(f32::NEG_INFINITY), f(f32::NEG_INFINITY)), 0);
+        let sub = f32::from_bits(1); // the smallest subnormal
+        assert_eq!(Add.apply(f(sub), f(sub)), 2, "subnormals are kept");
+        assert_eq!(Gt.apply(f(sub), f(0.0)), 1);
+        // __floatsisf: signed, exact below 2^24, round-to-nearest-even above.
+        assert_eq!(FloatSi.apply(1000, 0xDEAD), f(1000.0));
+        assert_eq!(FloatSi.apply(-2048i32 as u32, 0), f(-2048.0));
+        assert_eq!(FloatSi.apply(0, 0), 0, "+0.0");
+        assert_eq!(FloatSi.apply(16_777_217, 0), f(16_777_216.0), "tie to even");
+        assert_eq!(FloatSi.apply(16_777_219, 0), f(16_777_220.0), "tie to even");
+        assert_eq!(FloatSi.apply(i32::MIN as u32, 0), 0xCF00_0000, "-2^31");
+        assert_eq!(
+            FloatSi.apply(i32::MAX as u32, 0),
+            0x4F00_0000,
+            "rounds to 2^31"
+        );
+    }
+
+    #[test]
     fn soft_double_ops_match_libgcc_soft_fp() {
         use SoftDoubleOp::*;
         let d = |x: f64| x.to_bits();
@@ -1652,6 +1919,45 @@ mod tests {
         assert_eq!(FixUnsSi.apply(d(-1.0), 0), 0);
         assert_eq!(FixUnsSi.apply(d(f64::NEG_INFINITY), 0), 0);
         assert_eq!(FixUnsSi.apply(0xFFF8_0000_0000_0000, 0), 0);
+        // __adddf3.
+        assert_eq!(Add.apply(d(0.1), d(0.2)), d(0.1 + 0.2));
+        assert_eq!(
+            Add.apply(d(f64::INFINITY), d(f64::NEG_INFINITY)),
+            SOFT_FP_CANONICAL_NAN
+        );
+        // __fixdfsi: truncation toward zero, signed saturation, NaN by sign.
+        let int = |x: i32| u64::from(x as u32);
+        assert_eq!(FixSi.apply(d(-3.9), 0), int(-3));
+        assert_eq!(FixSi.apply(d(1767225600.0), 0), int(1_767_225_600));
+        assert_eq!(FixSi.apply(d(2_147_483_648.0), 0), int(i32::MAX));
+        assert_eq!(FixSi.apply(d(-2_147_483_649.0), 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(d(f64::NEG_INFINITY), 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(SOFT_FP_CANONICAL_NAN, 0), int(i32::MAX));
+        assert_eq!(FixSi.apply(0xFFF8_0000_0000_0000, 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(d(-0.9), 0), int(0), "(-1, 1) truncates to 0");
+        assert_eq!(FixSi.apply(d(0.9), 0), int(0));
+        assert_eq!(
+            FixSi.apply(d(-2_147_483_648.0), 0),
+            int(i32::MIN),
+            "-2^31 exact"
+        );
+        // Signed zero, overflow to infinity and infinities in compares.
+        assert_eq!(Add.apply(d(-0.0), d(-0.0)), d(-0.0));
+        assert_eq!(Add.apply(d(-0.0), d(0.0)), d(0.0));
+        assert_eq!(Mul.apply(d(f64::MAX), d(2.0)), d(f64::INFINITY));
+        assert_eq!(Ge.apply(d(f64::INFINITY), d(f64::INFINITY)), int(0));
+        assert_eq!(Le.apply(d(f64::NEG_INFINITY), d(f64::MIN)), int(-1));
+        // __gedf2 / __ledf2: -1/0/1, and the unordered results -2 / 2.
+        for (op, nan) in [(Ge, -2), (Le, 2)] {
+            assert_eq!(op.apply(d(1.0), d(2.0)), int(-1));
+            assert_eq!(op.apply(d(2.0), d(2.0)), int(0));
+            assert_eq!(op.apply(d(-0.0), d(0.0)), int(0), "-0 == +0");
+            assert_eq!(op.apply(d(3.0), d(2.0)), int(1));
+            assert_eq!(op.apply(SOFT_FP_CANONICAL_NAN, d(2.0)), int(nan));
+            assert_eq!(op.apply(d(2.0), SOFT_FP_CANONICAL_NAN), int(nan));
+            assert!(!op.returns_double());
+        }
+        assert!(!FixSi.returns_double() && Add.returns_double());
         assert!(!FixUnsSi.returns_double());
         assert!(FloatUnsSi.returns_double() && Mul.returns_double() && Div.returns_double());
     }

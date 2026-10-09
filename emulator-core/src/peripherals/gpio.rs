@@ -199,6 +199,7 @@ pub const HC165_SLOTS: usize = 8;
 /// The 8-button 74HC165 shift register model feeding `HC165_DATA` (GPIO7).
 /// See the module doc for the exact edge-detection and bit-order choices this
 /// implements.
+#[derive(Clone)]
 pub struct Hc165 {
     /// The 8 button slots, settable at any time (by a test harness or real UI
     /// wiring) — these are *not* what gets shifted out; [`Hc165::latched`] is
@@ -289,6 +290,7 @@ impl Hc165 {
 /// The GPIO peripheral: per-pin output level / output-enable storage for
 /// all 26 documented pin-data bits, plus the external-input rules and the
 /// [`Hc165`] model described in the module doc.
+#[derive(Clone)]
 pub struct Gpio {
     /// `GPIO_OUT_REG`: bit per pin, driven output level.
     out: u32,

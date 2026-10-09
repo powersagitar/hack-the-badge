@@ -9,6 +9,8 @@
 //! [`Cpu::set_pending_interrupts`] (`crate::boot::step_with_interrupts`,
 //! level delivery);
 //! [`Cpu::raise_interrupt`] is the one-shot variant unit tests use.
+//! The optional cycle counter ([`CycleCounter`]) is generic too: chip
+//! setup supplies its CSR addresses ([`Csrs::set_cycle_counter`]).
 
 mod decode;
 // The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
@@ -26,7 +28,9 @@ pub mod rom_stubs;
 #[cfg(test)]
 pub(crate) use decode::decode_32;
 pub use decode::{AluOp, BranchKind, CsrOp, CsrSrc, Instruction, LoadKind, MulDivOp, StoreKind};
-pub use registers::{csr_addr, exception_code, mstatus_bits, Csrs, Registers};
+pub use registers::{
+    csr_addr, exception_code, mstatus_bits, Csrs, CycleCounter, CycleCounterCsrs, Registers,
+};
 pub use rom_stubs::{RomStub, RomStubTable};
 
 use crate::mem::Bus;
@@ -54,6 +58,7 @@ pub struct StepInfo {
 }
 
 /// The RV32IMC CPU core.
+#[derive(Clone)]
 pub struct Cpu {
     pub regs: Registers,
     pub csr: Csrs,
@@ -318,6 +323,11 @@ impl Cpu {
             self.waiting = false;
         }
 
+        // Every step past this point does work (trap entry, ROM stub or
+        // instruction): one cycle-counter count, before the instruction
+        // runs (see `registers::CycleCounter`).
+        self.csr.tick_cycle_counter();
+
         if self.pending_interrupts != 0 && self.csr.mstatus & mstatus_bits::MIE != 0 {
             let line = select_interrupt_line(self.pending_interrupts, &self.interrupt_priorities);
             self.pending_interrupts &= !(1u32 << line);
@@ -527,6 +537,11 @@ impl Cpu {
                     self.regs.write(rom_stubs::REG_A1, (result >> 32) as u32);
                 }
             }
+            RomStubEffect::SoftFloat(op) => {
+                let a = self.regs.read(rom_stubs::REG_A0);
+                let b = self.regs.read(rom_stubs::REG_A1);
+                self.regs.write(rom_stubs::REG_A0, op.apply(a, b));
+            }
             RomStubEffect::BusRegisterWrite(write) => {
                 if let Some(addr) = self.bus_register_write_addr(&write) {
                     self.apply_bus_register_op(write.op, addr, bus);
@@ -672,6 +687,142 @@ impl Cpu {
                     }
                 }
                 self.regs.write(rom_stubs::REG_A0, diff as u32);
+            }
+            RomStubEffect::Strcasecmp => {
+                let s1 = self.regs.read(rom_stubs::REG_A0);
+                let s2 = self.regs.read(rom_stubs::REG_A1);
+                let mut diff: i32 = 0;
+                for i in 0..rom_stubs::MAX_STUB_MEMORY_BYTES {
+                    let x = bus.read8(s1.wrapping_add(i)).to_ascii_lowercase();
+                    let y = bus.read8(s2.wrapping_add(i)).to_ascii_lowercase();
+                    diff = i32::from(x) - i32::from(y);
+                    if diff != 0 || y == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, diff as u32);
+            }
+            RomStubEffect::Strlcpy => {
+                let dst = self.regs.read(rom_stubs::REG_A0);
+                let src = self.regs.read(rom_stubs::REG_A1);
+                let siz = self.regs.read(rom_stubs::REG_A2);
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                let mut slen: u32 = 0;
+                while slen < cap && bus.read8(src.wrapping_add(slen)) != 0 {
+                    slen += 1;
+                }
+                if siz > 0 {
+                    let n = slen.min(siz - 1);
+                    for i in 0..n {
+                        let byte = bus.read8(src.wrapping_add(i));
+                        bus.write8(dst.wrapping_add(i), byte);
+                    }
+                    bus.write8(dst.wrapping_add(n), 0);
+                }
+                self.regs.write(rom_stubs::REG_A0, slen);
+            }
+            RomStubEffect::Strtol | RomStubEffect::Atoi => {
+                // ROM `atoi` is `strtol(s, NULL, 10)` (ROM ELF `atoi` at
+                // 0x4003_1dac: `li a2, 10; li a1, 0; j strtol`).
+                let atoi = stub.effect == RomStubEffect::Atoi;
+                let nptr = self.regs.read(rom_stubs::REG_A0);
+                let endptr = if atoi {
+                    0
+                } else {
+                    self.regs.read(rom_stubs::REG_A1)
+                };
+                let base_arg = if atoi {
+                    10
+                } else {
+                    self.regs.read(rom_stubs::REG_A2)
+                };
+                let cap = rom_stubs::MAX_STUB_MEMORY_BYTES;
+                let at = |bus: &mut B, i: u32| bus.read8(nptr.wrapping_add(i));
+                let mut i: u32 = 0;
+                while i < cap && matches!(at(bus, i), b' ' | b'\t'..=b'\r') {
+                    i += 1;
+                }
+                let mut neg = false;
+                match at(bus, i) {
+                    b'-' => {
+                        neg = true;
+                        i += 1;
+                    }
+                    b'+' => i += 1,
+                    _ => {}
+                }
+                let mut base = base_arg;
+                // An invalid base returns 0 and leaves `*endptr` alone (the
+                // ROM's `_strtol_l`, 0x4003_1dc4, also sets `errno` = EINVAL;
+                // `errno` is not modeled).
+                let valid_base = base == 0 || (2..=36).contains(&base);
+                let digit = |c: u8| match c {
+                    b'0'..=b'9' => u32::from(c - b'0'),
+                    b'a'..=b'z' => u32::from(c - b'a') + 10,
+                    b'A'..=b'Z' => u32::from(c - b'A') + 10,
+                    _ => 99,
+                };
+                if valid_base && (base == 0 || base == 16) && at(bus, i) == b'0'
+                    // Taken whatever follows, as the ROM does: "0xg" parses no
+                    // digit, so `*endptr` = `nptr`.
+                    && matches!(at(bus, i + 1), b'x' | b'X')
+                {
+                    i += 2;
+                    base = 16;
+                } else if base == 0 {
+                    base = if at(bus, i) == b'0' { 8 } else { 10 };
+                }
+                let start = i;
+                let mut acc: u64 = 0;
+                let mut over = false;
+                while valid_base && i < cap {
+                    let d = digit(at(bus, i));
+                    if d >= base {
+                        break;
+                    }
+                    acc = acc * u64::from(base) + u64::from(d);
+                    if acc > 0x8000_0000 {
+                        over = true;
+                        acc = 0x8000_0000;
+                    }
+                    i += 1;
+                }
+                let consumed = i > start;
+                let value: i32 = if over || (!neg && acc > 0x7fff_ffff) {
+                    if neg {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
+                } else if neg {
+                    (acc as i64).wrapping_neg() as i32
+                } else {
+                    acc as i32
+                };
+                if endptr != 0 && valid_base {
+                    let end = if consumed { nptr.wrapping_add(i) } else { nptr };
+                    for (k, b) in end.to_le_bytes().iter().enumerate() {
+                        bus.write8(endptr.wrapping_add(k as u32), *b);
+                    }
+                }
+                self.regs
+                    .write(rom_stubs::REG_A0, if consumed { value as u32 } else { 0 });
+            }
+            RomStubEffect::Strrchr => {
+                let s = self.regs.read(rom_stubs::REG_A0);
+                let c = self.regs.read(rom_stubs::REG_A1) as u8;
+                let mut found = 0;
+                for i in 0..=rom_stubs::MAX_STUB_MEMORY_BYTES {
+                    let addr = s.wrapping_add(i);
+                    let byte = bus.read8(addr);
+                    if byte == c {
+                        found = addr;
+                    }
+                    if byte == 0 {
+                        break;
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, found);
             }
             RomStubEffect::Strlcat => {
                 let dst = self.regs.read(rom_stubs::REG_A0);
@@ -1673,6 +1824,38 @@ mod tests {
         assert_eq!(cpu.csr.mepc, 4, "mepc is the instruction after WFI");
     }
 
+    fn csr_op(funct3: u32, rd: u32, csr: u32, rs1: u32) -> u32 {
+        (csr << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x73
+    }
+
+    #[test]
+    fn cycle_counter_counts_each_working_step_but_not_wfi_parking() {
+        const CTR: u32 = 0x7e2;
+        let mut cpu = Cpu::new();
+        cpu.csr.set_cycle_counter(CycleCounterCsrs {
+            counter: CTR as u16,
+            controls: [0x7e0, 0x7e1],
+        });
+        let mut bus = TestBus::with_program(&[
+            addi(6, 0, 100),
+            csr_op(0b010, 5, CTR, 0), // csrrs x5, ctr, x0
+            csr_op(0b001, 0, CTR, 6), // csrrw x0, ctr, x6
+            csr_op(0b010, 7, CTR, 0), // csrrs x7, ctr, x0
+            WFI,
+        ]);
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.regs.read(5), 2, "counted before the read executes");
+        assert_eq!(cpu.regs.read(7), 101, "the written value, then one count");
+        cpu.step(&mut bus); // WFI retires: one count
+        assert!(cpu.is_waiting());
+        for _ in 0..10 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.csr.read(CTR as u16), 102, "parked steps do not count");
+    }
+
     #[test]
     fn wfi_with_mie_clear_resumes_after_wfi_without_trapping() {
         let mut cpu = Cpu::new();
@@ -2640,6 +2823,34 @@ mod tests {
         let a = split(2.5e7);
         let r = run(SoftDoubleOp::FixUnsSi, [a[0], a[1], 0, 0]);
         assert_eq!(r, (25_000_000, a[1]));
+        // __gedf2(1.0, 2.0) = -1: an `int` in a0; a1 untouched.
+        let (a, b) = (split(1.0), split(2.0));
+        let r = run(SoftDoubleOp::Ge, [a[0], a[1], b[0], b[1]]);
+        assert_eq!(r, (-1i32 as u32, a[1]));
+    }
+
+    #[test]
+    fn soft_float_rom_stubs_read_a0_a1_and_write_a0() {
+        use rom_stubs::SoftFloatOp;
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(
+            ROM_STUB_ADDR,
+            RomStub::soft_float("__mulsf3", SoftFloatOp::Mul),
+        );
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 1.5f32.to_bits());
+        cpu.regs.write(11, 4.0f32.to_bits());
+        cpu.regs.write(12, 0x1234);
+        cpu.regs.write(1, 0x40);
+        cpu.regs.pc = ROM_STUB_ADDR;
+        let mut bus = rom_stub_test_bus();
+        let info = cpu.step(&mut bus);
+        assert_eq!(info.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.pc, 0x40, "pc == ra");
+        assert_eq!(cpu.regs.read(10), 6.0f32.to_bits());
+        assert_eq!(cpu.regs.read(11), 4.0f32.to_bits(), "a1 untouched");
+        assert_eq!(cpu.regs.read(12), 0x1234, "a2 untouched");
     }
 
     #[test]

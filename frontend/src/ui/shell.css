@@ -144,3 +144,30 @@ h1 {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+#provision-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.provision-role {
+  padding: 5px 8px;
+  border-radius: 8px;
+  border: 1px solid #333a44;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.provision-status {
+  color: var(--muted);
+}
+
+.provision-hint {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+}

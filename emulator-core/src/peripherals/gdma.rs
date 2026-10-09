@@ -322,6 +322,7 @@ fn decode(offset: u32) -> Option<Reg> {
 }
 
 /// The GDMA peripheral. See the module doc.
+#[derive(Clone)]
 pub struct Gdma {
     int_raw: [u32; NUM_CHANNELS],
     int_ena: [u32; NUM_CHANNELS],

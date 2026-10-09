@@ -29,7 +29,6 @@ use crate::cpu::Cpu;
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::{parse_image, ImageParseError};
 use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, RTC_RANGE};
-use crate::peripherals::systimer::TICKS_PER_STEP;
 
 /// Parses `image` (expected to be the raw bytes of an ESP-IDF app image,
 /// e.g. `frontend/public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
@@ -99,6 +98,10 @@ pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), Image
     let mut cpu = Cpu::new();
     cpu.regs.pc = parsed.header.entry_addr;
     cpu.regs.write(2, initial_stack_pointer());
+    // The ESP32-C3 CPU's performance counter (`mpccr`), which the CPU has
+    // whether or not ROM stubs are installed (Task D-M5-3).
+    cpu.csr
+        .set_cycle_counter(crate::mem::soc::ESP32C3_CYCLE_COUNTER);
 
     Ok((cpu, bus))
 }
@@ -243,12 +246,13 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 ///
 /// If the core is parked by `WFI` ([`Cpu::is_waiting`]) and no line is
 /// asserted, nothing can happen until some peripheral raises one, and the
-/// only modeled peripheral whose state changes with time alone is the
-/// SYSTIMER. So instead of the usual one-step tick *after* the step, the
+/// modeled peripherals whose state changes with time alone are the
+/// SYSTIMER and the USB-Serial-JTAG host (a queued packet arrives after a
+/// packet time). So instead of the usual one-step tick *after* the step, the
 /// SYSTIMER is advanced *before* it by
-/// `ticks_until_next_alarm().unwrap_or(0).max(TICKS_PER_STEP)` ticks --
-/// straight to the next alarm that could raise an interrupt, or one
-/// ordinary step's worth if none is armed -- and the lines are sampled
+/// `FirmwareBus::ticks_until_next_event` ticks -- straight to the next
+/// alarm or USB host packet that could raise an interrupt, or one ordinary
+/// step's worth if none is pending -- and the lines are sampled
 /// again, so an alarm reached by the jump wakes the core (and, with `MIE`
 /// set, is taken) in this same step. With FreeRTOS's tick (alarm 0, period
 /// 160,000 ticks on the real boot) an idle tick costs one step instead of
@@ -263,12 +267,8 @@ pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu:
     let mut lines = bus.asserted_lines();
     let fast_forward = cpu.is_waiting() && lines == 0;
     if fast_forward {
-        let ticks = bus
-            .systimer
-            .ticks_until_next_alarm()
-            .unwrap_or(0)
-            .max(TICKS_PER_STEP);
-        bus.systimer.advance_by(ticks);
+        let ticks = bus.ticks_until_next_event();
+        bus.advance_idle(ticks);
         lines = bus.asserted_lines();
     }
     cpu.set_pending_interrupts(lines);
@@ -331,6 +331,9 @@ mod tests {
         let info = cpu.step(&mut bus);
         assert!(!info.trap_taken);
         assert_eq!(cpu.regs.pc, 0x4200_0024);
+        // The ESP32-C3 performance counter (`mpccr`, 0x7E2) is installed
+        // and counted that step.
+        assert_eq!(cpu.csr.read(0x7e2), 1);
     }
 
     #[test]

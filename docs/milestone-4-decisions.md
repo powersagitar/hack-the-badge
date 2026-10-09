@@ -149,6 +149,13 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
 
 ## I2C0 with no device attached (Task D-M4-1)
 
+> **Superseded in part by Milestone 5 Task D-M5-2**
+> (`milestone-5-decisions.md`, "SC7A20H accelerometer on I2C0"): the
+> SC7A20H accelerometer now answers at `0x19`, so `hal_accel` prints its
+> detection line and the boot rung pins that line. The first bullet below
+> (no device) still describes every other address; the rest of this
+> section stands.
+
 - **No device answers on the bus** (coordinator ruling R11). The
   controller is modeled; the accelerometer (SC7A20H) and any other I2C
   device are not. Every ACK slot reads 1 (SDA released), so an address
@@ -320,11 +327,13 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   "handles HOME" hook (`0x4201_3920`) always says yes, and its button
   handler (`0x4201_4130`) reacts only to START while unprovisioned; with
   the flag set, HOME goes to the launcher (`0x4203_8cba`). So a synthetic
-  identity in the littlefs `storage` partition (its format to be read from
-  the firmware, never from the physical badge's dump) would get there; it
-  needs a data-handling ruling first. Then the planned launcher rungs:
-  `boots_to_launcher` and a DOWN/RIGHT navigation rung (whichever moves
-  the selection).
+  identity in the littlefs `storage` partition (its format read from the
+  firmware; see `milestone-5-decisions.md`, ruling R-M5-1) would get
+  there. Then the planned launcher rungs: `boots_to_launcher` and a
+  DOWN/RIGHT navigation rung (whichever moves the selection). (Resolved
+  in Milestone 5: the badge is provisioned through its own console with
+  committed fake identities, rulings R-M5-1 and R-M5-2; see
+  `milestone-5-decisions.md`.)
 - Launching and playing a built-in app (Snake, Dice) comes after the
   launcher.
 - The ~6,000,000-step busy phase after START (hot PCs `0x420b_ead4`,
@@ -335,12 +344,14 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
 
 - No I2C device: the accelerometer probe is NACKed and the self-test reads
   0 mg. An SC7A20H model behind the address phase would change
-  `hal_accel`'s line.
+  `hal_accel`'s line. (Resolved in Milestone 5 Task D-M5-2: an SC7A20H
+  model; see `milestone-5-decisions.md`.)
 - RMT transmissions are consumed but not decoded, so the LEDs are never
   shown; a frontend LED view would need symbol capture.
 - NFC is not modeled (the self-test waits for a card forever).
 - No USB-Serial-JTAG interrupt source; the console REPL the badge starts
-  after the launcher may install the interrupt-driven driver.
+  after the launcher may install the interrupt-driven driver. (Resolved in
+  Milestone 5 Task 2; see `milestone-5-decisions.md`.)
 - Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`),
   SYSTEM `0x600c_0058`/`+0x08`, RTC_CNTL `0x6000_80bc`. Harmless so far.
 - Zero-latency RMT, I2C0 and SPIMEM1 (see their sections above).
@@ -372,6 +383,8 @@ reaches the launcher) is the next stall-loop task: boot-probe to step
   the same way.
 - The boot-ladder tests each boot from scratch (the suite takes ~2.6 s
   today); add the shared-checkpoint fixture if it passes ~10 s.
+  (Resolved in Milestone 5 Task 8: shared checkpoints, see
+  `milestone-5-decisions.md`.)
 - `MAX_STUB_MEMORY_BYTES` clamps in the `strlen`/`memcmp`/`MD5Update`
   stubs truncate silently.
 - Small duplications: the `memcpy`/`memset` and `memcmp`/`strncmp` stub

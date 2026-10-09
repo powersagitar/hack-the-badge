@@ -144,6 +144,7 @@ const XTAL32K_HZ: u64 = 32_768;
 /// are identical register layouts at different bases; `crate::mem::bus`
 /// owns one of each as separate fields). See the module doc for exactly
 /// what's modeled.
+#[derive(Clone)]
 pub struct Timg {
     /// Word-granular storage for every register in `0x00..REGS_END`,
     /// covering the watchdog config/feed/write-protect registers and the

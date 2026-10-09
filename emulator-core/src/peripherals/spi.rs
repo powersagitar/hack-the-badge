@@ -258,6 +258,7 @@ pub const CMD_RAMWR: u8 = 0x2C;
 
 /// The ST7789 command/pixel-stream interpreter. See the module doc for the
 /// full behavior and every judgment call it required.
+#[derive(Clone)]
 pub struct St7789 {
     framebuffer: Vec<u16>,
     current_command: Option<u8>,
@@ -397,6 +398,7 @@ impl St7789 {
 /// for the full register model and the trigger flow (which needs a
 /// cross-peripheral GPIO read `Spi` itself doesn't have access to — see
 /// [`Spi::write_byte`]'s doc).
+#[derive(Clone)]
 pub struct Spi {
     cmd: u32,
     user: u32,

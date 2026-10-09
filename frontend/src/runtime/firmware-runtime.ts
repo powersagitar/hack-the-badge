@@ -55,6 +55,7 @@
 import type { ButtonName } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 import { blitFramebuffer } from "../render/framebuffer";
+import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
 
 /** See this module's doc for the reasoning behind this number. */
 export const DEFAULT_CYCLES_PER_FRAME = 500_000;
@@ -89,6 +90,38 @@ export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
   UP: 7,
   AUX1: 8,
 };
+
+/**
+ * Emulated steps after `provision()` before an unfinished provisioner is
+ * abandoned and reported as failed ("timed out"). Steps, not wall time, so
+ * a slow browser does not time out early.
+ */
+export const PROVISION_TIMEOUT_STEPS = 60_000_000;
+
+/**
+ * Minimum emulated steps a button stays pressed (100 ms at 16 MHz; same
+ * value as `PRESS_HOLD_STEPS` in `emulator-core/tests/boot_progress.rs`).
+ * A shorter click would be missed by the firmware's button polling.
+ */
+export const PRESS_HOLD_STEPS = 1_600_000;
+
+/** Steps per shake half-period (`SHAKE_HALF_STEPS` in boot_progress.rs). */
+export const SHAKE_HALF_STEPS = 1_000_000;
+const SHAKE_HALF_PERIODS = 6;
+const REST_ACCELERATION: [number, number, number] = [0, 0, 1000];
+
+/**
+ * The acceleration (mg) `elapsed` steps into a shake: six alternating
+ * half-periods (+,-,+,...) of (s*2000, s*2000, 1000), then `null` (done;
+ * the caller restores the rest acceleration). Mirrors `shake()` in
+ * `emulator-core/tests/boot_progress.rs`.
+ */
+export function shakeAcceleration(elapsed: number): [number, number, number] | null {
+  const k = Math.floor(elapsed / SHAKE_HALF_STEPS);
+  if (k >= SHAKE_HALF_PERIODS) return null;
+  const s = k % 2 === 0 ? 1 : -1;
+  return [s * 2000, s * 2000, 1000];
+}
 
 export type FrameScheduler = (cb: (timeMs: number) => void) => number;
 export type FrameCanceler = (handle: number) => void;
@@ -126,10 +159,16 @@ export interface FirmwareRuntime {
   stop(): void;
   /** Mirrors `lifecycle.ts`'s `AppRuntime.injectButton` signature. */
   injectButton(button: ButtonName, kind: "pressed" | "released"): void;
+  /** Starts typing the provisioning flow for `identityJson`, replacing any in flight. */
+  provision(identityJson: string): void;
+  /** The current provisioning state, or `null` if none was started since the last reset. */
+  provisionState(): ProvisionState | null;
+  /** Shakes the emulated accelerometer (the onboarding's "Shake it!" page). */
+  shake(): void;
   /** Re-boots the firmware from the same image, keeping held buttons. */
   reset(): void;
   /**
-   * Real-firmware mode has no launcher/exit concept in this milestone (that's
+   * Real-firmware mode has no Lua-style exit-to-launcher (that's
    * a Lua-sandbox-mode-only affordance — see `badge.app.exit()` in
    * `lifecycle.ts`). Always `false`; exists so `shell.ts`/`main.ts` can treat
    * both runtimes uniformly without a type-level special case.
@@ -169,12 +208,61 @@ export function createFirmwareRuntime(
   let frameHandle: number | null = null;
   let disposed = false;
 
+  let provisioner: Provisioner | null = null;
+  let lastState: ProvisionState | null = null;
+  let provisionStartedAt = 0;
+  /** Step at which the current shake began, or `null`. */
+  let shakeStartedAt: number | null = null;
+  let lastShakeAccel: string | null = null;
+  /** Per button: step of its latest press, and a release deferred to a step. */
+  const pressedAt = new Map<ButtonName, number>();
+  const pendingRelease = new Map<ButtonName, number>();
+
+  function pollProvisioner(now: number): void {
+    if (!provisioner) return;
+    lastState = provisioner.poll();
+    if (lastState.kind === "ok" || lastState.kind === "failed") {
+      provisioner = null;
+    } else if (now - provisionStartedAt > PROVISION_TIMEOUT_STEPS) {
+      provisioner = null;
+      lastState = { kind: "failed", reason: "timed out" };
+    }
+  }
+
+  function pollShake(now: number): void {
+    if (shakeStartedAt === null) return;
+    const a = shakeAcceleration(now - shakeStartedAt);
+    if (a === null) {
+      shakeStartedAt = null;
+      lastShakeAccel = null;
+      handle.setAcceleration(...REST_ACCELERATION);
+      return;
+    }
+    const key = a.join(",");
+    if (key === lastShakeAccel) return;
+    lastShakeAccel = key;
+    handle.setAcceleration(...a);
+  }
+
+  function pollReleases(now: number): void {
+    for (const [button, at] of pendingRelease) {
+      if (now < at) continue;
+      pendingRelease.delete(button);
+      pressedAt.delete(button);
+      handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+    }
+  }
+
   function loop(): void {
     // Guards against a callback that was already queued by the real
     // scheduler before stop() canceled it — a race a test's fake scheduler
     // can also simulate by invoking a "canceled" callback directly.
     if (frameHandle === null) return;
     stepFirmwareFrame(handle, ctx, cyclesPerFrame);
+    const now = handle.totalSteps();
+    pollProvisioner(now);
+    pollShake(now);
+    pollReleases(now);
     if (frameHandle !== null) {
       frameHandle = scheduleFrame(loop);
     }
@@ -196,10 +284,45 @@ export function createFirmwareRuntime(
   function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
     const slot = RAW_SLOT_BY_BUTTON[button];
     if (slot === undefined) return;
-    handle.setRawButton(slot, kind === "pressed");
+    const now = handle.totalSteps();
+    if (kind === "pressed") {
+      pendingRelease.delete(button);
+      pressedAt.set(button, now);
+      handle.setRawButton(slot, true);
+      return;
+    }
+    const since = pressedAt.get(button);
+    if (since !== undefined && now - since < PRESS_HOLD_STEPS) {
+      pendingRelease.set(button, since + PRESS_HOLD_STEPS);
+      return;
+    }
+    pendingRelease.delete(button);
+    pressedAt.delete(button);
+    handle.setRawButton(slot, false);
+  }
+
+  function provision(identityJson: string): void {
+    provisioner = createProvisioner(handle, identityJson);
+    lastState = { kind: "waiting" };
+    provisionStartedAt = handle.totalSteps();
+  }
+
+  function shake(): void {
+    shakeStartedAt = handle.totalSteps();
+    lastShakeAccel = null;
   }
 
   function reset(): void {
+    provisioner = null;
+    lastState = null;
+    shakeStartedAt = null;
+    lastShakeAccel = null;
+    // Don't strand a button whose deferred release we are dropping.
+    for (const button of pendingRelease.keys()) handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+    pressedAt.clear();
+    pendingRelease.clear();
+    // The emulator's acceleration survives a reset; put it back at rest.
+    handle.setAcceleration(...REST_ACCELERATION);
     handle.reset();
   }
 
@@ -215,6 +338,9 @@ export function createFirmwareRuntime(
     stop,
     injectButton,
     reset,
+    provision,
+    provisionState: () => lastState,
+    shake,
     isExitRequested: () => false,
     dispose,
   };

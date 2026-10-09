@@ -166,4 +166,24 @@ impl FirmwareEmulator {
     pub fn console_output(&self) -> String {
         self.inner.console_output()
     }
+
+    /// Bytes a USB host sends to the badge's console; returns how many
+    /// were accepted (see `FirmwareRuntime::serial_input`).
+    #[wasm_bindgen(js_name = serialInput)]
+    pub fn serial_input(&mut self, bytes: &[u8]) -> usize {
+        self.inner.serial_input(bytes)
+    }
+
+    /// Serial input the firmware has not read yet.
+    #[wasm_bindgen(js_name = serialPending)]
+    pub fn serial_pending(&self) -> usize {
+        self.inner.serial_pending()
+    }
+
+    /// The acceleration the SC7A20H reports, in mg per axis (see
+    /// `FirmwareRuntime::set_acceleration`).
+    #[wasm_bindgen(js_name = setAcceleration)]
+    pub fn set_acceleration(&mut self, x_mg: i32, y_mg: i32, z_mg: i32) {
+        self.inner.set_acceleration(x_mg, y_mg, z_mg);
+    }
 }

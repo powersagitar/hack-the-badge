@@ -149,6 +149,7 @@ const LINE_MASK: u32 = 0x1F; // 5 bits: CPU interrupt line 0..=31
 const PRIO_MASK: u32 = 0xF; // 4-bit priority / threshold fields
 
 /// The ESP32-C3 interrupt matrix. See the module doc.
+#[derive(Clone)]
 pub struct InterruptController {
     /// Every source's MAP register, indexed by `offset / 4`.
     map: [u32; MAP_SOURCE_COUNT as usize],

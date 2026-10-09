@@ -34,6 +34,7 @@
 import { renderFrame } from "./render/canvas";
 import { createFirmwareRuntime, type FirmwareRuntime } from "./runtime/firmware-runtime";
 import { createHttpFileLoader, loadApp } from "./runtime/lifecycle";
+import { TEST_IDENTITY_ROLES, testIdentityUrl } from "./runtime/test-identities";
 import { mountShell, type ButtonInjector, type EmulatorMode } from "./ui/shell";
 
 const APP_DIR = "smoke-test";
@@ -179,6 +180,36 @@ function main(): void {
       startLuaPaintLoop();
     }
   }
+
+  let fetchError = "";
+  const provisionControls = shell.mountProvisionControls(
+    TEST_IDENTITY_ROLES,
+    async (role) => {
+      fetchError = "";
+      try {
+        const rt = await ensureFirmwareRuntime();
+        const res = await fetch(testIdentityUrl(role));
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        rt.provision(await res.text());
+      } catch (e) {
+        console.error(`Could not load test identity ${role}:`, e);
+        fetchError = `could not load ${role}`;
+      }
+    },
+    () => firmwareRuntime?.shake(),
+  );
+  setInterval(() => {
+    provisionControls.setVisible(mode === "firmware");
+    const st = firmwareRuntime?.provisionState() ?? null;
+    let text = fetchError;
+    if (st) {
+      if (st.kind === "waiting") text = "waiting for the console\u2026";
+      else if (st.kind === "typing") text = "provisioning\u2026";
+      else if ("line" in st) text = st.line;
+      else if ("reason" in st) text = `failed: ${st.reason}`;
+    }
+    provisionControls.setStatus(text);
+  }, 250);
 
   refreshModeToggle();
   luaRuntime.start();

@@ -32,7 +32,7 @@ pub const CPU_INTR_FROM_CPU_0_REG: u32 = 0x028;
 pub const FROM_CPU_COUNT: usize = 4;
 const FROM_CPU_END: u32 = CPU_INTR_FROM_CPU_0_REG + 4 * FROM_CPU_COUNT as u32;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct System {
     /// Bit 0 of `SYSTEM_CPU_INTR_FROM_CPU_<n>_REG`.
     from_cpu: [bool; FROM_CPU_COUNT],

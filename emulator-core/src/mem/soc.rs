@@ -149,6 +149,7 @@ pub const SYSTEM_RANGE: Range<u32> = 0x600c_0000..0x600c_1000;
 pub const SRC_SPI2: u32 = 19; // ETS_SPI2_INTR_SOURCE
 pub const SRC_RMT: u32 = 28; // ETS_RMT_INTR_SOURCE (INTERRUPT_CORE0_RMT_INTR_MAP_REG = 0x070)
 pub const SRC_I2C_EXT0: u32 = 29; // ETS_I2C_EXT0_INTR_SOURCE
+pub const SRC_USB_SERIAL_JTAG: u32 = 26; // ETS_USB_SERIAL_JTAG_INTR_SOURCE (soc/esp32c3/include/soc/interrupts.h)
 pub const SRC_SYSTIMER_TARGET0: u32 = 37; // ETS_SYSTIMER_TARGET0_INTR_SOURCE
 pub const SRC_SYSTIMER_TARGET1: u32 = 38;
 pub const SRC_SYSTIMER_TARGET2: u32 = 39;
@@ -258,6 +259,33 @@ pub const DBUS_CACHE_RANGE: Range<u32> = 0x3C00_0000..0x3C80_0000;
 /// `SOC_IRAM0_CACHE_ADDRESS_LOW..HIGH` (same header). Shares the 128 MMU
 /// entries with [`DBUS_CACHE_RANGE`].
 pub const IBUS_CACHE_RANGE: Range<u32> = 0x4200_0000..0x4280_0000;
+
+/// SYSCON, formerly APB_CTRL (`DR_REG_SYSCON_BASE` = `DR_REG_APB_CTRL_BASE`
+/// = `0x6002_6000`, ESP-IDF v5.5.3
+/// `components/soc/esp32c3/register/soc/reg_base.h:41-42`). Only the RNG
+/// data register is modeled (`crate::peripherals::apb_ctrl`); every other
+/// offset keeps the bus's logged catch-all behavior.
+pub const APB_CTRL_RANGE: Range<u32> = 0x6002_6000..0x6002_7000;
+
+/// The ESP32-C3 CPU's machine performance-counter CSRs, as the core's
+/// chip-agnostic cycle counter (`crate::cpu::CycleCounter`). ESP-IDF v5.5.3
+/// `components/riscv/include/riscv/rv_utils.h:41-43`: `CSR_PCER_MACHINE`
+/// `0x7e0`, `CSR_PCMR_MACHINE` `0x7e1`, `CSR_PCCR_MACHINE` `0x7e2`;
+/// `rv_utils_get_cycle_count()` / `rv_utils_set_cycle_count()` (same file,
+/// lines 107-131) read and write `CSR_PCCR_MACHINE` in M-mode on targets
+/// with `SOC_CPU_HAS_CSR_PC` (esp32c3 `soc_caps.h`). This is what
+/// `esp_cpu_get_cycle_count()` returns, e.g. in `esp_random()`
+/// (`components/esp_hw_support/hw_random.c`) and the early log timestamp.
+///
+/// PCER/PCMR are stored only: nothing in ESP-IDF v5.5.3 for the ESP32-C3,
+/// the app or the ESP32-C3 ROM ELF writes them, so the firmware relies on
+/// the counter running from reset, and no source to cite says otherwise.
+/// The counter therefore always counts (Milestone 5 Task D-M5-3, ruling
+/// R-T9-1).
+pub const ESP32C3_CYCLE_COUNTER: crate::cpu::CycleCounterCsrs = crate::cpu::CycleCounterCsrs {
+    counter: 0x7e2,
+    controls: [0x7e0, 0x7e1],
+};
 
 #[cfg(test)]
 mod tests {
