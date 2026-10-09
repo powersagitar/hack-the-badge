@@ -513,9 +513,10 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 /// fast-forwards SYSTIMER to its next alarm. Over a run of 5,550,000 steps:
 /// - no exception is taken (the last trap is an interrupt) and no panic
 ///   text prints;
-/// - SYSTIMER time ran ahead of the step count by at least 1,500,000 ticks
-///   (only the idle fast-forward can do that; measured 1,827,031 in
-///   Milestone 3);
+/// - the idle fast-forward charged at least 1,500,000 ticks
+///   (`Clock::idle_ticks`; measured 1,827,072 in Milestone 6 Task 1, where
+///   SYSTIMER ran 1,827,060 ticks ahead of the step count: the 12
+///   fast-forward steps are charged as idle, not as steps);
 /// - counter 1, the FreeRTOS tick's, is past 40 tick periods of 160,000, so
 ///   the scheduler kept ticking after the first wake.
 #[test]
@@ -529,12 +530,12 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
         "the last trap taken was an interrupt, not an exception; mcause=0x{:08x}",
         rt.cpu().csr.mcause
     );
-    let systimer = &rt.bus().systimer;
-    let ahead = systimer.elapsed_ticks() - rt.total_steps();
+    let idle = rt.bus().clock.idle_ticks();
     assert!(
-        ahead >= 1_500_000,
-        "idle fast-forward added only {ahead} ticks"
+        idle >= 1_500_000,
+        "idle fast-forward added only {idle} ticks"
     );
+    let systimer = &rt.bus().systimer;
     assert!(
         systimer.counter(1) >= 40 * 160_000,
         "counter 1 = {}",

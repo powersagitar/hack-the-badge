@@ -127,6 +127,16 @@ pub fn is_xip_addr(addr: u32) -> bool {
 /// `crate::peripherals::systimer` for what's actually modeled within it.
 pub const SYSTIMER_RANGE: Range<u32> = 0x6002_3000..0x6002_4000;
 
+/// SYSTIMER's counting rate: a fixed 16 MHz on the ESP32-C3, XTAL (40 MHz)
+/// through a fixed 2.5 divider. ESP-IDF v5.5.3 has no tick-rate macro in
+/// `hal/esp32c3/include/hal/systimer_ll.h` (its
+/// `systimer_ll_get_clock_source()` just returns `SYSTIMER_CLK_SRC_XTAL`);
+/// the rate is in `esp_hw_support/port/esp32c3/systimer.c`, whose
+/// `systimer_ticks_to_us()` is `ticks / 16` ("40MHz/2.5 = 16MHz"), and
+/// `soc/esp32c3/include/soc/soc_caps.h`'s `SOC_SYSTIMER_FIXED_DIVIDER`
+/// ("Clock source divider is fixed: 2.5").
+pub const SYSTIMER_HZ: u64 = 16_000_000;
+
 /// `INTERRUPT_CORE0` (the ESP32-C3's non-PLIC interrupt matrix) registers
 /// (`DR_REG_INTERRUPT_CORE0_BASE == DR_REG_INTERRUPT_BASE`, confirmed via
 /// ESP-IDF v5.5.3's `soc/reg_base.h`). Same one-4KiB-page rationale as

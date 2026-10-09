@@ -68,10 +68,12 @@ pub const NUM_RAW_BUTTON_SLOTS: usize = 1 + crate::peripherals::gpio::HC165_SLOT
 /// its own serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunSummary {
-    /// How many `step()` calls this run made (equal to the requested budget;
-    /// this runtime has no halt state — even a firmware stuck in a trap loop
-    /// keeps consuming steps, and so does a core parked in `WFI`: each
-    /// waiting step counts once, see [`FirmwareRuntime::run`]).
+    /// How many `step()` calls this run made. For [`FirmwareRuntime::run`]
+    /// this equals the requested budget (this runtime has no halt state —
+    /// even a firmware stuck in a trap loop keeps consuming steps, and so
+    /// does a core parked in `WFI`: each waiting step counts once); for
+    /// [`FirmwareRuntime::run_until`] it can be fewer, when the target time
+    /// is reached first.
     pub steps: u32,
     /// How many of those steps took a trap instead of completing an
     /// instruction.
@@ -151,7 +153,21 @@ impl FirmwareRuntime {
     /// 3 Task 6; pinned by
     /// `tests::run_returns_after_budget_even_if_wfi_never_wakes`).
     pub fn run(&mut self, budget: u32) -> RunSummary {
-        self.run_impl(budget, None)
+        self.run_impl(budget, None, None)
+    }
+
+    /// Runs until emulated time reaches `target_time_us` or `max_steps`
+    /// steps have run, whichever is first; `RunSummary::steps` is the
+    /// number run (0 if the target is already past). The browser's frame
+    /// pacing and the time-based button holds use this (Milestone 6).
+    pub fn run_until(&mut self, target_time_us: u64, max_steps: u32) -> RunSummary {
+        let target_ticks = self.bus.clock.ticks_at_us(target_time_us);
+        self.run_impl(max_steps, Some(target_ticks), None)
+    }
+
+    /// Emulated time since construction or the last reset, in microseconds.
+    pub fn emulated_time_us(&self) -> u64 {
+        self.bus.clock.elapsed_us()
     }
 
     /// Same as [`FirmwareRuntime::run`], but also tallies each step's
@@ -162,16 +178,25 @@ impl FirmwareRuntime {
     /// `Option` parameter on `run` itself) so `run`'s own hot path stays
     /// allocation-free for the WASM build, which never needs this.
     pub fn run_traced(&mut self, budget: u32, pc_hist: &mut HashMap<u32, u64>) -> RunSummary {
-        self.run_impl(budget, Some(pc_hist))
+        self.run_impl(budget, None, Some(pc_hist))
     }
 
-    /// Shared body for [`FirmwareRuntime::run`]/[`FirmwareRuntime::run_traced`].
-    fn run_impl(&mut self, budget: u32, mut pc_hist: Option<&mut HashMap<u32, u64>>) -> RunSummary {
-        let mut summary = RunSummary {
-            steps: budget,
-            ..RunSummary::default()
-        };
-        for _ in 0..budget {
+    /// Shared body for [`FirmwareRuntime::run`],
+    /// [`FirmwareRuntime::run_until`] and [`FirmwareRuntime::run_traced`]:
+    /// up to `budget` steps, stopping early (before a step) once the clock
+    /// has reached `stop_at_ticks`.
+    fn run_impl(
+        &mut self,
+        budget: u32,
+        stop_at_ticks: Option<u64>,
+        mut pc_hist: Option<&mut HashMap<u32, u64>>,
+    ) -> RunSummary {
+        let mut summary = RunSummary::default();
+        let mut ran: u32 = 0;
+        while ran < budget {
+            if stop_at_ticks.is_some_and(|t| self.bus.clock.total_ticks() >= t) {
+                break;
+            }
             if let Some(hist) = pc_hist.as_deref_mut() {
                 *hist.entry(self.cpu.regs.pc).or_insert(0) += 1;
             }
@@ -185,8 +210,10 @@ impl FirmwareRuntime {
             if info.rom_stub.is_some() {
                 summary.rom_stub_calls += 1;
             }
+            ran += 1;
         }
-        self.total_steps += u64::from(budget);
+        summary.steps = ran;
+        self.total_steps += u64::from(ran);
         summary.pc = self.cpu.regs.pc;
         summary
     }
@@ -554,5 +581,40 @@ mod tests {
         rt.bus.write32(GPIO_RANGE.start + OUT_REG, load_bit);
         rt.bus
             .write32(GPIO_RANGE.start + OUT_REG, load_bit | clk_bit);
+    }
+
+    #[test]
+    fn emulated_time_starts_at_zero_and_follows_the_clock() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert_eq!(rt.emulated_time_us(), 0);
+        rt.run(1_600);
+        // Legacy ratio (until Task 3): one 16 MHz tick per step.
+        assert_eq!(rt.emulated_time_us(), 100);
+    }
+
+    #[test]
+    fn run_until_stops_at_the_target_time() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let s = rt.run_until(1_000, 1_000_000);
+        assert!(rt.emulated_time_us() >= 1_000);
+        assert_eq!(u64::from(s.steps), rt.total_steps());
+        assert!(s.steps < 1_000_000);
+    }
+
+    #[test]
+    fn run_until_stops_at_the_step_cap() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let s = rt.run_until(u64::MAX / 2, 500);
+        assert_eq!(s.steps, 500);
+        assert_eq!(rt.total_steps(), 500);
+    }
+
+    #[test]
+    fn run_until_a_past_target_runs_nothing() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(10_000);
+        let s = rt.run_until(0, 1_000);
+        assert_eq!(s.steps, 0);
+        assert_eq!(rt.total_steps(), 10_000);
     }
 }

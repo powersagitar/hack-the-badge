@@ -2346,6 +2346,29 @@ unmapped access in the window was `0x6002_60B0` reads.
   Decisions and the old → new table are in `milestone-5-decisions.md`,
   "Cycle counter and RNG".
 
+### Milestone 6 Task 1: the clock
+
+Emulated time now has one owner, `emulator-core/src/clock.rs`'s `Clock`
+(chip-agnostic: it converts executed steps into ticks of a fixed-rate
+timer at a CPU frequency that may change, keeping the sub-tick remainder
+exactly across a frequency switch). `FirmwareBus::clock` drives SYSTIMER
+and the USB-Serial-JTAG packet timing: `tick_peripherals` hands each
+step's ticks to both (and skips them on a step that completes no tick),
+and the WFI fast-forward charges its jump to the clock as idle time
+(`Clock::idle_ticks`). `ticks_until_next_event` returns `None` when
+nothing is armed, and an idle step then passes an ordinary step's time.
+`SysTimer::advance()` is gone. `FirmwareRuntime` gained
+`emulated_time_us()` and `run_until(target_us, max_steps)`, passed through
+to the browser as `runUntil`/`emulatedTimeUs` (not yet used by the UI).
+
+The clock runs at the legacy ratio for now, CPU frequency =
+`SYSTIMER_HZ` (16 MHz), one tick per step, so this changed no timing:
+no rung number, step count or frame hash moved. The WFI rung now checks
+`idle_ticks` (1,827,072 at step 5,550,000) instead of SYSTIMER's lead over
+the step count (1,827,060; the 12 fast-forward steps are charged as idle,
+not as steps). Task 3 makes the clock follow the firmware's SYSTEM clock
+registers.
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB

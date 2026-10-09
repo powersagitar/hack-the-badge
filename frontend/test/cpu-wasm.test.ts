@@ -151,6 +151,24 @@ describe("emulator-wasm firmware-boot boundary", () => {
     },
     60_000,
   );
+
+  test("runUntil stops at the target emulated time or the step cap", () => {
+    const wasmBytes = readFileSync(
+      new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
+    );
+    initCpuWasmSync(wasmBytes);
+    const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+    const handle = createFirmwareEmulator(new Uint8Array(image));
+    try {
+      expect(handle.emulatedTimeUs()).toBe(0);
+      const s = handle.runUntil(1_000, 1_000_000);
+      expect(handle.emulatedTimeUs()).toBeGreaterThanOrEqual(1_000);
+      expect(s.steps).toBe(handle.totalSteps());
+      expect(handle.runUntil(1e12, 500).steps).toBe(500);
+    } finally {
+      handle.dispose();
+    }
+  });
 });
 
 /*

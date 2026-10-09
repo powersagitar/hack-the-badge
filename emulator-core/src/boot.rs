@@ -211,8 +211,8 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 
 /// Samples the interrupt lines currently asserted to the core
 /// ([`FirmwareBus::asserted_lines`]) into the CPU, steps `cpu` once, then
-/// advances [`FirmwareBus`]'s peripheral time
-/// ([`FirmwareBus::tick_peripherals`]: the SYSTIMER's counter) exactly once.
+/// advances [`FirmwareBus`]'s emulated time and timed peripherals
+/// ([`FirmwareBus::tick_peripherals`]: the clock, SYSTIMER, USB) exactly once.
 ///
 /// This is the interrupt-delivery driving loop (interrupt matrix + SYSTIMER
 /// + SYSTEM software interrupts, see `crate::peripherals`). Callers that
@@ -248,15 +248,16 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 /// asserted, nothing can happen until some peripheral raises one, and the
 /// modeled peripherals whose state changes with time alone are the
 /// SYSTIMER and the USB-Serial-JTAG host (a queued packet arrives after a
-/// packet time). So instead of the usual one-step tick *after* the step, the
-/// SYSTIMER is advanced *before* it by
-/// `FirmwareBus::ticks_until_next_event` ticks -- straight to the next
-/// alarm or USB host packet that could raise an interrupt, or one ordinary
-/// step's worth if none is pending -- and the lines are sampled
-/// again, so an alarm reached by the jump wakes the core (and, with `MIE`
-/// set, is taken) in this same step. With FreeRTOS's tick (alarm 0, period
-/// 160,000 ticks on the real boot) an idle tick costs one step instead of
-/// 160,000.
+/// packet time). So instead of the usual one-step tick *after* the step,
+/// emulated time and those peripherals are advanced *before* it by
+/// `FirmwareBus::ticks_until_next_event` ticks (an idle charge, see
+/// `crate::clock::Clock::idle_ticks`) -- straight to the next alarm or USB
+/// host packet that could raise an interrupt, or one ordinary step's
+/// time (`FirmwareBus::tick_peripherals`) if none is pending -- and the
+/// lines are sampled again, so an alarm reached by the jump wakes the core
+/// (and, with `MIE` set, is taken) in this same step. With FreeRTOS's tick
+/// (alarm 0, period 160,000 ticks on the real boot) an idle tick costs one
+/// step instead of 160,000.
 ///
 /// Either way this is one call, one `Cpu::step` and one step of a caller's
 /// budget, with no loop inside: a `WFI` that never wakes (nothing armed, or
@@ -267,8 +268,13 @@ pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu:
     let mut lines = bus.asserted_lines();
     let fast_forward = cpu.is_waiting() && lines == 0;
     if fast_forward {
-        let ticks = bus.ticks_until_next_event();
-        bus.advance_idle(ticks);
+        match bus.ticks_until_next_event() {
+            // At least one tick, as before: an event already due still
+            // costs a tick of time.
+            Some(ticks) => bus.advance_idle(ticks.max(1)),
+            // Nothing armed: an idle step passes an ordinary step's time.
+            None => bus.tick_peripherals(),
+        }
         lines = bus.asserted_lines();
     }
     cpu.set_pending_interrupts(lines);

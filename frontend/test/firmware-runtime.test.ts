@@ -43,6 +43,7 @@ function makeStubCtx() {
 /** A hand-written fake `FirmwareEmulatorHandle` — no WASM involved, per `bridge.ts`'s design intent. */
 function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
   const runBudgets: number[] = [];
+  const runUntilCalls: Array<[number, number]> = [];
   const buttonCalls: Array<[number, boolean]> = [];
   const counters = { resetCalls: 0, disposeCalls: 0 };
   const width = 4;
@@ -53,6 +54,16 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
       runBudgets.push(budget);
       return {
         steps: budget,
+        traps: 0,
+        romStubCalls: 0,
+        pc: 0x4200_0000,
+        lastInstructionFault: undefined,
+      };
+    },
+    runUntil(targetUs: number, maxSteps: number): CpuRunSummary {
+      runUntilCalls.push([targetUs, maxSteps]);
+      return {
+        steps: 0,
         traps: 0,
         romStubCalls: 0,
         pc: 0x4200_0000,
@@ -76,6 +87,7 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     totalSteps(): number {
       return 0;
     },
+    emulatedTimeUs: () => 0,
     serialInput: () => 0,
     serialPending: () => 0,
     consoleOutput: () => "",
@@ -86,7 +98,7 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     ...overrides,
   };
 
-  return { handle, runBudgets, buttonCalls, counters };
+  return { handle, runBudgets, runUntilCalls, buttonCalls, counters };
 }
 
 describe("RAW_SLOT_BY_BUTTON", () => {

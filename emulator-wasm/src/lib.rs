@@ -118,6 +118,20 @@ impl FirmwareEmulator {
         }
     }
 
+    /// Runs until emulated time reaches `target_us` or `max_steps` steps.
+    #[wasm_bindgen(js_name = runUntil)]
+    pub fn run_until(&mut self, target_us: f64, max_steps: u32) -> RunReport {
+        RunReport {
+            inner: self.inner.run_until(target_us as u64, max_steps),
+        }
+    }
+
+    /// Emulated time since construction or the last reset, in microseconds.
+    #[wasm_bindgen(getter, js_name = emulatedTimeUs)]
+    pub fn emulated_time_us(&self) -> f64 {
+        self.inner.emulated_time_us() as f64
+    }
+
     /// Presses/releases a raw button slot — slot 0 is `PIN_START` (GPIO9),
     /// slots 1..=8 are the 74HC165's button bits. The human-name→slot mapping
     /// lives in `frontend/src/runtime/firmware-runtime.ts`; see

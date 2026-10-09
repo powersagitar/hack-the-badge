@@ -19,8 +19,8 @@
  * 2. **No leaked WASM handles.** `RunReport` is a wasm-bindgen *class*: it owns
  *    memory on the Rust side that only `free()` releases. A render loop calling
  *    `run()` 60 times a second and dropping the result would leak steadily, so
- *    [`FirmwareEmulatorHandle.run`] copies the fields into a plain object and
- *    frees the handle immediately. Callers never see a `RunReport`.
+ *    [`FirmwareEmulatorHandle.run`] (and `runUntil`) copies the fields into a
+ *    plain object and frees the handle immediately. Callers never see a `RunReport`.
  * 3. **A named interface** the rest of the app depends on instead of the
  *    generated `.d.ts`, so `src/runtime/firmware-runtime.ts` can be unit-tested
  *    against a hand-written fake with no WASM involved.
@@ -69,6 +69,8 @@ export interface CpuRunSummary {
 export interface FirmwareEmulatorHandle {
   /** Runs `budget` instruction steps. */
   run(budget: number): CpuRunSummary;
+  /** Runs until emulated time reaches `targetUs` or `maxSteps` steps, whichever is first. */
+  runUntil(targetUs: number, maxSteps: number): CpuRunSummary;
   /** Re-boots from the same image, keeping held buttons. */
   reset(): void;
   /**
@@ -85,6 +87,8 @@ export interface FirmwareEmulatorHandle {
   pc(): number;
   /** Steps run since construction or the last `reset()`. */
   totalSteps(): number;
+  /** Emulated time since construction or the last `reset()`, in microseconds. */
+  emulatedTimeUs(): number;
   /** Bytes a USB host sends to the badge's console; returns how many were accepted. */
   serialInput(bytes: Uint8Array): number;
   /** Serial input the firmware has not read yet. */
@@ -152,25 +156,33 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     if (disposed) throw new Error("cpu/bridge: emulator has been disposed");
   }
 
+  /** Copies a `RunReport` into plain data and frees the WASM handle. */
+  function summarize(report: RunReport): CpuRunSummary {
+    try {
+      return {
+        steps: report.steps,
+        traps: report.traps,
+        romStubCalls: report.romStubCalls,
+        pc: report.pc,
+        lastInstructionFault: report.lastInstructionFault,
+      };
+    } finally {
+      // See this module's doc: `RunReport` is a WASM-owned handle, and a
+      // per-frame caller would otherwise leak one every frame.
+      report.free();
+    }
+  }
+
   return {
     screenWidth,
     screenHeight,
     run(budget: number): CpuRunSummary {
       assertLive();
-      const report: RunReport = wasm.run(budget);
-      try {
-        return {
-          steps: report.steps,
-          traps: report.traps,
-          romStubCalls: report.romStubCalls,
-          pc: report.pc,
-          lastInstructionFault: report.lastInstructionFault,
-        };
-      } finally {
-        // See this module's doc: `RunReport` is a WASM-owned handle, and a
-        // per-frame caller would otherwise leak one every frame.
-        report.free();
-      }
+      return summarize(wasm.run(budget));
+    },
+    runUntil(targetUs: number, maxSteps: number): CpuRunSummary {
+      assertLive();
+      return summarize(wasm.runUntil(targetUs, maxSteps));
     },
     reset(): void {
       assertLive();
@@ -191,6 +203,10 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     totalSteps(): number {
       assertLive();
       return wasm.totalSteps;
+    },
+    emulatedTimeUs(): number {
+      assertLive();
+      return wasm.emulatedTimeUs;
     },
     serialInput(bytes: Uint8Array): number {
       assertLive();

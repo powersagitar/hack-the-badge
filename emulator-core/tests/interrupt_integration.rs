@@ -216,11 +216,12 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
     // Per SysTimer's comparator model (see its module doc): the
     // COMP0_LOAD write at step `comp0_load_step` latches load_base =
     // counter-at-that-instant, so the first alarm is at load_base + PERIOD.
-    // counter-at-that-instant equals `comp0_load_step` (SysTimer::advance increments once per
+    // counter-at-that-instant equals `comp0_load_step` (at the legacy
+    // one-tick-per-step clock the counter increments once per
     // step_with_interrupts call, so after N calls the counter is N; the
     // COMP0_LOAD write itself happens *during* cpu.step() at step index
-    // `comp0_load_step`, i.e. before that step's own advance() call, so the
-    // live counter it reads is exactly `comp0_load_step`). The comparator
+    // `comp0_load_step`, i.e. before that step's own tick_peripherals()
+    // call, so the live counter it reads is exactly `comp0_load_step`). The comparator
     // then fires (INT_RAW latched, the source asserted) in the tick
     // after step index `comp0_load_step + PERIOD - 1`, where the counter
     // reaches that target; the next step samples the asserted line at its

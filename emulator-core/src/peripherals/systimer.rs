@@ -106,19 +106,23 @@
 //! - Counters are 52 bits and wrap; alarm arithmetic ignores wrap (2^52
 //!   ticks at 16 MHz is ~8.9 years).
 //!
-//! ## Tick rate (placeholder)
+//! ## Tick rate
 //!
-//! Real hardware counts at a fixed 16 MHz; `Cpu::step()` has no cycle
-//! model, so [`TICKS_PER_STEP`] is 1 tick per step. Only the relative
-//! timing of alarms is meaningful.
+//! Real hardware counts at a fixed 16 MHz (`crate::mem::soc::SYSTIMER_HZ`).
+//! The counter is driven by emulated time: `crate::clock::Clock` turns
+//! executed steps into ticks and `crate::mem::bus::FirmwareBus::tick_peripherals`
+//! hands each step's ticks to [`SysTimer::advance_by`] (Milestone 6). Until
+//! Milestone 6 Task 3 the clock runs at the legacy ratio, one tick per step
+//! ([`TICKS_PER_STEP`]).
 
 use crate::mem::soc::SRC_SYSTIMER_TARGET0;
 
-/// Ticks each working counter advances per [`SysTimer::advance`] call, i.e.
-/// per `Cpu::step()` in the driving loop (`crate::boot::step_with_interrupts`),
-/// except on a step spent waiting in `WFI`, where the loop jumps straight to
-/// the next alarm ([`SysTimer::ticks_until_next_alarm`], Milestone 3 Task 6).
-/// See the module doc's "Tick rate" section.
+/// The legacy (pre-Milestone-6) ratio of SYSTIMER ticks to `Cpu::step()`s,
+/// which the clock still runs at until Milestone 6 Task 3. Kept until then
+/// for USB-Serial-JTAG's packet timing
+/// (`crate::peripherals::usb_serial_jtag::PACKET_TICKS`). On a step spent
+/// waiting in `WFI` the driving loop instead jumps straight to the next
+/// alarm ([`SysTimer::ticks_until_next_alarm`], Milestone 3 Task 6).
 pub const TICKS_PER_STEP: u64 = 1;
 
 const COUNTER_MASK_52: u64 = (1u64 << 52) - 1;
@@ -313,12 +317,6 @@ impl SysTimer {
     /// bit `n` set) -- level, recomputed from live state.
     pub fn pending_sources(&self) -> u64 {
         u64::from(self.int_raw & self.int_ena & INT_MASK) << SRC_SYSTIMER_TARGET0
-    }
-
-    /// [`SysTimer::advance_by`]`(`[`TICKS_PER_STEP`]`)`. Call once per
-    /// `Cpu::step()` -- see `crate::boot::step_with_interrupts`.
-    pub fn advance(&mut self) {
-        self.advance_by(TICKS_PER_STEP);
     }
 
     /// Advances every working counter by `ticks` and fires each enabled
@@ -536,11 +534,11 @@ mod tests {
     fn only_unit0_counts_out_of_reset() {
         let mut t = SysTimer::new();
         for _ in 0..3 {
-            t.advance();
+            t.advance_by(1);
         }
-        assert_eq!(t.counter(0), 3 * TICKS_PER_STEP);
+        assert_eq!(t.counter(0), 3);
         assert_eq!(t.counter(1), 0, "UNIT1_WORK_EN resets to 0");
-        assert_eq!(t.elapsed_ticks(), 3 * TICKS_PER_STEP);
+        assert_eq!(t.elapsed_ticks(), 3);
     }
 
     #[test]
@@ -607,7 +605,7 @@ mod tests {
         arm_periodic_unit0(&mut t, 10);
         t.advance_by(9);
         assert!(!target_pending(&t, 0), "must not fire early");
-        t.advance();
+        t.advance_by(1);
         assert!(target_pending(&t, 0));
     }
 
@@ -621,7 +619,7 @@ mod tests {
         assert!(!target_pending(&t, 0));
         t.advance_by(9);
         assert!(!target_pending(&t, 0));
-        t.advance();
+        t.advance_by(1);
         assert!(target_pending(&t, 0));
     }
 
@@ -634,7 +632,7 @@ mod tests {
         w(&mut t, INT_ENA_REG, 1 << 2);
         t.advance_by(4);
         assert!(!target_pending(&t, 2));
-        t.advance();
+        t.advance_by(1);
         assert!(target_pending(&t, 2));
         w(&mut t, INT_CLR_REG, 1 << 2);
         t.advance_by(50);

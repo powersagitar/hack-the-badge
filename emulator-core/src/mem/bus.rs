@@ -169,6 +169,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::console::Console;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
@@ -181,7 +182,7 @@ use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::system::System;
-use crate::peripherals::systimer::{SysTimer, TICKS_PER_STEP};
+use crate::peripherals::systimer::SysTimer;
 use crate::peripherals::timg::Timg;
 use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
@@ -190,7 +191,7 @@ use super::soc::{
     is_xip_addr, APB_CTRL_RANGE, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
     IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
     MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
-    SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    SYSTEM_RANGE, SYSTIMER_HZ, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
 };
 use super::Bus;
 
@@ -316,6 +317,9 @@ pub struct FirmwareBus {
     /// installs some (`crate::boot::boot_from_factory_image_with_rom_stubs`
     /// installs `crate::rom`'s ESP32-C3 set).
     rom_data: Vec<RomDataBlob>,
+    /// Emulated time. Until Milestone 6 Task 3 the CPU frequency equals
+    /// `SYSTIMER_HZ`, i.e. one tick per step, the pre-Milestone-6 timing.
+    pub clock: Clock,
     /// The SYSTIMER peripheral (`crate::peripherals::systimer`), a concrete
     /// named field per this plan's pre-flight design ruling — see the
     /// module doc.
@@ -459,6 +463,7 @@ impl FirmwareBus {
             ram_regions,
             rom_code: Vec::new(),
             rom_data: Vec::new(),
+            clock: Clock::new(SYSTIMER_HZ, SYSTIMER_HZ, 1),
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             system: System::new(),
@@ -562,22 +567,23 @@ impl FirmwareBus {
         self.intc.poll(self.pending_sources())
     }
 
-    /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
-    /// ticks. Call exactly once per `Cpu::step()` (except a step spent
-    /// waiting in `WFI`, which advances SYSTIMER by its own fast-forward
-    /// instead) — see
-    /// `crate::boot::step_with_interrupts`, which samples
-    /// [`FirmwareBus::asserted_lines`] itself at the start of the next step,
-    /// so this returns nothing.
+    /// Advances emulated time by one executed step and every timed
+    /// peripheral by the ticks that step completed (none on most steps
+    /// once the CPU runs faster than SYSTIMER). Call exactly once per
+    /// `Cpu::step()` that is not an idle fast-forward -- see
+    /// `crate::boot::step_with_interrupts`.
     pub fn tick_peripherals(&mut self) {
-        self.systimer.advance();
-        self.usb_serial_jtag.advance(TICKS_PER_STEP);
+        let ticks = self.clock.step();
+        if ticks > 0 {
+            self.systimer.advance_by(ticks);
+            self.usb_serial_jtag.advance(ticks);
+        }
     }
 
-    /// How far an idle (WFI) core may fast-forward: to the next SYSTIMER
-    /// alarm or the next USB host packet, whichever is first; at least one
-    /// step's worth of ticks.
-    pub fn ticks_until_next_event(&self) -> u64 {
+    /// How far an idle (WFI) core may fast-forward: the ticks to the next
+    /// SYSTIMER alarm or USB host packet, whichever is first, or `None`
+    /// when neither is pending.
+    pub fn ticks_until_next_event(&self) -> Option<u64> {
         [
             self.systimer.ticks_until_next_alarm(),
             self.usb_serial_jtag.ticks_until_next_packet(),
@@ -585,12 +591,12 @@ impl FirmwareBus {
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or(0)
-        .max(TICKS_PER_STEP)
     }
 
-    /// Advances every timed peripheral by `ticks` during an idle fast-forward.
+    /// Advances emulated time and every timed peripheral by `ticks` during
+    /// an idle fast-forward.
     pub fn advance_idle(&mut self, ticks: u64) {
+        self.clock.advance_idle(ticks);
         self.systimer.advance_by(ticks);
         self.usb_serial_jtag.advance(ticks);
     }
@@ -1698,7 +1704,7 @@ mod tests {
         // source -- see `crate::peripherals::rtc_cntl`'s module doc) well
         // past the ~294-step quotient threshold before triggering.
         for _ in 0..1_000_000 {
-            bus.systimer.advance();
+            bus.systimer.advance_by(1);
         }
         // TIME_UPDATE_REG (+0x0c): set bit 31 (RTC_CNTL_TIME_UPDATE).
         bus.write32(0x6000_8000 + 0x0c, 1 << 31);
@@ -1868,10 +1874,14 @@ mod tests {
     fn idle_fast_forward_stops_at_the_next_host_packet() {
         use crate::peripherals::usb_serial_jtag::PACKET_TICKS;
         let mut bus = bus_with(vec![]);
-        // No alarm armed and no host input: one step's worth.
-        assert_eq!(bus.ticks_until_next_event(), TICKS_PER_STEP);
+        // No alarm armed and no host input: nothing to fast-forward to.
+        assert_eq!(bus.ticks_until_next_event(), None);
         bus.usb_serial_jtag.host_send(&[b'a'; 65]);
-        assert_eq!(bus.ticks_until_next_event(), 1, "first packet is due now");
+        assert_eq!(
+            bus.ticks_until_next_event(),
+            Some(1),
+            "first packet is due now"
+        );
         bus.advance_idle(1);
         // Firmware drains the packet; the next one is a packet time away.
         for _ in 0..64 {
@@ -1879,7 +1889,7 @@ mod tests {
         }
         assert_eq!(
             bus.ticks_until_next_event(),
-            PACKET_TICKS,
+            Some(PACKET_TICKS),
             "no SYSTIMER alarm is armed on a fresh bus"
         );
         bus.advance_idle(PACKET_TICKS);
@@ -1888,5 +1898,17 @@ mod tests {
             0b100,
             "DATA_AVAIL"
         );
+    }
+
+    #[test]
+    fn zero_tick_steps_leave_the_systimer_untouched() {
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.clock = Clock::new(80_000_000, SYSTIMER_HZ, 1);
+        for _ in 0..4 {
+            bus.tick_peripherals();
+            assert_eq!(bus.systimer.elapsed_ticks(), 0);
+        }
+        bus.tick_peripherals();
+        assert_eq!(bus.systimer.elapsed_ticks(), 1);
     }
 }
