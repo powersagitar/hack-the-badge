@@ -108,22 +108,18 @@
 //!
 //! ## Tick rate
 //!
-//! Real hardware counts at a fixed 16 MHz (`crate::mem::soc::SYSTIMER_HZ`).
-//! The counter is driven by emulated time: `crate::clock::Clock` turns
-//! executed steps into ticks and `crate::mem::bus::FirmwareBus::tick_peripherals`
-//! hands each step's ticks to [`SysTimer::advance_by`] (Milestone 6). Until
-//! Milestone 6 Task 3 the clock runs at the legacy ratio, one tick per step
-//! ([`TICKS_PER_STEP`]).
+//! The counter runs at the real 16 MHz (`crate::mem::soc::SYSTIMER_HZ`),
+//! in emulated time. Time comes from the bus's one `crate::clock::Clock`,
+//! which turns each executed step into ticks at the CPU frequency the
+//! firmware's SYSTEM clock registers select (`System::cpu_hz`: 40 MHz on
+//! XTAL, 80 or 160 MHz on the PLL; one tick per five steps at 80 MHz);
+//! `crate::mem::bus::FirmwareBus::tick_peripherals` hands each step's
+//! ticks to [`SysTimer::advance_by`] and skips steps that complete none
+//! (Milestone 6). On a step spent waiting in `WFI` the driving loop instead
+//! jumps straight to the next alarm ([`SysTimer::ticks_until_next_alarm`],
+//! Milestone 3 Task 6), charged to the clock as idle time.
 
 use crate::mem::soc::SRC_SYSTIMER_TARGET0;
-
-/// The legacy (pre-Milestone-6) ratio of SYSTIMER ticks to `Cpu::step()`s,
-/// which the clock still runs at until Milestone 6 Task 3. Kept until then
-/// for USB-Serial-JTAG's packet timing
-/// (`crate::peripherals::usb_serial_jtag::PACKET_TICKS`). On a step spent
-/// waiting in `WFI` the driving loop instead jumps straight to the next
-/// alarm ([`SysTimer::ticks_until_next_alarm`], Milestone 3 Task 6).
-pub const TICKS_PER_STEP: u64 = 1;
 
 const COUNTER_MASK_52: u64 = (1u64 << 52) - 1;
 /// `*_HI` registers are 20 bits (`[19:0]`).

@@ -367,11 +367,12 @@ mod tests {
         assert!(rt.cpu().is_waiting());
         assert_eq!(rt.pc(), 0x4200_0024, "parked after the wfi");
         assert_eq!(rt.total_steps(), 1000);
-        // Nothing armed: time still passes at the ordinary one-step rate.
-        assert_eq!(
-            rt.bus().systimer.elapsed_ticks(),
-            1000 * crate::peripherals::systimer::TICKS_PER_STEP
-        );
+        // Nothing armed: time still passes at the ordinary per-step rate.
+        // `from_image` applies the boot initializers, which seed the
+        // bootloader's 80 MHz PLL clock (`crate::rom`, R-T2-4), and this
+        // image never writes SYSTEM, so 1000 steps are 1000 * 16 / 80 =
+        // 200 SYSTIMER ticks.
+        assert_eq!(rt.bus().systimer.elapsed_ticks(), 200);
     }
 
     #[test]
@@ -529,7 +530,7 @@ mod tests {
 
     /// A clone is a full checkpoint (the boot rungs share them,
     /// `tests/boot_progress.rs`): from a real-firmware state just before the
-    /// first pixels land (~1.13M steps), a clone and its original each run
+    /// first pixels land (~1.72M steps; ~1.13M before Milestone 6 Task 3), a clone and its original each run
     /// 100,000 more steps and end identical, and the original's run does not
     /// leak into the clone.
     #[test]
@@ -540,10 +541,10 @@ mod tests {
         )
         .expect("factory.bin");
         let mut original = FirmwareRuntime::from_image(&image).expect("boot");
-        original.run(1_100_000);
+        original.run(1_700_000);
         let mut clone = original.clone();
         original.run(100_000);
-        assert_eq!(clone.total_steps(), 1_100_000, "the clone did not move");
+        assert_eq!(clone.total_steps(), 1_700_000, "the clone did not move");
         clone.run(100_000);
         assert_eq!(clone.pc(), original.pc());
         assert_eq!(clone.total_steps(), original.total_steps());
@@ -588,8 +589,11 @@ mod tests {
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
         assert_eq!(rt.emulated_time_us(), 0);
         rt.run(1_600);
-        // Legacy ratio (until Task 3): one 16 MHz tick per step.
-        assert_eq!(rt.emulated_time_us(), 100);
+        // The boot initializers seed the bootloader's 80 MHz PLL clock
+        // (R-T2-4) and this image never writes SYSTEM: 1,600 steps at
+        // 80 MHz are 320 ticks of the 16 MHz SYSTIMER, 20 us. (100 us under
+        // the pre-Milestone-6 one-tick-per-step clock.)
+        assert_eq!(rt.emulated_time_us(), 20);
     }
 
     #[test]

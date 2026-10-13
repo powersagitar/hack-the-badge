@@ -99,25 +99,25 @@ export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
 export const PROVISION_TIMEOUT_STEPS = 60_000_000;
 
 /**
- * Minimum emulated steps a button stays pressed (100 ms at 16 MHz; same
- * value as `PRESS_HOLD_STEPS` in `emulator-core/tests/boot_progress.rs`).
- * A shorter click would be missed by the firmware's button polling.
+ * Minimum emulated time a button stays pressed: 100 ms (same value as
+ * `PRESS_HOLD_US` in `emulator-core/tests/boot_progress.rs`). A shorter
+ * click would be missed by the firmware's button polling.
  */
-export const PRESS_HOLD_STEPS = 1_600_000;
+export const PRESS_HOLD_US = 100_000;
 
-/** Steps per shake half-period (`SHAKE_HALF_STEPS` in boot_progress.rs). */
-export const SHAKE_HALF_STEPS = 1_000_000;
+/** Emulated µs per shake half-period (`SHAKE_HALF_US` in boot_progress.rs). */
+export const SHAKE_HALF_US = 62_500;
 const SHAKE_HALF_PERIODS = 6;
 const REST_ACCELERATION: [number, number, number] = [0, 0, 1000];
 
 /**
- * The acceleration (mg) `elapsed` steps into a shake: six alternating
- * half-periods (+,-,+,...) of (s*2000, s*2000, 1000), then `null` (done;
- * the caller restores the rest acceleration). Mirrors `shake()` in
- * `emulator-core/tests/boot_progress.rs`.
+ * The acceleration (mg) `elapsedUs` of emulated time into a shake: six
+ * alternating half-periods (+,-,+,...) of (s*2000, s*2000, 1000), then
+ * `null` (done; the caller restores the rest acceleration). Mirrors
+ * `shake()` in `emulator-core/tests/boot_progress.rs`.
  */
-export function shakeAcceleration(elapsed: number): [number, number, number] | null {
-  const k = Math.floor(elapsed / SHAKE_HALF_STEPS);
+export function shakeAcceleration(elapsedUs: number): [number, number, number] | null {
+  const k = Math.floor(elapsedUs / SHAKE_HALF_US);
   if (k >= SHAKE_HALF_PERIODS) return null;
   const s = k % 2 === 0 ? 1 : -1;
   return [s * 2000, s * 2000, 1000];
@@ -211,10 +211,13 @@ export function createFirmwareRuntime(
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
-  /** Step at which the current shake began, or `null`. */
+  /** Emulated time (µs) at which the current shake began, or `null`. */
   let shakeStartedAt: number | null = null;
   let lastShakeAccel: string | null = null;
-  /** Per button: step of its latest press, and a release deferred to a step. */
+  /**
+   * Per button: emulated time (µs) of its latest press, and a release
+   * deferred to an emulated time.
+   */
   const pressedAt = new Map<ButtonName, number>();
   const pendingRelease = new Map<ButtonName, number>();
 
@@ -259,10 +262,11 @@ export function createFirmwareRuntime(
     // can also simulate by invoking a "canceled" callback directly.
     if (frameHandle === null) return;
     stepFirmwareFrame(handle, ctx, cyclesPerFrame);
-    const now = handle.totalSteps();
-    pollProvisioner(now);
-    pollShake(now);
-    pollReleases(now);
+    // The provisioner's timeout is in steps; holds and shakes in emulated time.
+    pollProvisioner(handle.totalSteps());
+    const nowUs = handle.emulatedTimeUs();
+    pollShake(nowUs);
+    pollReleases(nowUs);
     if (frameHandle !== null) {
       frameHandle = scheduleFrame(loop);
     }
@@ -284,7 +288,7 @@ export function createFirmwareRuntime(
   function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
     const slot = RAW_SLOT_BY_BUTTON[button];
     if (slot === undefined) return;
-    const now = handle.totalSteps();
+    const now = handle.emulatedTimeUs();
     if (kind === "pressed") {
       pendingRelease.delete(button);
       pressedAt.set(button, now);
@@ -292,8 +296,8 @@ export function createFirmwareRuntime(
       return;
     }
     const since = pressedAt.get(button);
-    if (since !== undefined && now - since < PRESS_HOLD_STEPS) {
-      pendingRelease.set(button, since + PRESS_HOLD_STEPS);
+    if (since !== undefined && now - since < PRESS_HOLD_US) {
+      pendingRelease.set(button, since + PRESS_HOLD_US);
       return;
     }
     pendingRelease.delete(button);
@@ -308,7 +312,7 @@ export function createFirmwareRuntime(
   }
 
   function shake(): void {
-    shakeStartedAt = handle.totalSteps();
+    shakeStartedAt = handle.emulatedTimeUs();
     lastShakeAccel = null;
   }
 

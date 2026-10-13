@@ -21,17 +21,17 @@ ESP32-C3 device), in two complementary modes:
    minimal peripheral set) written in Rust and compiled to WebAssembly.
    **Current state (end of Milestone 5):** boot runs through the ESP-IDF
    startup log, FreeRTOS and `app_main` (the boot splash is final from
-   about step 5.54M, `boots_to_first_real_frame`), formats and mounts
+   about step 5.03M, `boots_to_first_real_frame`), formats and mounts
    littlefs on the blank `storage` partition, and launches My Badge, which
    on blank flash shows its unregistered **first-run screen**
    (`boots_to_first_run_screen`; START opens the hardware self-test,
    `first_run_screen_responds_to_start`). `app_main` then starts the
-   firmware's USB console REPL (`badge> ` at about step 16.8M). The **app
+   firmware's USB console REPL (`badge> ` at about step 16.6M). The **app
    launcher is reached by provisioning a fake test identity through that
    console** (the firmware's own `put /littlefs/identity.json <size>` and
    `prov apply`), then walking the on-badge onboarding app ("Setup", 11
    pages, including a shake on page 6) to My Badge's registered screen,
-   and pressing HOME (`boots_to_launcher`, about 317.5M steps for role
+   and pressing HOME (`boots_to_launcher`, about 366M steps for role
    hacker; DOWN moves the selection, `launcher_responds_to_navigation`).
    Every role's walk is a rung (`provisions_<role>_through_the_console`).
    The registered, onboarding, launcher and navigation frames were
@@ -100,11 +100,11 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   plus the stretch rung `launcher_opens_dice`
   (Milestone 4's `boots_to_first_run_screen` and
   `first_run_screen_responds_to_start` still hold on blank flash). The
-  identity walks are 280M to 345M emulated steps each, so the suite
+  identity walks are about 347M to 375M emulated steps each, so the suite
   shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s) and takes
-  about 42 s on 18 cores (one chain of about 450M steps, hacker's walk to Dice, is
+  about 42 s on 18 cores (one chain of about 488M steps, hacker's walk to Dice, is
   the floor). The debug
-  `cargo test --workspace` runs the same rungs in about 26 s, because the
+  `cargo test --workspace` runs the same rungs in about 28 s, because the
   dev profile builds `emulator-core` at `opt-level = 3` (root
   `Cargo.toml`). When boot moves, update the rung whose budget it
   affects; the per-task history goes in the notes, not the test docs.
@@ -151,8 +151,9 @@ frontend/             Vite + TypeScript web app (own package.json).
   src/runtime/firmware-runtime.ts
                       Firmware-mode runtime over the WASM handle: the
                       frame loop, the button-name -> raw-slot table, a
-                      minimum press hold (PRESS_HOLD_STEPS, 1.6M emulated
-                      steps; earlier releases are deferred), provision()
+                      minimum press hold (PRESS_HOLD_US, 100 ms of
+                      emulated time; earlier releases are deferred),
+                      provision()
                       with a 60M-step timeout (PROVISION_TIMEOUT_STEPS),
                       and shake() (the rungs' two-axis shake pattern, then
                       rest). Reset abandons a provisioner and a shake.
@@ -271,7 +272,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       sampled every step by boot::step_with_interrupts; the
                       core takes the highest-priority pending line, ties to
                       the lowest; while the core waits in WFI that loop
-                      fast-forwards SYSTIMER to its next alarm, Task 6),
+                      fast-forwards SYSTIMER to its next alarm, Task 6;
+                      since Milestone 6 time comes from clock.rs's Clock,
+                      which converts steps to 16 MHz ticks at the CPU
+                      frequency System::cpu_hz selects),
                       SYSTEM's FROM_CPU software-interrupt registers
                       and its CPU_PER_CONF/SYSCLK_CONF clock registers
                       with System::cpu_hz (system.rs, Milestone 6 Task
@@ -302,8 +306,8 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       output reaches the console. Since Milestone 5 it also
                       receives: a host queue (1 MiB cap, excess refused)
                       feeds the 64-byte OUT FIFO one packet at a time,
-                      PACKET_STEPS = 8,210 CPU steps apart (51.3 us of
-                      full-speed bus at 160 MHz); INT_ST/INT_ENA/INT_CLR
+                      PACKET_TICKS = 821 SYSTIMER ticks apart (51.3 us of
+                      full-speed bus; Milestone 6); INT_ST/INT_ENA/INT_CLR
                       are real and drive interrupt source 26, which the
                       firmware's interrupt-driven console driver needs;
                       the WFI fast-forward stops at the next packet. The

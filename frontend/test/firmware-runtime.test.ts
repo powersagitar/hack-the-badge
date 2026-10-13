@@ -4,10 +4,10 @@ import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import {
   createFirmwareRuntime,
   DEFAULT_CYCLES_PER_FRAME,
-  PRESS_HOLD_STEPS,
+  PRESS_HOLD_US,
   PROVISION_TIMEOUT_STEPS,
   RAW_SLOT_BY_BUTTON,
-  SHAKE_HALF_STEPS,
+  SHAKE_HALF_US,
   shakeAcceleration,
   stepFirmwareFrame,
 } from "../src/runtime/firmware-runtime";
@@ -210,13 +210,13 @@ describe("createFirmwareRuntime", () => {
   });
 
   test("injectButton maps a button name to its raw slot and press/release state", () => {
-    let stepsNow = 0;
-    const { handle, buttonCalls } = makeFakeHandle({ totalSteps: () => stepsNow });
+    let timeUsNow = 0;
+    const { handle, buttonCalls } = makeFakeHandle({ emulatedTimeUs: () => timeUsNow });
     const { ctx } = makeStubCtx();
     const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
 
     runtime.injectButton("UP", "pressed");
-    stepsNow = PRESS_HOLD_STEPS;
+    timeUsNow = PRESS_HOLD_US;
     runtime.injectButton("UP", "released");
     runtime.injectButton("AUX1", "pressed");
 
@@ -263,10 +263,14 @@ describe("createFirmwareRuntime", () => {
   });
 });
 
-/** A fake console handle, a settable step counter and a manual frame scheduler. */
+/**
+ * A fake console handle, a settable step counter and emulated time, and a
+ * manual frame scheduler.
+ */
 function rig() {
   let consoleText = "";
   let steps = 0;
+  let timeUs = 0;
   const typed: string[] = [];
   const accel: Array<[number, number, number]> = [];
   const fake = makeFakeHandle({
@@ -277,6 +281,7 @@ function rig() {
     serialPending: () => 0,
     consoleOutput: () => consoleText,
     totalSteps: () => steps,
+    emulatedTimeUs: () => timeUs,
     setAcceleration: (x, y, z) => {
       accel.push([x, y, z]);
     },
@@ -295,6 +300,7 @@ function rig() {
     buttonCalls: fake.buttonCalls,
     print: (s: string) => (consoleText += s),
     setSteps: (n: number) => (steps = n),
+    setTimeUs: (n: number) => (timeUs = n),
   };
 }
 
@@ -354,65 +360,65 @@ describe("FirmwareRuntime provisioning", () => {
 
 describe("shakeAcceleration", () => {
   test("alternates six half-periods then rests", () => {
-    expect(SHAKE_HALF_STEPS).toBe(1_000_000);
+    expect(SHAKE_HALF_US).toBe(62_500);
     expect(shakeAcceleration(0)).toEqual([2000, 2000, 1000]);
-    expect(shakeAcceleration(SHAKE_HALF_STEPS - 1)).toEqual([2000, 2000, 1000]);
-    expect(shakeAcceleration(SHAKE_HALF_STEPS)).toEqual([-2000, -2000, 1000]);
-    expect(shakeAcceleration(5 * SHAKE_HALF_STEPS)).toEqual([-2000, -2000, 1000]);
-    expect(shakeAcceleration(6 * SHAKE_HALF_STEPS)).toBeNull();
+    expect(shakeAcceleration(SHAKE_HALF_US - 1)).toEqual([2000, 2000, 1000]);
+    expect(shakeAcceleration(SHAKE_HALF_US)).toEqual([-2000, -2000, 1000]);
+    expect(shakeAcceleration(5 * SHAKE_HALF_US)).toEqual([-2000, -2000, 1000]);
+    expect(shakeAcceleration(6 * SHAKE_HALF_US)).toBeNull();
   });
 });
 
 describe("FirmwareRuntime shake", () => {
-  test("is scheduled from the frame loop off totalSteps, then rests", () => {
-    const { rt, accel, frame, setSteps } = rig();
-    setSteps(500);
+  test("is scheduled from the frame loop off emulated time, then rests", () => {
+    const { rt, accel, frame, setTimeUs } = rig();
+    setTimeUs(500);
     rt.start();
     rt.shake();
     frame();
     expect(accel).toEqual([[2000, 2000, 1000]]);
     frame(); // unchanged half-period: no repeated call
     expect(accel.length).toBe(1);
-    setSteps(500 + SHAKE_HALF_STEPS);
+    setTimeUs(500 + SHAKE_HALF_US);
     frame();
     expect(accel.at(-1)).toEqual([-2000, -2000, 1000]);
-    setSteps(500 + 6 * SHAKE_HALF_STEPS);
+    setTimeUs(500 + 6 * SHAKE_HALF_US);
     frame();
     expect(accel.at(-1)).toEqual([0, 0, 1000]);
     expect(accel.length).toBe(3);
     const n = accel.length;
-    setSteps(500 + 20 * SHAKE_HALF_STEPS);
+    setTimeUs(500 + 20 * SHAKE_HALF_US);
     frame();
     expect(accel.length).toBe(n);
   });
 
   test("reset cancels a shake and restores rest acceleration", () => {
-    const { rt, accel, frame, setSteps } = rig();
+    const { rt, accel, frame, setTimeUs } = rig();
     rt.start();
     rt.shake();
     frame();
     rt.reset();
     expect(accel.at(-1)).toEqual([0, 0, 1000]);
     const n = accel.length;
-    setSteps(SHAKE_HALF_STEPS);
+    setTimeUs(SHAKE_HALF_US);
     frame();
     expect(accel.length).toBe(n);
   });
 });
 
 describe("FirmwareRuntime press hold", () => {
-  test("a release before PRESS_HOLD_STEPS is deferred to the frame loop", () => {
-    const { rt, buttonCalls, frame, setSteps } = rig();
+  test("a release before PRESS_HOLD_US is deferred to the frame loop", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
     rt.start();
-    setSteps(100);
+    setTimeUs(100);
     rt.injectButton("A", "pressed");
-    setSteps(200);
+    setTimeUs(200);
     rt.injectButton("A", "released");
     expect(buttonCalls).toEqual([[RAW_SLOT_BY_BUTTON.A, true]]);
-    setSteps(100 + PRESS_HOLD_STEPS - 1);
+    setTimeUs(100 + PRESS_HOLD_US - 1);
     frame();
     expect(buttonCalls.length).toBe(1);
-    setSteps(100 + PRESS_HOLD_STEPS);
+    setTimeUs(100 + PRESS_HOLD_US);
     frame();
     expect(buttonCalls).toEqual([
       [RAW_SLOT_BY_BUTTON.A, true],
@@ -421,34 +427,34 @@ describe("FirmwareRuntime press hold", () => {
   });
 
   test("a release after the hold has elapsed is immediate", () => {
-    const { rt, buttonCalls, setSteps } = rig();
+    const { rt, buttonCalls, setTimeUs } = rig();
     rt.injectButton("B", "pressed");
-    setSteps(PRESS_HOLD_STEPS);
+    setTimeUs(PRESS_HOLD_US);
     rt.injectButton("B", "released");
     expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.B, false]);
   });
 
   test("a re-press before the deferred release cancels it", () => {
-    const { rt, buttonCalls, frame, setSteps } = rig();
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
     rt.start();
     rt.injectButton("A", "pressed");
-    setSteps(10);
+    setTimeUs(10);
     rt.injectButton("A", "released");
-    setSteps(20);
+    setTimeUs(20);
     rt.injectButton("A", "pressed");
-    setSteps(20 + PRESS_HOLD_STEPS + 5);
+    setTimeUs(20 + PRESS_HOLD_US + 5);
     frame();
     expect(buttonCalls.every(([, p]) => p)).toBe(true);
   });
 
   test("reset clears pending releases", () => {
-    const { rt, buttonCalls, frame, setSteps } = rig();
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
     rt.start();
     rt.injectButton("A", "pressed");
     rt.injectButton("A", "released");
     rt.reset();
     const n = buttonCalls.length;
-    setSteps(PRESS_HOLD_STEPS * 2);
+    setTimeUs(PRESS_HOLD_US * 2);
     frame();
     expect(buttonCalls.length).toBe(n);
   });

@@ -31,7 +31,11 @@ export const LINE_END = "\n";
 export const PUT_READY = "READY";
 /** The host's chunk size: one USB full-speed bulk packet. */
 export const PUT_CHUNK_BYTES = 64;
-/** Steps between payload chunks: 2x the measured 24,000-step drain threshold. */
+/**
+ * Steps between payload chunks: 2x the measured 24,000-step drain threshold
+ * (re-measured under Milestone 6's clock: 24,000 still passes, so unchanged;
+ * `PUT_CHUNK_GAP_STEPS` in `emulator-core/tests/common/provision.rs`).
+ */
 export const PUT_CHUNK_GAP_STEPS = 48_000;
 
 export type ProvisionState =

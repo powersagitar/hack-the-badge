@@ -105,6 +105,105 @@ the code, this file and the code win.
   registers as `freq_before` and rescales the cycle counter by it. If
   wrong: the app's first clock switch and the cycle counter would start
   from a frequency the real badge never had.
+- **R-T3-1, the synthetic-image runtime tests run at 80 MHz.**
+  `FirmwareRuntime::from_image` boots through
+  `boot_from_factory_image_with_rom_stubs`, which applies the boot
+  initializers, so the synthetic images get the R-T2-4 PLL seed: 1,000
+  steps of `run_returns_after_budget_even_if_wfi_never_wakes` are 200
+  ticks (1000 × 16 / 80; the brief's 400 assumed XTAL), and Task 1's
+  `emulated_time_starts_at_zero_and_follows_the_clock` reads 20 µs after
+  1,600 steps (320 ticks; 100 µs under the old clock). Both were measured,
+  not only computed. A bare `FirmwareBus::from_segments` bus has no
+  initializers: it is constructed at the 40 MHz XTAL clock and its first
+  step applies `SYSCLK_CONF`'s reset value, `PRE_DIV_CNT` = 1, i.e. XTAL / 2
+  = 20 MHz (`a_bare_bus_follows_the_reset_clock_registers`). If wrong: a
+  runtime test would pin a rate the boot never runs at.
+- **R-T3-2, the zero-tick test's pattern.** The brief expected the five
+  steps after the PLL switch in `zero_tick_steps_leave_the_systimer_untouched`
+  to tick `0, 0, 0, 0, 1`. `xtal_bus()`'s own 40 MHz step leaves 2/5 of a
+  tick pending, the switch keeps it (rescaled, R-T1-1) and the sync step
+  adds 1/5, so the second step completes a tick: the test asserts per-step
+  ticks `[0, 1, 0, 0, 0]`, which still checks that four of five steps
+  leave SYSTIMER untouched. If wrong: a dropped or doubled remainder at the
+  switch would go unnoticed.
+- **R-T3-3, the invalid-encoding bus test.** The brief's
+  `invalid_clock_encoding_keeps_the_clock_rate` only checked `SOC_CLK_SEL`
+  = 3 from 40 MHz, the constructor's own rate, so a bus that fell back to
+  its default would pass. The test also switches to PLL 160 MHz (a rate
+  only the registers give) and checks that `SOC_CLK_SEL` = 3 and then
+  `CPUPERIOD_SEL` = 3 both keep 160 MHz. If wrong: an invalid write could
+  reset the clock without a test noticing.
+- **R-T3-4, the early-boot shift and the historical fault-step rungs.**
+  The clock made early boot about 600,000 steps longer: between the app's
+  first `rtc_clk_init()` switch to the 40 MHz XTAL clock (step 836) and
+  its switch back to the PLL, `rtc_init()` waits on the RTC timer
+  (the loops at `0x4038_bbbe` and `0x4038_f8f6`, the pair Milestone 3
+  Task D1 unblocked), and RTC time follows SYSTIMER ticks, which now
+  come 2.5 steps apart instead of 1. The first log line moves from about
+  step 401,000 to 1,001,000; after it the shift is a near constant
+  599,794 steps (to `heap_init`), 599,842 (the `memchr` call), 599,938
+  (the first yield) and 600,230 (from `app_main`'s SPI setup to the idle
+  `wfi`). Rungs that run to a pre-Milestone-6 fault step (`memcpy`
+  401,761, `ets_efuse_get_spiconfig` 402,113, `esprv_intc_int_enable`
+  405,806, `itoa` 407,471) now run to that step plus the measured shift
+  there, so they cover the same instructions as at `00dd7d5`; windows
+  given in round numbers (440,000, 493,000, 583,000..596,000,
+  590,000..596,608, 596,000, the ROM-wall test's 420,000 and the
+  legacy-data test's 500,000) move by 600,000, and console-needle budgets
+  without a doc formula (efuse, cpu freq, heap_init, RTCRAM, spi_flash,
+  `main_task`, `sleep_gpio`, LVGL) move by 600,000 too, which keeps each
+  one's headroom over its line. Each doc keeps the historical step. If
+  wrong: an exact-step rung would stop short of the call it was written
+  for and pass vacuously.
+- **R-T3-5, tick-period thresholds are re-pinned to the measured floor.**
+  Two rungs count FreeRTOS tick periods at a step: the WFI rung (counter 1
+  past 40 periods at step 5,550,000; measured 42.8 before, 17.5 now) and
+  `rom_stub_boot`'s phase 9 (42 periods at `MD5Init`; 42.86 before, 16.78
+  now). A busy step is a fifth of a tick at 80 MHz instead of a whole one,
+  so the same steps hold fewer periods; the thresholds become 17 and 16,
+  the floor of the measured value, the same rule the old 40 and 42 were
+  set by. The rungs still prove the scheduler ticks repeatedly after the
+  first wake. If wrong: a stalled tick would still pass if it stopped
+  after 16 periods (as it would have after 42 before).
+- **R-T3-6, `interrupt_integration.rs` runs at a stated clock.** Its
+  synthetic programs assumed one SYSTIMER tick per step and a bare bus;
+  with the clock following the registers a bare bus runs at the reset
+  value, 20 MHz. `build_bus` now writes `SYSCLK_CONF` = 0 (XTAL / 1, 40
+  MHz, 2/5 of a tick per step), and the tests derive their step counts
+  from that rate (`ticks_after`, `steps_for`) instead of equating steps
+  and ticks: the first alarm's trap step is `steps_for(ticks_after(load
+  step) + PERIOD)`, which is `load step + PERIOD` at one tick per step.
+  The NOP padding grew to 192 so the threshold test's 75 masked steps stay
+  on fetchable code. Not in the brief's file list; the file had to change
+  for the suite to pass. If wrong: the exact-step interrupt test would
+  pin a rate no bus runs at.
+- **R-T3-7, RTC_CNTL's conversion is unchanged (backlog).**
+  `rtc_cntl.rs` converts SYSTIMER ticks to RTC slow-clock cycles as
+  `ticks * RC_SLOW_HZ / XTAL_HZ`, Milestone 3's placeholder from when a
+  tick was a step. Ticks are now real 16 MHz time, so RTC time runs at
+  `SYSTIMER_HZ / XTAL_HZ` = 0.4 of emulated time; dividing by
+  `SYSTIMER_HZ` instead would be faithful and would shorten R-T3-4's
+  early-boot wait. Task 3 rewrote the doc for the clock model but kept
+  the formula (the brief asked for docs, and changing it moves every early
+  pin again); it is a Milestone 7 backlog item. If wrong: early boot
+  spends more steps in `rtc_init()` than the badge would at the same CPU
+  frequency.
+- **R-T3-8, budgets and doc figures re-measured.** Every rung budget
+  with a doc formula was re-measured with the same instrumentation on
+  `00dd7d5` and on Task 3 (a temporary `eprintln!` in the stable-frame,
+  console and provisioning helpers, removed before commit) and recomputed
+  by its own formula; several Milestone 5 doc figures were already stale
+  at `00dd7d5` (for example `PROV OK` at 29.99M..30.24M and the
+  first-run frame at the 16,000,000 sample, not 15,500,000), so the new
+  docs quote only Task 3's measurements. Budgets went down where the
+  firmware now needs fewer steps (`LAUNCHER_RESPONSE_STEPS` 33M → 26M,
+  `PROVISION_DEADLINE` 38M → 37M, the splash `MAX` 11.1M → 10.1M,
+  `SELF_TEST_MAX_STEPS` 32M → 31.75M) and up where the formula says so
+  (`FIRST_RUN_MAX_STEPS` 17.5M → 17.75M, `CONSOLE_DEADLINE` 23M → 24M;
+  "rounded to 1,000,000" is read as rounded up). Stability windows,
+  `FRAME_CHUNK`, `ANIMATED_PAGE_STEPS` and `ONBOARDING_RESPONSE_MARGIN`
+  stay in steps, unchanged (spec: they measure firmware work). If wrong:
+  a budget would sit closer to its event than its formula intends.
 
 ## Measurements
 
@@ -167,4 +266,95 @@ for reference (old → new):
 | `main_task: Calling app_main()` | 555,165 | 555,108 |
 | `LVGL: Starting LVGL task` | 669,268 (`I (125)`) | 670,838 (`I (126)`) |
 
+### Task 3: the clock follows the firmware's CPU frequency
+
+`FirmwareBus::clock` is constructed at the 40 MHz XTAL clock and, once
+per step (after the instruction) and at the start of every idle
+fast-forward, takes the frequency `System::cpu_hz` derives from the SYSTEM
+clock registers; an invalid encoding keeps the previous rate.
+`TICKS_PER_STEP` and `PACKET_STEPS` are gone; one OUT packet is
+`PACKET_TICKS` = 821 SYSTIMER ticks (51.3 µs, about 4,105 steps at
+80 MHz). Button holds and the shake run in emulated time:
+`PRESS_HOLD_US` = 100,000 and `SHAKE_HALF_US` = 62,500 in the rungs, the
+WASM twin (`runForUs` over `runUntil`) and the browser runtime.
+
+**No frame hash moved.** Every hash rung passed unchanged on the first
+run (splash, first-run screen, self-test, the 11 roles' page 1 and
+registered screens, role hacker's 14 onboarding frames and the shaken
+page, page 7..11, the launcher, launcher after DOWN, the six frames to
+Dice, Dice open and the Dice roll `0x692c6023de06d917`). Nothing went to
+the human gate. With log timestamps stripped, the console through step
+20,000,000 is identical to `00dd7d5`'s.
+
+Measured on `00dd7d5` ("old") and on Task 3 ("new") with the same
+probes; old values from the rung docs are given where the docs were
+current.
+
+| Item (file) | Old | New | Reason |
+| --- | --- | --- | --- |
+| `cpu freq` console line | `I (5) cpu_start: cpu freq: 80000000 Hz` at ~407,291 | `I (12) cpu_start: cpu freq: 80000000 Hz` at ~1,007,000 | R-T3-4 shift; timestamp = cycle counter / 80 |
+| early timestamps | `W (10)` rtc_init; `I (5)` cpu_start..spi_flash..sleep_gpio Configure; `I (6)` sleep_gpio Enable, main_task | `W (25)` rtc_init; `I (12)` cpu_start..heap_init; `I (13)` spi_flash, sleep_gpio; `I (14)` main_task | same; needles re-pinned exactly |
+| `LVGL: Starting LVGL task` | `I (126)` at ~671,000 | `I (134)` at ~1,272,000 | shift |
+| first non-blank frame | 1,133,900 | 1,725,000 (100-step sampling) | shift + LVGL timing |
+| splash final (`boots_to_first_real_frame`) | 5,541,000; found at the 6,750,000 sample; `MAX` 11,100,000 | 5,032,000; 6,250,000 sample; `MAX` 10,100,000 | fewer FreeRTOS ticks per step |
+| littlefs `mount failed` / superblocks | ~5,620,000 / 5,692,000 | ~5,108,000 / 5,174,000 | |
+| `hal_accel` / `hal_sleep` / `launched My Badge` | ~6.09M / ~6.14M / ~12.29M (docs) | ~5.55M / ~5.64M / ~11.59M | |
+| first-run screen first sample (`FIRST_RUN_MAX_STEPS`) | 16,000,000 (doc said 15,500,000); 17,500,000 | 15,750,000; 17,750,000 | |
+| START → self-test (`SELF_TEST_MAX_STEPS`) | first 23,600,000; 32,000,000 | first 22,658,244 (hold 5,658,244 steps; first frame change 3.47M after the press); 31,750,000 | time-based hold |
+| `hal_console: console started` (10k sampling) | 16,860,000 (doc) | 16,650,000; budget 21,000,000 unchanged | |
+| console rungs (`CONSOLE_DEADLINE`) | doc 16.78M / 17.24M / 17.33M / 18.4M; 23M | prompt 16.65M, READY 17.05M, `PROV FAIL` 17.50M, stable check 18.70M; 24M | |
+| 600-byte `put` (`RING_TEST_DEADLINE`) | 18.63M (doc 17.88M); 23M | 17.68M; 23M unchanged | |
+| `PROV OK`, all roles (`PROVISION_DEADLINE`) | 29.99M..30.24M (doc 30.19M); 38M | 28.64M..28.89M; 37M | |
+| role hacker: page 1 stable | 31,392,000 | 30,042,000 | |
+| shake starts / shaken page stable | 224,042,000 / 230,542,000 | 226,830,776 / 233,962,348 | holds 3.5M..6.9M steps |
+| page 7 after A's release | 8.75M | 3.0M | |
+| page 8 animation in `ANIMATED_PAGE_STEPS` (9M) | ~14 frames, 0.25M..2M each (doc) | 24 changes, 0.1M..0.85M each | |
+| registered screen after START's release (`REGISTERED_RESPONSE_STEPS`) | 9.25M..9.5M (doc 4.3M..4.7M) | 4.5M..5.5M | constant unchanged (margin) |
+| role hacker: registered screen stable | 333,742,000 | 338,806,407 | |
+| HOME → `launched Launcher` / launcher stable, after the release (`LAUNCHER_RESPONSE_STEPS`) | ~9M before the draw (doc) / 17.75M..18.0M; 33M | 2.6M / 12.25M; 26M | |
+| **steps to the launcher** (role hacker, first stable) | 361,092,000 (CLAUDE.md said ~317.5M) | 365,842,438 | |
+| launcher after DOWN | 5.5M after release; 376,192,000 | 1.25M; 380,750,668 | |
+| **steps to Dice** open / rolled | 467,542,000 / 477,392,000 | 469,745,544 / 480,131,502 | |
+| Dice open after A's release | ~3.3M | 3.25M | |
+| `first_trap_is_the_from_cpu_0_yield...` | write 528,091 / trap 528,092; no exception to 571,712 | 1,128,029 / 1,128,030; 1,171,942 | R-T3-4 |
+| D10 rung (the step before the first yield) | 528,090 | 1,128,028 | R-T3-4 |
+| qsort return | 408,767 | 1,008,561 | R-T3-4 |
+| D2 / D3 / fix round 1 / D4 exact steps | 401,761 / 402,113 / 405,806 / 407,471 | 1,001,555 / 1,001,907 / 1,005,600 / 1,007,265 | R-T3-4 (+599,794) |
+| D9 / memchr / D11 / rtc_xtal runs | 440,000 / 493,000 / 596,000 / 596,000 | 1,040,000 / 1,093,000 / 1,196,000 / 1,196,000 | R-T3-4 (+600,000) |
+| SPI poll window, first poll | 583,000..596,000, 583,919 | 1,183,000..1,196,000, 1,184,149 | R-T3-4 |
+| `__bswapsi2` window, stub step | 590,000..596,608, 594,503 | 1,190,000..1,196,608, 1,194,733 | R-T3-4 |
+| console-needle budgets (efuse, heap_init, cpu freq, RTCRAM, spi_flash, sleep_gpio, `main_task`, LVGL) | 420k, 420k, 500k, 500k, 500k, 500k, 750k, 1M | 1.02M, 1.02M, 1.1M, 1.1M, 1.1M, 1.1M, 1.35M, 1.6M | R-T3-4 (+600,000) |
+| GDMA rung: blank at | 1,100,000 | 1,700,000 | first pixels moved |
+| WFI rung at 5,550,000: `idle_ticks` / counter 1 | 1,825,445 / 6,847,442 (≥ 40 periods) | 1,920,289 / 2,806,273 (≥ 17 periods) | R-T3-5 |
+| `rom_stub_boot` phases 1 / 3 / 4 / 5 | 528,091 / 583,919 / 594,502 / 594,503 | 1,128,029 / 1,184,149 / 1,194,732 / 1,194,733 | R-T3-4 |
+| phases 6 / 7 / 8 (wfi, retire, fast-forward) | 598,096 / 598,097 / 598,098, jump 89,894 ticks | 1,198,326 / 1,198,327 / 1,198,328, jump 145,882 ticks | |
+| phases 9 / 10 (`MD5Init`) | 5,560,532 / 5,560,533, ≥ 42 periods | 5,050,336 / 5,050,337, ≥ 16 periods (16.78) | R-T3-5 |
+| ROM-wall test budget / legacy-data run | 420,000 / 500,000 | 1,020,000 / 1,100,000 | R-T3-4 |
+| `a_clone_runs_exactly_like_its_original` checkpoint | 1,100,000 | 1,700,000 | first pixels moved |
+| runtime WFI test / emulated-time test | 1,000 ticks / 100 µs | 200 ticks / 20 µs | R-T3-1 |
+| WASM twin: splash horizon / first-run cap / hold / shake | 6,750,000 / 17,500,000 / 1.6M steps / 1M steps | 6,250,000 / 17,750,000 / 100 ms / 62.5 ms | mirrors the rungs |
+
+**Chunk gap (`PUT_CHUNK_GAP_STEPS`).** With packets 821 ticks apart
+(about 4,105 steps at 80 MHz, was 8,210), the brief's rule was applied
+with `provisions_hacker_through_the_console` and
+`put_accepts_a_payload_larger_than_the_rx_ring`: 24,000 passes both, so
+48,000 stays (2x margin). For the record, 12,000 passes the provisioning
+walk but fails the 600-byte `put`. `frontend/src/runtime/provisioner.ts`
+and its test keep 48,000.
+
+**Hold cost.** A 100 ms hold is 8M steps of busy CPU at 80 MHz; the
+measured holds took 0.18M to 6.9M steps (Dice's A press 176,690, mostly
+idle; onboarding presses 3.1M..6.9M), against 1.6M before.
+`HOLD_MAX_STEPS` = 40M is never approached.
+
+**Wall times** (18 cores): release `boot_progress` 56 pass in 41.6 s
+(before 41.2 s); debug `cargo test --workspace` 29.2 s wall including
+`boot_progress`'s 28.0 s; `bun test` 137 pass in 36.4 s. The suite stays
+far from the 90 s stop line, so the opt-level-3 backlog item is not
+needed for this task.
+
 ## Milestone 7 backlog
+
+- **RTC_CNTL's tick conversion** (R-T3-7): divide by `SYSTIMER_HZ`, not
+  `XTAL_HZ`, so RTC slow-clock time follows emulated time; re-pin the
+  early-boot rungs it moves.

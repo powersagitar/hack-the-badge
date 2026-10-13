@@ -80,15 +80,17 @@
 //! Real hardware: this counter free-runs, counting `RTC_SLOW_CLK` cycles
 //! continuously in the background, and the `TIME_UPDATE` trigger just
 //! snapshots its live value into `TIME_LOW0`/`TIME_HIGH0`. This emulator has
-//! no free-running background clock -- the only notion of "elapsed time" it
-//! has is the CPU's own instruction count, which `crate::peripherals::systimer::SysTimer`
-//! already tracks as its monotonic `elapsed_ticks()` (advanced by exactly
-//! [`crate::peripherals::systimer::TICKS_PER_STEP`] -- documented there as 1
-//! tick per `Cpu::step()`, a placeholder since `Cpu::step()` has no
-//! cycle-accurate timing model -- except that a step spent waiting in `WFI`
-//! may jump it ahead to the next SYSTIMER alarm, Milestone 3 Task 6; RTC
-//! time follows that jump, as real time would). Rather than add a second, redundant
-//! step-counting field here, [`RtcCntl::write_byte`] takes that live
+//! no free-running background clock of its own -- its notion of "elapsed
+//! time" is the bus's one `crate::clock::Clock`, which
+//! `crate::peripherals::systimer::SysTimer` already follows as its
+//! monotonic `elapsed_ticks()`. Since Milestone 6 those are real 16 MHz
+//! SYSTIMER ticks of emulated time: the clock converts each executed step
+//! at the CPU frequency the firmware selects (one tick per five steps at
+//! 80 MHz), and a step spent waiting in `WFI` may jump it ahead to the next
+//! SYSTIMER alarm (Milestone 3 Task 6), which RTC time follows, as real time
+//! would. (Before Milestone 6 one step was one tick, so this count was the
+//! CPU's step count.) Rather than add a second, redundant
+//! time-keeping field here, [`RtcCntl::write_byte`] takes that live
 //! SYSTIMER tick count as a parameter at the moment of the trigger --
 //! `crate::mem::bus::FirmwareBus` passes `self.systimer.elapsed_ticks()` directly
 //! (not a unit counter, which firmware can stop or reload -- Task 5),
@@ -96,14 +98,18 @@
 //! already used for INTC's `CPU_INT_EIP_STATUS_REG` and SPI2's D/C-line
 //! read (see `mem::bus`'s module doc).
 //!
-//! That step count is then converted to RTC slow-clock cycles by treating
-//! one `Cpu::step()` as approximately one `XTAL_HZ` cycle (the same
-//! placeholder-but-documented spirit as SYSTIMER's own 1-tick-per-step
-//! choice: this emulator has no real cycle-per-instruction model to derive
-//! a better ratio from) and scaling by `RC_SLOW_HZ / XTAL_HZ`:
+//! That tick count is then converted to RTC slow-clock cycles by treating
+//! one tick as one `XTAL_HZ` cycle and scaling by `RC_SLOW_HZ / XTAL_HZ`
+//! (Milestone 3's placeholder, from when a tick was one `Cpu::step()` and
+//! there was no time model to derive a better ratio from):
 //! ```text
 //! rtc_ticks = elapsed_steps * RC_SLOW_HZ / XTAL_HZ
 //! ```
+//! Milestone 6 kept the formula unchanged (the parameter keeps its old
+//! name, `elapsed_steps`), so RTC slow-clock time now runs at
+//! `SYSTIMER_HZ / XTAL_HZ` = 0.4 of emulated time; moving the divisor to
+//! `crate::mem::soc::SYSTIMER_HZ` is a recorded backlog item
+//! (`docs/milestone-6-decisions.md`), not a silent behavior change here.
 //! `RC_SLOW_HZ`/`XTAL_HZ` are reused from `crate::peripherals::timg` (made
 //! `pub(crate)` there for exactly this reuse) rather than duplicated, per
 //! the task brief. The result is masked to the register pair's real 48-bit
@@ -112,9 +118,9 @@
 //!
 //! This is monotonically non-decreasing in `elapsed_steps` (multiplying and
 //! integer-dividing by fixed positive constants preserves ordering), so two
-//! latches taken with enough real steps between them are guaranteed to
-//! differ once enough steps have passed to move the quotient by at least 1
-//! (`XTAL_HZ / RC_SLOW_HZ` ~= 294 steps) -- see the module's tests.
+//! latches taken with enough ticks between them are guaranteed to
+//! differ once enough ticks have passed to move the quotient by at least 1
+//! (`XTAL_HZ / RC_SLOW_HZ` ~= 294 ticks) -- see the module's tests.
 //!
 //! ## STORE4 (`RTC_XTAL_FREQ_REG`, Milestone 3 Task D12)
 //!

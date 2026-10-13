@@ -98,8 +98,9 @@ impl CycleCounterCsrs {
 /// in `WFI` with nothing pending does not count, and neither do the steps
 /// the driving loop fast-forwards over while the core waits
 /// (`crate::boot::step_with_interrupts`). One count per step matches the
-/// emulator's timing model (`TICKS_PER_STEP = 1`: one instruction per
-/// 16 MHz SYSTIMER tick); there is no per-instruction cycle model.
+/// emulator's timing model: one instruction is one CPU cycle (the clock's
+/// `cycles_per_step`, `crate::clock`), and emulated time follows the CPU
+/// frequency the firmware selects; there is no per-instruction cycle model.
 ///
 /// The count advances *before* the step's instruction executes, so a CSR
 /// write to the counter replaces the count including the writing step's

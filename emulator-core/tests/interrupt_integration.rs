@@ -50,6 +50,25 @@ const SYSTIMER_BASE: u32 = 0x6002_3000;
 const INTC_BASE: u32 = 0x600c_2000;
 const TARGET_LINE: u32 = 5;
 const PERIOD: u32 = 20;
+/// `SYSTEM_SYSCLK_CONF_REG`. [`build_bus`] writes 0 to it (XTAL / 1), so
+/// these tests' CPU runs at 40 MHz against the 16 MHz SYSTIMER: 2/5 of a
+/// tick per step (Milestone 6: emulated time follows the CPU clock
+/// registers; a bare bus would otherwise run at their reset value, XTAL / 2).
+const SYSCLK_CONF: u32 = 0x600c_0058;
+
+/// NOPs after [`build_program`]'s setup: enough for the longest run past
+/// it (the threshold test's 75 masked steps at 2.5 steps per tick).
+const PADDING: usize = 192;
+
+/// Whole SYSTIMER ticks after `steps` working steps at 40 MHz.
+fn ticks_after(steps: usize) -> u64 {
+    steps as u64 * 16 / 40
+}
+
+/// The fewest working steps at 40 MHz that complete `ticks` ticks.
+fn steps_for(ticks: u64) -> usize {
+    (0..).find(|&n| ticks_after(n) >= ticks).unwrap()
+}
 
 // ---- Minimal RV32I(+Zicsr) encoders, mirroring emulator_core::cpu's own
 // private test helpers (not reusable across crates, so reimplemented here).
@@ -184,7 +203,7 @@ fn build_program() -> (Vec<u32>, usize) {
 
     // 9. Padding: plenty of NOPs so the CPU has valid instructions to keep
     //    fetching for as long as the test needs to step past the interrupt.
-    for _ in 0..64 {
+    for _ in 0..PADDING {
         prog.push(addi(0, 0, 0));
     }
 
@@ -192,6 +211,7 @@ fn build_program() -> (Vec<u32>, usize) {
 }
 
 fn build_bus(prog: &[u32]) -> FirmwareBus {
+    use emulator_core::mem::Bus;
     let mut bytes = Vec::with_capacity(prog.len() * 4);
     for w in prog {
         bytes.extend_from_slice(&w.to_le_bytes());
@@ -203,7 +223,14 @@ fn build_bus(prog: &[u32]) -> FirmwareBus {
         file_offset: 0,
         len,
     }];
-    FirmwareBus::from_segments(flash, &segments)
+    let mut bus = FirmwareBus::from_segments(flash, &segments);
+    bus.write32(SYSCLK_CONF, 0); // XTAL / 1: 40 MHz, see SYSCLK_CONF
+    bus
+}
+
+/// See [`peripheral_to_interrupt_matrix_to_cpu_end_to_end`].
+fn expected_first_trap_step(comp0_load_step: usize) -> usize {
+    steps_for(ticks_after(comp0_load_step) + u64::from(PERIOD))
 }
 
 #[test]
@@ -216,18 +243,18 @@ fn peripheral_to_interrupt_matrix_to_cpu_end_to_end() {
     // Per SysTimer's comparator model (see its module doc): the
     // COMP0_LOAD write at step `comp0_load_step` latches load_base =
     // counter-at-that-instant, so the first alarm is at load_base + PERIOD.
-    // counter-at-that-instant equals `comp0_load_step` (at the legacy
-    // one-tick-per-step clock the counter increments once per
-    // step_with_interrupts call, so after N calls the counter is N; the
-    // COMP0_LOAD write itself happens *during* cpu.step() at step index
+    // The write happens *during* cpu.step() at step index
     // `comp0_load_step`, i.e. before that step's own tick_peripherals()
-    // call, so the live counter it reads is exactly `comp0_load_step`). The comparator
-    // then fires (INT_RAW latched, the source asserted) in the tick
-    // after step index `comp0_load_step + PERIOD - 1`, where the counter
-    // reaches that target; the next step samples the asserted line at its
-    // start (step_with_interrupts' level delivery) and takes it -- so the
-    // trap is taken at step index `comp0_load_step + PERIOD`.
-    let expected_trap_step = comp0_load_step + PERIOD as usize;
+    // call, so the live counter it reads is the ticks of the
+    // `comp0_load_step` steps before it ([`ticks_after`], 2/5 of a tick per
+    // step at 40 MHz). The comparator then fires (INT_RAW latched, the
+    // source asserted) in the tick of the first step after which the
+    // counter reaches that target; the next step samples the asserted line
+    // at its start (step_with_interrupts' level delivery) and takes it --
+    // so the trap is taken at step index `steps_for(target)`. (At the
+    // pre-Milestone-6 one tick per step that was `comp0_load_step +
+    // PERIOD`.)
+    let expected_trap_step = expected_first_trap_step(comp0_load_step);
 
     const STEP_BUDGET: usize = 200;
     let mut trap_step: Option<usize> = None;
@@ -298,7 +325,7 @@ fn cleared_source_is_not_retaken_but_the_next_alarm_is() {
     let mut cpu = Cpu::new();
     cpu.regs.pc = PROGRAM_LOAD_ADDR;
 
-    let expected_trap_step = comp0_load_step + PERIOD as usize;
+    let expected_trap_step = expected_first_trap_step(comp0_load_step);
     let mut taken_at = None;
     for i in 0..200 {
         if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
@@ -320,11 +347,11 @@ fn cleared_source_is_not_retaken_but_the_next_alarm_is() {
         !(bus.systimer.pending_sources() & (1 << 37) != 0),
         "INT_CLR de-asserts the source"
     );
-    cpu.regs.pc = PROGRAM_LOAD_ADDR + 4 * (prog.len() as u32 - 64);
+    cpu.regs.pc = PROGRAM_LOAD_ADDR + 4 * (prog.len() - PADDING) as u32;
     cpu.csr.mstatus |= mstatus_bits::MIE;
 
     // Well before the next alarm (PERIOD ticks after the first): no trap.
-    for i in 0..(PERIOD as usize - 5) {
+    for i in 0..steps_for(u64::from(PERIOD) - 5) {
         let info = step_with_interrupts(&mut cpu, &mut bus);
         assert!(
             !info.trap_taken,
@@ -333,7 +360,7 @@ fn cleared_source_is_not_retaken_but_the_next_alarm_is() {
     }
     // The next period's alarm does fire.
     let mut second = false;
-    for _ in 0..(2 * PERIOD as usize) {
+    for _ in 0..steps_for(2 * u64::from(PERIOD)) {
         if step_with_interrupts(&mut cpu, &mut bus).trap_taken {
             second = true;
             break;
@@ -362,7 +389,7 @@ fn raised_threshold_masks_a_pending_line_until_lowered() {
         step_with_interrupts(&mut cpu, &mut bus);
     }
     bus.write32(INTC_BASE + 0x194, 2);
-    for i in 0..(PERIOD as usize + 10) {
+    for i in 0..steps_for(u64::from(PERIOD) + 10) {
         let info = step_with_interrupts(&mut cpu, &mut bus);
         assert!(!info.trap_taken, "masked by threshold, fired at {i}");
     }
@@ -454,7 +481,8 @@ fn two_pending_lines(systimer_line: u32, systimer_pri: u32, swi_line: u32, swi_p
     let conf = bus.read32(SYSTIMER_BASE);
     bus.write32(SYSTIMER_BASE, conf | (1 << 24));
     bus.write32(SYSTIMER_BASE + 0x64, 1);
-    for _ in 0..6 {
+    // Past the period-5 alarm (5 ticks at 40 MHz), plus one step.
+    for _ in 0..=steps_for(5) {
         step_with_interrupts(&mut cpu, &mut bus); // MIE clear: nothing taken
     }
     bus.write32(0x600c_0028, 1); // FROM_CPU_0
