@@ -21,17 +21,17 @@ ESP32-C3 device), in two complementary modes:
    minimal peripheral set) written in Rust and compiled to WebAssembly.
    **Current state (end of Milestone 5):** boot runs through the ESP-IDF
    startup log, FreeRTOS and `app_main` (the boot splash is final from
-   about step 5.03M, `boots_to_first_real_frame`), formats and mounts
+   about step 4.43M, `boots_to_first_real_frame`), formats and mounts
    littlefs on the blank `storage` partition, and launches My Badge, which
    on blank flash shows its unregistered **first-run screen**
    (`boots_to_first_run_screen`; START opens the hardware self-test,
    `first_run_screen_responds_to_start`). `app_main` then starts the
-   firmware's USB console REPL (`badge> ` at about step 16.6M). The **app
+   firmware's USB console REPL (`badge> ` at about step 16.0M). The **app
    launcher is reached by provisioning a fake test identity through that
    console** (the firmware's own `put /littlefs/identity.json <size>` and
    `prov apply`), then walking the on-badge onboarding app ("Setup", 11
    pages, including a shake on page 6) to My Badge's registered screen,
-   and pressing HOME (`boots_to_launcher`, about 366M steps for role
+   and pressing HOME (`boots_to_launcher`, about 365M steps for role
    hacker; DOWN moves the selection, `launcher_responds_to_navigation`).
    Every role's walk is a rung (`provisions_<role>_through_the_console`).
    The registered, onboarding, launcher and navigation frames were
@@ -100,9 +100,9 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   plus the stretch rung `launcher_opens_dice`
   (Milestone 4's `boots_to_first_run_screen` and
   `first_run_screen_responds_to_start` still hold on blank flash). The
-  identity walks are about 347M to 375M emulated steps each, so the suite
+  identity walks are about 346M to 375M emulated steps each, so the suite
   shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s) and takes
-  about 42 s on 18 cores (one chain of about 488M steps, hacker's walk to Dice, is
+  about 42 s on 18 cores (one chain of about 487M steps, hacker's walk to Dice, is
   the floor). The debug
   `cargo test --workspace` runs the same rungs in about 28 s, because the
   dev profile builds `emulator-core` at `opt-level = 3` (root

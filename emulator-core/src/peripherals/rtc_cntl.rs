@@ -98,29 +98,38 @@
 //! already used for INTC's `CPU_INT_EIP_STATUS_REG` and SPI2's D/C-line
 //! read (see `mem::bus`'s module doc).
 //!
-//! That tick count is then converted to RTC slow-clock cycles by treating
-//! one tick as one `XTAL_HZ` cycle and scaling by `RC_SLOW_HZ / XTAL_HZ`
-//! (Milestone 3's placeholder, from when a tick was one `Cpu::step()` and
-//! there was no time model to derive a better ratio from):
+//! Both clocks count the same emulated time: `elapsed_ticks` SYSTIMER
+//! ticks are `elapsed_ticks / SYSTIMER_HZ` seconds, and the RTC slow clock
+//! (`RC_SLOW`, the reset-default source above) runs at `RC_SLOW_HZ` cycles
+//! per second, so the snapshot is
 //! ```text
-//! rtc_ticks = elapsed_steps * RC_SLOW_HZ / XTAL_HZ
+//! rtc_ticks = elapsed_ticks * RC_SLOW_HZ / SYSTIMER_HZ
 //! ```
-//! Milestone 6 kept the formula unchanged (the parameter keeps its old
-//! name, `elapsed_steps`), so RTC slow-clock time now runs at
-//! `SYSTIMER_HZ / XTAL_HZ` = 0.4 of emulated time; moving the divisor to
-//! `crate::mem::soc::SYSTIMER_HZ` is a recorded backlog item
-//! (`docs/milestone-6-decisions.md`), not a silent behavior change here.
-//! `RC_SLOW_HZ`/`XTAL_HZ` are reused from `crate::peripherals::timg` (made
-//! `pub(crate)` there for exactly this reuse) rather than duplicated, per
-//! the task brief. The result is masked to the register pair's real 48-bit
-//! width (`TIME_LOW0` 32 bits + `TIME_HIGH0`'s 16 architected bits) so it
-//! wraps like real hardware would rather than growing unbounded.
+//! with `SYSTIMER_HZ` = 16 MHz (`crate::mem::soc::SYSTIMER_HZ`: ESP-IDF
+//! v5.5.3 `components/esp_hw_support/port/esp32c3/systimer.c`,
+//! `systimer_ticks_to_us()` = ticks / 16, and `soc_caps.h`'s
+//! `SOC_SYSTIMER_FIXED_DIVIDER`, XTAL / 2.5) and `RC_SLOW_HZ` = 136 kHz
+//! (`crate::peripherals::timg::RC_SLOW_HZ`: `clk_tree_defs.h`'s
+//! `SOC_CLK_RC_SLOW_FREQ_APPROX`), the same constants TIMG's calibration
+//! model uses, so one second of SYSTIMER time is `RC_SLOW_HZ` RTC cycles.
+//! (Milestone 3 to Milestone 6 Task 3 divided by `XTAL_HZ` instead, a
+//! placeholder from when a tick was one `Cpu::step()`; once ticks became
+//! real 16 MHz time that ran RTC time at 0.4 of emulated time, so
+//! Milestone 6 Task D-M6-1 moved the divisor, ruling R-T3-9 in
+//! `docs/milestone-6-decisions.md`.) `RC_SLOW_HZ` is reused from
+//! `crate::peripherals::timg` (made `pub(crate)` there for exactly this
+//! reuse) rather than duplicated. The product is computed in `u128`, so it
+//! cannot overflow for any `u64` tick count, and the result is masked to
+//! the register pair's real 48-bit width (`TIME_LOW0` 32 bits +
+//! `TIME_HIGH0`'s 16 architected bits) so it wraps like real hardware
+//! would rather than growing unbounded (2^48 slow cycles at 136 kHz is
+//! about 65 years).
 //!
-//! This is monotonically non-decreasing in `elapsed_steps` (multiplying and
+//! This is monotonically non-decreasing in `elapsed_ticks` (multiplying and
 //! integer-dividing by fixed positive constants preserves ordering), so two
 //! latches taken with enough ticks between them are guaranteed to
 //! differ once enough ticks have passed to move the quotient by at least 1
-//! (`XTAL_HZ / RC_SLOW_HZ` ~= 294 ticks) -- see the module's tests.
+//! (`SYSTIMER_HZ / RC_SLOW_HZ` ~= 118 ticks) -- see the module's tests.
 //!
 //! ## STORE4 (`RTC_XTAL_FREQ_REG`, Milestone 3 Task D12)
 //!
@@ -142,7 +151,8 @@
 //! not logged as unmapped.
 
 use super::set_byte;
-use super::timg::{RC_SLOW_HZ, XTAL_HZ};
+use super::timg::RC_SLOW_HZ;
+use crate::mem::soc::SYSTIMER_HZ;
 
 /// End of the modeled register window (word-array storage): every RTC_CNTL
 /// register named in `rtc_cntl_reg.h` up to its highest cited offset
@@ -236,13 +246,13 @@ impl RtcCntl {
         word.to_le_bytes()[idx]
     }
 
-    /// `elapsed_steps` is SYSTIMER's monotonic `elapsed_ticks()` at the
+    /// `elapsed_ticks` is SYSTIMER's monotonic `elapsed_ticks()` at the
     /// moment of this specific byte write -- see the module doc's "Deriving
     /// the counter value" section. Only consulted when this write is the
     /// one that completes the `TIME_UPDATE` trigger; ignored otherwise (so
     /// passing a stale/arbitrary value on non-triggering writes is
     /// harmless).
-    pub fn write_byte(&mut self, offset: u32, val: u8, elapsed_steps: u64) {
+    pub fn write_byte(&mut self, offset: u32, val: u8, elapsed_ticks: u64) {
         let word_offset = offset & !0b11;
         let idx = offset & 0b11;
         if word_offset >= REGS_END {
@@ -272,7 +282,8 @@ impl RtcCntl {
                 // `UNIT0_OP_REG` handling of the same idiom.
                 set_byte(&mut self.regs[widx], idx, val);
                 if idx == 3 && val & TIME_UPDATE_BYTE3_BIT != 0 {
-                    let raw = (elapsed_steps as u128) * (RC_SLOW_HZ as u128) / (XTAL_HZ as u128);
+                    let raw =
+                        (elapsed_ticks as u128) * (RC_SLOW_HZ as u128) / (SYSTIMER_HZ as u128);
                     self.latched = (raw as u64) & COUNTER_MASK_48;
                 }
             }
@@ -287,12 +298,12 @@ mod tests {
 
     /// Writes `v` to `off` as 4 ascending byte writes (matching how
     /// `crate::mem::bus::FirmwareBus` dispatches a real `sw`), passing the
-    /// same `elapsed_steps` for all four -- realistic, since the live
+    /// same `elapsed_ticks` for all four -- realistic, since the live
     /// SYSTIMER counter doesn't move *during* a single instruction's
     /// dispatch.
-    fn w(t: &mut RtcCntl, off: u32, v: u32, elapsed_steps: u64) {
+    fn w(t: &mut RtcCntl, off: u32, v: u32, elapsed_ticks: u64) {
         for (i, b) in v.to_le_bytes().iter().enumerate() {
-            t.write_byte(off + i as u32, *b, elapsed_steps);
+            t.write_byte(off + i as u32, *b, elapsed_ticks);
         }
     }
     fn r(t: &mut RtcCntl, off: u32) -> u32 {
@@ -312,22 +323,32 @@ mod tests {
     #[test]
     fn trigger_latches_elapsed_time_scaled_to_the_rtc_slow_clock() {
         let mut t = RtcCntl::new();
-        let elapsed_steps: u64 = 1_000_000;
-        w(&mut t, TIME_UPDATE_REG, 1 << 31, elapsed_steps);
+        let elapsed_ticks: u64 = 1_000_000;
+        w(&mut t, TIME_UPDATE_REG, 1 << 31, elapsed_ticks);
 
-        let expected = (elapsed_steps as u128 * RC_SLOW_HZ as u128 / XTAL_HZ as u128) as u64;
+        let expected = (elapsed_ticks as u128 * RC_SLOW_HZ as u128 / SYSTIMER_HZ as u128) as u64;
         assert_ne!(
             expected, 0,
-            "test's own steps budget must produce a real tick count"
+            "test's own tick budget must produce a real slow-cycle count"
         );
         assert_eq!(latched_value(&mut t), expected);
+    }
+
+    #[test]
+    fn one_second_of_systimer_ticks_is_one_second_of_rc_slow_cycles() {
+        // 16,000,000 SYSTIMER ticks are 1 s of emulated time, which the
+        // free-running RTC timer counts as RC_SLOW_HZ (136,000) cycles.
+        let mut t = RtcCntl::new();
+        w(&mut t, TIME_UPDATE_REG, 1 << 31, SYSTIMER_HZ);
+        assert_eq!(latched_value(&mut t), RC_SLOW_HZ);
+        assert_eq!(latched_value(&mut t), 136_000);
     }
 
     #[test]
     fn only_the_byte_containing_the_trigger_bit_fires_the_latch() {
         let mut t = RtcCntl::new();
         // Write bytes 0..=2 of TIME_UPDATE_REG (all zero, no trigger bit
-        // anywhere in them) with a large elapsed_steps -- must NOT latch.
+        // anywhere in them) with a large elapsed_ticks -- must NOT latch.
         t.write_byte(TIME_UPDATE_REG, 0x00, 999_999);
         t.write_byte(TIME_UPDATE_REG + 1, 0x00, 999_999);
         t.write_byte(TIME_UPDATE_REG + 2, 0x00, 999_999);
@@ -339,7 +360,7 @@ mod tests {
 
         // Now byte 3 arrives with the trigger bit set: exactly one latch.
         t.write_byte(TIME_UPDATE_REG + 3, 0x80, 999_999);
-        let expected = (999_999u128 * RC_SLOW_HZ as u128 / XTAL_HZ as u128) as u64;
+        let expected = (999_999u128 * RC_SLOW_HZ as u128 / SYSTIMER_HZ as u128) as u64;
         assert_eq!(latched_value(&mut t), expected);
     }
 
@@ -349,7 +370,7 @@ mod tests {
         w(&mut t, TIME_UPDATE_REG, 1 << 31, 10_000);
         let first = latched_value(&mut t);
 
-        // Comfortably more than XTAL_HZ/RC_SLOW_HZ (~294) steps later, so
+        // Comfortably more than SYSTIMER_HZ/RC_SLOW_HZ (~118) ticks later, so
         // the integer-divided quotient is guaranteed to have moved.
         w(&mut t, TIME_UPDATE_REG, 1 << 31, 10_000 + 1_000_000);
         let second = latched_value(&mut t);
@@ -357,7 +378,7 @@ mod tests {
         assert!(
             second > first,
             "expected the second latch ({second}) to exceed the first ({first}) \
-             after 1,000,000 more elapsed steps"
+             after 1,000,000 more elapsed ticks"
         );
     }
 
@@ -377,7 +398,7 @@ mod tests {
 
         // The read-modify-write: same word, OR in TIME_UPDATE (bit 31).
         w(&mut t, TIME_UPDATE_REG, (1 << 29) | (1 << 31), 500_000);
-        let expected = (500_000u128 * RC_SLOW_HZ as u128 / XTAL_HZ as u128) as u64;
+        let expected = (500_000u128 * RC_SLOW_HZ as u128 / SYSTIMER_HZ as u128) as u64;
         assert_eq!(latched_value(&mut t), expected);
         assert_ne!(
             r(&mut t, TIME_UPDATE_REG) & (1 << 29),

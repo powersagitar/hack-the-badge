@@ -410,9 +410,9 @@ hacker; step counts are emulated steps, not time, re-measured in
 Milestone 6 Task 3, when emulated time started following the firmware's
 CPU frequency):
 
-- The boot splash is final from about step 5.03M (`boots_to_first_real_frame`,
+- The boot splash is final from about step 4.43M (`boots_to_first_real_frame`,
   hash `0x5599c270ab0429fa`). My Badge's first-run screen ("Not
-  registered yet") is stable from the 15,750,000-step sample
+  registered yet") is stable from the 15,250,000-step sample
   (`boots_to_first_run_screen`, `0x8c5027cec0f79490`), and START still
   opens the hardware self-test (`first_run_screen_responds_to_start`,
   `0x7f325d838835baaa`, with a 100 ms press of emulated time). Both were compared
@@ -423,7 +423,7 @@ CPU frequency):
   started`, rung `boot_starts_the_console`); its interrupt-driven
   USB-Serial-JTAG driver needs interrupt source 26 and the RX direction,
   both modeled since Task 2. The `badge> ` prompt is up at about step
-  16.64M, and `prov show` answers `provisioned=0` on blank flash.
+  16.04M, and `prov show` answers `provisioned=0` on blank flash.
 - **Provisioning through the console.** A host (the Rust test helper
   `tests/common/provision.rs`, or the browser's
   `frontend/src/runtime/provisioner.ts`) types the firmware's own
@@ -431,7 +431,7 @@ CPU frequency):
   in 64-byte chunks 48,000 steps apart (the firmware's driver drops what
   does not fit its 256-byte RX ring), then `prov apply`. The fixtures are
   `frontend/public/firmware/test-identities/<role>.json`, one per role in
-  the firmware's role table. `PROV OK` prints at 28.64M to 28.89M steps,
+  the firmware's role table. `PROV OK` prints at 28.19M to 28.39M steps,
   depending on the role. An empty record is rejected (`PROV FAIL invalid
   or missing /littlefs/identity.json`) and the badge stays unregistered.
 - **Onboarding.** `prov apply` resets onboarding, and My Badge hands over
@@ -439,13 +439,13 @@ CPU frequency):
   name. Page 3 wants every button pressed; page 6 ("Shake it!") reads the
   SC7A20H accelerometer on I2C0 (modeled since Task D-M5-2; host input
   `FirmwareRuntime::set_acceleration`, at rest (0, 0, +1000) mg) and
-  passes after a two-axis shake (the walk shakes at about step 226.8M);
+  passes after a two-axis shake (the walk shakes at about step 226.0M);
   page 8 is animated; page 11 needs "I agree" ticked, then START.
 - **Registered screen and launcher.** Setup ends on My Badge's registered
-  screen (role hacker at about step 338.8M; every role's frame differs,
+  screen (role hacker at about step 337.9M; every role's frame differs,
   since it shows the name). HOME opens the launcher, a 4x4 icon grid
-  (stable at about 365.8M; the same frame for all 11 roles), and DOWN
-  moves the selection to the next row (about 380.8M). Rungs:
+  (stable at about 365.0M; the same frame for all 11 roles), and DOWN
+  moves the selection to the next row (about 379.9M). Rungs:
   `provisions_<role>_through_the_console` (11),
   `onboarding_shake_page_advances_after_a_shake`, `boots_to_launcher`,
   `launcher_is_role_independent` and `launcher_responds_to_navigation`.
@@ -464,8 +464,8 @@ CPU frequency):
 - **A built-in app: Dice** (Task 9 stretch, rung `launcher_opens_dice`).
   From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
   (`launched Dice`; first stable frame `0x9be3a4205d54f3ff`, "d20", "--").
-  A rolls: "2" (`0x692c6023de06d917`; open at about 469.7M, rolled at
-  480.1M). The value comes from `esp_random()`
+  A rolls: "2" (`0x692c6023de06d917`; open at about 468.9M, rolled at
+  479.3M). The value comes from `esp_random()`
   over the emulator's fixed-seed RNG (Task D-M5-3), so it is
   deterministic and not the badge's roll. The human partner compared the
   open and rolled frames and the roll animation with the physical badge
@@ -566,12 +566,10 @@ plan text), plus the full Milestone 4 backlog, are in
    app's `rtc_clk_init()` rescales the counter from the bootloader's 80
    MHz, so they read `W (10)` for `rtc_init`, `I (5)` from `cpu_start:
    Unicore app` through `sleep_gpio: Configure ...`, then `I (6)` from
-   `sleep_gpio: Enable ...` through `Calling app_main()`. Since Milestone
-   6 Task 3 early boot takes about 600,000 more steps (`rtc_init()`'s
-   RTC-timer waits at the 40 MHz XTAL clock), so they read `W (25)` for
-   `rtc_init`, `I (12)` from `cpu_start: Unicore app` through `heap_init`,
-   `I (13)` for `spi_flash` and `sleep_gpio`, and `I (14)` for
-   `main_task`. They have not been compared with the badge's values.
+   `sleep_gpio: Enable ...` through `Calling app_main()`. Milestone 6
+   Task 3 moved them (to `W (25)`, `I (12)`..`I (14)`, while RTC time ran
+   at 0.4 of emulated time) and Task D-M6-1 moved them back to exactly
+   these values. They have not been compared with the badge's values.
 
 ### Ground truth from the physical badge
 
@@ -2454,16 +2452,29 @@ registers.
   `I (13)` and `I (14)` (were `W (10)`, `I (5)`, `I (6)`). Later, with fewer
   FreeRTOS ticks per step, boot needs fewer steps: the splash is final at
   5.03M (was 5.54M), `MD5Init` at 5,050,337 (was 5,560,533), `badge> `
-  at 16.64M (was 17.61M on `00dd7d5`). Holds cost 3.1M..6.9M steps of
-  mostly busy CPU (was 1.6M), so the walks grow: role hacker's launcher is
+  at 16.64M (1,000-step sampling; was 17.61M on `00dd7d5`). Holds cost
+  0.18M..6.9M steps, mostly busy CPU (was 1.6M), so the walks grow: role hacker's launcher is
   stable at 365.8M (was 361.1M on `00dd7d5`) and the Dice roll at 480.1M
   (was 477.4M). Two tick-period thresholds are re-pinned to their measured
   floor (R-T3-5), and `interrupt_integration.rs` now runs its bus at XTAL /
   1 with step counts derived from that rate (R-T3-6). RTC_CNTL still
   converts ticks as if each were an XTAL cycle, so RTC time runs at 0.4
-  of emulated time (R-T3-7, backlog). The release `boot_progress` suite
-  takes 41.6 s. Old → new figures: `docs/milestone-6-decisions.md`,
-  "Measurements".
+  of emulated time (R-T3-7; fixed by Task D-M6-1 below). The release
+  `boot_progress` suite takes 41.6 s. Old → new figures:
+  `docs/milestone-6-decisions.md`, "Measurements".
+
+### Milestone 6 Task D-M6-1: the RTC timer counts SYSTIMER time
+
+RTC_CNTL's `TIME_UPDATE` snapshot now converts SYSTIMER ticks with
+`RC_SLOW_HZ / SYSTIMER_HZ` instead of `/ XTAL_HZ` (ruling R-T3-9), so
+RTC slow-clock time follows emulated time. `rtc_init()`'s RTC-timer waits
+take their real time again, which cancels all but 221 steps of Task 3's
+600,000-step early shift: the first log line is back at about step
+401,000, early timestamps read `W (10)`, `I (5)`, `I (6)` as at `00dd7d5`,
+the first yield is at 528,313, `MD5Init` at 4,450,328, the splash final at
+4.43M, `badge> ` at 16.04M, `PROV OK` at 28.19M..28.39M, role hacker's
+launcher stable at 365.0M and the Dice roll at 479.3M; holds still cost
+0.18M..6.93M steps. No frame hash moved.
 
 ## Emulated flash chip: what it contains
 

@@ -187,7 +187,8 @@ the code, this file and the code win.
   the formula (the brief asked for docs, and changing it moves every early
   pin again); it is a Milestone 7 backlog item. If wrong: early boot
   spends more steps in `rtc_init()` than the badge would at the same CPU
-  frequency.
+  frequency. (Superseded by R-T3-9: Task D-M6-1 moved the divisor in
+  Milestone 6.)
 - **R-T3-8, budgets and doc figures re-measured.** Every rung budget
   with a doc formula was re-measured with the same instrumentation on
   `00dd7d5` and on Task 3 (a temporary `eprintln!` in the stable-frame,
@@ -204,6 +205,28 @@ the code, this file and the code win.
   `FRAME_CHUNK`, `ANIMATED_PAGE_STEPS` and `ONBOARDING_RESPONSE_MARGIN`
   stay in steps, unchanged (spec: they measure firmware work). If wrong:
   a budget would sit closer to its event than its formula intends.
+- **R-T3-9, the RTC timer counts SYSTIMER time (Task D-M6-1).**
+  (Orchestrator ruling after Task 3's review; it pulls R-T3-7 forward
+  from the backlog.) Since Task 3 the value `RtcCntl::write_byte`
+  receives is SYSTIMER ticks of emulated time, so dividing it by
+  `XTAL_HZ` was a unit error against the register-faithful constraint and
+  the spec's one-clock rule. The snapshot is now `elapsed_ticks *
+  RC_SLOW_HZ / SYSTIMER_HZ` (`SYSTIMER_HZ` from `systimer.c` /
+  `SOC_SYSTIMER_FIXED_DIVIDER`, `RC_SLOW_HZ` =
+  `SOC_CLK_RC_SLOW_FREQ_APPROX`), so 16,000,000 ticks (1 s) latch 136,000
+  slow cycles (`one_second_of_systimer_ticks_is_one_second_of_rc_slow_cycles`);
+  the parameter is renamed `elapsed_ticks` and TIMG's `XTAL_HZ` is private
+  again. `rtc_init()`'s RTC-timer waits now take the time they ask for,
+  which cancels all but 221 steps of R-T3-4's 600,000-step early shift:
+  every early event from the first log line to the idle `wfi` is now 221
+  steps after its `00dd7d5` step, and the early timestamps are back to
+  `00dd7d5`'s exactly (`W (10)`, `I (5)`, `I (6)`, LVGL `I (126)`). Under
+  R-T3-4's rule the historical fault-step rungs run to the old step + 221,
+  and the round windows and formula-less budgets return to their
+  `00dd7d5` values (every event stays inside its window, with the same
+  relations as at `00dd7d5`). If wrong: RTC time would again drift
+  against SYSTIMER and every timed wait on it would cost the wrong number
+  of steps.
 
 ## Measurements
 
@@ -302,7 +325,7 @@ current.
 | first-run screen first sample (`FIRST_RUN_MAX_STEPS`) | 16,000,000 (doc said 15,500,000); 17,500,000 | 15,750,000; 17,750,000 | |
 | START → self-test (`SELF_TEST_MAX_STEPS`) | first 23,600,000; 32,000,000 | first 22,658,244 (hold 5,658,244 steps; first frame change 3.47M after the press); 31,750,000 | time-based hold |
 | `hal_console: console started` (10k sampling) | 16,860,000 (doc) | 16,650,000; budget 21,000,000 unchanged | |
-| console rungs (`CONSOLE_DEADLINE`) | doc 16.78M / 17.24M / 17.33M / 18.4M; 23M | prompt 16.65M, READY 17.05M, `PROV FAIL` 17.50M, stable check 18.70M; 24M | |
+| console rungs (`CONSOLE_DEADLINE`) | doc 16.78M / 17.24M / 17.33M / 18.4M; 23M | prompt 16.64M (1,000-step sampling), READY 17.05M, `PROV FAIL` 17.50M, stable check 18.70M; 24M | |
 | 600-byte `put` (`RING_TEST_DEADLINE`) | 18.63M (doc 17.88M); 23M | 17.68M; 23M unchanged | |
 | `PROV OK`, all roles (`PROVISION_DEADLINE`) | 29.99M..30.24M (doc 30.19M); 38M | 28.64M..28.89M; 37M | |
 | role hacker: page 1 stable | 31,392,000 | 30,042,000 | |
@@ -353,8 +376,49 @@ idle; onboarding presses 3.1M..6.9M), against 1.6M before.
 far from the 90 s stop line, so the opt-level-3 backlog item is not
 needed for this task.
 
-## Milestone 7 backlog
+### Task D-M6-1: the RTC timer counts SYSTIMER time
 
-- **RTC_CNTL's tick conversion** (R-T3-7): divide by `SYSTIMER_HZ`, not
-  `XTAL_HZ`, so RTC slow-clock time follows emulated time; re-pin the
-  early-boot rungs it moves.
+Ruling R-T3-9. No frame hash moved (every hash rung passed unchanged,
+including all hardware-compared frames and the Dice roll), and with
+timestamps stripped the console is unchanged; the timestamps themselves
+went back to `00dd7d5`'s. Measured with the same probes and
+instrumentation as Task 3 (removed before commit).
+
+| Item | `00dd7d5` | Task 3 (`b172f97`) | D-M6-1 | Reason |
+| --- | --- | --- | --- | --- |
+| first log line (`rtc_init`) | ~401,000, `W (10)` | ~1,001,000, `W (25)` | ~401,000, `W (10)` | RTC waits now take their real time |
+| early needles | `I (5)` / `I (6)` | `I (12)` / `I (13)` / `I (14)` | `I (5)` / `I (6)` | same; re-pinned exactly |
+| LVGL line | `I (126)` ~671,000 | `I (134)` ~1,272,000 | `I (126)` ~672,000 | |
+| `ets_get_cpu_frequency` slot / `ets_printf` first call | 400,689 / 400,711 | 1,000,483 / 1,000,505 | 400,910 / 400,932 | +221 vs `00dd7d5` |
+| qsort return | 408,767 | 1,008,561 | 408,988 | |
+| D2 / D3 / fix round 1 / D4 runs | 401,761 / 402,113 / 405,806 / 407,471 | 1,001,555 / 1,001,907 / 1,005,600 / 1,007,265 | 401,982 / 402,334 / 406,027 / 407,692 | old + 221 |
+| first yield write / trap; D10; no-exception-to | 528,091 / 528,092; 528,090; 571,712 | 1,128,029 / 1,128,030; 1,128,028; 1,171,942 | 528,312 / 528,313; 528,311; 571,933 | |
+| SPI poll first reached | 583,919 | 1,184,149 | 584,140 | |
+| `__bswapsi2` call / stub | 594,502 / 594,503 | 1,194,732 / 1,194,733 | 594,723 / 594,724 | |
+| idle `wfi` / retire / fast-forward; jump | 598,096 / 7 / 8; 89,894 ticks | 1,198,326 / 7 / 8; 145,882 | 598,317 / 8 / 9; 145,940 | |
+| round windows (D9, memchr, D11, rtc_xtal, SPI, bswap, ROM wall, legacy data) | 440k, 493k, 596k, 596k, 583k..596k, 590k..596,608, 420k, 500k | +600,000 each | `00dd7d5` values | R-T3-9 |
+| needle budgets (efuse, heap_init, cpu freq, RTCRAM, spi_flash, sleep_gpio, `main_task`, LVGL) | 420k, 420k, 500k, 500k, 500k, 500k, 750k, 1M | +600,000 each | `00dd7d5` values | |
+| first non-blank frame; GDMA "blank at"; clone checkpoint | 1,133,900; 1.1M; 1.1M | 1,725,000; 1.7M; 1.7M | 1,124,900; 1.1M; 1.1M | |
+| splash final; found at; `MAX` | 5,541,000; 6.75M; 11.1M | 5,032,000; 6.25M; 10.1M | 4,432,000; 5.5M; 8.9M | formula |
+| `MD5Init` (rom_stub_boot phases 9/10); periods | 5,560,532/3; 42.86 | 5,050,336/7; 16.78 | 4,450,327/8; 16.78 (≥ 16 unchanged) | |
+| `load_partitions_accepts_...` run before single-stepping | 5,000,000 | 5,000,000 (passed) | 4,000,000 | `MD5Init` now before 5M |
+| WFI rung at 5.55M: `idle_ticks`; counter 1 | 1,825,445; 42.8 periods (≥ 40) | 1,920,289; 17.5 (≥ 17) | 2,262,240; 20.4 (≥ 20) | R-T3-5 floor |
+| littlefs mount failed / superblocks | ~5,620,000 / 5,692,000 | ~5,108,000 / 5,174,000 | ~4,508,000 / 4,574,000 | |
+| `hal_accel` / `hal_sleep` / `launched My Badge` | ~6.09M / ~6.14M / ~12.29M | ~5.55M / ~5.64M / ~11.59M | ~4.95M / ~5.04M / ~10.99M | |
+| first-run screen sample; `FIRST_RUN_MAX_STEPS` | 16.0M; 17.5M | 15.75M; 17.75M | 15.25M; 17.25M | formula |
+| self-test first sample; `SELF_TEST_MAX_STEPS` | 23.6M; 32M | 22,658,244; 31.75M | 22,158,230; 31.25M | formula |
+| `badge> ` prompt (1,000-step sampling); console started (10,000-step) | ~17.61M; doc 16,860,000 | 16.64M; 16,650,000 | 16.04M; 16,050,000 (budget 21M unchanged) | |
+| console rungs: READY / `PROV FAIL` / stable check end; `CONSOLE_DEADLINE` | 18.05M / 21.9M / 23.1M; 23M | 17.05M / 17.50M / 18.70M; 24M | 16.55M / 17.00M / 18.20M; 23M | formula |
+| 600-byte `put` done; `RING_TEST_DEADLINE` | 18.63M; 23M | 17.68M; 23M | 17.18M; 22M | formula |
+| `PROV OK`, all roles; `PROVISION_DEADLINE` | 29.99M..30.24M; 38M | 28.64M..28.89M; 37M | 28.19M..28.39M; 36M | formula |
+| responses after release: registered / page 7 / launcher / nav / Dice open / START's first change | 9.25..9.5M / 8.75M / 17.75..18.0M / 5.5M / ~3.3M / ~6M (doc) | 4.5..5.5M / 3.0M / 12.25M / 1.25M / 3.25M / 3.47M | same as Task 3 (START 3.48M) | `LAUNCHER_RESPONSE_STEPS` 26M and the response docs unchanged |
+| walks to the registered screen (11 roles) | 341.5M..342.8M | 346.6M..348.0M | 345.9M..347.9M | |
+| **launcher** (hacker, first stable) | 361,092,000 | 365,842,438 | 364,961,924 | |
+| **Dice** open / rolled | 467,542,000 / 477,392,000 | 469,745,544 / 480,131,502 | 468,864,915 / 479,250,828 | |
+| holds (all presses) | 1.6M | 0.18M..6.9M | 0.18M..6.93M | |
+| WASM twin: splash horizon / first-run cap / `PROVISION_DEADLINE` | 6.75M / 17.5M / 38M | 6.25M / 17.75M / 37M | 5.5M / 17.25M / 36M | mirrors |
+
+Wall times: release `boot_progress` 41.2 s (56/56); see the Task D-M6-1
+report for the full check.
+
+## Milestone 7 backlog

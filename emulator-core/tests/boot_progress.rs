@@ -29,15 +29,13 @@
 //! `docs/firmware-emulator-notes.md` ("History"); when boot moves, update
 //! the rung whose budget it affects.
 //!
-//! Milestone 6 Task 3 (emulated time follows the firmware's CPU frequency)
-//! moved early boot about 600,000 steps later: `rtc_init()`'s waits on the
-//! RTC timer run at the 40 MHz XTAL clock `rtc_clk_init()` selects first,
-//! 2.5 steps per SYSTIMER tick instead of 1. A rung pinned at a
-//! pre-Milestone-6 fault step now runs to that step plus the measured
-//! shift at that point (599,794 steps through `heap_init`, 599,938 at the
-//! first yield, 600,230 from `app_main`'s SPI setup on; round windows add
-//! 600,000), so it still covers the same code; its doc keeps the
-//! historical step.
+//! Milestone 6 (emulated time follows the firmware's CPU frequency, and the
+//! RTC timer counts that time faithfully) moved every early-boot event 221
+//! steps later than at `00dd7d5`, from `rtc_init()`'s first log line to the
+//! idle `wfi`. A rung pinned at a pre-Milestone-6 fault step runs to that
+//! step plus those 221 steps, so it still covers the same code; its doc
+//! keeps the historical step. Windows and budgets given in round numbers
+//! are unchanged.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -117,23 +115,23 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 
 /// The SYSTEM `FROM_CPU_0` software interrupt reaches the core: the first
 /// trap of the whole boot is vPortYield's request (written on step
-/// 1,128,029), taken on the next step as an interrupt on CPU line 4 (where
+/// 528,312), taken on the next step as an interrupt on CPU line 4 (where
 /// the firmware routes `ETS_FROM_CPU_INTR0_SOURCE`), and no exception
-/// follows through step 1,171,942 (the pre-Task-D11 `gpio_matrix_out`
-/// fault's step, 571,712, plus the 600,230-step shift). The
+/// follows through step 571,933 (the pre-Task-D11 `gpio_matrix_out`
+/// fault's step, 571,712, plus the 221-step shift). The
 /// scheduler-start spin at `0x4200_0cd2` is gone.
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_128_029);
+    let summary = rt.run(528_312);
     assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "the yield must be taken on the next step");
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004);
-    let summary = rt.run(1_171_942 - 1_128_030);
+    let summary = rt.run(571_933 - 528_313);
     assert_eq!(
         summary.last_instruction_fault, None,
-        "no exception through step 1,171,942 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
+        "no exception through step 571,933 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
     );
     assert_ne!(
         rt.pc(),
@@ -144,27 +142,26 @@ fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
 
 /// The first context switch works, so FreeRTOS runs `main_task`, which
 /// prints `main_task: Started on CPU0` and `main_task: Calling app_main()`
-/// (step ~1,156,000; both are in the physical badge's log too).
+/// (step ~556,000; both are in the physical badge's log too).
 #[test]
 fn boot_reaches_main_task_calling_app_main() {
-    let (rt, ok) = boot_until_console_contains("I (14) main_task: Calling app_main()", 1_350_000);
+    let (rt, ok) = boot_until_console_contains("I (6) main_task: Calling app_main()", 750_000);
     let console = rt.console_output();
     assert!(ok, "pc=0x{:08x}\nconsole:\n{console}", rt.pc());
     assert!(
-        console.contains("I (14) main_task: Started on CPU0"),
+        console.contains("I (6) main_task: Started on CPU0"),
         "console:\n{console}"
     );
 }
 
 /// ROM `gpio_matrix_out`/`gpio_matrix_in` are real stubs, so `app_main`'s
-/// SPI bus setup runs: through step 1,196,000 (596,000 before the
-/// Milestone 6 shift; past the old fault on step 571,713) no exception is
-/// taken (the last trap is an interrupt), no panic text prints, and
-/// `main_task: Calling app_main()` is in the console.
+/// SPI bus setup runs: through step 596,000 (past the old fault on step
+/// 571,713) no exception is taken (the last trap is an interrupt), no panic
+/// text prints, and `main_task: Calling app_main()` is in the console.
 #[test]
 fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_196_000);
+    let summary = rt.run(596_000);
     assert_eq!(
         summary.last_instruction_fault,
         None,
@@ -179,7 +176,7 @@ fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site
     );
     let console = rt.console_output();
     assert!(
-        console.contains("I (14) main_task: Calling app_main()"),
+        console.contains("I (6) main_task: Calling app_main()"),
         "console:
 {console}"
     );
@@ -192,42 +189,42 @@ fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site
     }
 }
 
-/// ROM `memcpy` is a real stub: zero traps through step 1,001,555, the
-/// step the unstubbed call used to fault at (401,761) plus the 599,794-step
+/// ROM `memcpy` is a real stub: zero traps through step 401,982, the
+/// step the unstubbed call used to fault at (401,761) plus the 221-step
 /// Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     // 401,761: the exact step the pre-Task-D2 `memcpy` fault occurred at,
-    // 1,001,555 after Milestone 6's 599,794-step shift. Running exactly that
+    // 401,982 after Milestone 6's 221-step shift. Running exactly that
     // many steps and finding zero traps proves the call that used to fault
     // right at this boundary now completes.
-    let summary = rt.run(1_001_555);
+    let summary = rt.run(401_982);
     assert_eq!(
         summary.traps, 0,
         "expected zero traps through the pre-Task-D2 memcpy fault's exact \
-         step count (401,761, now 1,001,555) now that memcpy is HLE-stubbed; got \
+         step count (401,761, now 401,982) now that memcpy is HLE-stubbed; got \
          {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
 }
 
 /// ROM `ets_efuse_get_spiconfig` and the six ROM calls after it are real
-/// stubs: zero traps through step 1,001,907, the step the first used to
-/// fault at (402,113) plus the 599,794-step Milestone 6 shift.
+/// stubs: zero traps through step 402,334, the step the first used to
+/// fault at (402,113) plus the 221-step Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     // 402,113: the exact step the pre-Task-D3 `ets_efuse_get_spiconfig`
-    // fault occurred at, 1,001,907 after Milestone 6's shift. Running
+    // fault occurred at, 402,334 after Milestone 6's 221-step shift. Running
     // exactly that many steps and finding zero
     // traps proves the call that used to fault right at this boundary now
     // completes.
-    let summary = rt.run(1_001_907);
+    let summary = rt.run(402_334);
     assert_eq!(
         summary.traps, 0,
         "expected zero traps through the pre-Task-D3 \
-         ets_efuse_get_spiconfig fault's exact step count (402,113, now 1,001,907) now \
+         ets_efuse_get_spiconfig fault's exact step count (402,113, now 402,334) now \
          that it's HLE-stubbed; got {} traps, last_instruction_fault = \
          {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
@@ -235,44 +232,44 @@ fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() 
 }
 
 /// `esprv_intc_int_enable` and its siblings write the interrupt-controller
-/// registers for real: zero traps through step 1,005,600, the step the
-/// unstubbed call used to fault at (405,806) plus the 599,794-step
+/// registers for real: zero traps through step 406,027, the step the
+/// unstubbed call used to fault at (405,806) plus the 221-step
 /// Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     // 405,806: the exact step the pre-fix-round-1 `esprv_intc_int_enable`
-    // fault occurred at, 1,005,600 after Milestone 6's shift. Running
+    // fault occurred at, 406,027 after Milestone 6's 221-step shift. Running
     // exactly that many steps and finding zero
     // traps proves the call that used to fault right at this boundary now
     // completes.
-    let summary = rt.run(1_005_600);
+    let summary = rt.run(406_027);
     assert_eq!(
         summary.traps, 0,
         "expected zero traps through the pre-fix-round-1 \
-         esprv_intc_int_enable fault's exact step count (405,806, now 1,005,600) now that \
+         esprv_intc_int_enable fault's exact step count (405,806, now 406,027) now that \
          it's HLE-stubbed; got {} traps, last_instruction_fault = {:?}, \
          pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
 }
 
-/// ROM `itoa`/`strcat` are real stubs: zero traps through step 1,007,265,
+/// ROM `itoa`/`strcat` are real stubs: zero traps through step 407,692,
 /// the step the unstubbed `itoa` used to fault at (407,471) plus the
-/// 599,794-step Milestone 6 shift. (It was called by newlib's `abort()`,
+/// 221-step Milestone 6 shift. (It was called by newlib's `abort()`,
 /// not by normal boot; the abort's cause was fixed later.)
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     // 407,471: the exact step the pre-Task-D4 `itoa` fault occurred at,
-    // 1,007,265 after Milestone 6's shift. Running exactly that many steps
+    // 407,692 after Milestone 6's 221-step shift. Running exactly that many steps
     // and finding zero traps proves the
     // call that used to fault right at this boundary now completes.
-    let summary = rt.run(1_007_265);
+    let summary = rt.run(407_692);
     assert_eq!(
         summary.traps, 0,
         "expected zero traps through the pre-Task-D4 itoa fault's exact \
-         step count (407,471, now 1,007,265) now that it's HLE-stubbed; got {} traps, \
+         step count (407,471, now 407,692) now that it's HLE-stubbed; got {} traps, \
          last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
@@ -281,13 +278,13 @@ fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
 /// `cpu_start`'s app-image-header check passes (the header bytes before the
 /// DROM segment are mapped, today through the flash MMU), so boot prints the
 /// `app_init`/`efuse_init` block, ending at `efuse_init: Chip rev:` (step
-/// ~1,008,000), and `Invalid app image header` never appears.
+/// ~409,000), and `Invalid app image header` never appears.
 #[test]
 fn boot_reaches_efuse_inits_chip_rev_line() {
-    let (rt, ok) = boot_until_console_contains("efuse_init: Chip rev:", 1_020_000);
+    let (rt, ok) = boot_until_console_contains("efuse_init: Chip rev:", 420_000);
     assert!(
         ok,
-        "never printed \"efuse_init: Chip rev:\" within 1020000 steps; pc=0x{:08x}\nconsole:\n{}",
+        "never printed \"efuse_init: Chip rev:\" within 420000 steps; pc=0x{:08x}\nconsole:\n{}",
         rt.pc(),
         rt.console_output()
     );
@@ -302,23 +299,23 @@ fn boot_reaches_efuse_inits_chip_rev_line() {
 /// The ROM frequency pair is stateful, so `cpu_start` reports the
 /// frequency the firmware selected: 80 MHz, as in the physical badge's
 /// boot log (Milestone 6 Task 2; it printed 160 MHz from a constant stub
-/// before). Printed at step ~1,007,000.
+/// before). Printed at step ~407,500.
 #[test]
 fn boot_reports_the_badges_80_mhz_cpu_clock() {
-    assert_reaches("cpu_start: cpu freq: 80000000 Hz", 1_100_000);
+    assert_reaches("cpu_start: cpu freq: 80000000 Hz", 500_000);
 }
 
 /// ROM `qsort` is guest-executed code (`emulator_core::rom::QSORT_BODY`):
-/// after exactly 1,008,561 steps its `ret` has run and `pc` is back in its
+/// after exactly 408,988 steps its `ret` has run and `pc` is back in its
 /// caller, `s_prepare_reserved_regions()`, with zero traps. Step-exact:
 /// it moves whenever anything before `qsort` changes.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_008_561);
+    let summary = rt.run(408_988);
     assert_eq!(
         summary.traps, 0,
-        "expected zero traps through ROM qsort's return (1,008,561 steps); got \
+        "expected zero traps through ROM qsort's return (408,988 steps); got \
          {} traps, last_instruction_fault = {:?}, pc = 0x{:08x}",
         summary.traps, summary.last_instruction_fault, summary.pc
     );
@@ -331,16 +328,16 @@ fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
 
 /// The ROM layout table (`ets_rom_layout_p`) is backed, so
 /// `s_prepare_reserved_regions()`'s overlap check passes: `heap_init`'s
-/// first line prints (step ~1,010,000) and no `memory_layout` error does.
+/// first line prints (step ~410,000) and no `memory_layout` error does.
 #[test]
 fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
     let (rt, ok) = boot_until_console_contains(
-        "I (12) heap_init: Initializing. RAM available for dynamic allocation:",
-        1_020_000,
+        "I (5) heap_init: Initializing. RAM available for dynamic allocation:",
+        420_000,
     );
     assert!(
         ok,
-        "never printed heap_init's first line within 1020000 steps; pc=0x{:08x}\nconsole:\n{}",
+        "never printed heap_init's first line within 420000 steps; pc=0x{:08x}\nconsole:\n{}",
         rt.pc(),
         rt.console_output()
     );
@@ -353,22 +350,22 @@ fn boot_reaches_heap_inits_first_line_past_the_reserved_region_check() {
 
 /// libgcc `__clzsi2`/`__ffssi2` are real stubs, so `heap_init` walks its
 /// whole region list and prints its last line, the `RTCRAM` region (step
-/// ~1,016,000; in the physical badge's log too).
+/// ~416,000; in the physical badge's log too).
 #[test]
 fn boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers() {
     assert_reaches(
-        "I (12) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
-        1_100_000,
+        "I (5) heap_init: At 50000020 len 00001FC8 (7 KiB): RTCRAM",
+        500_000,
     );
 }
 
 /// `esp_rom_newlib_init_common_mutexes` and the libc calls after it are
-/// real stubs: zero traps through step 1,040,000 (440,000 before the
-/// Milestone 6 shift), past the old fault on step 417,992.
+/// real stubs: zero traps through step 440,000, past the old fault on step
+/// 417,992.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_040_000);
+    let summary = rt.run(440_000);
     assert_eq!(
         summary.traps,
         0,
@@ -378,20 +375,18 @@ fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site
         rt.console_output()
     );
     assert!(
-        rt.console_output()
-            .contains("I (12) heap_init: At 50000020"),
+        rt.console_output().contains("I (5) heap_init: At 50000020"),
         "heap_init's last region line should be present"
     );
 }
 
 /// The SPI1 flash controller answers JEDEC RDID with the badge's ID, so
 /// flash-chip detection succeeds (`spi_flash: detected chip: generic`, step
-/// ~1,047,000; in the physical badge's log too) instead of logging `memspi: no
+/// ~447,000; in the physical badge's log too) instead of logging `memspi: no
 /// response`.
 #[test]
 fn boot_reaches_spi_flash_detected_chip_generic() {
-    let (rt, ok) =
-        boot_until_console_contains("I (13) spi_flash: detected chip: generic", 1_100_000);
+    let (rt, ok) = boot_until_console_contains("I (5) spi_flash: detected chip: generic", 500_000);
     assert!(
         ok,
         "flash-chip detection should succeed; pc=0x{:08x}\nconsole:\n{}",
@@ -404,13 +399,12 @@ fn boot_reaches_spi_flash_detected_chip_generic() {
     );
 }
 
-/// ROM `memchr`/`memmove` are real stubs: zero traps through step
-/// 1,093,000 (493,000 before the Milestone 6 shift), past the old fault on
-/// step 490,128, with the `sleep_gpio` lines printed.
+/// ROM `memchr`/`memmove` are real stubs: zero traps through step 493,000,
+/// past the old fault on step 490,128, with the `sleep_gpio` lines printed.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_093_000);
+    let summary = rt.run(493_000);
     assert_eq!(
         summary.traps,
         0,
@@ -421,18 +415,18 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
     );
     assert!(
         rt.console_output()
-            .contains("I (13) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
+            .contains("I (6) sleep_gpio: Enable automatic switching of GPIO sleep configuration"),
         "the sleep_gpio lines after flash detection should be present"
     );
 }
 
 /// `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get` and
 /// `esprv_intc_int_set_threshold` are real stubs: zero traps through step
-/// 1,128,028, the step before FreeRTOS's first yield request.
+/// 528,311, the step before FreeRTOS's first yield request.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    let summary = rt.run(1_128_028);
+    let summary = rt.run(528_311);
     assert_eq!(
         summary.traps,
         0,
@@ -449,15 +443,15 @@ fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_
 /// out.
 #[test]
 fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
-    let needle = "I (13) sleep_gpio: Enable automatic switching of GPIO sleep configuration";
-    let (rt, ok) = boot_until_console_contains(needle, 1_100_000);
+    let needle = "I (6) sleep_gpio: Enable automatic switching of GPIO sleep configuration";
+    let (rt, ok) = boot_until_console_contains(needle, 500_000);
     let console = rt.console_output();
     assert!(
         ok,
         "never printed {needle:?}; pc=0x{:08x}\nconsole:\n{console}",
         rt.pc()
     );
-    assert!(console.contains("I (13) spi_flash: flash io: dio"));
+    assert!(console.contains("I (5) spi_flash: flash io: dio"));
     assert!(!console.contains("Detected size"), "console:\n{console}");
 }
 
@@ -467,16 +461,15 @@ fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
 const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
 
 /// SPI2's `SPI_UPDATE` reads back 0 at once, so the `spi_hal_init()` poll
-/// (first reached on step 1,184,149) runs but does not spin: over steps
-/// 1,183,000..1,196,000 (583,000..596,000 before the Milestone 6 shift)
-/// each poll address is hit fewer than [`SPIN_THRESHOLD`] times and no
-/// exception is taken.
+/// (first reached on step 584,140) runs but does not spin: over steps
+/// 583,000..596,000 each poll address is hit fewer than [`SPIN_THRESHOLD`]
+/// times and no exception is taken.
 #[test]
 fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    rt.run(1_183_000);
+    rt.run(583_000);
     let mut hist: HashMap<u32, u64> = HashMap::new();
-    let summary = rt.run_traced(1_196_000 - 1_183_000, &mut hist);
+    let summary = rt.run_traced(596_000 - 583_000, &mut hist);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     let max_hits = PRE_TASK_9_SPI_UPDATE_POLL
         .clone()
@@ -501,16 +494,15 @@ const ROM_BSWAPSI2: u32 = 0x4000_0788;
 /// The return address of `spi_ll_set_command()`'s `__bswapsi2` call.
 const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
 
-/// ROM `__bswapsi2` is a real stub: over steps 1,190,000..1,196,608
-/// (590,000..596,608 before the Milestone 6 shift) it is entered exactly
-/// once (step 1,194,733, from `spi_ll_set_command()`), returns to its
-/// caller, and no exception is taken.
+/// ROM `__bswapsi2` is a real stub: over steps 590,000..596,608 it is
+/// entered exactly once (step 594,724, from `spi_ll_set_command()`),
+/// returns to its caller, and no exception is taken.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    rt.run(1_190_000);
+    rt.run(590_000);
     let mut hist: HashMap<u32, u64> = HashMap::new();
-    let summary = rt.run_traced(1_196_608 - 1_190_000, &mut hist);
+    let summary = rt.run_traced(596_608 - 590_000, &mut hist);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
         rt.cpu().csr.mcause & 0x8000_0000,
@@ -528,14 +520,14 @@ fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
 /// The shortcut boot seeds `RTC_XTAL_FREQ_REG` as the skipped bootloader
 /// would, so neither `rtc_clk`'s nor `clk_hal`'s "invalid RTC_XTAL_FREQ_REG"
 /// warning prints (the physical badge's log has neither). Checked over a run
-/// to step 1,196,000, past the SPI2 setup.
+/// to step 596,000, past the SPI2 setup.
 #[test]
 fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    rt.run(1_196_000);
+    rt.run(596_000);
     let console = rt.console_output();
     assert!(
-        console.contains("I (14) main_task: Calling app_main()"),
+        console.contains("I (6) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     assert!(
@@ -552,9 +544,10 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 ///   (`Clock::idle_ticks`; measured 1,827,072 in Milestone 6 Task 1, where
 ///   SYSTIMER ran 1,827,060 ticks ahead of the step count: the 12
 ///   fast-forward steps are charged as idle, not as steps; 1,825,445 after
-///   Task 2's stateful ROM CPU frequency; 1,920,289 after Task 3);
-/// - counter 1, the FreeRTOS tick's, is past 17 tick periods of 160,000
-///   (measured 2,806,273, 17.5 periods; 42.8 before Milestone 6 Task 3,
+///   Task 2's stateful ROM CPU frequency; 2,262,240 since Milestone 6
+///   Task D-M6-1);
+/// - counter 1, the FreeRTOS tick's, is past 20 tick periods of 160,000
+///   (measured 3,269,013, 20.4 periods; 42.8 before Milestone 6 Task 3,
 ///   when a busy step was a whole tick, not a fifth), so the scheduler
 ///   kept ticking after the first wake.
 #[test]
@@ -575,13 +568,13 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
     );
     let systimer = &rt.bus().systimer;
     assert!(
-        systimer.counter(1) >= 17 * 160_000,
+        systimer.counter(1) >= 20 * 160_000,
         "counter 1 = {}",
         systimer.counter(1)
     );
     let console = rt.console_output();
     assert!(
-        console.contains("I (14) main_task: Calling app_main()"),
+        console.contains("I (6) main_task: Calling app_main()"),
         "console:\n{console}"
     );
     for panic_text in ["Guru Meditation Error", "abort()", "Rebooting..."] {
@@ -590,20 +583,20 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
 }
 
 /// GDMA's TX out-link feeds SPI2, so LVGL's flushes reach the ST7789 model:
-/// the framebuffer is still blank at step 1,700,000 (first pixels land at
-/// ~1,725,000) and by step 5,550,000 holds a drawn frame of at least 2,000
+/// the framebuffer is still blank at step 1,100,000 (first pixels land at
+/// ~1,124,900) and by step 5,550,000 holds a drawn frame of at least 2,000
 /// distinct colors (the splash has 2,340), sent through GDMA channel 0,
 /// with no exception and no panic text. (The name is Milestone 3's; the
 /// `MD5Init` stall it mentions is gone.)
 #[test]
 fn boot_draws_frames_through_gdma_before_the_md5init_stall() {
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
-    rt.run(1_700_000);
+    rt.run(1_100_000);
     assert!(
         rt.framebuffer().iter().all(|px| *px == 0),
-        "nothing drawn yet at step 1,700,000"
+        "nothing drawn yet at step 1,100,000"
     );
-    let summary = rt.run(5_550_000 - 1_700_000);
+    let summary = rt.run(5_550_000 - 1_100_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
     assert!(
@@ -658,7 +651,9 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
     const ESP_OK: u32 = 0;
 
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
-    let summary = rt.run(5_000_000);
+    // MD5Init is first called on step 4,450,328 (Milestone 6 Task D-M6-1;
+    // 5,560,533 before Milestone 6).
+    let summary = rt.run(4_000_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
 
     // Single-step to load_partitions()'s first MD5Init, then to its epilogue.
@@ -697,14 +692,14 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
 /// USB-Serial-JTAG model reports SOF frames from an attached host, so
 /// ESP-IDF's connection monitor keeps the port "connected" and the VFS
 /// write does not drop `stdout` (`LVGL: Starting LVGL task`, step
-/// ~1,272,000).
+/// ~672,000).
 #[test]
 fn boot_prints_console_output_after_the_scheduler_starts() {
-    assert_reaches("LVGL: Starting LVGL task", 1_600_000);
+    assert_reaches("LVGL: Starting LVGL task", 1_000_000);
 }
 
 /// The emulated `storage` partition is blank, so `esp_littlefs` fails to
-/// mount it and starts formatting it (step ~5,108,000), without a panic. An
+/// mount it and starts formatting it (step ~4,508,000), without a panic. An
 /// emulator-only line: the physical badge's flash holds a filesystem.
 #[test]
 fn boot_reaches_littlefs_formatting_the_blank_storage_partition() {
@@ -726,7 +721,7 @@ const LFS_MAGIC: &[u8; 8] = b"littlefs";
 
 /// SPIMEM1 erases, programs and reads the chip, so the format writes the
 /// littlefs superblock into both blocks of the root metadata pair (`storage`
-/// blocks 0 and 1, at `0x2b_0000`/`0x2b_1000`, by step ~5,174,000) without a
+/// blocks 0 and 1, at `0x2b_0000`/`0x2b_1000`, by step ~4,574,000) without a
 /// fault, with no unmodeled SPIMEM1 command and no write left enabled.
 #[test]
 fn boot_formats_the_blank_storage_partition_with_littlefs() {
@@ -766,7 +761,7 @@ fn boot_reaches_hal_buttons_ready() {
 
 /// The SC7A20H accelerometer answers on I2C0 (address 0x19): `hal_accel`
 /// reads `WHO_AM_I` = 0x11 and prints the detection line the physical badge
-/// prints (step ~5.55M), then configures the sensor and starts its cache
+/// prints (step ~4.95M), then configures the sensor and starts its cache
 /// task, whose sample reads and ROM `__floatsisf` calls then run for
 /// 1,000,000 steps without a fault or panic text. (Until Milestone 5 Task
 /// D-M5-2 the bus had no device and this rung pinned `hal_accel`'s
@@ -791,7 +786,7 @@ fn boot_detects_the_sc7a20h_accelerometer_on_i2c0() {
 
 /// RMT completes the LED driver's ping-pong transmission on TX channel 0
 /// (`TX_END` reaches the driver's ISR through `SRC_RMT`), so `hal_sleep`
-/// starts (step ~5.64M; the physical badge prints this line too) and the
+/// starts (step ~5.04M; the physical badge prints this line too) and the
 /// channel is no longer running.
 #[test]
 fn boot_reaches_hal_sleep_after_the_rmt_transmission_completes() {
@@ -808,7 +803,7 @@ fn boot_reaches_hal_sleep_after_the_rmt_transmission_completes() {
 
 /// ROM `strdup`, `strchr` and `strcpy` are real, so the app registry
 /// launches its first app, My Badge (`app_reg: launched My Badge`, step
-/// ~11.59M), and runs without a fault or panic text to step 20,000,000, by
+/// ~10.99M), and runs without a fault or panic text to step 20,000,000, by
 /// which point the framebuffer is no longer the splash ([`SPLASH_HASH`]).
 #[test]
 fn boot_launches_the_first_app_and_leaves_the_splash_without_faulting() {
@@ -862,7 +857,7 @@ const BOOT_STABLE_FOR: u64 = 1_000_000;
 /// How long a frame must hold after a button press. After START the
 /// firmware computes for millions of steps without drawing before the
 /// self-test frame lands (about 6,000,000 under the pre-Milestone-6 clock;
-/// since Milestone 6 Task 3, 3,470,000 after the press, inside the 100 ms
+/// since Milestone 6, about 3,480,000 after the press, inside the 100 ms
 /// hold), so a 1,000,000-step window would take the unchanged first-run
 /// frame for the result.
 const AFTER_PRESS_STABLE_FOR: u64 = 8_000_000;
@@ -914,10 +909,10 @@ fn assert_no_panic_text(rt: &FirmwareRuntime) {
 
 /// Milestone 3's finish line: the real firmware boots to its first stable
 /// ST7789 frame, the boot splash, pinned by hash. The first non-blank
-/// frame (about step 1.725M) is not the finished splash; the framebuffer
-/// changes many times before it settles (from step ~5.03M), so the test
+/// frame (about step 1.125M) is not the finished splash; the framebuffer
+/// changes many times before it settles (from step ~4.43M), so the test
 /// pins the first frame that holds for [`BOOT_STABLE_FOR`] steps (found at
-/// the 6,250,000-step sample). `MAX` is the stable step × 2, rounded up.
+/// the 5,500,000-step sample). `MAX` is the stable step × 2, rounded up.
 ///
 /// The hash is of this framebuffer's row/column order. MADCTL is not
 /// modeled (the notes' "Known limitations"); the splash and the first-run
@@ -926,11 +921,11 @@ fn assert_no_panic_text(rt: &FirmwareRuntime) {
 /// it would leave the hash unchanged.
 ///
 /// Inspect a failing frame with
-/// `cargo run -p emulator-core --release --example boot-probe -- --steps 6000000 --dump-frame first-frame.png`
+/// `cargo run -p emulator-core --release --example boot-probe -- --steps 5000000 --dump-frame first-frame.png`
 /// (writes under the gitignored `local/`).
 #[test]
 fn boots_to_first_real_frame() {
-    const MAX: u64 = 10_100_000;
+    const MAX: u64 = 8_900_000;
     let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
     let (hash, step) = run_until_stable_frame(&mut rt, MAX, BOOT_STABLE_FOR, &[]);
     let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
@@ -950,8 +945,8 @@ fn boots_to_first_real_frame() {
 const FIRST_RUN_HASH: u64 = 0x8c50_27ce_c0f7_9490;
 
 /// [`boots_to_first_run_screen`]'s cap: the frame is first sampled at step
-/// 15,750,000; that + 2,000,000, rounded up to a 250,000 multiple.
-const FIRST_RUN_MAX_STEPS: u64 = 17_750_000;
+/// 15,250,000; that + 2,000,000, rounded up to a 250,000 multiple.
+const FIRST_RUN_MAX_STEPS: u64 = 17_250_000;
 
 /// Milestone 4's finish line: blank-flash boot reaches the first app's
 /// screen and it holds. The emulated flash has no identity
@@ -1006,10 +1001,10 @@ fn run_for_us(rt: &mut FirmwareRuntime, us: u64) {
 }
 
 /// [`first_run_screen_responds_to_start`]'s cap: the self-test frame is
-/// first sampled at step 22,658,244 (the 100 ms hold took 5,658,244
+/// first sampled at step 22,158,230 (the 100 ms hold took 5,658,230
 /// steps); that + [`AFTER_PRESS_STABLE_FOR`] + 1,000,000, rounded up to a
 /// 250,000 multiple.
-const SELF_TEST_MAX_STEPS: u64 = 31_750_000;
+const SELF_TEST_MAX_STEPS: u64 = 31_250_000;
 
 /// Button input reaches the firmware: from the stable first-run screen, a
 /// press and release of slot 0 (START) starts My Badge's hardware
@@ -1036,7 +1031,7 @@ fn first_run_screen_responds_to_start() {
 /// flash, as on the physical badge (the line follows `app_reg: launched My
 /// Badge`); the console runs the interrupt-driven USB-Serial-JTAG driver,
 /// so this needs Task 2's interrupt source. First printed at step
-/// 16,650,000 (10,000-step sampling); budget = that + 25%, rounded up to
+/// 16,050,000 (10,000-step sampling); budget = that + 25%, rounded up to
 /// 1,000,000.
 #[test]
 fn boot_starts_the_console() {
@@ -1044,16 +1039,17 @@ fn boot_starts_the_console() {
 }
 
 /// [`console_answers_prov_show_on_the_first_run_screen`] and later
-/// provisioning rungs: total-step deadline. Measured (Milestone 6 Task 3,
-/// 50,000-step sampling): the prompt appears at 16.65M, `put` is READY at
-/// 17.05M, `prov apply` answers by 17.50M, and the stable-frame check
-/// after it ends at 18.70M; that + 25%, rounded up to 1,000,000.
-const CONSOLE_DEADLINE: u64 = 24_000_000;
+/// provisioning rungs: total-step deadline. Measured (Milestone 6 Task
+/// D-M6-1): the prompt appears at 16.04M (1,000-step sampling), `put` is
+/// READY at 16.55M, `prov apply` answers by 17.00M, and the stable-frame
+/// check after it ends at 18.20M (50,000-step sampling); that + 25%,
+/// rounded up to 1,000,000.
+const CONSOLE_DEADLINE: u64 = 23_000_000;
 
 /// [`put_accepts_a_payload_larger_than_the_rx_ring`]: total-step deadline.
-/// Measured (Milestone 6 Task 3): finished at 17.68M (50,000-step
+/// Measured (Milestone 6 Task D-M6-1): finished at 17.18M (50,000-step
 /// sampling, host-paced chunks); that + 25%, rounded up to 1,000,000.
-const RING_TEST_DEADLINE: u64 = 23_000_000;
+const RING_TEST_DEADLINE: u64 = 22_000_000;
 
 // ---------------------------------------------------------------------
 // Checkpoints. A `FirmwareRuntime` clone is a full snapshot (pinned by
@@ -1155,10 +1151,10 @@ fn console_rejects_an_empty_identity() {
 // ---------------------------------------------------------------------
 
 /// Total-step deadline for provisioning from the first-run screen: the
-/// slowest role (workshop_lead) prints `PROV OK` at 28.89M (all roles
-/// 28.64M..28.89M, host-paced `put`, 50,000-step sampling); + 25%,
+/// slowest role (workshop_lead) prints `PROV OK` at 28.39M (all roles
+/// 28.19M..28.39M, host-paced `put`, 50,000-step sampling); + 25%,
 /// rounded up to 1,000,000.
-const PROVISION_DEADLINE: u64 = 37_000_000;
+const PROVISION_DEADLINE: u64 = 36_000_000;
 /// How long after a press (or the shake) a response may take to start:
 /// page 7 settled about 9M steps after A under the pre-Milestone-6 clock
 /// (a transition animation; 3M after A's release since Milestone 6 Task

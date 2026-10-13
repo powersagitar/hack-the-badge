@@ -530,7 +530,7 @@ mod tests {
 
     /// A clone is a full checkpoint (the boot rungs share them,
     /// `tests/boot_progress.rs`): from a real-firmware state just before the
-    /// first pixels land (~1.72M steps; ~1.13M before Milestone 6 Task 3), a clone and its original each run
+    /// first pixels land (~1.125M steps), a clone and its original each run
     /// 100,000 more steps and end identical, and the original's run does not
     /// leak into the clone.
     #[test]
@@ -541,10 +541,10 @@ mod tests {
         )
         .expect("factory.bin");
         let mut original = FirmwareRuntime::from_image(&image).expect("boot");
-        original.run(1_700_000);
+        original.run(1_100_000);
         let mut clone = original.clone();
         original.run(100_000);
-        assert_eq!(clone.total_steps(), 1_700_000, "the clone did not move");
+        assert_eq!(clone.total_steps(), 1_100_000, "the clone did not move");
         clone.run(100_000);
         assert_eq!(clone.pc(), original.pc());
         assert_eq!(clone.total_steps(), original.total_steps());

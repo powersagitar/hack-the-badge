@@ -925,8 +925,8 @@ impl FirmwareBus {
             // is just direct field access, the same pattern the
             // INTERRUPT_CORE0/SPI2 tiers above already use. See
             // `crate::peripherals::rtc_cntl`'s module doc.
-            let elapsed_steps = self.systimer.elapsed_ticks();
-            self.rtc_cntl.write_byte(offset, val, elapsed_steps);
+            let elapsed_ticks = self.systimer.elapsed_ticks();
+            self.rtc_cntl.write_byte(offset, val, elapsed_ticks);
             return;
         }
         if SPIMEM1_RANGE.contains(&addr) {
@@ -1963,8 +1963,9 @@ mod tests {
     const SYSCLK_CONF: u32 = SYSTEM_RANGE.start + 0x058;
     const CPU_PER_CONF: u32 = SYSTEM_RANGE.start + 0x008;
 
-    /// A bare bus (no boot initializers) with SYSCLK_CONF set as the boot
-    /// initializer sets it (XTAL / 1) and applied by one step's sync.
+    /// A bare bus (no boot initializers) with SYSCLK_CONF set to XTAL / 1
+    /// (SOC_CLK_SEL 0, PRE_DIV_CNT 0: 40 MHz) and applied by one step's
+    /// sync.
     fn xtal_bus() -> FirmwareBus {
         let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
         bus.write32(SYSCLK_CONF, 0);
