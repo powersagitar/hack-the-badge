@@ -1556,3 +1556,171 @@ fn launcher_opens_dice() {
     );
     assert_no_panic_text(&rt);
 }
+
+/// A half-open pixel rectangle `[x0, x1) x [y0, y1)`.
+#[derive(Clone, Copy, Debug)]
+struct Rect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+/// FNV-1a over `rect`'s pixels only (same byte order as
+/// [`framebuffer_fnv1a`]).
+fn region_fnv1a(fb: &[u16], width: usize, rect: Rect) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for y in rect.y0..rect.y1 {
+        for px in &fb[y * width + rect.x0..y * width + rect.x1] {
+            for b in px.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+    }
+    h
+}
+
+/// Snake's play area (the grid, without the title/score text and without
+/// its 1-px border), measured from the Task 4 exploration's start frame
+/// (100 ms after A's release): along row 140 the border color starts at
+/// x = 14 and x = 305, along column 100 at y = 40 and y = 235; the area is
+/// the 290 x 194 px inside them.
+const PLAY_AREA: Rect = Rect {
+    x0: 15,
+    y0: 41,
+    x1: 305,
+    y1: 235,
+};
+
+static SNAKE: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// From the hacker launcher: DOWN x3, RIGHT x2 ("Snake"), then A, held
+/// [`PRESS_HOLD_US`]; the clone is taken the moment A is released.
+fn snake_open() -> FirmwareRuntime {
+    SNAKE
+        .get_or_init(|| {
+            let mut rt = launcher_for(OWN_ROLE);
+            let mut previous = LAUNCHER_HASH;
+            for &(slot, expected) in &TO_DICE[..5] {
+                let (hash, step) = press_and_settle(&mut rt, slot, previous);
+                assert_eq!(hash, expected, "after slot {slot}, stable at step {step}");
+                previous = hash;
+            }
+            press(&mut rt, 1);
+            rt
+        })
+        .clone()
+}
+
+/// When [`launcher_opens_snake`] samples Snake's frame, in emulated time
+/// after A's release. Snake does not wait for a key: it draws its start
+/// screen (snake of three cells, heading right, at the play area's middle
+/// row) in stripes from 56 ms to 75.5 ms after release and makes its first
+/// move at about 222 ms, so 150 ms is mid-way through the start frame's
+/// hold.
+const SNAKE_OPEN_FRAME_US: u64 = 150_000;
+/// Snake's start screen: title "Snake", "Start to pause", "Score 0 Hi 0",
+/// the empty play area with the snake and one food dot (its position comes
+/// from the emulator's fixed-seed RNG, `peripherals::apb_ctrl::RNG_SEED`,
+/// so it is not the badge's). Provisional until Task 5.
+const SNAKE_OPEN_HASH: u64 = 0xe7d5_38c7_42f1_9d89;
+
+/// Milestone 6: Snake opens from the launcher. Its frame
+/// [`SNAKE_OPEN_FRAME_US`] after A's release is pinned (Snake moves without
+/// waiting for a key, so no frame is stable for [`AFTER_PRESS_STABLE_FOR`]);
+/// provisional, to be compared with the physical badge in Task 5.
+#[test]
+fn launcher_opens_snake() {
+    let mut rt = snake_open();
+    run_for_us(&mut rt, SNAKE_OPEN_FRAME_US);
+    let hash = framebuffer_fnv1a(rt.framebuffer());
+    assert_eq!(
+        hash,
+        SNAKE_OPEN_HASH,
+        "Snake opened (step {})",
+        rt.total_steps()
+    );
+    assert!(
+        rt.console_output().contains("app_reg: launched Snake"),
+        "console:\n{}",
+        rt.console_output()
+    );
+    assert_no_panic_text(&rt);
+}
+
+/// Sampling period of [`move_times`].
+const MOVE_SAMPLE_US: u64 = 2_000;
+/// Changes of [`PLAY_AREA`] closer than this belong to one move (LVGL
+/// flushes a redraw in several stripes).
+const MOVE_MERGE_US: u64 = 20_000;
+
+/// Emulated times at which [`PLAY_AREA`] started to change, over
+/// `window_us`, sampled every [`MOVE_SAMPLE_US`]; changes within
+/// [`MOVE_MERGE_US`] of the previous change are one move.
+fn move_times(rt: &mut FirmwareRuntime, window_us: u64) -> Vec<u64> {
+    let width = rt.screen_width();
+    let end = rt.emulated_time_us() + window_us;
+    let mut last = region_fnv1a(rt.framebuffer(), width, PLAY_AREA);
+    let mut last_change: Option<u64> = None;
+    let mut starts = Vec::new();
+    while rt.emulated_time_us() < end {
+        run_for_us(rt, MOVE_SAMPLE_US);
+        let h = region_fnv1a(rt.framebuffer(), width, PLAY_AREA);
+        if h != last {
+            let now = rt.emulated_time_us();
+            if last_change.is_none_or(|t| now - t > MOVE_MERGE_US) {
+                starts.push(now);
+            }
+            last_change = Some(now);
+            last = h;
+        }
+    }
+    starts
+}
+
+/// [`snake_hits_wall_game_over`]'s window, from the start frame
+/// ([`SNAKE_OPEN_FRAME_US`] after release): the game-over overlay is
+/// drawn about 1,964 ms after that point (2,114 ms after release); that
+/// + 50 %, rounded up to 3 s.
+const SNAKE_TO_WALL_WINDOW_US: u64 = 3_000_000;
+/// [`PLAY_AREA`] changes from the start frame to game over with no input:
+/// 11 moves right (one cell per 170 ms tick, from the middle of the area to
+/// the right-most column), then the game-over redraw on the 12th tick,
+/// which [`move_times`] counts as the 12th change. Provisional until
+/// Task 5.
+const SNAKE_MOVES_TO_WALL: usize = 12;
+/// The game-over frame: a "Game over / A to restart" box over the play
+/// area, the snake's head in the right-most column. Provisional until
+/// Task 5.
+const SNAKE_GAME_OVER_HASH: u64 = 0x3582_df91_6283_9f3a;
+
+/// How long [`snake_hits_wall_game_over`] watches for a move after A's
+/// release on game over. The restarted game redraws its start screen
+/// 22 ms to 34 ms into the 100 ms hold and makes its first move about
+/// 176 ms after the press (72 ms after release), then one every 170 ms.
+const SNAKE_RESTART_WINDOW_US: u64 = 500_000;
+
+/// With no input the snake runs into the wall: "Game over / A to
+/// restart" after [`SNAKE_MOVES_TO_WALL`] changes of the play area (Task
+/// 5 compares that count and the frame with the badge); A restarts.
+#[test]
+fn snake_hits_wall_game_over() {
+    let mut rt = snake_open();
+    run_for_us(&mut rt, SNAKE_OPEN_FRAME_US);
+    let moves = move_times(&mut rt, SNAKE_TO_WALL_WINDOW_US);
+    assert_eq!(moves.len(), SNAKE_MOVES_TO_WALL, "moves at {moves:?}");
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, BOOT_STABLE_FOR, &[]);
+    assert_eq!(
+        hash, SNAKE_GAME_OVER_HASH,
+        "game over, stable at step {step}"
+    );
+    // A restarts at once and the new game runs without a key (the next
+    // stable frame is the next game over), so the check is that the play
+    // area moves again.
+    press(&mut rt, 1);
+    let moves = move_times(&mut rt, SNAKE_RESTART_WINDOW_US);
+    assert!(!moves.is_empty(), "no move after A on game over");
+    assert_no_panic_text(&rt);
+}

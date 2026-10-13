@@ -227,6 +227,27 @@ the code, this file and the code win.
   relations as at `00dd7d5`). If wrong: RTC time would again drift
   against SYSTIMER and every timed wait on it would cost the wrong number
   of steps.
+- **R-T4-1, Snake's open frame is time-pinned (variant B), and the
+  move count starts there.** Snake does not wait for a key: its start
+  screen holds only from 75.5 ms to about 222 ms after A's release, far
+  shorter than `AFTER_PRESS_STABLE_FOR`, so `launcher_opens_snake` pins
+  the frame `SNAKE_OPEN_FRAME_US` = 150 ms after release. The game-over
+  rung runs to that same point before `move_times`, so the start-screen
+  redraw (56 ms to 75.5 ms after release) is not counted; the count is
+  11 moves plus the game-over redraw, which `move_times` sees as a
+  twelfth change (`SNAKE_MOVES_TO_WALL` = 12). If wrong: Task 5 compares
+  a count that includes or excludes a redraw the badge's observer counts
+  differently; the doc comment says which.
+- **R-T4-2, the restart check is "the play area moves again".** A on
+  game over restarts at once (the start screen is redrawn 22 ms to 34 ms
+  into the 100 ms hold, with a new food position) and the new game runs
+  without a key, so the brief's `press_and_settle` found the *next* game
+  over (a different frame, because the food moved) and its `assert_ne!`
+  passed for the wrong reason. Per the brief's fallback the rung asserts
+  that `move_times` over `SNAKE_RESTART_WINDOW_US` = 500 ms after A's
+  release is non-empty (three moves are expected). If wrong: a restart
+  that left the snake frozen would still be caught; one that ran a
+  different game would not be.
 
 ## Measurements
 
@@ -420,5 +441,37 @@ instrumentation as Task 3 (removed before commit).
 
 Wall times: release `boot_progress` 41.2 s (56/56); see the Task D-M6-1
 report for the full check.
+
+### Task 4: Snake opens and reaches game over (provisional until Task 5)
+
+Explored from the hacker launcher checkpoint (DOWN x3, RIGHT x2, A held
+100 ms; A released at emulated 118,871,665 us, step 449,179,709), sampling
+the framebuffer every 1 ms and 20 ms for 5 s. Every value below is
+provisional until Task 5 compares it with the physical badge.
+
+| Question | Answer |
+| --- | --- |
+| `app_reg: launched Snake` | printed (`launcher_opens_snake` asserts it) |
+| waits for a key before moving? | no: start screen drawn 56..75.5 ms after release, first move ~222 ms |
+| start direction | right, three cells on the play area's middle row |
+| play area (`PLAY_AREA`) | x 15..305, y 41..235 (half-open, inside the 1-px border at x 14/305, y 40/235; measured along row 140 and column 100 of the start frame); cells 12 px |
+| time between moves | 170 ms exactly (each move flushes in two stripes 3.5 ms apart) |
+| moves to the wall with no input | 11; the game-over overlay is drawn on the 12th tick, 2,105..2,114 ms after release |
+| game over | "Game over / A to restart" box over the play area; stable (unchanged to 5 s) |
+| A on game over | restarts at once with a new food position; the snake moves ~72 ms after release |
+| cost | 5 s of Snake is 17.6M steps (~1.4 s wall, release); the five navigation presses + A take ~5.7 s wall from the launcher checkpoint |
+
+| Pin | Value |
+| --- | --- |
+| `SNAKE_OPEN_FRAME_US` | 150,000 |
+| `SNAKE_OPEN_HASH` | `0xe7d5_38c7_42f1_9d89` |
+| `SNAKE_TO_WALL_WINDOW_US` | 3,000,000 (from the open frame; game over ~1,964 ms after it, + 50 %) |
+| `SNAKE_MOVES_TO_WALL` | 12 (11 moves + the game-over redraw, R-T4-1) |
+| `SNAKE_GAME_OVER_HASH` | `0x3582_df91_6283_9f3a` |
+| `SNAKE_RESTART_WINDOW_US` | 500,000 (R-T4-2) |
+| `MOVE_SAMPLE_US` / `MOVE_MERGE_US` | 2,000 / 20,000 |
+
+The food dot's positions come from the emulator's fixed-seed RNG, so
+they are not the badge's; Task 5 compares layout, not the food.
 
 ## Milestone 7 backlog
