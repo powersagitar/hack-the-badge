@@ -53,8 +53,11 @@
 //! Model: both registers are stored and read back through their R/W masks
 //! (`0xff` and `0x0fff`); the RO fields (`CLK_XTAL_FREQ`, `CLK_DIV_EN`)
 //! read 0 and ignore writes, as do the reserved bits. [`System::cpu_hz`]
-//! is the frequency `rtc_clk_cpu_freq_get_config` would report, with the
-//! crystal at [`crate::mem::soc::XTAL_HZ`]; it is `None` for an encoding
+//! decodes the registers as `rtc_clk_cpu_freq_get_config` does, with the
+//! crystal at [`crate::mem::soc::XTAL_HZ`], but in Hz: that function works
+//! in whole MHz, so a divider that does not divide 40 MHz evenly
+//! (`PRE_DIV_CNT` 2) gives 13,333,333 Hz here where it reports 13 MHz
+//! (this firmware only selects 40 and 80 MHz). It is `None` for an encoding
 //! that function aborts on, and the bus then keeps the previous frequency
 //! (it never panics and never sets a zero frequency). Byte-split writes
 //! update one byte lane each; the derived frequency is meaningful only once
@@ -150,9 +153,9 @@ impl System {
         self.from_cpu[n] = val & 1 != 0;
     }
 
-    /// The CPU frequency these registers select, per ESP-IDF v5.5.3
-    /// `rtc_clk_cpu_freq_get_config`; `None` for an encoding it would abort
-    /// on. See the module doc.
+    /// The CPU frequency these registers select, in Hz, decoded as ESP-IDF
+    /// v5.5.3 `rtc_clk_cpu_freq_get_config` does; `None` for an encoding it
+    /// would abort on. See the module doc.
     pub fn cpu_hz(&self) -> Option<u64> {
         match (self.sysclk_conf >> 10) & 0b11 {
             0 => Some(XTAL_HZ / (u64::from(self.sysclk_conf & 0x3ff) + 1)),

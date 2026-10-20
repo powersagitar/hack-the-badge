@@ -12,7 +12,12 @@
 //! remainder in units of `1 / cpu_hz` of a tick (`cycles * timer_hz`) and
 //! carries it, which makes the conversion exact over any run. When the CPU
 //! frequency changes, the pending fraction of a tick is rescaled to the new
-//! unit, so no time is lost or invented at a switch.
+//! unit (`remainder * new / old`, rounded down). Whenever `old` divides
+//! `remainder * new` the rescale is exact and no time is lost or invented
+//! at a switch; otherwise a switch drops less than one `1 / new` unit of a
+//! tick. Whether a chip's rates are exact is the chip setup's concern (the
+//! ESP32-C3 rates the badge firmware uses are; see
+//! `docs/firmware-emulator-notes.md`, "Timing model").
 //!
 //! Idle time (a WFI fast-forward) is charged in whole ticks and also
 //! counted separately ([`Clock::idle_ticks`]).
@@ -52,8 +57,8 @@ impl Clock {
         self.timer_hz
     }
 
-    /// Switches the CPU frequency, keeping the pending fraction of a tick.
-    /// `0` is ignored.
+    /// Switches the CPU frequency, keeping the pending fraction of a tick
+    /// (rescaled; see the module doc for when that is exact). `0` is ignored.
     pub fn set_cpu_hz(&mut self, hz: u64) {
         if hz == 0 || hz == self.cpu_hz {
             return;

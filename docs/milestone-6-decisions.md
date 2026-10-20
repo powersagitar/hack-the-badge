@@ -13,6 +13,27 @@ the code, this file and the code win.
 
 ## Rulings
 
+Every ruling of the milestone, with its reason and what it would cost if
+wrong. R-PF rulings came from a preflight scan of the plan before Task 1;
+R-T*n*-*k* rulings from Task *n* (D-M6-1's are under Task 3, which it
+followed).
+
+- **R-PF-1, Task 1's emulated-time test follows the clock switch.**
+  Task 1's `emulated_time_starts_at_zero_and_follows_the_clock` pinned
+  the legacy ratio (1,600 steps = 100 µs). Task 3 makes the clock follow
+  the SYSTEM registers, so the plan's Task 3 had to update that test too,
+  although its text did not name it: a legacy-ratio assertion is plainly
+  wrong after the switch. The value it was first expected to take (40 µs
+  at 40 MHz) was superseded by R-T2-5 and R-T3-1 (20 µs at 80 MHz). If
+  wrong: one test line.
+- **R-PF-2, the clock-init progress check.** `rom_stub_boot.rs`'s
+  `rom_stubbed_boot_gets_past_the_mask_rom_wall` checked that boot hit
+  the `ets_get_cpu_frequency` *stub*. Since Task 2 that address is guest
+  ROM code, so no stub fires there; the check is kept, with the same
+  meaning ("ets_get_cpu_frequency (clock init)"), as "a step executed at
+  `ETS_GET_CPU_FREQUENCY`" (`StepInfo::pc_before`). The spec deletes the
+  stub, not the progress check. If wrong: boot could stop reaching clock
+  init without that test noticing.
 - **R-T1-1, the fractional-tick test.** The plan's
   `frequency_change_keeps_the_fractional_tick` expected the two steps
   after an 80 → 40 MHz switch (3/5 tick pending) to tick `[0, 1]`. That
@@ -23,6 +44,12 @@ the code, this file and the code win.
   modes: a dropped remainder gives `[0, 0, 1, 0]`, and a remainder kept
   without rescaling gives `[1, 1, ...]`. If wrong: a frequency switch
   could lose or invent time without a test noticing.
+- **R-T1-2, `SYSTIMER_HZ`'s citation.** The plan cited
+  `SYSTIMER_LL_TICKS_PER_US` from `systimer_ll.h`, which ESP-IDF v5.5.3
+  does not have. `SYSTIMER_HZ` (16 MHz) cites what does exist: the
+  ESP32-C3 `systimer.c` (ticks / 16, "40MHz/2.5 = 16MHz") and
+  `soc_caps.h`'s `SOC_SYSTIMER_FIXED_DIVIDER`. A citation never names a
+  symbol that is not in the source. If wrong: a doc line.
 - **R-T1-3, the WFI rung's metric.**
   `boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting`
   now measures `clock.idle_ticks()` (1,827,072 at step 5,550,000) instead
@@ -31,6 +58,11 @@ the code, this file and the code win.
   not one tick of it as a step. The `>= 1,500,000` threshold is
   unchanged. If wrong: the rung would no longer prove that the
   fast-forward is what put time ahead of the steps.
+- **R-T1-4, `CLAUDE.md`'s clock entry waits for Task 9.** The plan puts
+  `CLAUDE.md` in Task 9, so Task 1 did not add a `clock.rs` entry there.
+  If wrong: `CLAUDE.md` was stale for a few commits (Tasks 2, 3 and
+  D-M6-1 updated some entries and figures in passing; Task 9 finished
+  it).
 - **R-T1-5, time conversions saturate.** `Clock::ticks_at_us` and
   `Clock::elapsed_us` compute in `u128` and saturate to `u64::MAX`
   rather than truncating with `as`. Above about 1.15e18 µs the tick count
@@ -41,13 +73,11 @@ the code, this file and the code win.
   A saturated target is never reached, so `run_until` runs to its step
   cap. If wrong: a far-future target from the browser would silently run
   zero steps.
-- **R-PF-2, the clock-init progress check.** `rom_stub_boot.rs`'s
-  `rom_stubbed_boot_gets_past_the_mask_rom_wall` checked that boot hit
-  the `ets_get_cpu_frequency` *stub*. Since Task 2 that address is guest
-  ROM code, so no stub fires there; the check is kept, with the same
-  meaning ("ets_get_cpu_frequency (clock init)"), as "a step executed at
-  `ETS_GET_CPU_FREQUENCY`" (`StepInfo::pc_before`). If wrong: boot could
-  stop reaching clock init without that test noticing.
+- **R-T1-6, design-changing rulings go in this file with their task.**
+  R-T1-1 and R-T1-3 went into this list in Task 1's fix commit, as the
+  plan asks of every ruling that changes the design; Task 9 added the
+  rulings that had been kept only in the task records. If wrong: a doc
+  paragraph.
 - **R-T2-1, early log timestamps are timing.** The pre-scheduler log
   timestamp is the cycle counter divided by `ets_get_cpu_frequency() *
   1000`, and the app's `rtc_clk_init()` rescales the cycle counter by
@@ -105,6 +135,15 @@ the code, this file and the code win.
   registers as `freq_before` and rescales the cycle counter by it. If
   wrong: the app's first clock switch and the cycle counter would start
   from a frequency the real badge never had.
+- **R-T2-5, Task 3's synthetic-image numbers follow the 80 MHz seed.**
+  (Amends R-PF-1.) With R-T2-4's seed, the plan's Task 3 numbers that
+  assumed a synthetic image at 40 MHz are recomputed at 80 MHz: 1,000
+  steps of `run_returns_after_budget_even_if_wfi_never_wakes` are 200
+  ticks, and 1,600 steps of `emulated_time_starts_at_zero_and_follows_the_clock`
+  are 320 ticks, 20 µs. The bare-bus tests (`xtal_bus()`,
+  `a_bare_bus_follows_the_reset_clock_registers`) apply no initializers
+  and stand as written. Task 3 measured them (R-T3-1). If wrong: test
+  constants.
 - **R-T3-1, the synthetic-image runtime tests run at 80 MHz.**
   `FirmwareRuntime::from_image` boots through
   `boot_from_factory_image_with_rom_stubs`, which applies the boot
@@ -277,6 +316,61 @@ the code, this file and the code win.
   runs to the open frame (`SNAKE_OPEN_FRAME_US`) before counting, as the
   game-over rung does (R-T4-1). If wrong: the start-screen redraw would
   count as a move.
+- **R-T6-3, the speed rung pins the exact move period.** The badge
+  comparison stays as the spec's tolerance (median within ±25 % of
+  `BADGE_MOVE_INTERVAL_US`), and the rung also asserts that every gap
+  between consecutive moves equals `SNAKE_MOVE_INTERVAL_US` = 170,000 us,
+  the emulator's exact, deterministic move period (Tasks 4 and 5; it
+  agrees with the badge per Task 5). The reason: Task 6's Step 2 found
+  that the ±25 % check alone passes under the pre-Milestone-6 clock
+  (160 ms), so it did not guard the timing model as the spec asks, and a
+  tighter tolerance such as ±5 % would be arbitrary; exact pins are the
+  house style for this deterministic emulator. `SPEED_WINDOW_US` ends
+  before the game-over redraw (184 ms after the 11th move, about
+  2,106 ms after release), so every counted change is a move and none
+  needs excluding. Under the legacy clock the rung now fails ("move gaps
+  not all 170000 us"; Task 6 below). If wrong: one more pin to re-pin if
+  the firmware's timing legitimately moves. (The pin is as fine as the
+  2 ms sampling, `MOVE_SAMPLE_US`.)
+- **R-T6-4, the restart window is 600 ms.** `SNAKE_RESTART_WINDOW_US`
+  went from 500,000 to 600,000 when Task 6 tightened the restart check
+  to three moves: the third move comes 416 ms after A's release, and with
+  every delay 25 % longer about 545 ms (Task 6 below). If wrong: a
+  slightly looser restart window.
+- **R-T7-1, Task 7 commits before the human's browser check.** The plan
+  put Task 7's commit after its Step 5 human gate, only so the commit
+  could carry any tuning the gate called for. The commit came first, so
+  the task's code review ran before the human's browser time, and the
+  tuning landed as follow-up commits with their measurements here. If
+  wrong: one extra commit.
+- **R-T7-2, the speed readout divides by the real frame time.** The
+  plan's `speed()` divided the emulated advance by the clamped wall
+  delta, so the readout could not fall below 1.0x when frames took
+  longer than 50 ms, which hides exactly the slow-machine case the
+  readout exists to show. `speed()` uses the unclamped wall delta; a tab
+  back from the background costs one near-zero sample at the smoothing's
+  0.1 weight. If wrong: a brief dip in the readout after a tab returns.
+- **R-T7-3, `stop()` flushes only deferred releases.** A deferred
+  release (a button let go before its 100 ms hold ran out) is applied at
+  `stop()` rather than left pending; buttons still held keep their press
+  times and stay asserted, and `reset()` clears everything. Emulated
+  time does not
+  advance while stopped, so a held button's hold continues after a
+  restart. If wrong: a held button's hold measured across a stop.
+- **R-T7-4, the steady 1.2x was a pacing defect.** The human saw the
+  readout steady at 1.2x while Snake ran. Task 7's contract is emulated
+  time equal to wall time, so this was treated as a defect to root-cause,
+  not a CPI question: the WFI fast-forward jumped past `run_until`'s
+  target to the next FreeRTOS tick. Fixed by `boot::idle_until` (Task 7
+  below). If wrong: one diagnosis round.
+- **R-T7-5, the step cap is measured.** `DEFAULT_STEPS_PER_FRAME` went
+  from the spec's starting guess, 1,000,000, to 150,000: at 1,000,000 a
+  busy stretch ran at 9.6 fps in the human's browser (about 104 ms per
+  frame, about 10M steps/s), and those long frames caused the input lag
+  and the 328 ms INP. 150,000 steps is about one 60 Hz frame of work.
+  The spec allows tuning by measurement. If wrong: busy stretches run a
+  little slower than they could on fast machines (throughput per wall
+  second is mostly unchanged).
 
 ## Measurements
 
@@ -296,8 +390,12 @@ All green. Wall times on the development machine (18 cores):
 ### Task 2: SYSTEM clock registers and the stateful ROM frequency pair
 
 With the R-T2-4 seeds (80 MHz on the PLL, `s_ticks_per_us` = 80),
-`ets_update_cpu_frequency` is called with 40 at step 836, 80 at 401,743
-and 80 at 404,369 (then 40/80 around every idle). Cycle-scaled waits
+`ets_update_cpu_frequency` is called with 40 at step 836 (the app's
+`rtc_clk_init()` switching to the XTAL clock), 80 at 401,743 (its switch
+back to the PLL, after `rtc_init()`'s RTC-timer waits), and 80 again at
+404,369 while already at 80 (a second set to the same frequency; its
+caller was not traced, and since the setter only stores the value it is
+harmless), then 40/80 around every idle. Cycle-scaled waits
 count 80 instead of 160 per microsecond, and the app's `rtc_clk_init()`
 rescales the cycle counter from 80 MHz, not 40, so step-exact pins move.
 No frame hash moved, either in the first commit or after fix round 1:
@@ -468,15 +566,17 @@ instrumentation as Task 3 (removed before commit).
 | holds (all presses) | 1.6M | 0.18M..6.9M | 0.18M..6.93M | |
 | WASM twin: splash horizon / first-run cap / `PROVISION_DEADLINE` | 6.75M / 17.5M / 38M | 6.25M / 17.75M / 37M | 5.5M / 17.25M / 36M | mirrors |
 
-Wall times: release `boot_progress` 41.2 s (56/56); see the Task D-M6-1
-report for the full check.
+Wall times (the full check, all green): release `boot_progress` 56 pass
+in 41.1 s; debug `cargo test --workspace` 30.8 s (534 lib tests);
+`bun test` 137 pass; clippy 3 warnings (unchanged).
 
 ### Task 4: Snake opens and reaches game over (provisional until Task 5)
 
 Explored from the hacker launcher checkpoint (DOWN x3, RIGHT x2, A held
 100 ms; A released at emulated 118,871,665 us, step 449,179,709), sampling
-the framebuffer every 1 ms and 20 ms for 5 s. Every value below is
-provisional until Task 5 compares it with the physical badge.
+the framebuffer every 1 ms for the first 2.4 s and every 20 ms for 5 s.
+Every value below was provisional until Task 5 compared it with the
+physical badge (Task 5 confirmed them).
 
 | Question | Answer |
 | --- | --- |
@@ -516,7 +616,8 @@ committed).
 
 **Badge side.** The human recorded the physical badge with a phone (an
 untouched run into the wall, and a run with one turn) and asked that the
-numbers be measured from it. They were measured frame by frame (29.97 fps, true frame timestamps):
+numbers be measured from it. They were measured frame by frame (29.97
+fps, true frame timestamps):
 
 | Question | Badge | Emulator |
 | --- | --- | --- |
@@ -526,7 +627,7 @@ numbers be measured from it. They were measured frame by frame (29.97 fps, true 
 | one-turn run | one turn right → up: 10 moves right, then 8 up to the top wall | n/a |
 | geometry | play area about 24 × 16 cells; 3-cell snake starting rightward from the same cell | the same |
 | game-over screen | the same as the emulator's | "Game over / A to restart" |
-| start screen to first move | about 168 ms | about 150 to 170 ms |
+| start screen to first move | about 168 ms | about 147 ms (start screen complete 75.5 ms after A's release, first move at about 222 ms) |
 | last move to game-over overlay | about 200 ms | 184 ms gap |
 
 The last two rows agree within the video's frame quantization (33.4 ms
@@ -605,20 +706,11 @@ ways:
   instead of 12). Ruling R-T6-3 (below) added an exact pin, and Step 2
   was re-run.
 
-**Ruling R-T6-3, the speed rung pins the exact move period.** The
-badge comparison stays as the spec's tolerance (median within ±25 % of
-`BADGE_MOVE_INTERVAL_US`), and the rung also asserts that every gap
-between consecutive moves equals `SNAKE_MOVE_INTERVAL_US` = 170,000 us,
-the emulator's exact, deterministic move period (Tasks 4 and 5; it
-agrees with the badge per Task 5). `SPEED_WINDOW_US` ends before the
-game-over redraw (184 ms after the 11th move, about 2,106 ms after
-release), so every counted change is a move and none needs excluding.
-The exact pin guards the timing model; the ±25 % check is the badge
-comparison. **Step 2 re-run** (legacy clock from A's release, probe
-reverted): `snake_moves_on_its_own` **FAILS**, "move gaps not all
-170000 us", with gaps 221,951 us and then 160,000 us (160,000 ≠
-170,000). If wrong: a clock change that kept Snake within ±25 % of the
-badge but changed its period would go unnoticed.
+**Step 2 re-run after ruling R-T6-3** (the exact gap pin; see Rulings),
+legacy clock from A's release, probe reverted: `snake_moves_on_its_own`
+**FAILS**, "move gaps not all 170000 us", with gaps 221,951 us and then
+160,000 us (160,000 ≠ 170,000). The exact pin guards the timing model;
+the ±25 % check is the badge comparison.
 
 Checks (after R-T6-3): release `boot_progress` 60 passed in 41.2 s;
 `cargo test --workspace` green (`boot_progress` 27.9 s, before R-T6-3);
@@ -677,8 +769,35 @@ unclamped frame time (R-T7-2).
   release) adds no lag. The 60 ms is the firmware's own poll and redraw
   and is not changed. The lag was the long frames: a key event waits for
   the running frame (about 104 ms), and its paint waits for the next one,
-  which matches the 328 ms INP. The 150,000-step cap bounds both. The
-  browser gate re-measures it.
+  which matches the 328 ms INP. The 150,000-step cap bounds both.
+
+Fixes: `36f7551` (`boot::idle_until`) and `292e740` (the 150,000-step
+cap); no rung pin moved.
+
+**The human's re-check (same day, after both fixes):**
+
+- Snake runs at 0.9x to 1.0x and 100 to 110 fps and feels like the
+  badge; input lag does not affect it. INP is 64 ms (was 328 ms).
+- Each launcher move dips the readout from 1.0x to about 0.1x and the
+  frame rate from 120 to 60 fps, then both recover. Onboarding and the
+  launcher show input lag, and the screen visibly repaints top to bottom.
+
+**Cause:** busy redraws are CPU-bound. The core runs about 10M to 12M
+steps/s (about 10M in the browser; natively, the release suite's
+longest chain, hacker's walk of about 487M steps to Dice, takes
+about 42 s, about 11M/s) against the badge's 80M cycles/s, so a
+full-screen redraw plays
+back about 8x slower than on the badge, and input waits behind it.
+Pacing, Task 7's contract, is correct: an idle-dominated app keeps real
+time. Throughput is not in Task 7's scope.
+
+**The human's decision:** accept Task 7 and put emulator core
+throughput on the Milestone 7 backlog ("Backlog it").
+
+Steady-state Snake readout: a frame that redraws a move needs about
+230,000 steps, more than the 150,000 cap, so about half a frame of debt
+is dropped per move (every 170 ms); the readout sits at about 0.95x on
+Snake by design, matching the human's 0.9x to 1.0x.
 
 Out of scope: the dev server's "ReferenceError: Can't find variable:
 process" comes from `fengari/src/luaconf.js` line 3, which reads
@@ -711,5 +830,147 @@ after), the new food at (15, 13), score 1. Not compared with the
 physical badge (its food position differs, Task 5). No existing pin
 moved.
 
+Open question (Milestone 7 backlog): after the eat, the game-over draw
+comes 50 to 134 ms after the tick that hits the wall, against about
+22 ms with no eat. Not explained; a high-score save is a guess, not
+verified.
+
+### Task 9: suite times at the end of the milestone
+
+Measured on the development machine (18 cores) at the Task 9 commit:
+
+| Check | Result | Time |
+| --- | --- | --- |
+| `cargo test --workspace` (debug) | 534 lib + 93 integration tests pass (62 boot rungs) | 31 s wall including the build check; `boot_progress` 28.2 s |
+| `cargo test -p emulator-core --release --test boot_progress` | 62 pass | 41.8 s (42 s wall) |
+| `cargo clippy --workspace --all-targets` | 3 warnings, the same three as at `ed71dd8` | |
+| `bun run build:wasm`, `bun run typecheck` | ok | |
+| `bun test` | 147 pass, 0 fail | 37.1 s |
+
+Against the branch base (`ed71dd8`: release 41.0 s, debug `boot_progress`
+27.3 s, `bun test` 38.4 s) the suites are flat: the seven new rungs
+branch from shared checkpoints.
 
 ## Milestone 7 backlog
+
+The Milestone 6 backlog (`docs/milestone-5-decisions.md`) items this
+milestone did not finish are carried here, plus what Milestone 6 found.
+
+### Speed and timing
+
+- **Emulator core throughput** (the human's decision at Task 7's
+  browser gate). The core runs about 10M to 12M steps/s against the
+  badge's 80M cycles/s, so busy redraws play back about 8x slower than
+  on the badge: the launcher and onboarding repaint visibly and input
+  waits behind them. Profile the core, try a decoded-instruction cache,
+  and run the emulator in a Web Worker so input never waits on a busy
+  frame; the goal is busy redraws at real time.
+- The release profile is `opt-level = "s"`; at `opt-level = 3` the
+  release `boot_progress` suite once ran in 23.0 s instead of 33.8 s
+  (Milestone 5, not re-measured), and the WASM build would likely speed
+  up the same way. Needs a WASM size and browser-speed check; part of
+  the throughput item.
+- **Snake's game-over draw after an eat** comes 50 to 134 ms after the
+  tick that hits the wall, against about 22 ms with no eat (Task 8).
+  Unexplained; possibly a high-score save, unverified.
+- CPI 1 is calibrated only against a timer-paced app (Snake's move
+  period). Busy work (a redraw, the Dice roll animation, which played "a
+  bit faster" than the badge under the pre-Milestone-6 clock and was not
+  re-checked) has not been timed against the badge.
+- Zero-latency RMT, I2C0 and SPIMEM1 (carried).
+- The cycle counter counts one per working step; PCER/PCMR do not gate
+  it (carried).
+
+### Apps and UI
+
+- Other built-in apps are untested; only Dice and Snake are checked.
+- RNG: a browser-supplied seed for `APB_CTRL_RND_DATA_REG` (today fixed).
+- A console pane in the frontend (the firmware's REPL is reachable
+  through `serialInput`/`consoleOutput`); `serialInput` copies the whole
+  JS array before the 1 MiB cap is applied, so cap or chunk it on the JS
+  side when the pane lands.
+- Motion input beyond the Shake button (`DeviceMotionEvent` on a phone).
+- Milestone 5 Task 7 review minors still open: a fetch error message
+  lingers and can be masked by a stale provision state (clear it on a
+  successful `provision()` and on reset, `main.ts`); two fast clicks
+  start concurrent fetches and the last to resolve wins, not the last
+  click. (The third, flushing deferred releases in `stop()`, is done.)
+- Small Task 7 cleanups: `speed()` returns 0 as its "no reading yet"
+  sentinel; `main.ts` writes the status separator as a literal middle dot
+  where the file otherwise uses escapes; `pollShake` in
+  `firmware-runtime.ts` clears `lastShakeAccel` twice in a row.
+- The Lua mode's dev server logs "ReferenceError: Can't find variable:
+  process": `fengari/src/luaconf.js` reads `process.env.FENGARICONF`
+  without a guard. It predates Milestone 6.
+- Only role hacker's frames were compared with hardware; onboarding page 8
+  ("Bump to connect") is animated and not pinned; the six navigation
+  frames between the launcher and Dice and Snake's after-eat frame are
+  pinned but not compared.
+
+### Peripherals
+
+- RMT transmissions are consumed but not decoded, so the LEDs (including
+  `prov apply`'s green flashes and role colour) are never shown.
+- NFC is not modeled (the self-test waits for a card forever).
+- The busy phase after START on the first-run screen (about 6M steps
+  under the old clock; hot PCs `0x420b_ead4`, `0x420b_b6a4`) is not
+  traced.
+- SC7A20H: data ready is always set (no ODR time base); 1 mg/digit is
+  the typical sensitivity where the datasheet's table says 1024 counts/g;
+  the face-up rest orientation is an assumption.
+- I2C0: an `OP_WRITE` command with an empty TX FIFO leaves the address
+  phase armed (malformed command lists only; untested).
+- USB-Serial-JTAG: where the `put` task spends its CPU time per 64-byte
+  packet is not identified (a per-byte VFS read is the suspect); if it
+  is an emulator gap, `PUT_CHUNK_GAP_STEPS` could shrink.
+- `R_M5_3`'s closure follows direct calls only (indirect VFS, littlefs
+  and cJSON pointers were not followed).
+- ROM stubs: `strtol`/`atoi` do not set `errno`; the 8 MiB
+  `MAX_STUB_MEMORY_BYTES` cap of the string stubs has no test.
+- Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`) and
+  RTC_CNTL `0x6000_80bc` (SYSTEM's clock registers are modeled since
+  Task 2). Harmless so far.
+- Early log timestamps have not been compared with the badge's.
+
+### Build and tests
+
+- The release suite's wall time is one chain (hacker's walk to the Dice
+  roll, about 487M steps); only a faster emulator shortens it.
+- Test minors left from Milestone 6's reviews: `snake_eats` could assert
+  growth of exactly one cell (`after * 3 == at_open * 4`) and that its
+  150 ms frame is `SNAKE_OPEN_HASH`, and its `SNAKE_DOWN_SLOT` = 4
+  duplicates `NAV_SLOT` without a cross-reference;
+  `run_until_a_past_target_runs_nothing` uses target 0 (always past),
+  where a mid-run target would test it properly; the
+  `DEFAULT_STEPS_PER_FRAME` test restates the constant;
+  `snake_moves_on_its_own`'s exact gap pin is as fine as `MOVE_SAMPLE_US`
+  (2 ms).
+
+### Carried from Milestones 3 and 4 (untouched)
+
+- ST7789 `MADCTL` (`0x20`, then `0x60`) is unmodeled; orientation is
+  human-confirmed for every pinned frame so far, Snake's included.
+- GPIO0 (the display D/C pin) is routed as SPI2 `FSPIWP`/`FSPIHD`; routing
+  is stored only.
+- eFuse block unmodeled: boot logs chip revision v0.0, the badge is v0.4.
+- Flagged ROM-stub guesses: `rom_i2c_readReg*` returning 0,
+  `Cache_Get_*` returning 0 (notes, history item 5).
+- Edge-type interrupts are simplified: `CPU_INT_TYPE_REG` and
+  `CPU_INT_CLEAR_REG` are plain storage.
+- GDMA: DMA spans that cross into an adjacent RAM region are rejected;
+  the RX in-link walk, CPU FIFO push/pop, the `OUT_DSCR*` pre-fetch
+  registers and transfer timing are not modeled; a trailing zero-length
+  `suc_eof` descriptor is never visited; `RESTART` with nothing to
+  restart leaves the channel active.
+- `boot_until_console_contains` checks in 250,000-step chunks, so rung
+  budgets are looser than they read; stable-frame steps are quantized
+  the same way.
+- Small duplications: the `memcpy`/`memset` and `memcmp`/`strncmp` stub
+  arms, and the `header_with_speed_size` test helper in `image.rs` and
+  `rom.rs`.
+
+Resolved from the Milestone 6 backlog in Milestone 6: Snake (playable,
+compared with the badge), the `CPU_FREQ_MHZ` = 160 stub, `TICKS_PER_STEP`
+= 1 (one clock that follows the firmware's 40/80 MHz switches),
+`PACKET_STEPS` (now `PACKET_TICKS`, bus time), SYSTEM's unmapped clock
+registers, and the `stop()` flush of deferred releases.

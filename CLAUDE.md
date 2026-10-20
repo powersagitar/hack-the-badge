@@ -12,14 +12,17 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestones 2–5): the badge's *built-in* apps (Snake,
+2. **Real-firmware mode** (Milestones 2–6): the badge's *built-in* apps (Snake,
    Dice, etc.) are native RISC-V machine code baked into one monolithic
    ESP-IDF app image — not extractable as Lua files (confirmed by
    flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   **Current state (end of Milestone 5):** boot runs through the ESP-IDF
+   **Current state (end of Milestone 6):** emulated time follows the
+   firmware's own CPU clock (it switches between 40 and 80 MHz; one
+   instruction per cycle against the 16 MHz SYSTIMER), and boot runs
+   through the ESP-IDF
    startup log, FreeRTOS and `app_main` (the boot splash is final from
    about step 4.43M, `boots_to_first_real_frame`), formats and mounts
    littlefs on the blank `storage` partition, and launches My Badge, which
@@ -40,14 +43,23 @@ ESP32-C3 device), in two complementary modes:
    open and roll frames and the roll animation were compared with the badge on
    2026-10-08, the six navigation frames between the launcher and Dice are
    pinned but not compared; the roll value comes from the emulator's
-   fixed-seed RNG). Snake launches but is not playable yet (backlog). Read
-   `docs/firmware-emulator-notes.md`'s "Known limitations" (current state,
-   open limitations, and the stall-by-stall history) before assuming any
-   other built-in app works in this mode. Design decisions (some override
-   the plan text, e.g. interrupt threshold `>=`) are in
-   `docs/milestone-3-decisions.md`, `docs/milestone-4-decisions.md` and
-   `docs/milestone-5-decisions.md`; the last has the Milestone 6
-   backlog.
+   fixed-seed RNG). **Snake is playable** (DOWN x3, RIGHT x2, A): it
+   opens (`launcher_opens_snake`), moves at the badge's 170 ms per move
+   (`snake_moves_on_its_own`), steers (`snake_steers`), reaches game over
+   at the wall and restarts (`snake_hits_wall_game_over`), and eats
+   (stretch, `snake_eats`); the start, after-turn and game-over frames
+   and the speed were compared with the badge on 2026-10-20 and match
+   (the after-eat frame was not compared). In the browser the emulator
+   is paced to wall-clock time: Snake runs at about 1.0x, but busy
+   screens (the launcher, onboarding) run slower than real time, because
+   the core does about 10M to 12M steps/s against the badge's 80M
+   (Milestone 7 backlog). Read
+   `docs/firmware-emulator-notes.md`'s "Timing model" and "Known
+   limitations" (current state, open limitations, and the stall-by-stall
+   history) before assuming any other built-in app works in this mode.
+   Design decisions (some override the plan text, e.g. interrupt
+   threshold `>=`) are in `docs/milestone-3-decisions.md` through
+   `docs/milestone-6-decisions.md`; the last has the Milestone 7 backlog.
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -78,7 +90,7 @@ run from the repo root.
 - `bun run build` — production build to `frontend/dist/`
 - `bun run preview` — preview a production build
 - `bun test` — run unit tests (`bun test path/to/file.test.ts` for a single file;
-  the whole run takes about 40 s, most of it the WASM twin that provisions
+  the whole run takes about 37 s, most of it the WASM twin that provisions
   and walks to the launcher, `test/cpu-wasm.test.ts`)
 - `bun run typecheck` — type-check without emitting (`tsc --noEmit`)
 
@@ -97,14 +109,20 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   console line, a no-fault point, or a framebuffer state. The finish line
   is provisioning plus the launcher: `provisions_<role>_through_the_console`
   (11 roles), `boots_to_launcher` and `launcher_responds_to_navigation`,
-  plus the stretch rung `launcher_opens_dice`
+  plus the stretch rung `launcher_opens_dice`; Milestone 6 adds Snake
+  (`launcher_opens_snake`, `snake_moves_on_its_own`, `snake_steers`,
+  `snake_hits_wall_game_over`, stretch `snake_eats`), the clock's
+  `boot_reports_the_badges_80_mhz_cpu_clock` and the pacing rung
+  `run_until_ends_idle_frames_at_the_target`
   (Milestone 4's `boots_to_first_run_screen` and
   `first_run_screen_responds_to_start` still hold on blank flash). The
   identity walks are about 346M to 375M emulated steps each, so the suite
-  shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s) and takes
-  about 42 s on 18 cores (one chain of about 487M steps, hacker's walk to Dice, is
+  shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s; the Snake
+  rungs branch from hacker's launcher) and its 62 rungs take about 42 s
+  on 18 cores (one chain of about 487M steps, hacker's walk to Dice, is
   the floor). The debug
-  `cargo test --workspace` runs the same rungs in about 28 s, because the
+  `cargo test --workspace` runs the same rungs in about 28 s (31 s wall
+  with the other tests), because the
   dev profile builds `emulator-core` at `opt-level = 3` (root
   `Cargo.toml`). When boot moves, update the rung whose budget it
   affects; the per-task history goes in the notes, not the test docs.
@@ -150,13 +168,21 @@ frontend/             Vite + TypeScript web app (own package.json).
                       dispatches on_enter/on_tick/on_button/on_exit.
   src/runtime/firmware-runtime.ts
                       Firmware-mode runtime over the WASM handle: the
-                      frame loop, the button-name -> raw-slot table, a
+                      frame loop, paced to wall-clock time (Milestone 6:
+                      each animation frame runUntil()s the emulator by
+                      the wall delta, clamped to MAX_FRAME_DELTA_MS =
+                      50 ms, at most DEFAULT_STEPS_PER_FRAME = 150,000
+                      steps; a capped frame drops its debt, so busy
+                      firmware runs in slow motion; speed() is the
+                      smoothed emulated/wall ratio the status line shows
+                      as "N.Nx"), the button-name -> raw-slot table, a
                       minimum press hold (PRESS_HOLD_US, 100 ms of
-                      emulated time; earlier releases are deferred),
-                      provision()
+                      emulated time; earlier releases are deferred and
+                      flushed by stop()), provision()
                       with a 60M-step timeout (PROVISION_TIMEOUT_STEPS),
-                      and shake() (the rungs' two-axis shake pattern, then
-                      rest). Reset abandons a provisioner and a shake.
+                      and shake() (the rungs' two-axis shake pattern,
+                      SHAKE_HALF_US = 62.5 ms half-periods, then rest).
+                      Reset abandons a provisioner and a shake.
   src/runtime/provisioner.ts
                       Types the firmware's own provisioning commands into
                       the emulated USB console (wait for `badge> `,
@@ -225,6 +251,20 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       back into firmware (qsort's comparator) are real
                       RV32 code instead; cpu/encode.rs is the const-fn
                       RV32IM encoder those code blobs are assembled with.
+  src/clock.rs        Chip-agnostic emulated time (Milestone 6): Clock
+                      converts executed steps into ticks of a fixed-rate
+                      timer at a CPU frequency that can change
+                      (cycles_per_step = 1, CPI 1), carrying the sub-tick
+                      remainder and rescaling it on a frequency switch,
+                      so time never drifts; idle fast-forward time is
+                      charged in whole ticks and counted apart
+                      (idle_ticks). FirmwareBus::clock runs it against
+                      the 16 MHz SYSTIMER (mem/soc.rs SYSTIMER_HZ) at
+                      the frequency System::cpu_hz selects: one tick per
+                      five steps at 80 MHz, two per five at 40 MHz.
+                      SYSTIMER, the USB packet timing, the RTC timer,
+                      emulated_time_us and run_until all read this one
+                      clock. Knows no ESP32-C3 constant.
   src/md5.rs          Chip-agnostic MD5 in Colin Plumb's context shape
                       (the ROM's md5_context_t layout), shared by the ROM
                       MD5 stubs (RomStubEffect::Md5, Task D13) and
@@ -278,8 +318,14 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       frequency System::cpu_hz selects),
                       SYSTEM's FROM_CPU software-interrupt registers
                       and its CPU_PER_CONF/SYSCLK_CONF clock registers
-                      with System::cpu_hz (system.rs, Milestone 6 Task
-                      2; the rest of SYSTEM is unmapped),
+                      (system.rs, Milestone 6; the rest of SYSTEM is
+                      unmapped): System::cpu_hz decodes them as
+                      rtc_clk_cpu_freq_get_config does (XTAL 40 MHz /
+                      (PRE_DIV_CNT + 1), PLL 80/160 MHz, RC_FAST 20 MHz),
+                      the bus applies it to the clock once per step,
+                      after the instruction (never a byte-split half
+                      write), and an invalid encoding keeps the previous
+                      frequency,
                       SYSCON/APB_CTRL's RNG data register (apb_ctrl.rs:
                       a fixed-seed xorshift32, one value per word read,
                       for esp_random(); Task D-M5-3), GPIO
@@ -294,8 +340,10 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       the descriptor walk reads RAM, so it is
                       FirmwareBus::gdma_pull), TIMG0/TIMG1 (timg.rs: RTC
                       slow-clock calibration, inert watchdog storage) and
-                      RTC_CNTL (rtc_cntl.rs: the RTC timer and the
-                      RTC_XTAL_FREQ_REG store). console.rs is the capped
+                      RTC_CNTL (rtc_cntl.rs: the RTC timer, which counts
+                      SYSTIMER time in RC slow-clock cycles since
+                      Milestone 6, and the RTC_XTAL_FREQ_REG store).
+                      console.rs is the capped
                       byte sink for firmware output. Its one feed is the
                       USB-Serial-JTAG EP1 TX FIFO (usb_serial_jtag.rs, the
                       badge's real console), written both by firmware
@@ -354,8 +402,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       above. Also the guest-executed ROM code blobs
                       (`ESP32C3_ROM_CODE`: the one-`jal` jump-table slot
                       plus body of qsort (insertion sort), of strdup,
-                      and of the ets_get/update_cpu_frequency pair
-                      over the ROM .data s_ticks_per_us (Milestone 6),
+                      and of the ets_get/update_cpu_frequency pair,
+                      stateful over the ROM .data s_ticks_per_us as in
+                      the real ROM (Milestone 6; the firmware's own
+                      bookkeeping, not the clock's source; there is no
+                      CPU_FREQ_MHZ constant any more),
                       in ROM ranges no linker-script symbol points into;
                       strdup reaches the firmware's `_malloc_r` through
                       the ROM `.bss` `syscall_table_ptr` word at
@@ -364,8 +415,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       layout table, values from Espressif's ROM ELF),
                       and the ROM's writable `.data` boot reads
                       (`esp32c3_rom_ram_initializers`: the SPI-flash legacy
-                      data, `chip_size` from the image header, plus the
-                      bootloader's `RTC_XTAL_FREQ_REG` store, Task D12), all
+                      data, `chip_size` from the image header, the
+                      bootloader's `RTC_XTAL_FREQ_REG` store, Task D12,
+                      and since Milestone 6 the clock state the
+                      bootloader leaves: `SYSCLK_CONF` = PLL, 80 MHz, and
+                      `s_ticks_per_us` = 80), all
                       installed by boot.rs alongside the stub table. Addresses
                       sourced from ESP-IDF's own linker scripts, not
                       guessed — see docs/firmware-emulator-notes.md.
@@ -386,7 +440,11 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       data (the ROM's SPI-flash legacy data, and the
                       RTC_CNTL register the bootloader stores the XTAL
                       frequency in, written through the bus) lives in
-                      rom.rs.
+                      rom.rs. boot::step_with_interrupts runs one step
+                      (interrupt delivery, then WFI fast-forward or an
+                      instruction);
+                      boot::idle_until bounds an idle wait at a
+                      run_until target (Milestone 6 Task 7).
   src/runtime.rs      FirmwareRuntime: the whole emulator as one owned,
                       driveable object. Buttons are addressed by raw slot
                       index here (0 = direct-GPIO START, 1..=8 = shift-
@@ -397,15 +455,22 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       serial_input/serial_pending (bytes a USB host sends
                       to the console) and set_acceleration (what the
                       SC7A20H reports, in mg; default face up, (0, 0,
-                      +1000); survives reset). FirmwareRuntime is Clone:
+                      +1000); survives reset). Emulated time (Milestone
+                      6): emulated_time_us (the clock's time since boot
+                      or reset) and run_until(target_us, max_steps),
+                      which runs until that time or the step cap; an idle
+                      wait stops exactly at the target. The rungs' and
+                      the browser's holds and pacing use it.
+                      FirmwareRuntime is Clone:
                       a clone is a full snapshot, which the boot rungs use
                       as shared checkpoints.
 emulator-wasm/        Thin wasm-bindgen shim over emulator-core — logic-free
                       by design (see its module doc re: why framebuffer()
                       returns an owned Vec, not a borrowed slice, to avoid a
                       use-after-free across WASM-heap-growing calls;
-                      serialInput, serialPending and setAcceleration are
-                      one-line passthroughs too). Built
+                      serialInput, serialPending, setAcceleration,
+                      runUntil and emulatedTimeUs are one-line
+                      passthroughs too). Built
                       via `bun run build:wasm` into
                       frontend/src/cpu/wasm-pkg/ (gitignored). Consumed by
                       frontend/'s src/cpu/bridge.ts,

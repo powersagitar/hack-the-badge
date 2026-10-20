@@ -63,15 +63,17 @@ use crate::peripherals::spi::{SCREEN_HEIGHT, SCREEN_WIDTH};
 /// the module doc.
 pub const NUM_RAW_BUTTON_SLOTS: usize = 1 + crate::peripherals::gpio::HC165_SLOTS;
 
-/// What one [`FirmwareRuntime::run`] call did. Plain `Copy` data so the WASM
+/// What one [`FirmwareRuntime::run`], [`FirmwareRuntime::run_until`] or
+/// [`FirmwareRuntime::run_traced`] call did. Plain `Copy` data so the WASM
 /// shim can hand each field across the boundary as a scalar without needing
 /// its own serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunSummary {
     /// How many `step()` calls this run made. For [`FirmwareRuntime::run`]
-    /// this equals the requested budget (this runtime has no halt state —
-    /// even a firmware stuck in a trap loop keeps consuming steps, and so
-    /// does a core parked in `WFI`: each waiting step counts once); for
+    /// and [`FirmwareRuntime::run_traced`] this equals the requested budget
+    /// (this runtime has no halt state — even a firmware stuck in a trap
+    /// loop keeps consuming steps, and so does a core parked in `WFI`: each
+    /// waiting step counts once); for
     /// [`FirmwareRuntime::run_until`] it can be fewer, when the target time
     /// is reached first.
     pub steps: u32,

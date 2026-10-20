@@ -397,18 +397,157 @@ hardware self-test, each raw slot lights the on-screen label of the
 button in this table (slot 8 is the self-test's "SideSwitch"). That is
 the firmware agreeing with the table, still not a press on real hardware.
 
+## Timing model
+
+Since Milestone 6 the emulator has one notion of emulated time, and every
+timed peripheral, the button holds and the browser's pacing read it.
+Decisions and measurements are in
+[`milestone-6-decisions.md`](milestone-6-decisions.md).
+
+**The clock.** `emulator-core/src/clock.rs`'s `Clock` is chip-agnostic:
+it converts executed steps into ticks of a fixed-rate timer at a CPU
+frequency that can change. For the ESP32-C3 the timer is SYSTIMER at
+`SYSTIMER_HZ` = 16 MHz (`mem/soc.rs`; ESP-IDF's `systimer.c`, 40 MHz /
+2.5) and each step is `cycles_per_step` = 1 CPU cycle. A step adds
+`cycles * timer_hz` to a remainder kept in units of `1 / cpu_hz` of a
+tick and completes a tick each time the remainder passes `cpu_hz`, so
+the conversion never drifts: at 80 MHz exactly one tick every five
+steps, at 40 MHz two ticks every five. A frequency switch rescales the
+pending remainder (`remainder * new / old`); for every pair of the
+rates the firmware can reach here (20 MHz at register reset, 40, 80 and
+160 MHz, against 16 MHz) that division is exact, so a switch loses or
+invents no time. `Clock::total_ticks` is all emulated time,
+`Clock::idle_ticks` the part charged by idle fast-forwards. Steps that
+complete no tick leave SYSTIMER untouched (`tick_peripherals` skips
+them).
+
+**Dynamic frequency scaling, 40/80 MHz.** The firmware runs ESP-IDF
+power management: it drops the CPU to the 40 MHz XTAL clock around each
+idle and returns to the 80 MHz PLL when busy (a probe while planning
+counted 1,419 switches each way in 30M steps of blank-flash boot plus
+the self-test; never 160 MHz). It
+switches through two SYSTEM registers, `SYSTEM_CPU_PER_CONF_REG`
+(`0x600c_0008`) and `SYSTEM_SYSCLK_CONF_REG` (`0x600c_0058`), modeled
+in `peripherals/system.rs` from ESP-IDF v5.5.3's `system_reg.h`,
+`clk_tree_ll.h` and `rtc_clk_cpu_freq_get_config`. `System::cpu_hz`
+decodes them (XTAL / (`PRE_DIV_CNT` + 1), PLL 80 or 160 MHz by
+`CPUPERIOD_SEL`, RC_FAST 20 MHz). `FirmwareBus::sync_cpu_clock` applies
+it once per step, after the instruction, so the four byte-lane writes
+of one `sw` are never seen half done, and at the start of each idle
+fast-forward. An invalid encoding (`SOC_CLK_SEL` = 3, `CPUPERIOD_SEL` >=
+2) keeps the previous frequency and never panics. The shortcut boot
+seeds what the skipped 2nd-stage bootloader leaves: `SYSCLK_CONF` =
+`1 << 10` (PLL, 80 MHz) and the ROM's `s_ticks_per_us` = 80 (ruling
+R-T2-4); a bare test bus has no seeds and starts at 40 MHz, then its
+first step applies the register reset value, XTAL / 2 = 20 MHz.
+
+**The ROM frequency pair is bookkeeping, not the clock.** ROM
+`ets_update_cpu_frequency`/`ets_get_cpu_frequency` are guest code
+transcribed from the rev3 ROM ELF over `s_ticks_per_us`. The firmware
+uses the stored value to convert cycle counts to microseconds and to
+print `cpu freq: 80000000 Hz`; the clock's rate comes from the
+registers only.
+
+**The cycle counter.** `mpccr` (CSR `0x7e2`) counts one cycle per
+working step at CPI 1 and nothing for a step spent waiting in `WFI`, so
+idle fast-forward time is not counted.
+
+**Idle fast-forward.** When the core waits in `WFI` with no interrupt
+line asserted, `boot::step_with_interrupts` jumps to the next event,
+`FirmwareBus::ticks_until_next_event` (the next SYSTIMER alarm or the
+next USB packet), in one step, and charges the jump to the clock as idle
+ticks. With nothing armed, an idle step costs an ordinary step's time.
+Snake's CPU is idle about 96 % of the time, so most of its emulated
+time costs almost no steps.
+
+**USB packet time.** One USB-Serial-JTAG OUT packet occupies the bus
+for 51.3 us, `PACKET_TICKS` = 821 SYSTIMER ticks (about 4,105 steps at
+80 MHz). The host's gap between 64-byte `put` chunks,
+`PUT_CHUNK_GAP_STEPS` = 48,000, stays in steps: it is the host waiting
+for the firmware's console task to drain its RX ring, which is CPU
+work (24,000 still passes; 12,000 does not).
+
+**The RTC timer.** RTC_CNTL's `TIME_UPDATE` snapshot converts SYSTIMER
+ticks to RC slow-clock cycles at `RC_SLOW_HZ / SYSTIMER_HZ` (136,000
+cycles per emulated second), so `rtc_init()`'s waits on it take their
+real time (Task D-M6-1).
+
+**Emulated time and `run_until`.** `FirmwareRuntime::emulated_time_us`
+is the clock's time since boot or the last reset.
+`FirmwareRuntime::run_until(target_us, max_steps)` runs until emulated
+time reaches the target or the step cap, whichever is first, checking
+before each step; it reports the steps used. When the core waits in
+`WFI`, nothing is asserted and the next event lies past the target,
+`boot::idle_until` advances idle time only to the target, takes no
+step, and stops, so a run that ends idle ends exactly on its target
+(`run_until_ends_idle_frames_at_the_target`). Splitting one idle wait in
+two changes nothing the guest sees: the alarm comes at the same tick and
+the waking step is the same step, taken by the next run. A run that ends
+busy overshoots by at most one step's time, and so can an idle run with
+nothing armed (negligible either way).
+Before `idle_until`, every 8.3 ms browser frame ended on the next 10 ms
+FreeRTOS tick, 1,667 us late, and the badge ran at 1.2x. The rungs, the
+WASM twin and the browser hold a button press for `PRESS_HOLD_US` =
+100 ms and shake in `SHAKE_HALF_US` = 62.5 ms half-periods of emulated
+time (`run_for_us` over `run_until`).
+
+**CPI.** `cycles_per_step` = 1 says every instruction takes one CPU
+cycle. The real core takes more for some (loads, taken branches, divides,
+flash cache misses), so busy work finishes sooner in emulated time than
+on the badge. CPI 1 stands after the hardware comparison (Milestone 6
+Task 5): Snake moves every 170 ms in the emulator and every 170.0 ms on
+average on the badge. That comparison could not have moved CPI anyway:
+the move interval is the firmware's own timer period, with the CPU about
+96 % idle in between. Busy work (a redraw, a Dice animation) has not
+been timed against the badge.
+
+**Pacing in the browser.** `frontend/src/runtime/firmware-runtime.ts`
+runs one `runUntil` per `requestAnimationFrame`, to the previous
+frame's emulated time plus the wall-clock delta since the previous
+frame:
+
+- The delta is clamped to `MAX_FRAME_DELTA_MS` = 50 ms, so a tab back
+  from the background gets 50 ms, not a catch-up burst. The first frame
+  after `start()` or `reset()` runs nothing.
+- `DEFAULT_STEPS_PER_FRAME` = 150,000 steps caps one frame's work. It is
+  measured (ruling R-T7-5): with the first cap of 1,000,000, a busy
+  stretch ran at 9.6 fps in the human's browser, so about 104 ms per
+  frame and about 10M steps/s (Bun's JavaScriptCore runs the same WASM at
+  12.3M steps/s), and 104 ms frames gave a 328 ms INP. 150,000 steps is
+  12 to 15 ms of work, about one 60 Hz frame. Snake needs about 4,000 to
+  30,000 steps per 8.3 ms frame and about 230,000 for a frame that
+  redraws a move, so only move frames hit the cap.
+- A capped frame drops its debt: the next frame targets its own
+  `now + delta`, so the emulator runs in slow motion instead of freezing
+  the tab to catch up.
+- `speed()` is each frame's emulated advance over its real, unclamped
+  wall delta, smoothed (weight 0.1), shown as `N.Nx` in the firmware
+  status line. Below 1.0x the cap binds (or frames take longer than
+  50 ms). A tab back from the background adds one near-zero sample.
+- The provisioner's timeout and chunk gap stay in steps (host pacing
+  against CPU work); holds and the shake are emulated time.
+
+Measured by the human on 2026-10-20: Snake runs at 0.9x to 1.0x and 100
+to 110 fps with a 64 ms INP and feels like the badge. Busy screens cannot
+keep up: at about 10M steps/s against 80M cycles/s, a fully busy stretch
+tops out near 0.12x. Each launcher move dips the readout to about 0.1x
+and the frame rate to 60 fps, the screen repaints visibly top to bottom,
+and onboarding and the launcher show input lag. Core throughput is on
+the Milestone 7 backlog.
+
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 5)
+### Current state (end of Milestone 6)
 
 Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
 synthetic flash through `app_main` to My Badge's first-run screen, and
 from there, provisioned through the firmware's own USB console with a
 committed fake identity, through the onboarding app to the app launcher,
-which responds to navigation. From a cold boot (release build, role
-hacker; step counts are emulated steps, not time, re-measured in
-Milestone 6 Task 3, when emulated time started following the firmware's
-CPU frequency):
+which responds to navigation and opens Dice and Snake. Snake is playable.
+From a cold boot (release build, role hacker; step counts are emulated
+steps, not time, under the Milestone 6 clock: re-measured after Task
+D-M6-1, the last Milestone 6 change that moved them; see "Timing model"
+above for how steps relate to emulated time):
 
 - The boot splash is final from about step 4.43M (`boots_to_first_real_frame`,
   hash `0x5599c270ab0429fa`). My Badge's first-run screen ("Not
@@ -459,9 +598,9 @@ CPU frequency):
   hardware.
 - No fault, no panic text on the way. Still unmodeled on this path: the
   LEDs (`prov apply`'s green flashes and role colour are sent over RMT
-  but not shown) and NFC. Snake launches but ends in "Game over" before
-  any input (backlog).
-- **A built-in app: Dice** (Task 9 stretch, rung `launcher_opens_dice`).
+  but not shown) and NFC.
+- **A built-in app: Dice** (Milestone 5 Task 9 stretch, rung
+  `launcher_opens_dice`).
   From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
   (`launched Dice`; first stable frame `0x9be3a4205d54f3ff`, "d20", "--").
   A rolls: "2" (`0x692c6023de06d917`; open at about 468.9M, rolled at
@@ -470,7 +609,43 @@ CPU frequency):
   deterministic and not the badge's roll. The human partner compared the
   open and rolled frames and the roll animation with the physical badge
   on 2026-10-08: the pictures match, and the animation matches but plays
-  a bit faster (emulated time; see the decisions' Remarks).
+  a bit faster (seen under the pre-Milestone-6 clock and not re-checked
+  since; see the Milestone 5 decisions' Remarks).
+- **Snake is playable** (Milestone 6). From the launcher, DOWN x3, RIGHT
+  x2 and A launch it (`launched Snake`; A is released at about step
+  449.2M, 118.87 s of emulated time). Snake does not wait for a key: the
+  start screen is drawn 56 to 75.5 ms after A's release and pinned 150 ms
+  after it (`launcher_opens_snake`, `0xe7d5_38c7_42f1_9d89`), and the
+  snake moves right one 12 px cell every 170 ms, exactly
+  (`snake_moves_on_its_own`). UP after the first move turns it
+  (`snake_steers`, `0xcccb_b8c5_d80a_93e9`); with no input it makes 11
+  moves and the 12th tick draws "Game over / A to restart"
+  (`snake_hits_wall_game_over`, `0x3582_df91_6283_9f3a`), and A restarts
+  at once. A scripted DOWN and RIGHT eat the food, which the fixed-seed
+  RNG puts at cell (23, 14) (`snake_eats`, `0x8275_2f57_3ba4_ddab`).
+  The human partner compared the start, after-turn and game-over frames
+  and the speed with the physical badge on 2026-10-20 (the badge moves
+  every 170.0 ms on average, 11 moves to the wall): they match. The
+  after-eat frame was not compared (the badge's food comes from its real
+  RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
+  like the badge (the human's check, 2026-10-20).
+
+**Resolved in Milestone 6** (details in "Timing model" above, the history
+below and [`milestone-6-decisions.md`](milestone-6-decisions.md)):
+
+- One emulated clock (`clock.rs`) that follows the firmware's own CPU
+  frequency through the SYSTEM clock registers (40/80 MHz), replacing
+  `TICKS_PER_STEP` = 1, which ran the CPU about 5x too slow against
+  SYSTIMER (Tasks 1 to 3).
+- The ROM `ets_get_cpu_frequency`/`ets_update_cpu_frequency` pair is
+  stateful guest code; the `CPU_FREQ_MHZ` = 160 stub is gone and boot
+  logs `cpu freq: 80000000 Hz`, as the badge does (Task 2).
+- USB packet time in SYSTIMER ticks (`PACKET_TICKS`, Task 3) and the RTC
+  timer in SYSTIMER time (Task D-M6-1).
+- Snake: it used to reach "Game over" with no input; it is now playable
+  and compared with the badge (Tasks 4 to 6, stretch Task 8).
+- The browser paces the emulator to wall-clock time, with a speed
+  readout (Task 7), and flushes deferred button releases in `stop()`.
 
 **Resolved in Milestone 5** (details in the history below and in
 [`milestone-5-decisions.md`](milestone-5-decisions.md)):
@@ -527,14 +702,18 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
+**Open limitations (Milestone 7 candidates)** (the Milestone 7 backlog in
+`milestone-6-decisions.md` is the complete list):
 
-**Open limitations (Milestone 6 candidates)** (the Milestone 6 backlog in
-`milestone-5-decisions.md` is the complete list):
-
-1. **Only one built-in app is playable.** Dice opens from the launcher and
-   rolls (`launcher_opens_dice`). Snake launches but reaches "Game over"
-   with no input (Milestone 6 backlog; observed with `RND_DATA` reading 0,
-   before the PRNG, and not re-checked).
+1. **Busy screens run slower than real time.** The emulator core runs
+   about 10M to 12M steps per second (native release and the browser
+   alike) against the badge's 80M cycles per second, so a stretch where
+   the CPU is busy (a full-screen redraw, onboarding, the launcher)
+   plays back about 8x slower than on the badge. Idle-dominated apps such
+   as Snake keep real time (see "Timing model"). In the browser a
+   launcher move dips the readout to about 0.1x, the screen visibly
+   repaints top to bottom, and input waits behind the redraw. Only two
+   built-in apps (Dice and Snake) are checked; the others are untested.
 2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
@@ -547,12 +726,9 @@ plan text), plus the full Milestone 4 backlog, are in
    answers on I2C0; any other I2C address is NACKed. RMT transmissions
    are consumed but not shown, and NFC is not modeled.
 4. The dormant items from the history below: flagged ROM-stub guesses
-   (item 5; the `CPU_FREQ_MHZ` = 160 stub is gone since Milestone 6 Task
-   2, and since Task 3 the USB packet pacing is bus time, `PACKET_TICKS`,
-   not 160 MHz steps) and simplified edge interrupts (item 9). Item 6
-   (`TICKS_PER_STEP = 1`) is resolved: since Milestone 6 Task 3 the clock
-   follows the firmware's CPU frequency (one cycle per step). Item 7 (the bootloader's
-   extra DROM page) is resolved: the MMU seeds entry 127.
+   (item 5) and simplified edge interrupts (item 9). (Items 6 and 7 are
+   resolved; so is the old `CPU_FREQ_MHZ` = 160 stub, see "Resolved in
+   Milestone 6".)
 5. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
@@ -570,6 +746,11 @@ plan text), plus the full Milestone 4 backlog, are in
    Task 3 moved them (to `W (25)`, `I (12)`..`I (14)`, while RTC time ran
    at 0.4 of emulated time) and Task D-M6-1 moved them back to exactly
    these values. They have not been compared with the badge's values.
+7. **Snake's game-over draw after an eat comes late.** With no eat, the
+   game-over box is drawn 22 ms after the tick that hits the wall; after
+   an eat (`snake_eats`), 50 to 134 ms after it. Not explained (a
+   high-score save is a guess, not verified), and not compared with the
+   badge.
 
 ### Ground truth from the physical badge
 
@@ -586,6 +767,14 @@ data:
   `factory` 0x10000/0x2a0000, `storage` 0x2b0000/0x140000.
 
 ### History: the stall-by-stall log (Milestones 2 and 3)
+
+**Step numbers in this history are as each task measured them.** Every
+step count in the entries before "Milestone 6 Task 1" is
+pre-Milestone-6: SYSTIMER advanced one tick per step and boot ran at
+those steps, which the Milestone 6 clock moved (early boot by a few
+hundred steps, the walks to the launcher and Dice by a few million).
+The Milestone 6 entries give old and new figures; the current ones are
+in "Current state" above.
 
 As of the Milestone 2 merge, real-firmware boot runs 2,000,000+ instructions
 with zero traps, then stalls inside `rtc_clk_cal()`, polling an unmodeled
@@ -2476,6 +2665,34 @@ the first yield is at 528,313, `MD5Init` at 4,450,328, the splash final at
 launcher stable at 365.0M and the Dice roll at 479.3M; holds still cost
 0.18M..6.93M steps. No frame hash moved.
 
+### Milestone 6 Tasks 4 and 5: Snake opens; compared with the badge
+
+- **Task 4, exploration from the hacker launcher checkpoint** (DOWN x3,
+  RIGHT x2, A held 100 ms; A released at 118,871,665 us, step
+  449,179,709): `app_reg: launched Snake`, and with the new clock Snake
+  no longer starts at the wall. It does not wait for a key: the start
+  screen is drawn 56 to 75.5 ms after A's release, the snake (three
+  cells, middle row, heading right) makes its first move at about 222 ms
+  and then one 12 px cell every 170 ms exactly. With no input it makes 11
+  moves, and the 12th tick draws "Game over / A to restart" (2,105 to
+  2,114 ms after release; stable). A restarts at once with a new food
+  position. Rungs `launcher_opens_snake` (start frame time-pinned 150 ms
+  after release, `0xe7d5_38c7_42f1_9d89`, ruling R-T4-1) and
+  `snake_hits_wall_game_over` (12 play-area changes from the open frame:
+  11 moves and the game-over redraw; `0x3582_df91_6283_9f3a`; R-T4-2 for
+  the restart check). 5 s of Snake is 17.6M steps. Snake's earlier
+  failure (at the wall from the first frame, game over about 2M steps
+  later) was the old one-tick-per-step clock, which ran the CPU about 5x
+  too slow against the game's timer.
+- **Task 5, the human gate (2026-10-20).** From the human's phone video
+  of the physical badge, measured frame by frame: 170.0 ms mean between
+  moves over 10 intervals (170.8 ms over 17 in a run with one turn), 11
+  moves to the wall, the same 24 x 16-cell play area and start cell. The
+  emulator's 170,000 us is inside ±25 %, so CPI 1 stands (no
+  calibration). The start, after-one-turn and game-over frames were
+  accepted as matching. Between moves the CPU is idle 95.7 % of the time.
+  Figures: `docs/milestone-6-decisions.md`, "Task 5".
+
 ### Milestone 6 Task 6: Snake's speed and steering rungs
 
 - **Done:** `snake_moves_on_its_own` counts Snake's moves for 1.2 s from
@@ -2495,6 +2712,37 @@ launcher stable at 365.0M and the Dice roll at 479.3M; holds still cost
   also breaks the start frame, the turn frame and the move count to the
   wall, which the other three Snake rungs catch. Figures:
   `docs/milestone-6-decisions.md`, "Task 6".
+
+### Milestone 6 Task 7: browser pacing
+
+- **Done:** the browser frame loop runs `runUntil` to each frame's
+  wall-clock target with the delta clamped to 50 ms and a step cap per
+  frame; a capped frame drops its debt; the status line shows the speed
+  ratio; `stop()` flushes deferred releases (see "Timing model").
+- **The human's first browser check (2026-10-20)** found a steady 1.2x
+  readout on Snake, and 9.6 fps with a 328 ms INP in busy stretches.
+  The 1.2x was the WFI fast-forward jumping past `run_until`'s target to
+  the next 10 ms FreeRTOS tick (1,667 us late per 8,333 us frame):
+  `boot::idle_until` now stops an idle wait at the target (new rung
+  `run_until_ends_idle_frames_at_the_target`; a probe of 600 frames then
+  measured 0 us late, ratio 1.000). The 9.6 fps measured the browser at
+  about 10M steps/s, so the step cap went from 1,000,000 to 150,000.
+  No rung pin moved.
+- **Re-check:** Snake runs at 0.9x to 1.0x and 100 to 110 fps (INP
+  64 ms) and feels like the badge; busy screens (the launcher, onboarding)
+  dip to about 0.1x and repaint visibly, because the core runs about 10M
+  to 12M steps/s against the badge's 80M. The human accepted Task 7 and
+  put core throughput on the Milestone 7 backlog.
+
+### Milestone 6 Task 8: Snake eats (stretch)
+
+`snake_eats`: the fixed-seed RNG puts the first food at cell (23, 14);
+DOWN after the first move and RIGHT six moves later steer the snake into
+it on move 17, and the after-eat frame (four cells long, new food at
+(15, 13), score 1) is pinned (`0x8275_2f57_3ba4_ddab`, not compared with
+the badge, whose food comes from its real RNG). Open question: after an
+eat the game-over draw comes 50 to 134 ms after the tick instead of 22
+ms (Milestone 7 backlog).
 
 ## Emulated flash chip: what it contains
 
