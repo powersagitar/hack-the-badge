@@ -152,6 +152,14 @@ describe("RAW_SLOT_BY_BUTTON", () => {
   });
 });
 
+describe("DEFAULT_STEPS_PER_FRAME", () => {
+  test("fits about 15 ms of work at the measured browser rate", () => {
+    // About 10M steps/s in the browser (1M-step frames ran at 9.6 fps) and
+    // 12.3M under Bun's JavaScriptCore: 150,000 steps is 12 to 15 ms.
+    expect(DEFAULT_STEPS_PER_FRAME).toBe(150_000);
+  });
+});
+
 describe("frameTargetUs", () => {
   test("advances emulated time by the wall delta", () => {
     expect(frameTargetUs(1_000, 16)).toBe(17_000);

@@ -29,7 +29,9 @@
  *
  * Emulated time follows `requestAnimationFrame` time: each frame runs the
  * emulator (`FirmwareEmulatorHandle.runUntil`) until its emulated clock has
- * advanced by the wall-clock time since the previous frame, so the firmware's
+ * advanced by the wall-clock time since the previous frame (exactly: an idle
+ * wait stops at the target instead of jumping to the next alarm,
+ * `emulator-core`'s `boot::idle_until`, ruling R-T7-4), so the firmware's
  * own timers (Snake's move period, the button polling, animations) run at the
  * badge's speed. The first frame after `start()` (or `reset()`) has no
  * previous frame and runs nothing, so a paused or backgrounded runtime does
@@ -40,12 +42,20 @@
  * - The wall delta is clamped to `MAX_FRAME_DELTA_MS` (50 ms). A tab that
  *   comes back from the background, or a frame the browser delayed, gets at
  *   most 50 ms of emulated time, not a catch-up burst.
- * - `DEFAULT_STEPS_PER_FRAME` (1,000,000 steps) caps the work per frame. The
+ * - `DEFAULT_STEPS_PER_FRAME` (150,000 steps) caps the work per frame. The
  *   emulated clock advances by more than one step's worth per step while the
  *   CPU waits in WFI (the SYSTIMER fast-forward), so a mostly idle firmware
- *   reaches its target in far fewer steps than 80 MHz x the delta. The cap is
- *   a documented guess, not a measurement: tune it only by measuring the
- *   frame time in a real browser.
+ *   reaches its target in far fewer steps than 80 MHz x the delta. Snake
+ *   needs about 4,000 to 30,000 steps per 8.3 ms frame, and about 230,000
+ *   for a frame that redraws a move. The cap is measured (Milestone 6
+ *   Task 7, ruling R-T7-5; `docs/milestone-6-decisions.md`). With the
+ *   first cap of 1,000,000 steps, a busy stretch after onboarding ran at
+ *   9.6 fps in the human's browser, so about 104 ms per frame, or about
+ *   10M steps/s. Bun's JavaScriptCore runs the WASM at 12.3M steps/s.
+ *   150,000 steps is 12 to 15 ms of work, about one 60 Hz frame. Long
+ *   frames also delay input: a key event waits for the running frame, and
+ *   its paint waits for the next one, so 104 ms frames gave the measured
+ *   328 ms INP.
  *
  * When the cap binds, the frame stops short of its target and the missed
  * emulated time (the debt) is dropped: the next frame targets its own
@@ -69,7 +79,7 @@ import { createProvisioner, type ProvisionState, type Provisioner } from "./prov
 export const MAX_FRAME_DELTA_MS = 50;
 
 /** Most instruction steps one frame runs; see "Pacing" above. */
-export const DEFAULT_STEPS_PER_FRAME = 1_000_000;
+export const DEFAULT_STEPS_PER_FRAME = 150_000;
 
 /**
  * Human button name -> raw slot index, as consumed by

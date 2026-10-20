@@ -624,5 +624,67 @@ Checks (after R-T6-3): release `boot_progress` 60 passed in 41.2 s;
 `cargo test --workspace` green (`boot_progress` 27.9 s, before R-T6-3);
 clippy 3 warnings (unchanged); `cargo fmt --check` clean.
 
+### Task 7: browser pacing to wall-clock time
+
+The browser's frame loop now runs the emulator to each frame's wall-clock
+target (`runUntil`), with the wall delta clamped to 50 ms and a step cap
+per frame; a capped frame drops its debt, and `speed()` (the status
+line's `N.Nx`) shows the smoothed emulated/wall ratio over the real,
+unclamped frame time (R-T7-2).
+
+**The human's browser check (Step 5, 100-120 Hz display) found:**
+
+- **Steady 1.2x while Snake runs (R-T7-4).** The cause is in
+  `emulator-core`: `run_until` stopped only between steps, and the WFI
+  idle fast-forward jumped to the next SYSTIMER alarm even past the
+  target. With FreeRTOS's 10 ms tick, a probe of 600 `run_until` calls
+  of 8,333 us measured:
+  - First-run screen: every frame ended 1,667 us late (on the next tick
+    boundary). Ratio 1.200.
+  - Snake: frames ended a mean of 1,643 us late. Ratio 1.197.
+
+  Each frame's target is `now + delta`, so the lateness accumulated.
+  **Fix**: `boot::idle_until`. When the core waits in WFI with nothing
+  asserted and the next event lies past the target, `run_until` advances
+  the idle time only to the target, takes no step, and stops. The same
+  probe then measured 0 us late on all 600 frames in both places, a
+  ratio of 1.000. Splitting one idle wait into two charges changes
+  nothing the guest sees (the alarm is reached at the same tick, and the
+  waking step is the same step, taken by the next run). All 60
+  `boot_progress` rungs pass with no pin moved, including the rungs whose
+  holds end inside an idle wait. The new rung
+  `run_until_ends_idle_frames_at_the_target` pins it: 120 frames of
+  8,333 us on the first-run screen, each ending exactly at its target.
+  Before the fix it failed on frame 0, at 1,401,616 us against a target
+  of 1,400,005 us.
+- **0.2x and 9.6 fps after onboarding; 328 ms INP (R-T7-5).** At the
+  first cap of 1,000,000 steps, a busy stretch ran at 9.6 fps, so a
+  frame took about 104 ms and the browser ran about 10M steps/s. Bun's
+  JavaScriptCore runs the same WASM at 12.3M steps/s (busy boot, 16M
+  steps; `framebuffer()` copies in 0.02 ms). **`DEFAULT_STEPS_PER_FRAME`
+  = 150,000**, which is 12 to 15 ms of work at those rates, about one
+  60 Hz frame. Snake needs about 4,000 to 30,000 steps per 8.3 ms frame
+  and about 230,000 for a frame that redraws a move, so only move frames
+  are capped (about half a frame of debt each, every 170 ms). Busy
+  firmware still runs slowly: at about 10M steps/s against the badge's
+  80 MHz, a fully busy stretch cannot exceed about 0.12x in the browser.
+- **Input lag.** Button events reach the emulator at once:
+  `shell.ts`'s mousedown/keydown handlers call `injectButton`, which
+  calls `setRawButton` synchronously, with no queue and no wait for a
+  frame. The firmware acts on the press, not the release: on the hacker
+  launcher, DOWN held without release redraws the selection 60 ms (of
+  emulated time) after the press. So `PRESS_HOLD_US` (which only defers a
+  release) adds no lag. The 60 ms is the firmware's own poll and redraw
+  and is not changed. The lag was the long frames: a key event waits for
+  the running frame (about 104 ms), and its paint waits for the next one,
+  which matches the 328 ms INP. The 150,000-step cap bounds both. The
+  browser gate re-measures it.
+
+Out of scope: the dev server's "ReferenceError: Can't find variable:
+process" comes from `fengari/src/luaconf.js` line 3, which reads
+`process.env.FENGARICONF` without a guard. It predates this branch:
+`frontend/package.json`, `frontend/bun.lock` and
+`frontend/vite.config.ts` are unchanged since `ed71dd8`.
+
 
 ## Milestone 7 backlog
