@@ -53,6 +53,12 @@
  * rather than stalling the tab to catch up; `FirmwareRuntime.speed()` (the
  * smoothed emulated/wall ratio, shown in the firmware status line) reports
  * it.
+ *
+ * `speed()` divides each frame's emulated advance by the real, unclamped
+ * wall delta. Frames longer than 50 ms are slow motion even when the step
+ * cap does not bind (each one advances only 50 ms), and the readout has to
+ * show that. A tab returning from the background therefore contributes one
+ * near-zero sample, at the smoothing's 0.1 weight.
  */
 import type { ButtonName } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
@@ -177,7 +183,9 @@ export function stepFirmwareFrame(
   handle.runUntil(target, stepsPerFrame);
   const after = handle.emulatedTimeUs();
   blitFramebuffer(ctx, handle.framebuffer(), handle.screenWidth, handle.screenHeight);
-  return { emulatedDeltaUs: after - before, capped: after < target };
+  // The wasm shim truncates the target to whole µs (`target_us as u64`), so
+  // an uncapped frame with a fractional rAF delta ends at floor(target).
+  return { emulatedDeltaUs: after - before, capped: after < Math.floor(target) };
 }
 
 export interface FirmwareRuntime {
@@ -200,7 +208,8 @@ export interface FirmwareRuntime {
   reset(): void;
   /**
    * Smoothed ratio of emulated time to wall-clock time over recent frames
-   * (1 = the badge's speed; below 1 when the step cap binds). `0` until the
+   * (1 = the badge's speed; below 1 when the step cap binds or frames take
+   * longer than `MAX_FRAME_DELTA_MS`). `0` until the
    * second frame after `start()` or `reset()`.
    */
   speed(): number;
@@ -315,7 +324,8 @@ export function createFirmwareRuntime(
     lastWallMs = timeMs;
     const r = stepFirmwareFrame(handle, ctx, delta, stepsPerFrame);
     if (delta > 0) {
-      const ratio = r.emulatedDeltaUs / (Math.min(delta, MAX_FRAME_DELTA_MS) * 1000);
+      // The real frame time, not the clamped one: see "Pacing" above.
+      const ratio = r.emulatedDeltaUs / (delta * 1000);
       speed = speed === 0 ? ratio : 0.9 * speed + 0.1 * ratio;
     }
     // The provisioner's timeout is in steps; holds and shakes in emulated time.

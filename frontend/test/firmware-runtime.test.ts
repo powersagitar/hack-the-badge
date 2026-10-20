@@ -53,7 +53,8 @@ interface FakeHandleOptions extends Partial<FirmwareEmulatorHandle> {
 /**
  * A hand-written fake `FirmwareEmulatorHandle` — no WASM involved, per
  * `bridge.ts`'s design intent. `runUntil(target, max)` advances a fake
- * emulated clock to `min(target, now + max * usPerStep)`.
+ * emulated clock to `min(floor(target), now + max * usPerStep)`; the floor
+ * mimics the wasm shim's `target_us as u64` truncation.
  */
 function makeFakeHandle(options: FakeHandleOptions = {}) {
   const { usPerStep = 1, ...overrides } = options;
@@ -79,7 +80,7 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
     runUntil(targetUs: number, maxSteps: number): CpuRunSummary {
       runUntilCalls.push([targetUs, maxSteps]);
       const before = timeUs;
-      timeUs = Math.max(before, Math.min(targetUs, before + maxSteps * usPerStep));
+      timeUs = Math.max(before, Math.min(Math.floor(targetUs), before + maxSteps * usPerStep));
       return {
         steps: Math.round((timeUs - before) / usPerStep),
         traps: 0,
@@ -179,6 +180,14 @@ describe("stepFirmwareFrame", () => {
     // The next frame targets now + 16 ms, not the missed time.
     stepFirmwareFrame(handle, ctx, 16, 100);
     expect(handle.emulatedTimeUs()).toBeCloseTo(2.5, 5);
+  });
+  test("a fractional target the emulator truncates to whole µs is not capped", () => {
+    const { handle } = makeFakeHandle();
+    const { ctx } = makeStubCtx();
+    // A 60 Hz rAF delta (16.667 ms): target 16,666.67 µs, run to 16,666.
+    const r = stepFirmwareFrame(handle, ctx, 1000 / 60, 1_000_000);
+    expect(handle.emulatedTimeUs()).toBe(16_666);
+    expect(r.capped).toBe(false);
   });
 });
 
@@ -375,6 +384,23 @@ describe("FirmwareRuntime pacing", () => {
     // 640,000 steps x 0.0125 µs = 8,000 µs per 16 ms frame: 0.5x.
     expect(rt.speed()).toBeCloseTo(0.5, 1);
   });
+  test("speed() divides by the real frame time, not the clamped one", () => {
+    const { rt, frameAt } = pacedRig();
+    rt.start();
+    frameAt(0);
+    // 100 ms frames: each target clamps to 50 ms, uncapped, so 0.5x.
+    for (let t = 100; t <= 100 * 30; t += 100) frameAt(t);
+    expect(rt.speed()).toBeCloseTo(0.5, 5);
+  });
+  test("speed() smooths a changing ratio", () => {
+    const { rt, frameAt } = pacedRig();
+    rt.start();
+    frameAt(0);
+    frameAt(16); // ratio 1: seeds speed
+    expect(rt.speed()).toBeCloseTo(1, 5);
+    frameAt(116); // ratio 0.5 (50 ms of a 100 ms frame)
+    expect(rt.speed()).toBeCloseTo(0.9 * 1 + 0.1 * 0.5, 5);
+  });
   test("stop() flushes deferred releases", () => {
     const { rt, buttonCalls, frameAt } = pacedRig();
     rt.start();
@@ -383,6 +409,11 @@ describe("FirmwareRuntime pacing", () => {
     rt.injectButton("A", "released");
     rt.stop();
     expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
+    // The flushed release is not replayed after a restart.
+    rt.start();
+    for (let t = 1_000; t <= 1_000 + 4 * 50; t += 50) frameAt(t);
+    const releasesOfA = buttonCalls.filter(([slot, p]) => slot === RAW_SLOT_BY_BUTTON.A && !p);
+    expect(releasesOfA.length).toBe(1);
   });
 });
 
