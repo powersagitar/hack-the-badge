@@ -474,4 +474,60 @@ provisional until Task 5 compares it with the physical badge.
 The food dot's positions come from the emulator's fixed-seed RNG, so
 they are not the badge's; Task 5 compares layout, not the food.
 
+### Task 5: Snake compared with the physical badge (human gate, 2026-10-20)
+
+**Emulator side** (from the open point, no input, 3 s window): the 10
+intervals between moves 1 and 11 are all exactly 170,000 us, so the
+median is **170,000 us** (about 5.88 moves/s); 11 moves to the wall, and
+the game-over redraw 184,000 us after the 11th move. The emulator's
+three frames (start screen at `SNAKE_OPEN_HASH`, the snake one move
+after one turn UP, and game over at `SNAKE_GAME_OVER_HASH`) were
+exported as PNGs for the comparison (kept under `local/`, not
+committed).
+
+**Badge side.** The human recorded the physical badge with a phone (an
+untouched run into the wall, and a run with one turn) and asked that the
+numbers be measured from the human's phone video of the physical badge.
+They were measured frame by frame (29.97 fps, true frame timestamps):
+
+| Question | Badge | Emulator |
+| --- | --- | --- |
+| time between moves, untouched run | mean 170.0 ms over 10 intervals (first-to-last-move mean, ±3 ms); per-interval median 166.7 ms, because single intervals quantize to 4 to 6 video frames | 170.0 ms, every interval |
+| time between moves, one-turn run | mean 170.8 ms over 17 intervals | n/a |
+| moves before game over, untouched | 11 | 11 (`SNAKE_MOVES_TO_WALL` = 12 counts the game-over redraw too, R-T4-1) |
+| one-turn run | one turn right → up: 10 moves right, then 8 up to the top wall | n/a |
+| geometry | play area about 24 × 16 cells; 3-cell snake starting rightward from the same cell | the same |
+| game-over screen | the same as the emulator's | "Game over / A to restart" |
+| start screen to first move | about 168 ms | about 150 to 170 ms |
+| last move to game-over overlay | about 200 ms | 184 ms gap |
+
+The last two rows agree within the video's frame quantization (33.4 ms
+per frame); recorded as an observation, no action.
+
+**Verdicts.** The human pointed at the videos instead of separate
+photos. All three emulator PNGs (open, after one turn, game over) are
+accepted as matching ("all pngs match"). The food position differs, as
+expected: the emulator's RNG has a fixed seed.
+
+**Comparison.** `BADGE_MOVE_INTERVAL_US` = 170,000 (defined in
+`boot_progress.rs`, citing this gate; Task 6's speed rung consumes it).
+|170,000 − 170,000| = 0 ≤ 170,000 / 4 = 42,500, inside ±25 %: no
+calibration. **CPI 1 stands.** No change to `cycles_per_step`
+(`mem/bus.rs`) or the `mpccr` cycle counter. Moves to the wall agree
+(11 = 11), and no frame was rejected.
+
+CPI could not have moved the interval anyway: the CPU spends 0.9567 of
+the 3 s window idle in WFI (`Clock::idle_ticks()` over
+`Clock::total_ticks()` deltas: 46,005,504 / 48,087,760 ticks; 0.9604 to
+0.9613 per move interval). Each 170 ms tick keeps it busy for only about
+6.6 ms, so the move interval is the firmware's own timer period, not CPU
+throughput. A mismatch would have pointed at the clock rules, not at
+CPI.
+
+With the comparison done, `SNAKE_OPEN_HASH`, `SNAKE_MOVES_TO_WALL` and
+`SNAKE_GAME_OVER_HASH` are compared with the badge; they are no longer
+provisional. The test file keeps one compile-time check on the new
+constant: `SNAKE_TO_WALL_WINDOW_US` must hold `SNAKE_MOVES_TO_WALL`
+ticks at the badge's pace (12 × 170,000 = 2,040,000 < 3,000,000 us).
+
 ## Milestone 7 backlog

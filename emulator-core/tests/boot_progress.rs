@@ -1694,6 +1694,15 @@ const SNAKE_MOVES_TO_WALL: usize = 12;
 /// area, the snake's head in the right-most column. Provisional until
 /// Task 5.
 const SNAKE_GAME_OVER_HASH: u64 = 0x3582_df91_6283_9f3a;
+/// The physical badge's time between Snake moves: the mean over 10
+/// intervals of an untouched run into the wall, measured frame by frame
+/// from the human's phone video of the badge at the Task 5 human gate
+/// (2026-10-20; ±3 ms). The emulator's 170,000 us matches it.
+const BADGE_MOVE_INTERVAL_US: u64 = 170_000;
+// `SNAKE_TO_WALL_WINDOW_US` must hold the badge's own run to the wall:
+// `SNAKE_MOVES_TO_WALL` ticks at the badge's pace.
+const _: () =
+    assert!(SNAKE_MOVES_TO_WALL as u64 * BADGE_MOVE_INTERVAL_US < SNAKE_TO_WALL_WINDOW_US);
 
 /// How long [`snake_hits_wall_game_over`] watches for a move after A's
 /// release on game over. The restarted game redraws its start screen
