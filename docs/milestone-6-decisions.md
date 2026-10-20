@@ -248,6 +248,35 @@ the code, this file and the code win.
   release is non-empty (three moves are expected). If wrong: a restart
   that left the snake frozen would still be caught; one that ran a
   different game would not be.
+  Task 6 tightened the check: the frame after A's hold is not
+  `SNAKE_GAME_OVER_HASH`, and the play area makes at least three moves in
+  `SNAKE_RESTART_WINDOW_US` = 600 ms with a median interval within ±25 %
+  of `BADGE_MOVE_INTERVAL_US`.
+- **R-T5-1, the badge's move interval is used at compile time.** The
+  constant `BADGE_MOVE_INTERVAL_US` = 170,000 (Task 5's human gate) on its
+  own raised `dead_code` until Task 6's rungs used it. Instead of
+  `#[allow(dead_code)]`, the test file asserts at compile time that
+  `SNAKE_TO_WALL_WINDOW_US` holds `SNAKE_MOVES_TO_WALL` ticks at the
+  badge's pace (12 × 170,000 = 2,040,000 < 3,000,000 us). It checks the
+  window, not the emulator's speed; Task 6 keeps it. If wrong: a shorter
+  to-wall window could cut off a badge-paced run without a test noticing.
+- **R-T6-1, the steering rung pins the frame the human approved.**
+  `SNAKE_TURNED_HASH` = `0xcccb_b8c5_d80a_93e9` is Task 5's "after one
+  turn" frame (UP, `SNAKE_TURN_SLOT` = 7), which the human accepted on
+  2026-10-20. Task 5 pressed UP 240 ms after A's release and read the
+  frame at 485.5 ms; `snake_steers` keeps the plan's sequence (watch
+  1.5 move intervals, then press, then run one interval), which presses at
+  255.5 ms, releases at 355.5 ms and reads at 525.5 ms. Both presses fall
+  between the first move (222 ms) and the second tick (392 ms), which
+  turns the head up; the frame is unchanged from 395.5 ms to the third
+  tick at 562 ms, so both readings are the same frame. If wrong: the
+  pinned turn frame would not be the one compared with the badge.
+- **R-T6-2, no "Variant A" step in the speed rung.** Task 4 chose
+  variant B (Snake starts on its own), so the plan's "Variant A only"
+  comment line in `snake_moves_on_its_own` is dropped; the rung instead
+  runs to the open frame (`SNAKE_OPEN_FRAME_US`) before counting, as the
+  game-over rung does (R-T4-1). If wrong: the start-screen redraw would
+  count as a move.
 
 ## Measurements
 
@@ -487,8 +516,7 @@ committed).
 
 **Badge side.** The human recorded the physical badge with a phone (an
 untouched run into the wall, and a run with one turn) and asked that the
-numbers be measured from the human's phone video of the physical badge.
-They were measured frame by frame (29.97 fps, true frame timestamps):
+numbers be measured from it. They were measured frame by frame (29.97 fps, true frame timestamps):
 
 | Question | Badge | Emulator |
 | --- | --- | --- |
@@ -527,7 +555,59 @@ CPI.
 With the comparison done, `SNAKE_OPEN_HASH`, `SNAKE_MOVES_TO_WALL` and
 `SNAKE_GAME_OVER_HASH` are compared with the badge; they are no longer
 provisional. The test file keeps one compile-time check on the new
-constant: `SNAKE_TO_WALL_WINDOW_US` must hold `SNAKE_MOVES_TO_WALL`
+constant (ruling R-T5-1): `SNAKE_TO_WALL_WINDOW_US` must hold `SNAKE_MOVES_TO_WALL`
 ticks at the badge's pace (12 × 170,000 = 2,040,000 < 3,000,000 us).
+
+### Task 6: Snake's speed and steering rungs
+
+Two new rungs, measured from the hacker launcher checkpoint (times after
+A's release). No frame hash, step pin or existing constant moved except
+`SNAKE_RESTART_WINDOW_US` (below).
+
+| Rung | What it checks | Measured |
+| --- | --- | --- |
+| `snake_moves_on_its_own` | from the open frame (150 ms), at least six moves in `SPEED_WINDOW_US`; median interval within ±25 % of `BADGE_MOVE_INTERVAL_US` | seven moves, 222 ms to 1,242 ms; every interval 170,000 us |
+| `snake_steers` | UP (`SNAKE_TURN_SLOT` = 7) after the first move; the frame one interval after release is `SNAKE_TURNED_HASH`; at least three moves follow | first move 222 ms; press 255.5 to 355.5 ms; read at 525.5 ms, hash `0xcccb_b8c5_d80a_93e9` (R-T6-1); eight changes follow (seven moves up, then game over at the top wall) |
+| `snake_hits_wall_game_over` (tightened, R-T4-2) | after A on game over: the frame is not game over, and at least three moves with a median within ±25 % of the badge's | moves 76, 246, 416 and 586 ms after release |
+
+**`SPEED_WINDOW_US` = 1,200,000** (from the open frame). The first move
+comes 72 ms after the open frame and then one every 170 ms (Task 4), so
+six moves need 72 + 5 × 170 = 922 ms. At the slow edge of the ±25 % band
+(212.5 ms) they need 72 + 5 × 212.5 = 1,134.5 ms, inside the window. At
+the fast edge (127.5 ms) the window holds at most
+1 + (1,200 − 72) / 127.5 = 9 moves, short of the 11th move that reaches
+the wall, so no game-over redraw is counted anywhere in the band.
+
+**`SNAKE_RESTART_WINDOW_US`: 500,000 → 600,000.** The third move after
+A's release comes at 416 ms; with every delay 25 % longer it would come
+at about 1.25 × (176 + 340) − 100 = 545 ms (176 ms from the press to the
+first move, two intervals of 170 ms, less the 100 ms hold), which the
+old 500 ms window would miss.
+
+**Step 2, the regression check.** With the clock forced to the legacy
+ratio (one SYSTIMER tick per step, the pre-Milestone-6 clock, through a
+temporary probe in `FirmwareBus::sync_cpu_clock`, reverted), measured two
+ways:
+
+- From boot, the walk does not reach Snake: the firmware logs
+  `launched Launcher`, but no stable launcher frame is found within the
+  369.3M-step cap.
+- From A's release (the probe switched on after `snake_open()`), the
+  median move interval is **160,000 us** (play-area changes after the
+  open frame at 226, 448, 608, ..., 1,248 ms after release; the gaps are
+  222 ms, then 160 ms each). |160,000 − 170,000| = 10,000 ≤ 42,500,
+  so **`snake_moves_on_its_own` passes** under the legacy clock: the
+  interval is the firmware's own timer period, not CPU throughput (Task 5:
+  the CPU is about 96 % idle). The same clock fails the other three Snake
+  rungs: `launcher_opens_snake` (the start screen is not drawn by 150 ms),
+  `snake_steers` (a different frame at the read point) and
+  `snake_hits_wall_game_over` (13 changes instead of 12). So the timing
+  model is guarded by the Snake rungs together, not by the speed rung
+  alone; the speed rung's doc comment says so.
+
+Checks: release `boot_progress` 60 passed in 41.2 s; `cargo test
+--workspace` green (`boot_progress` 27.9 s); clippy 3 warnings
+(unchanged); `cargo fmt --check` clean.
+
 
 ## Milestone 7 backlog

@@ -1623,13 +1623,14 @@ const SNAKE_OPEN_FRAME_US: u64 = 150_000;
 /// Snake's start screen: title "Snake", "Start to pause", "Score 0 Hi 0",
 /// the empty play area with the snake and one food dot (its position comes
 /// from the emulator's fixed-seed RNG, `peripherals::apb_ctrl::RNG_SEED`,
-/// so it is not the badge's). Provisional until Task 5.
+/// so it is not the badge's). Compared with the physical badge on
+/// 2026-10-20 (Task 5): the layout matches; the food position differs.
 const SNAKE_OPEN_HASH: u64 = 0xe7d5_38c7_42f1_9d89;
 
 /// Milestone 6: Snake opens from the launcher. Its frame
 /// [`SNAKE_OPEN_FRAME_US`] after A's release is pinned (Snake moves without
 /// waiting for a key, so no frame is stable for [`AFTER_PRESS_STABLE_FOR`]);
-/// provisional, to be compared with the physical badge in Task 5.
+/// the frame was compared with the physical badge on 2026-10-20 (Task 5).
 #[test]
 fn launcher_opens_snake() {
     let mut rt = snake_open();
@@ -1687,12 +1688,12 @@ const SNAKE_TO_WALL_WINDOW_US: u64 = 3_000_000;
 /// [`PLAY_AREA`] changes from the start frame to game over with no input:
 /// 11 moves right (one cell per 170 ms tick, from the middle of the area to
 /// the right-most column), then the game-over redraw on the 12th tick,
-/// which [`move_times`] counts as the 12th change. Provisional until
-/// Task 5.
+/// which [`move_times`] counts as the 12th change. The badge also makes
+/// 11 moves to the wall (compared on 2026-10-20, Task 5).
 const SNAKE_MOVES_TO_WALL: usize = 12;
 /// The game-over frame: a "Game over / A to restart" box over the play
-/// area, the snake's head in the right-most column. Provisional until
-/// Task 5.
+/// area, the snake's head in the right-most column. Compared with the
+/// physical badge on 2026-10-20 (Task 5).
 const SNAKE_GAME_OVER_HASH: u64 = 0x3582_df91_6283_9f3a;
 /// The physical badge's time between Snake moves: the mean over 10
 /// intervals of an untouched run into the wall, measured frame by frame
@@ -1704,15 +1705,19 @@ const BADGE_MOVE_INTERVAL_US: u64 = 170_000;
 const _: () =
     assert!(SNAKE_MOVES_TO_WALL as u64 * BADGE_MOVE_INTERVAL_US < SNAKE_TO_WALL_WINDOW_US);
 
-/// How long [`snake_hits_wall_game_over`] watches for a move after A's
+/// How long [`snake_hits_wall_game_over`] watches for moves after A's
 /// release on game over. The restarted game redraws its start screen
 /// 22 ms to 34 ms into the 100 ms hold and makes its first move about
-/// 176 ms after the press (72 ms after release), then one every 170 ms.
-const SNAKE_RESTART_WINDOW_US: u64 = 500_000;
+/// 176 ms after the press (76 ms after release, as sampled), then one
+/// every 170 ms: moves at about 76, 246, 416 and 586 ms after release.
+/// The rung needs three; even with every delay 25 % longer the third
+/// comes at about 1.25 x (176 + 340) - 100 = 545 ms, inside 600 ms.
+const SNAKE_RESTART_WINDOW_US: u64 = 600_000;
 
 /// With no input the snake runs into the wall: "Game over / A to
-/// restart" after [`SNAKE_MOVES_TO_WALL`] changes of the play area (Task
-/// 5 compares that count and the frame with the badge); A restarts.
+/// restart" after [`SNAKE_MOVES_TO_WALL`] changes of the play area (the
+/// count and the frame were compared with the badge on 2026-10-20, Task
+/// 5); A restarts, and the new game moves at the badge's pace.
 #[test]
 fn snake_hits_wall_game_over() {
     let mut rt = snake_open();
@@ -1726,10 +1731,106 @@ fn snake_hits_wall_game_over() {
         "game over, stable at step {step}"
     );
     // A restarts at once and the new game runs without a key (the next
-    // stable frame is the next game over), so the check is that the play
-    // area moves again.
+    // stable frame is the next game over), so the check is that the game
+    // over box is gone and the play area moves again, at the badge's pace.
     press(&mut rt, 1);
+    assert_ne!(
+        framebuffer_fnv1a(rt.framebuffer()),
+        SNAKE_GAME_OVER_HASH,
+        "still game over after A"
+    );
     let moves = move_times(&mut rt, SNAKE_RESTART_WINDOW_US);
-    assert!(!moves.is_empty(), "no move after A on game over");
+    assert!(moves.len() >= 3, "restarted game, moves at {moves:?}");
+    let interval = median_interval(&moves);
+    let badge = BADGE_MOVE_INTERVAL_US;
+    assert!(
+        interval.abs_diff(badge) <= badge / 4,
+        "restarted game: move interval {interval} us vs badge {badge} us; moves at {moves:?}"
+    );
+    assert_no_panic_text(&rt);
+}
+
+/// Median gap between consecutive move start times. Panics with fewer
+/// than three moves (two intervals).
+fn median_interval(times: &[u64]) -> u64 {
+    assert!(times.len() >= 3, "too few moves: {times:?}");
+    let mut gaps: Vec<u64> = times.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_unstable();
+    gaps[gaps.len() / 2]
+}
+
+/// [`snake_moves_on_its_own`]'s window, from the start frame
+/// ([`SNAKE_OPEN_FRAME_US`] after release). The first move comes 72 ms
+/// after that point and then one every 170 ms (Task 4), so six moves need
+/// 72 + 5 x 170 = 922 ms. At the slow edge of the rung's ±25 % band
+/// (212.5 ms) six moves need 72 + 5 x 212.5 = 1,134.5 ms; at the fast
+/// edge (127.5 ms) 1.2 s holds at most 1 + (1,200 - 72) / 127.5 = 9
+/// moves, short of the 11th move that reaches the wall. So the window
+/// sees at least six moves and no game-over redraw across the band (at
+/// the emulator's 170 ms: seven moves, the last at 1,242 ms after
+/// release, well before the game-over redraw at 2,106 ms).
+const SPEED_WINDOW_US: u64 = 1_200_000;
+
+/// Milestone 6: the snake moves on its own at the badge's speed: the
+/// median emulated time between moves is within 25 % of the physical
+/// badge's ([`BADGE_MOVE_INTERVAL_US`], Task 5). The interval is the
+/// firmware's own timer period (the CPU is about 96 % idle), so on its own
+/// this rung does not catch the pre-Milestone-6 one-tick-per-step clock:
+/// with that clock from A's release the median is 160,000 us, inside the
+/// band; that clock moves the start frame, the turn frame and the move
+/// count instead ([`launcher_opens_snake`], [`snake_steers`],
+/// [`snake_hits_wall_game_over`] fail; Task 6 Step 2). Counting starts at
+/// the start frame, as in [`snake_hits_wall_game_over`], so the
+/// start-screen redraw is not a move.
+#[test]
+fn snake_moves_on_its_own() {
+    let mut rt = snake_open();
+    run_for_us(&mut rt, SNAKE_OPEN_FRAME_US);
+    let moves = move_times(&mut rt, SPEED_WINDOW_US);
+    assert!(moves.len() >= 6, "moves at {moves:?}");
+    let interval = median_interval(&moves);
+    let badge = BADGE_MOVE_INTERVAL_US;
+    assert!(
+        interval.abs_diff(badge) <= badge / 4,
+        "emulated move interval {interval} us vs badge {badge} us; moves at {moves:?}"
+    );
+    assert_no_panic_text(&rt);
+}
+
+/// The button [`snake_steers`] presses: UP (shift-register bit 6; the
+/// frontend's `RAW_SLOT_BY_BUTTON`). The snake starts heading right, so UP
+/// turns it.
+const SNAKE_TURN_SLOT: usize = 7;
+/// The frame after one turn UP: the snake is an L, its head one cell
+/// above the second cell (head at (172, 126)). The human compared this
+/// frame with the badge on 2026-10-20 (Task 5's `after-turn` frame).
+const SNAKE_TURNED_HASH: u64 = 0xcccb_b8c5_d80a_93e9;
+
+/// A direction press turns the snake on the next move. Timing, from A's
+/// release: [`move_times`] watches 1.5 move intervals (to about 255 ms),
+/// which sees the start-screen redraw and the first move (222 ms);
+/// [`SNAKE_TURN_SLOT`] is then pressed for [`PRESS_HOLD_US`] (to about
+/// 355 ms); the second tick (392 ms) moves the head up; the frame one
+/// move interval after release (about 525 ms; stable from 395 ms to the
+/// third tick at 562 ms) is pinned. Task 5 pressed UP at 240 ms and read
+/// the frame at 485 ms, the same stable frame. Afterwards the snake keeps
+/// moving (now upward).
+#[test]
+fn snake_steers() {
+    let mut rt = snake_open();
+    let first = move_times(&mut rt, BADGE_MOVE_INTERVAL_US * 3 / 2);
+    // The start-screen redraw (60 ms) and the first move (222 ms).
+    assert!(first.len() >= 2, "no first move: {first:?}");
+    press(&mut rt, SNAKE_TURN_SLOT);
+    run_for_us(&mut rt, BADGE_MOVE_INTERVAL_US);
+    assert_eq!(
+        framebuffer_fnv1a(rt.framebuffer()),
+        SNAKE_TURNED_HASH,
+        "after the turn (step {}, {} us)",
+        rt.total_steps(),
+        rt.emulated_time_us()
+    );
+    let more = move_times(&mut rt, SNAKE_TO_WALL_WINDOW_US / 2);
+    assert!(more.len() >= 3, "kept moving after the turn: {more:?}");
     assert_no_panic_text(&rt);
 }

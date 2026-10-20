@@ -2476,6 +2476,24 @@ the first yield is at 528,313, `MD5Init` at 4,450,328, the splash final at
 launcher stable at 365.0M and the Dice roll at 479.3M; holds still cost
 0.18M..6.93M steps. No frame hash moved.
 
+### Milestone 6 Task 6: Snake's speed and steering rungs
+
+- **Done:** `snake_moves_on_its_own` counts Snake's moves for 1.2 s from
+  its open frame and asserts the median interval is within ±25 % of the
+  physical badge's 170 ms (Task 5's human gate); the emulator's is
+  170,000 us exactly. `snake_steers` presses UP after the first move and
+  pins the frame one interval after release, the "after one turn" frame
+  the human accepted on 2026-10-20 (`0xcccb_b8c5_d80a_93e9`). The restart
+  check in `snake_hits_wall_game_over` now also asserts the game-over box
+  is gone and three moves at the badge's pace. No frame hash moved.
+- **Finding:** the speed rung alone does not catch the pre-Milestone-6
+  one-tick-per-step clock. With that clock from A's release Snake still
+  moves every 160 ms, because the interval is the firmware's own timer
+  period and the CPU is about 96 % idle; what the old clock breaks is
+  the start frame, the turn frame and the move count to the wall, which
+  the other three Snake rungs catch. Figures:
+  `docs/milestone-6-decisions.md`, "Task 6".
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
