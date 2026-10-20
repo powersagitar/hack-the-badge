@@ -686,5 +686,30 @@ process" comes from `fengari/src/luaconf.js` line 3, which reads
 `frontend/package.json`, `frontend/bun.lock` and
 `frontend/vite.config.ts` are unchanged since `ed71dd8`.
 
+### Task 8 (stretch): Snake eats
+
+`snake_eats` in `boot_progress.rs`. The grid is 24 x 16 cells of 12 px
+from (16, 42). At the start frame the snake fills cells (10..=12, 8),
+head (12, 8) heading right, and the **food is at (23, 14)** (pixels x
+292..=302, y 210..=220), found by a color census of `PLAY_AREA` in a
+temporary exploration test. The food comes from the fixed-seed RNG
+(`apb_ctrl::RNG_SEED`) and is already part of the pinned
+`SNAKE_OPEN_HASH`; the emulator reads no host time or entropy, and
+repeated runs gave the same frames step for step.
+
+**Path:** one move right to (13, 8); DOWN (slot 4), held 255 to 355 ms
+after A's release, turns move 2 (392 ms), and move 7 reaches (13, 14);
+RIGHT (slot 6), held 1,276 to 1,376 ms (the same phase, six intervals
+later), turns move 8, and move 17 (2,942 ms) enters the food cell. The
+after-eat frame is drawn by 2,948 ms and holds past 3,161 ms; the rung
+samples it at 2,991 ms (9.5 intervals after RIGHT's release). The next
+move hits the wall.
+
+**`SNAKE_ATE_HASH` = `0x8275_2f57_3ba4_ddab`**: the snake four cells
+long on row 14 (snake body color `0x07f5`: 327 px at open, 436 px
+after), the new food at (15, 13), score 1. Not compared with the
+physical badge (its food position differs, Task 5). No existing pin
+moved.
+
 
 ## Milestone 7 backlog

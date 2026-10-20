@@ -1850,6 +1850,86 @@ fn snake_steers() {
     assert_no_panic_text(&rt);
 }
 
+/// DOWN and RIGHT (shift-register bits 3 and 5; the frontend's
+/// `RAW_SLOT_BY_BUTTON`), [`snake_eats`]'s two turns.
+const SNAKE_DOWN_SLOT: usize = 4;
+const SNAKE_RIGHT_SLOT: usize = 6;
+/// The snake's body color (RGB565), the bulk of each 11 x 11 px cell; its
+/// edges use two darker shades. At the start frame [`PLAY_AREA`] holds
+/// 327 pixels of it (three cells).
+const SNAKE_BODY_COLOR: u16 = 0x07f5;
+/// [`snake_eats`]' wait after RIGHT's release: 9.5 move intervals, which
+/// lands mid-way through the after-eat frame's hold (see the rung).
+const SNAKE_EAT_FRAME_US: u64 = 9 * SNAKE_MOVE_INTERVAL_US + SNAKE_MOVE_INTERVAL_US / 2;
+/// The frame after the eat: the snake four cells long along row 14, its
+/// head in the right-most column on the old food cell, the new food at
+/// column 15, row 13, and the score 1. Not compared with the physical badge
+/// (the food position is the emulator's fixed-seed RNG's, see
+/// [`SNAKE_OPEN_HASH`]).
+const SNAKE_ATE_HASH: u64 = 0x8275_2f57_3ba4_ddab;
+
+/// Milestone 6 Task 8 (stretch): the snake eats and grows. The grid is
+/// 24 x 16 cells of 12 px from (16, 42) (cell (c, r) is the 11 x 11 px
+/// square at x = 16 + 12c, y = 42 + 12r). At the start frame the snake
+/// fills (10..=12, 8), head at (12, 8) heading right, and the food is at
+/// (23, 14) (pixels x 292..=302, y 210..=220). The food comes from
+/// `peripherals::apb_ctrl`'s fixed-seed RNG and is part of the pinned
+/// [`SNAKE_OPEN_HASH`]; the emulator reads no host time or entropy, so it
+/// is the same on every run. The path: one move right to (13, 8), DOWN for
+/// six moves to (13, 14), RIGHT for ten moves to (23, 14).
+///
+/// Timing, from A's release (moves at 222 ms + k x 170 ms): the start
+/// frame (150 ms) is sampled for the snake's pixel count; [`move_times`]
+/// watches to 255 ms, past the first move, as in [`snake_steers`]; DOWN is
+/// held to 355 ms, so move 2 (392 ms) turns down and move 7 (1,242 ms)
+/// reaches row 14. Six intervals after DOWN, RIGHT is pressed at the same
+/// phase (1,276 ms to 1,376 ms), so move 8 (1,412 ms) turns right and move
+/// 17 (2,942 ms) enters the food cell; the after-eat frame is drawn by
+/// 2,948 ms and holds past 3,161 ms. [`SNAKE_EAT_FRAME_US`] samples it at
+/// 2,991 ms. The next move hits the wall (game over).
+#[test]
+fn snake_eats() {
+    let mut rt = snake_open();
+    run_for_us(&mut rt, SNAKE_OPEN_FRAME_US);
+    let at_open = color_count(&rt, PLAY_AREA, SNAKE_BODY_COLOR);
+    let first = move_times(
+        &mut rt,
+        BADGE_MOVE_INTERVAL_US * 3 / 2 - SNAKE_OPEN_FRAME_US,
+    );
+    assert!(!first.is_empty(), "no first move");
+    press(&mut rt, SNAKE_DOWN_SLOT);
+    run_for_us(&mut rt, 6 * SNAKE_MOVE_INTERVAL_US - PRESS_HOLD_US);
+    press(&mut rt, SNAKE_RIGHT_SLOT);
+    run_for_us(&mut rt, SNAKE_EAT_FRAME_US);
+    assert_eq!(
+        framebuffer_fnv1a(rt.framebuffer()),
+        SNAKE_ATE_HASH,
+        "after the eat (step {}, {} us)",
+        rt.total_steps(),
+        rt.emulated_time_us()
+    );
+    let after = color_count(&rt, PLAY_AREA, SNAKE_BODY_COLOR);
+    assert!(
+        after > at_open,
+        "snake did not grow: {at_open} -> {after} px"
+    );
+    assert_no_panic_text(&rt);
+}
+
+/// Pixels of `color` inside `rect`.
+fn color_count(rt: &FirmwareRuntime, rect: Rect, color: u16) -> usize {
+    let width = rt.screen_width();
+    let fb = rt.framebuffer();
+    (rect.y0..rect.y1)
+        .map(|y| {
+            fb[y * width + rect.x0..y * width + rect.x1]
+                .iter()
+                .filter(|&&p| p == color)
+                .count()
+        })
+        .sum()
+}
+
 /// One 120 Hz browser frame of emulated time.
 const BROWSER_FRAME_US: u64 = 8_333;
 
