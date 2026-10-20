@@ -1849,3 +1849,25 @@ fn snake_steers() {
     assert!(more.len() >= 3, "kept moving after the turn: {more:?}");
     assert_no_panic_text(&rt);
 }
+
+/// One 120 Hz browser frame of emulated time.
+const BROWSER_FRAME_US: u64 = 8_333;
+
+/// Milestone 6 Task 7: the browser's frame pacing tracks the wall clock.
+/// On the idle first-run screen, each `run_until` of one 120 Hz frame ends
+/// exactly at its target. Before `boot::idle_until` bounded the WFI
+/// fast-forward, every frame ran on to FreeRTOS's next 10 ms tick, 1,667 us
+/// late, and the badge ran at 1.2x in the browser (also measured in Snake:
+/// 1.197x).
+#[test]
+fn run_until_ends_idle_frames_at_the_target() {
+    let mut rt = first_run_screen();
+    let start = rt.emulated_time_us();
+    for frame in 0..120 {
+        let target = rt.emulated_time_us() + BROWSER_FRAME_US;
+        let s = rt.run_until(target, 1_000_000);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        assert_eq!(rt.emulated_time_us(), target, "frame {frame}: {s:?}");
+    }
+    assert_eq!(rt.emulated_time_us() - start, 120 * BROWSER_FRAME_US);
+}

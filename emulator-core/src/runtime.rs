@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::boot::{boot_from_factory_image_with_rom_stubs, step_with_interrupts};
+use crate::boot::{boot_from_factory_image_with_rom_stubs, idle_until, step_with_interrupts};
 use crate::cpu::{exception_code, Cpu};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
@@ -160,6 +160,11 @@ impl FirmwareRuntime {
     /// steps have run, whichever is first; `RunSummary::steps` is the
     /// number run (0 if the target is already past). The browser's frame
     /// pacing and the time-based button holds use this (Milestone 6).
+    ///
+    /// An idle `WFI` wait whose next event lies past the target is advanced
+    /// only to the target ([`crate::boot::idle_until`]), so a run that ends
+    /// idle ends exactly at the target instead of at the next alarm; a run
+    /// that ends busy overshoots by at most one step's time.
     pub fn run_until(&mut self, target_time_us: u64, max_steps: u32) -> RunSummary {
         let target_ticks = self.bus.clock.ticks_at_us(target_time_us);
         self.run_impl(max_steps, Some(target_ticks), None)
@@ -194,8 +199,12 @@ impl FirmwareRuntime {
         let mut summary = RunSummary::default();
         let mut ran: u32 = 0;
         while ran < budget {
-            if stop_at_ticks.is_some_and(|t| self.bus.clock.total_ticks() >= t) {
-                break;
+            if let Some(t) = stop_at_ticks {
+                // An idle wait that runs past the target stops at it
+                // (`crate::boot::idle_until`), so time never overshoots.
+                if self.bus.clock.total_ticks() >= t || idle_until(&self.cpu, &mut self.bus, t) {
+                    break;
+                }
             }
             if let Some(hist) = pc_hist.as_deref_mut() {
                 *hist.entry(self.cpu.regs.pc).or_insert(0) += 1;

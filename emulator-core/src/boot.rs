@@ -290,6 +290,33 @@ pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu:
     info
 }
 
+/// Bounds [`step_with_interrupts`]'s idle fast-forward at `stop_at_ticks`
+/// (Milestone 6 Task 7): if the core is parked by `WFI` with no line
+/// asserted and the next event lies past `stop_at_ticks`, advances emulated
+/// time and the timed peripherals only to `stop_at_ticks` (an idle charge,
+/// no step) and returns `true`; otherwise does nothing and returns `false`.
+///
+/// Without it, a time-targeted run whose target falls inside an idle wait
+/// jumps to the next alarm instead: with FreeRTOS's 10 ms tick, every
+/// 8.3 ms browser frame ended on the next tick boundary, 1,667 us late, and
+/// the badge ran at 1.2x. Splitting one idle wait into two charges changes
+/// nothing the guest can see: the alarm is reached at the same tick, and
+/// the step that wakes the core is the same step, just taken by the next
+/// run.
+pub fn idle_until(cpu: &Cpu, bus: &mut FirmwareBus, stop_at_ticks: u64) -> bool {
+    if !cpu.is_waiting() || bus.asserted_lines() != 0 {
+        return false;
+    }
+    let left = stop_at_ticks.saturating_sub(bus.clock.total_ticks());
+    match bus.ticks_until_next_event() {
+        Some(ticks) if ticks.max(1) > left => {
+            bus.advance_idle(left);
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
