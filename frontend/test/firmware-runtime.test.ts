@@ -180,7 +180,7 @@ describe("stepFirmwareFrame", () => {
     expect(getPutImageDataCalls()).toBe(1);
   });
   test("a capped frame drops its debt", () => {
-    const { handle } = makeFakeHandle({ usPerStep: 0.0125 });
+    const { handle, runUntilCalls } = makeFakeHandle({ usPerStep: 0.0125 });
     const { ctx } = makeStubCtx();
     // 100 steps at 80 MHz = 1.25 µs of the 16,000 µs asked for.
     const r = stepFirmwareFrame(handle, ctx, 16, 100);
@@ -188,6 +188,10 @@ describe("stepFirmwareFrame", () => {
     // The next frame targets now + 16 ms, not the missed time.
     stepFirmwareFrame(handle, ctx, 16, 100);
     expect(handle.emulatedTimeUs()).toBeCloseTo(2.5, 5);
+    // Debt carried over would target 16,000 + 16,000 or the old target + 16 ms.
+    expect(runUntilCalls).toHaveLength(2);
+    expect(runUntilCalls[0]![0]).toBeCloseTo(16_000, 5);
+    expect(runUntilCalls[1]![0]).toBeCloseTo(1.25 + 16_000, 5);
   });
   test("a fractional target the emulator truncates to whole µs is not capped", () => {
     const { handle } = makeFakeHandle();

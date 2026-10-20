@@ -586,6 +586,9 @@ impl FirmwareBus {
     pub fn tick_peripherals(&mut self) {
         // The CPU clock the SYSTEM registers select now, sampled after the
         // step so a word write's byte-split halves are never seen alone.
+        // This runs before `clock.step()`, so the step that writes a clock
+        // register is itself charged at the new rate (at most 1 of the 5
+        // ticks per frequency switch).
         self.sync_cpu_clock();
         let ticks = self.clock.step();
         if ticks > 0 {

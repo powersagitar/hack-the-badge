@@ -703,7 +703,7 @@ ways:
   same clock fails the other three Snake rungs: `launcher_opens_snake`
   (the start screen is not drawn by 150 ms), `snake_steers` (a different
   frame at the read point) and `snake_hits_wall_game_over` (13 changes
-  instead of 12). Ruling R-T6-3 (below) added an exact pin, and Step 2
+  instead of 12). Ruling R-T6-3 (see Rulings) added an exact pin, and Step 2
   was re-run.
 
 **Step 2 re-run after ruling R-T6-3** (the exact gap pin; see Rulings),
@@ -849,7 +849,7 @@ Measured on the development machine (18 cores) at the Task 9 commit:
 
 Against the branch base (`ed71dd8`: release 41.0 s, debug `boot_progress`
 27.3 s, `bun test` 38.4 s) the suites are flat: the seven new rungs
-branch from shared checkpoints.
+(six Snake rungs and one boot rung) branch from shared checkpoints.
 
 ## Milestone 7 backlog
 
@@ -880,6 +880,10 @@ milestone did not finish are carried here, plus what Milestone 6 found.
 - Zero-latency RMT, I2C0 and SPIMEM1 (carried).
 - The cycle counter counts one per working step; PCER/PCMR do not gate
   it (carried).
+- `PROVISION_TIMEOUT_STEPS` (60M) in `frontend/src/runtime/firmware-runtime.ts`
+  is still counted in steps. Under wall-clock pacing an idle firmware
+  advances only about 0.5M steps/s in the browser, so a hung provision
+  takes minutes to time out. Add an emulated-time or wall-time bound.
 
 ### Apps and UI
 
@@ -934,8 +938,8 @@ milestone did not finish are carried here, plus what Milestone 6 found.
 
 ### Build and tests
 
-- The release suite's wall time is one chain (hacker's walk to the Dice
-  roll, about 487M steps); only a faster emulator shortens it.
+- The release suite's wall time is one chain (hacker's walk to Dice,
+  about 487M steps); only a faster emulator shortens it.
 - Test minors left from Milestone 6's reviews: `snake_eats` could assert
   growth of exactly one cell (`after * 3 == at_open * 4`) and that its
   150 ms frame is `SNAKE_OPEN_HASH`, and its `SNAKE_DOWN_SLOT` = 4
