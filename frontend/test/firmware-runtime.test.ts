@@ -3,7 +3,9 @@ import { BUTTON_NAMES } from "../src/badge/input";
 import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import {
   createFirmwareRuntime,
-  DEFAULT_CYCLES_PER_FRAME,
+  DEFAULT_STEPS_PER_FRAME,
+  frameTargetUs,
+  MAX_FRAME_DELTA_MS,
   PRESS_HOLD_US,
   PROVISION_TIMEOUT_STEPS,
   RAW_SLOT_BY_BUTTON,
@@ -40,8 +42,22 @@ function makeStubCtx() {
   return { ctx: ctx as unknown as CanvasRenderingContext2D, getPutImageDataCalls: () => putImageDataCalls };
 }
 
-/** A hand-written fake `FirmwareEmulatorHandle` — no WASM involved, per `bridge.ts`'s design intent. */
-function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
+interface FakeHandleOptions extends Partial<FirmwareEmulatorHandle> {
+  /**
+   * Emulated µs one step advances the fake clock by. Default 1, so the
+   * default 1,000,000-step cap never binds; 0.0125 is one step at 80 MHz.
+   */
+  usPerStep?: number;
+}
+
+/**
+ * A hand-written fake `FirmwareEmulatorHandle` — no WASM involved, per
+ * `bridge.ts`'s design intent. `runUntil(target, max)` advances a fake
+ * emulated clock to `min(target, now + max * usPerStep)`.
+ */
+function makeFakeHandle(options: FakeHandleOptions = {}) {
+  const { usPerStep = 1, ...overrides } = options;
+  let timeUs = 0;
   const runBudgets: number[] = [];
   const runUntilCalls: Array<[number, number]> = [];
   const buttonCalls: Array<[number, boolean]> = [];
@@ -62,8 +78,10 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     },
     runUntil(targetUs: number, maxSteps: number): CpuRunSummary {
       runUntilCalls.push([targetUs, maxSteps]);
+      const before = timeUs;
+      timeUs = Math.max(before, Math.min(targetUs, before + maxSteps * usPerStep));
       return {
-        steps: 0,
+        steps: Math.round((timeUs - before) / usPerStep),
         traps: 0,
         romStubCalls: 0,
         pc: 0x4200_0000,
@@ -87,7 +105,7 @@ function makeFakeHandle(overrides: Partial<FirmwareEmulatorHandle> = {}) {
     totalSteps(): number {
       return 0;
     },
-    emulatedTimeUs: () => 0,
+    emulatedTimeUs: () => timeUs,
     serialInput: () => 0,
     serialPending: () => 0,
     consoleOutput: () => "",
@@ -133,21 +151,40 @@ describe("RAW_SLOT_BY_BUTTON", () => {
   });
 });
 
+describe("frameTargetUs", () => {
+  test("advances emulated time by the wall delta", () => {
+    expect(frameTargetUs(1_000, 16)).toBe(17_000);
+  });
+  test("frame target clamps the wall delta", () => {
+    expect(frameTargetUs(0, 5_000)).toBe(MAX_FRAME_DELTA_MS * 1000);
+    expect(frameTargetUs(500, -3)).toBe(500);
+  });
+});
+
 describe("stepFirmwareFrame", () => {
-  test("runs exactly cyclesPerFrame steps and blits the resulting framebuffer", () => {
-    const { handle, runBudgets } = makeFakeHandle();
+  test("runs to the frame target and blits once", () => {
+    const { handle, runUntilCalls } = makeFakeHandle();
     const { ctx, getPutImageDataCalls } = makeStubCtx();
-
-    stepFirmwareFrame(handle, ctx, 12345);
-
-    expect(runBudgets).toEqual([12345]);
+    const r = stepFirmwareFrame(handle, ctx, 16, 1_000_000);
+    expect(runUntilCalls).toEqual([[16_000, 1_000_000]]);
+    expect(r).toEqual({ emulatedDeltaUs: 16_000, capped: false });
     expect(getPutImageDataCalls()).toBe(1);
+  });
+  test("a capped frame drops its debt", () => {
+    const { handle } = makeFakeHandle({ usPerStep: 0.0125 });
+    const { ctx } = makeStubCtx();
+    // 100 steps at 80 MHz = 1.25 µs of the 16,000 µs asked for.
+    const r = stepFirmwareFrame(handle, ctx, 16, 100);
+    expect(r.capped).toBe(true);
+    // The next frame targets now + 16 ms, not the missed time.
+    stepFirmwareFrame(handle, ctx, 16, 100);
+    expect(handle.emulatedTimeUs()).toBeCloseTo(2.5, 5);
   });
 });
 
 describe("createFirmwareRuntime", () => {
-  test("start() schedules frames via the injected scheduler, using DEFAULT_CYCLES_PER_FRAME by default", () => {
-    const { handle, runBudgets } = makeFakeHandle();
+  test("start() schedules frames via the injected scheduler, capped at DEFAULT_STEPS_PER_FRAME by default", () => {
+    const { handle, runUntilCalls } = makeFakeHandle();
     const { ctx } = makeStubCtx();
     const scheduledCbs: Array<(t: number) => void> = [];
     const runtime = createFirmwareRuntime(handle, ctx, {
@@ -163,7 +200,7 @@ describe("createFirmwareRuntime", () => {
 
     // Fire the scheduled frame manually (simulating one rAF tick).
     scheduledCbs[0](0);
-    expect(runBudgets).toEqual([DEFAULT_CYCLES_PER_FRAME]);
+    expect(runUntilCalls).toEqual([[0, DEFAULT_STEPS_PER_FRAME]]);
     // The loop reschedules itself for the next frame.
     expect(scheduledCbs).toHaveLength(2);
   });
@@ -186,7 +223,7 @@ describe("createFirmwareRuntime", () => {
   });
 
   test("stop() cancels the pending frame and further callbacks do not reschedule", () => {
-    const { handle, runBudgets } = makeFakeHandle();
+    const { handle, runUntilCalls } = makeFakeHandle();
     const { ctx } = makeStubCtx();
     const scheduledCbs: Array<(t: number) => void> = [];
     const canceled: number[] = [];
@@ -205,7 +242,7 @@ describe("createFirmwareRuntime", () => {
     // A late-firing callback (as if the browser had already queued it before
     // cancellation raced it) must not step the CPU or reschedule.
     scheduledCbs[0](0);
-    expect(runBudgets).toEqual([]);
+    expect(runUntilCalls).toEqual([]);
     expect(scheduledCbs).toHaveLength(1);
   });
 
@@ -303,6 +340,51 @@ function rig() {
     setTimeUs: (n: number) => (timeUs = n),
   };
 }
+
+/**
+ * Like {@link rig}, but each queued frame callback is invoked with an
+ * explicit `requestAnimationFrame` time, and the fake clock advances through
+ * `runUntil` (see {@link makeFakeHandle}).
+ */
+function pacedRig(opts: { usPerStep?: number; stepsPerFrame?: number } = {}) {
+  const fake = makeFakeHandle({ usPerStep: opts.usPerStep });
+  const queued: Array<(t: number) => void> = [];
+  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().ctx, {
+    stepsPerFrame: opts.stepsPerFrame,
+    scheduleFrame: (cb) => queued.push(cb),
+    cancelFrame: () => {},
+  });
+  const frameAt = (t: number) => queued.shift()?.(t);
+  return { rt, frameAt, fake: fake.handle, buttonCalls: fake.buttonCalls };
+}
+
+describe("FirmwareRuntime pacing", () => {
+  test("the first frame runs nothing and later frames follow the wall clock", () => {
+    const { rt, frameAt, fake } = pacedRig();
+    rt.start();
+    frameAt(1_000);
+    expect(fake.emulatedTimeUs()).toBe(0);
+    frameAt(1_016);
+    expect(fake.emulatedTimeUs()).toBe(16_000);
+  });
+  test("speed() reports the emulated/wall ratio", () => {
+    const { rt, frameAt } = pacedRig({ usPerStep: 0.0125, stepsPerFrame: 640_000 });
+    rt.start();
+    frameAt(0);
+    for (let t = 16; t <= 16 * 60; t += 16) frameAt(t);
+    // 640,000 steps x 0.0125 µs = 8,000 µs per 16 ms frame: 0.5x.
+    expect(rt.speed()).toBeCloseTo(0.5, 1);
+  });
+  test("stop() flushes deferred releases", () => {
+    const { rt, buttonCalls, frameAt } = pacedRig();
+    rt.start();
+    frameAt(0);
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.stop();
+    expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
+  });
+});
 
 describe("FirmwareRuntime provisioning", () => {
   test("provision() types once the prompt appears, polled by the frame loop", () => {
