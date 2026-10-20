@@ -2486,12 +2486,14 @@ launcher stable at 365.0M and the Dice roll at 479.3M; holds still cost
   the human accepted on 2026-10-20 (`0xcccb_b8c5_d80a_93e9`). The restart
   check in `snake_hits_wall_game_over` now also asserts the game-over box
   is gone and three moves at the badge's pace. No frame hash moved.
-- **Finding:** the speed rung alone does not catch the pre-Milestone-6
-  one-tick-per-step clock. With that clock from A's release Snake still
-  moves every 160 ms, because the interval is the firmware's own timer
-  period and the CPU is about 96 % idle; what the old clock breaks is
-  the start frame, the turn frame and the move count to the wall, which
-  the other three Snake rungs catch. Figures:
+- **Finding:** a ±25 % badge check alone does not catch the
+  pre-Milestone-6 one-tick-per-step clock. With that clock from A's
+  release Snake still moves every 160 ms, because the interval is the
+  firmware's own timer period and the CPU is about 96 % idle. So the
+  speed rung also pins every gap to the emulator's exact 170,000 us
+  period (ruling R-T6-3), and fails under the old clock; the old clock
+  also breaks the start frame, the turn frame and the move count to the
+  wall, which the other three Snake rungs catch. Figures:
   `docs/milestone-6-decisions.md`, "Task 6".
 
 ## Emulated flash chip: what it contains

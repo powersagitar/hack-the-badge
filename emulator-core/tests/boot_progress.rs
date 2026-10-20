@@ -1771,23 +1771,38 @@ fn median_interval(times: &[u64]) -> u64 {
 /// release, well before the game-over redraw at 2,106 ms).
 const SPEED_WINDOW_US: u64 = 1_200_000;
 
-/// Milestone 6: the snake moves on its own at the badge's speed: the
-/// median emulated time between moves is within 25 % of the physical
-/// badge's ([`BADGE_MOVE_INTERVAL_US`], Task 5). The interval is the
-/// firmware's own timer period (the CPU is about 96 % idle), so on its own
-/// this rung does not catch the pre-Milestone-6 one-tick-per-step clock:
-/// with that clock from A's release the median is 160,000 us, inside the
-/// band; that clock moves the start frame, the turn frame and the move
-/// count instead ([`launcher_opens_snake`], [`snake_steers`],
-/// [`snake_hits_wall_game_over`] fail; Task 6 Step 2). Counting starts at
-/// the start frame, as in [`snake_hits_wall_game_over`], so the
-/// start-screen redraw is not a move.
+/// The emulator's move period: exact and deterministic, every interval
+/// between Snake's moves 1 and 11 measured at 170,000 us (Tasks 4 and 5).
+/// It agrees with the physical badge's [`BADGE_MOVE_INTERVAL_US`]
+/// (Task 5's human gate, 2026-10-20).
+const SNAKE_MOVE_INTERVAL_US: u64 = 170_000;
+
+/// Milestone 6: the snake moves on its own at the badge's speed. Two
+/// checks (ruling R-T6-3):
+/// - every gap between consecutive moves is exactly
+///   [`SNAKE_MOVE_INTERVAL_US`]. This pin guards the timing model: under
+///   the pre-Milestone-6 one-tick-per-step clock (from A's release) the
+///   moves come 160,000 us apart and the rung fails (Task 6 Step 2);
+/// - the median gap is within 25 % of the physical badge's
+///   [`BADGE_MOVE_INTERVAL_US`] (Task 5): the badge comparison.
+///
+/// Counting starts at the start frame, as in
+/// [`snake_hits_wall_game_over`], so the start-screen redraw is not a
+/// move, and [`SPEED_WINDOW_US`] ends before the game-over redraw (the
+/// 11th move is at about 1,922 ms after release, the redraw at 2,106 ms),
+/// so every counted change is a move.
 #[test]
 fn snake_moves_on_its_own() {
     let mut rt = snake_open();
     run_for_us(&mut rt, SNAKE_OPEN_FRAME_US);
     let moves = move_times(&mut rt, SPEED_WINDOW_US);
     assert!(moves.len() >= 6, "moves at {moves:?}");
+    assert!(
+        moves
+            .windows(2)
+            .all(|w| w[1] - w[0] == SNAKE_MOVE_INTERVAL_US),
+        "move gaps not all {SNAKE_MOVE_INTERVAL_US} us; moves at {moves:?}"
+    );
     let interval = median_interval(&moves);
     let badge = BADGE_MOVE_INTERVAL_US;
     assert!(

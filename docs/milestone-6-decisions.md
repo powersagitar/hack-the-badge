@@ -566,7 +566,7 @@ A's release). No frame hash, step pin or existing constant moved except
 
 | Rung | What it checks | Measured |
 | --- | --- | --- |
-| `snake_moves_on_its_own` | from the open frame (150 ms), at least six moves in `SPEED_WINDOW_US`; median interval within ±25 % of `BADGE_MOVE_INTERVAL_US` | seven moves, 222 ms to 1,242 ms; every interval 170,000 us |
+| `snake_moves_on_its_own` | from the open frame (150 ms), at least six moves in `SPEED_WINDOW_US`; every gap exactly `SNAKE_MOVE_INTERVAL_US` (R-T6-3); median interval within ±25 % of `BADGE_MOVE_INTERVAL_US` | seven moves, 222 ms to 1,242 ms; every interval 170,000 us |
 | `snake_steers` | UP (`SNAKE_TURN_SLOT` = 7) after the first move; the frame one interval after release is `SNAKE_TURNED_HASH`; at least three moves follow | first move 222 ms; press 255.5 to 355.5 ms; read at 525.5 ms, hash `0xcccb_b8c5_d80a_93e9` (R-T6-1); eight changes follow (seven moves up, then game over at the top wall) |
 | `snake_hits_wall_game_over` (tightened, R-T4-2) | after A on game over: the frame is not game over, and at least three moves with a median within ±25 % of the badge's | moves 76, 246, 416 and 586 ms after release |
 
@@ -596,18 +596,33 @@ ways:
   median move interval is **160,000 us** (play-area changes after the
   open frame at 226, 448, 608, ..., 1,248 ms after release; the gaps are
   222 ms, then 160 ms each). |160,000 − 170,000| = 10,000 ≤ 42,500,
-  so **`snake_moves_on_its_own` passes** under the legacy clock: the
-  interval is the firmware's own timer period, not CPU throughput (Task 5:
-  the CPU is about 96 % idle). The same clock fails the other three Snake
-  rungs: `launcher_opens_snake` (the start screen is not drawn by 150 ms),
-  `snake_steers` (a different frame at the read point) and
-  `snake_hits_wall_game_over` (13 changes instead of 12). So the timing
-  model is guarded by the Snake rungs together, not by the speed rung
-  alone; the speed rung's doc comment says so.
+  so with only the badge comparison `snake_moves_on_its_own` passed
+  under the legacy clock: the interval is the firmware's own timer
+  period, not CPU throughput (Task 5: the CPU is about 96 % idle). The
+  same clock fails the other three Snake rungs: `launcher_opens_snake`
+  (the start screen is not drawn by 150 ms), `snake_steers` (a different
+  frame at the read point) and `snake_hits_wall_game_over` (13 changes
+  instead of 12). Ruling R-T6-3 (below) added an exact pin, and Step 2
+  was re-run.
 
-Checks: release `boot_progress` 60 passed in 41.2 s; `cargo test
---workspace` green (`boot_progress` 27.9 s); clippy 3 warnings
-(unchanged); `cargo fmt --check` clean.
+**Ruling R-T6-3, the speed rung pins the exact move period.** The
+badge comparison stays as the spec's tolerance (median within ±25 % of
+`BADGE_MOVE_INTERVAL_US`), and the rung also asserts that every gap
+between consecutive moves equals `SNAKE_MOVE_INTERVAL_US` = 170,000 us,
+the emulator's exact, deterministic move period (Tasks 4 and 5; it
+agrees with the badge per Task 5). `SPEED_WINDOW_US` ends before the
+game-over redraw (184 ms after the 11th move, about 2,106 ms after
+release), so every counted change is a move and none needs excluding.
+The exact pin guards the timing model; the ±25 % check is the badge
+comparison. **Step 2 re-run** (legacy clock from A's release, probe
+reverted): `snake_moves_on_its_own` **FAILS**, "move gaps not all
+170000 us", with gaps 221,951 us and then 160,000 us (160,000 ≠
+170,000). If wrong: a clock change that kept Snake within ±25 % of the
+badge but changed its period would go unnoticed.
+
+Checks (after R-T6-3): release `boot_progress` 60 passed in 41.2 s;
+`cargo test --workspace` green (`boot_progress` 27.9 s, before R-T6-3);
+clippy 3 warnings (unchanged); `cargo fmt --check` clean.
 
 
 ## Milestone 7 backlog
