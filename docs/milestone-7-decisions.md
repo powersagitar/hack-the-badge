@@ -99,6 +99,54 @@ R-T*n*-*k* rulings are made in Task *n*.
   time. If wrong: a change that made slicing observable would fail the
   bench rather than be reported as a speed-up, which is the intent.
 
+### Task 2
+
+- **R-T2-2, the WASM bench's comparable factor is the pin factor.** The
+  in-walk method (R-T2-1) stops at the first 250,000-step sample showing
+  the end hash, and a sample's emulated time can lie far past the
+  redraw's end: idle steps fast-forward to the next alarm, and
+  onboarding's end (67 ms) lies inside the 100 ms press hold, which has no
+  sample. Measured under Bun, the samples land 180,000 steps (95.8 ms)
+  after HOME's pinned end, 50,000 steps (0.6 ms) after DOWN's and 317,355
+  steps (173 ms) after onboarding's, so emulated over wall (`factor`)
+  reads 0.857x for onboarding, against 0.308x native. The bench therefore
+  also reports `pin_factor`: the pinned redraw's emulated time over the
+  wall time its pinned steps take at the in-walk steps/s, which is the
+  native factor's formula (native: pinned emulated time over the wall
+  time of exactly the pinned steps). It keeps R-T2-1's hashing overhead
+  (pessimistic, as intended), and is the number in the HOME, DOWN and
+  onboarding columns for WASM rows; `factor` is printed beside it. If
+  wrong: if busy steps cost more per step than the idle tail the in-walk
+  steps include, `pin_factor` reads slightly optimistic; the in-walk
+  steps exceed the pinned steps by at most 10.5 % (onboarding; HOME 0.9 %,
+  DOWN 0.7 %), so the error is small.
+- **R-T2-3, the unit tests test `timeRedraw`, not `runRedrawBench`.**
+  A fake handle cannot produce frames with the pinned FNV hashes (that
+  needs FNV-1a preimages), so `runRedrawBench`'s walk cannot run against
+  one. `redraw-bench.ts` exports `timeRedraw(name, endHash, handle, now,
+  act)`, the timing core `runRedrawBench` calls for each redraw with the
+  pinned end hash; `test/redraw-bench.test.ts` drives it with a fake whose
+  end hash is computed. `runUntilStable` and `pressAndSettle` take an
+  optional `onSample` hook (it only observes) so the timing sees each
+  sample. The walk itself is checked by running the bench (it throws on
+  any hash the twin test pins). If wrong: only test coverage.
+- **R-T2-4, the WASM walk is the twin test's, 371,857,010 steps to the
+  launcher.** The bench walks with `test/cpu-wasm.test.ts`'s schedule
+  (the frontend provisioner, polled every 50,000 steps), then
+  `launcher_responds_to_navigation`'s DOWN. Its walk reaches the
+  launcher 740,001 steps before the native walk (372,597,011), which
+  provisions with the Rust helper (the two provisioning hosts' schedules
+  differ; the exact cause was not traced); every pinned hash matches, and the
+  three redraws start from the same frames. The `walk` line covers boot
+  to the launcher, including the onboarding and HOME timings, not DOWN.
+  If wrong: the walk's steps/s compares two slightly different
+  schedules, under 0.2 % apart.
+- **R-T2-5, `bench:safari` loads the page three times by default.** The
+  brief says the driver prints the JSON; it does, once per load, plus the
+  same median summary `bench:wasm` prints (`--runs N` changes the
+  count), so a Safari row is a median of three like the Bun row. If
+  wrong: none; `--runs 1` is the brief's behaviour.
+
 ## Measurements
 
 The native benchmark is
@@ -117,6 +165,7 @@ reads a little below the redraws' steps/s.
 | Commit | Task | Host | Profile | Walk M steps/s | HOME x | DOWN x | Onboarding x | Release suite s |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `6cd0a6e` (measured at `8165dd6` plus Task 1's tests) | 1 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = "s"` | 13.43 | 0.184 | 0.232 | 0.308 | 41.5 |
+| `6cd0a6e` core (Task 2's bench, measured at `b9a7336` plus Task 2) | 2 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.00 | 0.151 | 0.199 | 0.264 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -145,6 +194,44 @@ The two new rungs do not lengthen the suites: `hacker_walk_totals_are_unchanged`
 continues from the shared launcher checkpoint, and
 `execution_digest_is_unchanged` (20M single steps) runs in parallel with
 the longest chain.
+
+### Task 2: the WASM benchmark (`6cd0a6e` core)
+
+`bun run bench:wasm` (Bun, three runs, median); `bun run bench:safari`
+with `bun run dev` running (Safari, through `safaridriver`); the page
+`http://localhost:5173/bench.html` (Chrome, or any browser). Each run
+walks once (R-T2-4) and times the three redraws in place, in a dedicated
+Worker in a browser. **In-walk method (R-T2-1):** each redraw is timed
+from the press to the first 250,000-step sample showing its end hash, so
+its wall time includes the sampling's framebuffer copies and hashing,
+which the native bench's unsampled passes do not; compare WASM rows with
+WASM rows only. The table's factors for WASM rows are the pin factors
+(R-T2-2); `factor` (emulated time to that sample over wall time) is
+printed beside them and is not comparable with native. The walk's steps/s
+includes the walk's hashing and the provisioning host, like the native
+walk line.
+
+Bun (JavaScriptCore), Apple M5 Pro:
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=b9a7336+dirty profile=release opt-level="s"
+BENCH median runs=3 walk msteps_per_s=11.00
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=1697.1 factor=0.206 msteps_per_s=11.36 pin_factor=0.151
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=581.9 factor=0.199 msteps_per_s=11.87 pin_factor=0.199
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=280.2 factor=0.857 msteps_per_s=11.90 pin_factor=0.264
+```
+
+(`+dirty`: Task 2's own uncommitted files; the core and the WASM build
+are `b9a7336`'s, whose `emulator-core` is `6cd0a6e`'s plus Task 1's
+tests. The three runs agreed within 0.4 % on every wall time.)
+
+Safari: not measured in Task 2. `bun run bench:safari` reached
+`safaridriver`, but `POST /session` failed twice with "session not
+created: The session timed out while connecting to a Safari instance"
+(Safari's automation session needs the human partner: Develop > Allow
+Remote Automation, and any first-use prompt Safari shows). Chrome: not
+measured in Task 2 (no browser extension in the implementer's session).
+Both rows are for the Task 2 gate.
 
 ## Profiles
 

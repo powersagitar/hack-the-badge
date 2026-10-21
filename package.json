@@ -9,6 +9,8 @@
     "preview": "bun run --cwd frontend preview",
     "test": "bun run --cwd frontend test",
     "typecheck": "bun run --cwd frontend typecheck",
-    "build:wasm": "bun run --cwd frontend build:wasm"
+    "build:wasm": "bun run --cwd frontend build:wasm",
+    "bench:wasm": "bun run --cwd frontend bench:wasm",
+    "bench:safari": "bun run --cwd frontend bench:safari"
   }
 }
