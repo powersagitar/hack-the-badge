@@ -146,6 +146,12 @@ R-T*n*-*k* rulings are made in Task *n*.
   same median summary `bench:wasm` prints (`--runs N` changes the
   count), so a Safari row is a median of three like the Bun row. If
   wrong: none; `--runs 1` is the brief's behaviour.
+- **R-T2-6, which browser runs make the baselines.** The Chrome baseline
+  is the single run taken alone (the bench page does one run per load).
+  The Safari baseline is the median of 3 runs. Run 1 overlapped a Chrome
+  run and is kept, because runs 2 and 3 ran alone and agree within 1 %.
+  If wrong: the browser baselines are off by a few %, below the effect
+  sizes Tasks 3 to 7 measure.
 
 ## Measurements
 
@@ -166,6 +172,8 @@ reads a little below the redraws' steps/s.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `6cd0a6e` (measured at `8165dd6` plus Task 1's tests) | 1 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = "s"` | 13.43 | 0.184 | 0.232 | 0.308 | 41.5 |
 | `6cd0a6e` core (Task 2's bench, measured at `b9a7336` plus Task 2) | 2 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.00 | 0.151 | 0.199 | 0.264 | n/a |
+| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.07 | 0.152 | 0.201 | 0.264 | — |
+| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 12.36 | 0.172 | 0.228 | 0.301 | — |
 
 The baseline's `BENCH` lines:
 
@@ -225,13 +233,25 @@ BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=280.2 fac
 are `b9a7336`'s, whose `emulator-core` is `6cd0a6e`'s plus Task 1's
 tests. The three runs agreed within 0.4 % on every wall time.)
 
-Safari: not measured in Task 2. `bun run bench:safari` reached
-`safaridriver`, but `POST /session` failed twice with "session not
-created: The session timed out while connecting to a Safari instance"
-(Safari's automation session needs the human partner: Develop > Allow
-Remote Automation, and any first-use prompt Safari shows). Chrome: not
-measured in Task 2 (no browser extension in the implementer's session).
-Both rows are for the Task 2 gate.
+Browsers (Step 8's gate, closed): the orchestrator measured both at
+`0468972` (in-walk method, Apple M5 Pro). Chrome was driven through
+chrome-devtools-mcp, because the Claude-in-Chrome extension was not
+available. Safari was driven through `safaridriver` (`bun run
+bench:safari`) after the human partner allowed automation; the
+implementer's earlier attempts had failed with "session not created"
+before that. Which runs make each baseline is ruling R-T2-6. In every
+host the steps per redraw were identical (home 19,286,041, down
+6,908,235, onboarding 3,335,609), and so was the walk (371,857,010).
+
+- Safari 27.0.1, `bun run bench:safari`, median of 3: walk 11.07
+  Msteps/s; pin factor HOME 0.152x, DOWN 0.201x, onboarding 0.264x;
+  literal factor 0.208, 0.201, 0.854. Run 1 overlapped a Chrome run;
+  runs 2 and 3 ran alone and agree within 1 %.
+- Chrome 155, `bench.html`, one run with nothing else running: walk
+  12.36 Msteps/s; pin factor HOME 0.172x, DOWN 0.228x, onboarding 0.301x;
+  literal factor 0.234, 0.227, 0.976. An earlier run that overlapped
+  Safari read 12.15 Msteps/s and pin factors 0.167, 0.219, 0.302, within
+  4 %.
 
 ## Profiles
 
