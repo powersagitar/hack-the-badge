@@ -49,7 +49,9 @@
 //!    `crate::peripherals` and `crate::peripherals::systimer`. Then
 //!    **SYSTEM** ([`crate::mem::soc::SYSTEM_RANGE`], Milestone 3 Task 4):
 //!    only the four `SYSTEM_CPU_INTR_FROM_CPU_<n>_REG` software-interrupt
-//!    registers (`crate::peripherals::system::System::handles`) are routed
+//!    registers and (Milestone 6 Task 2) the CPU-clock registers
+//!    `SYSTEM_CPU_PER_CONF_REG` and `SYSTEM_SYSCLK_CONF_REG`
+//!    (`crate::peripherals::system::System::handles`) are routed
 //!    to [`FirmwareBus::system`]; every other SYSTEM offset falls through to
 //!    the logged catch-all below, as before.
 //!    **SYSCON / APB_CTRL** ([`crate::mem::soc::APB_CTRL_RANGE`], Milestone 5
@@ -93,7 +95,8 @@
 //!    passes `&mut self.console` straight through, another instance of the
 //!    "no trait object" ruling's direct concrete-field access.
 //!    Since Milestone 5 it also receives: a host queue feeds paced 64-byte
-//!    OUT packets (`PACKET_STEPS`), its `INT_ST` drives interrupt source 26
+//!    OUT packets (`PACKET_TICKS` of emulated time apart), its `INT_ST`
+//!    drives interrupt source 26
 //!    ([`FirmwareBus::pending_sources`]), and the idle fast-forward stops
 //!    at the next host packet ([`FirmwareBus::ticks_until_next_event`]).
 //! 9. **TIMG0** ([`crate::mem::soc::TIMG0_RANGE`]): routed to
@@ -169,6 +172,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::clock::Clock;
 use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::console::Console;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
@@ -181,7 +185,7 @@ use crate::peripherals::rmt::Rmt;
 use crate::peripherals::rtc_cntl::RtcCntl;
 use crate::peripherals::spi::Spi;
 use crate::peripherals::system::System;
-use crate::peripherals::systimer::{SysTimer, TICKS_PER_STEP};
+use crate::peripherals::systimer::SysTimer;
 use crate::peripherals::timg::Timg;
 use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
@@ -190,7 +194,8 @@ use super::soc::{
     is_xip_addr, APB_CTRL_RANGE, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
     IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
     MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
-    SYSTEM_RANGE, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    SYSTEM_RANGE, SYSTIMER_HZ, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
+    XTAL_HZ,
 };
 use super::Bus;
 
@@ -316,6 +321,13 @@ pub struct FirmwareBus {
     /// installs some (`crate::boot::boot_from_factory_image_with_rom_stubs`
     /// installs `crate::rom`'s ESP32-C3 set).
     rom_data: Vec<RomDataBlob>,
+    /// Emulated time. Starts at the XTAL clock the ROM leaves; follows
+    /// [`System::cpu_hz`] from then on (sampled once per step, after the
+    /// instruction, in [`FirmwareBus::tick_peripherals`], and at the start
+    /// of an idle fast-forward in [`FirmwareBus::advance_idle`]; an invalid
+    /// encoding keeps the previous rate). A real boot's first step applies
+    /// the bootloader's 80 MHz PLL seed (`crate::rom`'s initializers).
+    pub clock: Clock,
     /// The SYSTIMER peripheral (`crate::peripherals::systimer`), a concrete
     /// named field per this plan's pre-flight design ruling — see the
     /// module doc.
@@ -324,7 +336,8 @@ pub struct FirmwareBus {
     /// same ruling.
     pub intc: InterruptController,
     /// The SYSTEM peripheral (`crate::peripherals::system`), same ruling —
-    /// only the `FROM_CPU_0..3` software-interrupt registers are modeled.
+    /// only the `FROM_CPU_0..3` software-interrupt registers and the two
+    /// CPU-clock registers (`CPU_PER_CONF`, `SYSCLK_CONF`) are modeled.
     pub system: System,
     /// SYSCON / APB_CTRL (`crate::peripherals::apb_ctrl`), same ruling --
     /// only the RNG data register (`APB_CTRL_RND_DATA_REG`) is modeled.
@@ -459,6 +472,9 @@ impl FirmwareBus {
             ram_regions,
             rom_code: Vec::new(),
             rom_data: Vec::new(),
+            // Starts at the XTAL clock the ROM leaves; follows
+            // `System::cpu_hz` from then on.
+            clock: Clock::new(XTAL_HZ, SYSTIMER_HZ, 1),
             systimer: SysTimer::new(),
             intc: InterruptController::new(),
             system: System::new(),
@@ -562,22 +578,38 @@ impl FirmwareBus {
         self.intc.poll(self.pending_sources())
     }
 
-    /// Advances [`FirmwareBus::systimer`]'s counter by one step's worth of
-    /// ticks. Call exactly once per `Cpu::step()` (except a step spent
-    /// waiting in `WFI`, which advances SYSTIMER by its own fast-forward
-    /// instead) — see
-    /// `crate::boot::step_with_interrupts`, which samples
-    /// [`FirmwareBus::asserted_lines`] itself at the start of the next step,
-    /// so this returns nothing.
+    /// Advances emulated time by one executed step and every timed
+    /// peripheral by the ticks that step completed (none on most steps
+    /// once the CPU runs faster than SYSTIMER). Call exactly once per
+    /// `Cpu::step()` that is not an idle fast-forward -- see
+    /// `crate::boot::step_with_interrupts`.
     pub fn tick_peripherals(&mut self) {
-        self.systimer.advance();
-        self.usb_serial_jtag.advance(TICKS_PER_STEP);
+        // The CPU clock the SYSTEM registers select now, sampled after the
+        // step so a word write's byte-split halves are never seen alone.
+        // This runs before `clock.step()`, so the step that writes a clock
+        // register is itself charged at the new rate (at most 1 of the 5
+        // ticks per frequency switch).
+        self.sync_cpu_clock();
+        let ticks = self.clock.step();
+        if ticks > 0 {
+            self.systimer.advance_by(ticks);
+            self.usb_serial_jtag.advance(ticks);
+        }
     }
 
-    /// How far an idle (WFI) core may fast-forward: to the next SYSTIMER
-    /// alarm or the next USB host packet, whichever is first; at least one
-    /// step's worth of ticks.
-    pub fn ticks_until_next_event(&self) -> u64 {
+    /// Points the clock at the CPU frequency the SYSTEM clock registers
+    /// select ([`System::cpu_hz`]); an invalid encoding (`None`) keeps the
+    /// previous rate, so the clock never runs at zero.
+    fn sync_cpu_clock(&mut self) {
+        if let Some(hz) = self.system.cpu_hz() {
+            self.clock.set_cpu_hz(hz);
+        }
+    }
+
+    /// How far an idle (WFI) core may fast-forward: the ticks to the next
+    /// SYSTIMER alarm or USB host packet, whichever is first, or `None`
+    /// when neither is pending.
+    pub fn ticks_until_next_event(&self) -> Option<u64> {
         [
             self.systimer.ticks_until_next_alarm(),
             self.usb_serial_jtag.ticks_until_next_packet(),
@@ -585,12 +617,14 @@ impl FirmwareBus {
         .into_iter()
         .flatten()
         .min()
-        .unwrap_or(0)
-        .max(TICKS_PER_STEP)
     }
 
-    /// Advances every timed peripheral by `ticks` during an idle fast-forward.
+    /// Advances emulated time and every timed peripheral by `ticks` during
+    /// an idle fast-forward. A clock-register write just before the `wfi`
+    /// takes effect here, so the idle time follows the new rate.
     pub fn advance_idle(&mut self, ticks: u64) {
+        self.sync_cpu_clock();
+        self.clock.advance_idle(ticks);
         self.systimer.advance_by(ticks);
         self.usb_serial_jtag.advance(ticks);
     }
@@ -894,8 +928,8 @@ impl FirmwareBus {
             // is just direct field access, the same pattern the
             // INTERRUPT_CORE0/SPI2 tiers above already use. See
             // `crate::peripherals::rtc_cntl`'s module doc.
-            let elapsed_steps = self.systimer.elapsed_ticks();
-            self.rtc_cntl.write_byte(offset, val, elapsed_steps);
+            let elapsed_ticks = self.systimer.elapsed_ticks();
+            self.rtc_cntl.write_byte(offset, val, elapsed_ticks);
             return;
         }
         if SPIMEM1_RANGE.contains(&addr) {
@@ -1193,6 +1227,21 @@ mod tests {
         assert!(bus.unmapped_log().is_empty(), "RND_DATA is mapped");
         assert_eq!(bus.read32(0x6002_60AC), 0);
         assert!(bus.unmapped_log().iter().any(|x| x.addr == 0x6002_60AC));
+    }
+
+    #[test]
+    fn system_clock_registers_are_routed() {
+        use crate::peripherals::system::{CPU_PER_CONF_REG, SYSCLK_CONF_REG};
+        let mut bus = bus_with(vec![]);
+        bus.write32(SYSTEM_RANGE.start + SYSCLK_CONF_REG, 1 << 10);
+        assert_eq!(bus.read32(SYSTEM_RANGE.start + SYSCLK_CONF_REG), 1 << 10);
+        bus.write32(SYSTEM_RANGE.start + CPU_PER_CONF_REG, 0x0d);
+        assert_eq!(bus.read32(SYSTEM_RANGE.start + CPU_PER_CONF_REG), 0x0d);
+        assert_eq!(bus.system.cpu_hz(), Some(160_000_000));
+        assert!(
+            bus.unmapped_log().is_empty(),
+            "both clock registers are mapped"
+        );
     }
 
     #[test]
@@ -1698,7 +1747,7 @@ mod tests {
         // source -- see `crate::peripherals::rtc_cntl`'s module doc) well
         // past the ~294-step quotient threshold before triggering.
         for _ in 0..1_000_000 {
-            bus.systimer.advance();
+            bus.systimer.advance_by(1);
         }
         // TIME_UPDATE_REG (+0x0c): set bit 31 (RTC_CNTL_TIME_UPDATE).
         bus.write32(0x6000_8000 + 0x0c, 1 << 31);
@@ -1868,10 +1917,14 @@ mod tests {
     fn idle_fast_forward_stops_at_the_next_host_packet() {
         use crate::peripherals::usb_serial_jtag::PACKET_TICKS;
         let mut bus = bus_with(vec![]);
-        // No alarm armed and no host input: one step's worth.
-        assert_eq!(bus.ticks_until_next_event(), TICKS_PER_STEP);
+        // No alarm armed and no host input: nothing to fast-forward to.
+        assert_eq!(bus.ticks_until_next_event(), None);
         bus.usb_serial_jtag.host_send(&[b'a'; 65]);
-        assert_eq!(bus.ticks_until_next_event(), 1, "first packet is due now");
+        assert_eq!(
+            bus.ticks_until_next_event(),
+            Some(1),
+            "first packet is due now"
+        );
         bus.advance_idle(1);
         // Firmware drains the packet; the next one is a packet time away.
         for _ in 0..64 {
@@ -1879,7 +1932,7 @@ mod tests {
         }
         assert_eq!(
             bus.ticks_until_next_event(),
-            PACKET_TICKS,
+            Some(PACKET_TICKS),
             "no SYSTIMER alarm is armed on a fresh bus"
         );
         bus.advance_idle(PACKET_TICKS);
@@ -1887,6 +1940,105 @@ mod tests {
             bus.read8(USB_SERIAL_JTAG_RANGE.start + 4) & 0b100,
             0b100,
             "DATA_AVAIL"
+        );
+    }
+
+    #[test]
+    fn zero_tick_steps_leave_the_systimer_untouched() {
+        let mut bus = xtal_bus();
+        bus.write32(CPU_PER_CONF, 0x0c); // CPUPERIOD_SEL 0 (80 MHz)
+        bus.write32(SYSCLK_CONF, 1 << 10); // PLL
+        bus.tick_peripherals(); // applies 80 MHz
+        assert_eq!(bus.clock.cpu_hz(), 80_000_000);
+        // `xtal_bus`'s 40 MHz step left 2/5 of a tick pending; the rescale
+        // keeps it, and the sync step itself adds 1/5 (3/5 pending). So the
+        // next five steps complete a tick on the second only: each of the
+        // other four advances SYSTIMER by nothing.
+        let mut per_step = Vec::new();
+        for _ in 0..5 {
+            let before = bus.systimer.elapsed_ticks();
+            bus.tick_peripherals();
+            per_step.push(bus.systimer.elapsed_ticks() - before);
+        }
+        assert_eq!(per_step, [0, 1, 0, 0, 0]);
+    }
+
+    const SYSCLK_CONF: u32 = SYSTEM_RANGE.start + 0x058;
+    const CPU_PER_CONF: u32 = SYSTEM_RANGE.start + 0x008;
+
+    /// A bare bus (no boot initializers) with SYSCLK_CONF set to XTAL / 1
+    /// (SOC_CLK_SEL 0, PRE_DIV_CNT 0: 40 MHz) and applied by one step's
+    /// sync.
+    fn xtal_bus() -> FirmwareBus {
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        bus.write32(SYSCLK_CONF, 0);
+        bus.tick_peripherals();
+        bus
+    }
+
+    #[test]
+    fn a_bare_bus_follows_the_reset_clock_registers() {
+        // No initializer: SYSCLK_CONF's reset PRE_DIV_CNT = 1 is XTAL / 2.
+        let mut bus = FirmwareBus::from_segments(Arc::from(Vec::new().into_boxed_slice()), &[]);
+        assert_eq!(
+            bus.clock.cpu_hz(),
+            40_000_000,
+            "constructed at the XTAL clock"
+        );
+        bus.tick_peripherals();
+        assert_eq!(bus.clock.cpu_hz(), 20_000_000);
+    }
+
+    #[test]
+    fn clock_follows_the_cpu_clock_registers_after_the_step() {
+        let mut bus = xtal_bus();
+        assert_eq!(bus.clock.cpu_hz(), 40_000_000);
+        bus.write32(CPU_PER_CONF, 0x0c); // CPUPERIOD_SEL 0 (80 MHz)
+        bus.write32(SYSCLK_CONF, 1 << 10); // PLL
+        assert_eq!(bus.clock.cpu_hz(), 40_000_000, "not until the step ends");
+        bus.tick_peripherals();
+        assert_eq!(bus.clock.cpu_hz(), 80_000_000);
+    }
+
+    #[test]
+    fn bus_steps_at_80_mhz_tick_once_every_five_steps() {
+        let mut bus = xtal_bus();
+        bus.write32(SYSCLK_CONF, 1 << 10);
+        bus.tick_peripherals(); // applies 80 MHz
+        let before = bus.clock.total_ticks();
+        for _ in 0..10 {
+            bus.tick_peripherals();
+        }
+        assert_eq!(bus.clock.total_ticks() - before, 2);
+    }
+
+    #[test]
+    fn invalid_clock_encoding_keeps_the_clock_rate() {
+        // From the XTAL rate: SOC_CLK_SEL 3 is invalid, 40 MHz stays.
+        let mut bus = xtal_bus();
+        bus.write32(SYSCLK_CONF, 3 << 10);
+        bus.tick_peripherals();
+        assert_eq!(bus.clock.cpu_hz(), 40_000_000);
+        // From a rate no reset value or default gives (PLL 160 MHz), so
+        // "kept" cannot pass by falling back to the constructor's rate.
+        bus.write32(CPU_PER_CONF, 0x0d); // CPUPERIOD_SEL 1 (160 MHz)
+        bus.write32(SYSCLK_CONF, 1 << 10); // PLL
+        bus.tick_peripherals();
+        assert_eq!(bus.clock.cpu_hz(), 160_000_000);
+        bus.write32(SYSCLK_CONF, 3 << 10); // SOC_CLK_SEL 3: invalid
+        bus.tick_peripherals();
+        assert_eq!(
+            bus.clock.cpu_hz(),
+            160_000_000,
+            "invalid SOC_CLK_SEL keeps the rate"
+        );
+        bus.write32(SYSCLK_CONF, 1 << 10);
+        bus.write32(CPU_PER_CONF, 0x0f); // CPUPERIOD_SEL 3: invalid
+        bus.tick_peripherals();
+        assert_eq!(
+            bus.clock.cpu_hz(),
+            160_000_000,
+            "invalid CPUPERIOD_SEL keeps the rate"
         );
     }
 }

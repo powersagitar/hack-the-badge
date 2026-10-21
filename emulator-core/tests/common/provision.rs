@@ -24,7 +24,11 @@ const CHUNK: u32 = 50_000;
 /// what does not fit its 256-byte RX ring, and the `put` task needs about
 /// 20-24k steps per 64-byte packet to drain it (measured, Milestone 5 Task
 /// D-M5-1: a 600-byte payload fails at 20,000 steps/packet and passes at
-/// 24,000), so the gap is 2x that. See `docs/milestone-5-decisions.md`.
+/// 24,000), so the gap is 2x that. Re-measured under Milestone 6's clock
+/// (packets 821 SYSTIMER ticks apart): 24,000 still passes both the
+/// 600-byte payload and role hacker's provisioning, 12,000 fails the
+/// former, so the gap stays 48,000. See `docs/milestone-5-decisions.md`
+/// and `docs/milestone-6-decisions.md`.
 pub const PUT_CHUNK_GAP_STEPS: u32 = 48_000;
 
 pub enum Outcome {

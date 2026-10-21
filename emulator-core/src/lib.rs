@@ -1,4 +1,5 @@
 pub mod boot;
+pub mod clock;
 pub mod cpu;
 pub mod md5;
 pub mod mem;

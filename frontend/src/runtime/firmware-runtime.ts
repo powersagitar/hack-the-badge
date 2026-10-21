@@ -2,8 +2,8 @@
  * Real-firmware runtime: mirrors `src/runtime/lifecycle.ts`'s role, but for
  * the CPU-emulator side (Milestone 2) instead of the Lua sandbox
  * (Milestone 1). Owns a `FirmwareEmulatorHandle` (`src/cpu/bridge.ts`), drives
- * a `requestAnimationFrame` loop that steps the CPU a fixed instruction
- * budget and blits the reconstructed framebuffer (`src/render/framebuffer.ts`)
+ * a `requestAnimationFrame` loop that runs the CPU to the frame's wall-clock
+ * time target and blits the reconstructed framebuffer (`src/render/framebuffer.ts`)
  * onto the same `<canvas>` `src/ui/shell.ts` already owns, and exposes an
  * `injectButton`-shaped API close enough to `lifecycle.ts`'s `AppRuntime` that
  * `shell.ts`'s existing button-pad/keyboard wiring can drive either runtime
@@ -25,40 +25,61 @@
  * -> `undefined`, the same fact `src/render/framebuffer.ts`'s module doc
  * records about `ImageData`).
  *
- * ## Cycles-per-frame budget
+ * ## Pacing
  *
- * No real clock-rate emulation exists (a known, out-of-scope plan-level
- * risk — see the Task 6 brief). `DEFAULT_CYCLES_PER_FRAME` is a documented
- * guess, not a measurement:
+ * Emulated time follows `requestAnimationFrame` time: each frame runs the
+ * emulator (`FirmwareEmulatorHandle.runUntil`) until its emulated clock has
+ * advanced by the wall-clock time since the previous frame (exactly: an idle
+ * wait stops at the target instead of jumping to the next alarm,
+ * `emulator-core`'s `boot::idle_until`, ruling R-T7-4), so the firmware's
+ * own timers (Snake's move period, the button polling, animations) run at the
+ * badge's speed. The first frame after `start()` (or `reset()`) has no
+ * previous frame and runs nothing, so a paused or backgrounded runtime does
+ * not count the time it was stopped.
  *
- * - The real badge runs its CPU at 80 MHz (per its own boot log; the
- *   emulator's ROM-stub `CPU_FREQ_MHZ` = 160 in `emulator-core/src/rom.rs`
- *   is a separate, documented flagged guess). At 60 fps that's ~1.33M
- *   instructions of real time per frame — more than is safe to spend
- *   synchronously inside one `requestAnimationFrame` callback.
- * - The prior session measured ~40M steps/s for `cargo test --release`
- *   (native, no WASM/JS-boundary overhead, no framebuffer copy/paint cost
- *   sharing the frame budget). WASM plus the per-`run()` `Vec<u16>` copy
- *   (`bridge.ts`'s buffer-aliasing-safety mechanism) and the RGB565->RGBA8888
- *   conversion `blitFramebuffer` does over all 76,800 pixels will all be
- *   slower than that native figure by an unmeasured but real amount.
- * - 500,000 steps/frame is chosen as a conservative fraction of a 16ms
- *   budget: enough to make visible progress every frame (roughly 3/8 of a
- *   real frame's worth of instructions, so boot/gameplay isn't rendered in
- *   slow motion relative to real time) while leaving comfortable headroom
- *   for the WASM call, the copy, and the paint even if the in-browser rate
- *   turns out to be a fraction of the native one. If profiling in a live
- *   browser (the controller's follow-up step, not this session's) shows a
- *   frame consistently taking too long, lowering this constant is the fix;
- *   nothing else in this module needs to change.
+ * Two bounds keep one frame from freezing the tab:
+ *
+ * - The wall delta is clamped to `MAX_FRAME_DELTA_MS` (50 ms). A tab that
+ *   comes back from the background, or a frame the browser delayed, gets at
+ *   most 50 ms of emulated time, not a catch-up burst.
+ * - `DEFAULT_STEPS_PER_FRAME` (150,000 steps) caps the work per frame. The
+ *   emulated clock advances by more than one step's worth per step while the
+ *   CPU waits in WFI (the SYSTIMER fast-forward), so a mostly idle firmware
+ *   reaches its target in far fewer steps than 80 MHz x the delta. Snake
+ *   needs about 4,000 to 30,000 steps per 8.3 ms frame, and about 230,000
+ *   for a frame that redraws a move. The cap is measured (Milestone 6
+ *   Task 7, ruling R-T7-5; `docs/milestone-6-decisions.md`). With the
+ *   first cap of 1,000,000 steps, a busy stretch after onboarding ran at
+ *   9.6 fps in the human's browser, so about 104 ms per frame, or about
+ *   10M steps/s. Bun's JavaScriptCore runs the WASM at 12.3M steps/s.
+ *   150,000 steps is 12 to 15 ms of work, about one 60 Hz frame. Long
+ *   frames also delay input: a key event waits for the running frame, and
+ *   its paint waits for the next one, so 104 ms frames gave the measured
+ *   328 ms INP.
+ *
+ * When the cap binds, the frame stops short of its target and the missed
+ * emulated time (the debt) is dropped: the next frame targets its own
+ * `now + delta`, not the missed time. The badge then runs in slow motion
+ * rather than stalling the tab to catch up; `FirmwareRuntime.speed()` (the
+ * smoothed emulated/wall ratio, shown in the firmware status line) reports
+ * it.
+ *
+ * `speed()` divides each frame's emulated advance by the real, unclamped
+ * wall delta. Frames longer than 50 ms are slow motion even when the step
+ * cap does not bind (each one advances only 50 ms), and the readout has to
+ * show that. A tab returning from the background therefore contributes one
+ * near-zero sample, at the smoothing's 0.1 weight.
  */
 import type { ButtonName } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 import { blitFramebuffer } from "../render/framebuffer";
 import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
 
-/** See this module's doc for the reasoning behind this number. */
-export const DEFAULT_CYCLES_PER_FRAME = 500_000;
+/** Largest wall-clock delta (ms) one frame advances emulated time by; see "Pacing" above. */
+export const MAX_FRAME_DELTA_MS = 50;
+
+/** Most instruction steps one frame runs; see "Pacing" above. */
+export const DEFAULT_STEPS_PER_FRAME = 150_000;
 
 /**
  * Human button name -> raw slot index, as consumed by
@@ -99,25 +120,25 @@ export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
 export const PROVISION_TIMEOUT_STEPS = 60_000_000;
 
 /**
- * Minimum emulated steps a button stays pressed (100 ms at 16 MHz; same
- * value as `PRESS_HOLD_STEPS` in `emulator-core/tests/boot_progress.rs`).
- * A shorter click would be missed by the firmware's button polling.
+ * Minimum emulated time a button stays pressed: 100 ms (same value as
+ * `PRESS_HOLD_US` in `emulator-core/tests/boot_progress.rs`). A shorter
+ * click would be missed by the firmware's button polling.
  */
-export const PRESS_HOLD_STEPS = 1_600_000;
+export const PRESS_HOLD_US = 100_000;
 
-/** Steps per shake half-period (`SHAKE_HALF_STEPS` in boot_progress.rs). */
-export const SHAKE_HALF_STEPS = 1_000_000;
+/** Emulated µs per shake half-period (`SHAKE_HALF_US` in boot_progress.rs). */
+export const SHAKE_HALF_US = 62_500;
 const SHAKE_HALF_PERIODS = 6;
 const REST_ACCELERATION: [number, number, number] = [0, 0, 1000];
 
 /**
- * The acceleration (mg) `elapsed` steps into a shake: six alternating
- * half-periods (+,-,+,...) of (s*2000, s*2000, 1000), then `null` (done;
- * the caller restores the rest acceleration). Mirrors `shake()` in
- * `emulator-core/tests/boot_progress.rs`.
+ * The acceleration (mg) `elapsedUs` of emulated time into a shake: six
+ * alternating half-periods (+,-,+,...) of (s*2000, s*2000, 1000), then
+ * `null` (done; the caller restores the rest acceleration). Mirrors
+ * `shake()` in `emulator-core/tests/boot_progress.rs`.
  */
-export function shakeAcceleration(elapsed: number): [number, number, number] | null {
-  const k = Math.floor(elapsed / SHAKE_HALF_STEPS);
+export function shakeAcceleration(elapsedUs: number): [number, number, number] | null {
+  const k = Math.floor(elapsedUs / SHAKE_HALF_US);
   if (k >= SHAKE_HALF_PERIODS) return null;
   const s = k % 2 === 0 ? 1 : -1;
   return [s * 2000, s * 2000, 1000];
@@ -127,8 +148,8 @@ export type FrameScheduler = (cb: (timeMs: number) => void) => number;
 export type FrameCanceler = (handle: number) => void;
 
 export interface FirmwareRuntimeOptions {
-  /** Instruction steps to run per animation frame. Default: {@link DEFAULT_CYCLES_PER_FRAME}. */
-  cyclesPerFrame?: number;
+  /** Most instruction steps to run per animation frame. Default: {@link DEFAULT_STEPS_PER_FRAME}. */
+  stepsPerFrame?: number;
   /** Injectable for testing; defaults to the real `requestAnimationFrame`. */
   scheduleFrame?: FrameScheduler;
   /** Injectable for testing; defaults to the real `cancelAnimationFrame`. */
@@ -136,26 +157,54 @@ export interface FirmwareRuntimeOptions {
 }
 
 /**
- * Runs one frame's worth of work: step the CPU `cyclesPerFrame` instructions,
- * then blit its current framebuffer to `ctx`. Pure with respect to scheduling
- * (no `requestAnimationFrame` involved) so it's directly unit-testable
- * against a fake `FirmwareEmulatorHandle` and a fake canvas context, the same
- * way `test/canvas.test.ts`/`test/framebuffer.test.ts` already stub those.
+ * The emulated time (µs) a frame starting at `emulatedUs` runs to: the wall
+ * delta, clamped to `[0, MAX_FRAME_DELTA_MS]`, added as emulated time.
+ */
+export function frameTargetUs(emulatedUs: number, wallDeltaMs: number): number {
+  const delta = Math.min(Math.max(wallDeltaMs, 0), MAX_FRAME_DELTA_MS);
+  return emulatedUs + delta * 1000;
+}
+
+/** What one {@link stepFirmwareFrame} did. */
+export interface FrameResult {
+  /** Emulated time (µs) the frame advanced. */
+  emulatedDeltaUs: number;
+  /** The step cap stopped the frame short of its target (the debt is dropped). */
+  capped: boolean;
+}
+
+/**
+ * Runs one frame's worth of work: run the CPU until its emulated clock has
+ * advanced by `wallDeltaMs` (clamped, see {@link frameTargetUs}) or
+ * `stepsPerFrame` steps have run, then blit its current framebuffer to `ctx`.
+ * Pure with respect to scheduling (no `requestAnimationFrame` involved) so
+ * it's directly unit-testable against a fake `FirmwareEmulatorHandle` and a
+ * fake canvas context, the same way `test/canvas.test.ts`/
+ * `test/framebuffer.test.ts` already stub those.
  */
 export function stepFirmwareFrame(
   handle: FirmwareEmulatorHandle,
   ctx: CanvasRenderingContext2D,
-  cyclesPerFrame: number,
-): void {
-  handle.run(cyclesPerFrame);
-  const pixels = handle.framebuffer();
-  blitFramebuffer(ctx, pixels, handle.screenWidth, handle.screenHeight);
+  wallDeltaMs: number,
+  stepsPerFrame: number,
+): FrameResult {
+  const before = handle.emulatedTimeUs();
+  const target = frameTargetUs(before, wallDeltaMs);
+  handle.runUntil(target, stepsPerFrame);
+  const after = handle.emulatedTimeUs();
+  blitFramebuffer(ctx, handle.framebuffer(), handle.screenWidth, handle.screenHeight);
+  // The wasm shim truncates the target to whole µs (`target_us as u64`), so
+  // an uncapped frame with a fractional rAF delta ends at floor(target).
+  return { emulatedDeltaUs: after - before, capped: after < Math.floor(target) };
 }
 
 export interface FirmwareRuntime {
   /** Begins the per-frame step+blit loop. Idempotent while already running. */
   start(): void;
-  /** Stops the loop. Does not dispose the underlying emulator handle. */
+  /**
+   * Stops the loop and releases any button whose release was deferred (see
+   * `PRESS_HOLD_US`). Does not dispose the underlying emulator handle.
+   */
   stop(): void;
   /** Mirrors `lifecycle.ts`'s `AppRuntime.injectButton` signature. */
   injectButton(button: ButtonName, kind: "pressed" | "released"): void;
@@ -167,6 +216,13 @@ export interface FirmwareRuntime {
   shake(): void;
   /** Re-boots the firmware from the same image, keeping held buttons. */
   reset(): void;
+  /**
+   * Smoothed ratio of emulated time to wall-clock time over recent frames
+   * (1 = the badge's speed; below 1 when the step cap binds or frames take
+   * longer than `MAX_FRAME_DELTA_MS`). `0` until the
+   * second frame after `start()` or `reset()`.
+   */
+  speed(): number;
   /**
    * Real-firmware mode has no Lua-style exit-to-launcher (that's
    * a Lua-sandbox-mode-only affordance — see `badge.app.exit()` in
@@ -188,7 +244,7 @@ export function createFirmwareRuntime(
   ctx: CanvasRenderingContext2D,
   options: FirmwareRuntimeOptions = {},
 ): FirmwareRuntime {
-  const cyclesPerFrame = options.cyclesPerFrame ?? DEFAULT_CYCLES_PER_FRAME;
+  const stepsPerFrame = options.stepsPerFrame ?? DEFAULT_STEPS_PER_FRAME;
   const scheduleFrame: FrameScheduler =
     options.scheduleFrame ??
     ((cb) => {
@@ -207,14 +263,21 @@ export function createFirmwareRuntime(
 
   let frameHandle: number | null = null;
   let disposed = false;
+  /** `requestAnimationFrame` time of the previous frame, or `null` (none since start/reset). */
+  let lastWallMs: number | null = null;
+  /** Exponentially smoothed emulated/wall ratio; `0` before the second frame. */
+  let speed = 0;
 
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
-  /** Step at which the current shake began, or `null`. */
+  /** Emulated time (µs) at which the current shake began, or `null`. */
   let shakeStartedAt: number | null = null;
   let lastShakeAccel: string | null = null;
-  /** Per button: step of its latest press, and a release deferred to a step. */
+  /**
+   * Per button: emulated time (µs) of its latest press, and a release
+   * deferred to an emulated time.
+   */
   const pressedAt = new Map<ButtonName, number>();
   const pendingRelease = new Map<ButtonName, number>();
 
@@ -253,16 +316,33 @@ export function createFirmwareRuntime(
     }
   }
 
-  function loop(): void {
+  function releaseAllPending(): void {
+    // Don't strand a button whose deferred release we are dropping.
+    for (const button of pendingRelease.keys()) {
+      handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+      pressedAt.delete(button);
+    }
+    pendingRelease.clear();
+  }
+
+  function loop(timeMs: number): void {
     // Guards against a callback that was already queued by the real
     // scheduler before stop() canceled it — a race a test's fake scheduler
     // can also simulate by invoking a "canceled" callback directly.
     if (frameHandle === null) return;
-    stepFirmwareFrame(handle, ctx, cyclesPerFrame);
-    const now = handle.totalSteps();
-    pollProvisioner(now);
-    pollShake(now);
-    pollReleases(now);
+    const delta = lastWallMs === null ? 0 : timeMs - lastWallMs;
+    lastWallMs = timeMs;
+    const r = stepFirmwareFrame(handle, ctx, delta, stepsPerFrame);
+    if (delta > 0) {
+      // The real frame time, not the clamped one: see "Pacing" above.
+      const ratio = r.emulatedDeltaUs / (delta * 1000);
+      speed = speed === 0 ? ratio : 0.9 * speed + 0.1 * ratio;
+    }
+    // The provisioner's timeout is in steps; holds and shakes in emulated time.
+    pollProvisioner(handle.totalSteps());
+    const nowUs = handle.emulatedTimeUs();
+    pollShake(nowUs);
+    pollReleases(nowUs);
     if (frameHandle !== null) {
       frameHandle = scheduleFrame(loop);
     }
@@ -271,6 +351,8 @@ export function createFirmwareRuntime(
   function start(): void {
     if (disposed) throw new Error("runtime/firmware-runtime: cannot start a disposed runtime");
     if (frameHandle !== null) return;
+    // A resume must not count the time the loop was stopped.
+    lastWallMs = null;
     frameHandle = scheduleFrame(loop);
   }
 
@@ -279,12 +361,14 @@ export function createFirmwareRuntime(
       cancelFrame(frameHandle);
       frameHandle = null;
     }
+    // With the loop stopped nothing would poll a deferred release.
+    releaseAllPending();
   }
 
   function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
     const slot = RAW_SLOT_BY_BUTTON[button];
     if (slot === undefined) return;
-    const now = handle.totalSteps();
+    const now = handle.emulatedTimeUs();
     if (kind === "pressed") {
       pendingRelease.delete(button);
       pressedAt.set(button, now);
@@ -292,8 +376,8 @@ export function createFirmwareRuntime(
       return;
     }
     const since = pressedAt.get(button);
-    if (since !== undefined && now - since < PRESS_HOLD_STEPS) {
-      pendingRelease.set(button, since + PRESS_HOLD_STEPS);
+    if (since !== undefined && now - since < PRESS_HOLD_US) {
+      pendingRelease.set(button, since + PRESS_HOLD_US);
       return;
     }
     pendingRelease.delete(button);
@@ -308,7 +392,7 @@ export function createFirmwareRuntime(
   }
 
   function shake(): void {
-    shakeStartedAt = handle.totalSteps();
+    shakeStartedAt = handle.emulatedTimeUs();
     lastShakeAccel = null;
   }
 
@@ -317,10 +401,10 @@ export function createFirmwareRuntime(
     lastState = null;
     shakeStartedAt = null;
     lastShakeAccel = null;
-    // Don't strand a button whose deferred release we are dropping.
-    for (const button of pendingRelease.keys()) handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+    releaseAllPending();
     pressedAt.clear();
-    pendingRelease.clear();
+    speed = 0;
+    lastWallMs = null;
     // The emulator's acceleration survives a reset; put it back at rest.
     handle.setAcceleration(...REST_ACCELERATION);
     handle.reset();
@@ -341,6 +425,7 @@ export function createFirmwareRuntime(
     provision,
     provisionState: () => lastState,
     shake,
+    speed: () => speed,
     isExitRequested: () => false,
     dispose,
   };

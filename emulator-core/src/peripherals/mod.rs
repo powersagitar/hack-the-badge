@@ -18,7 +18,8 @@
 //! - [`system`]: [`system::System`], the SYSTEM peripheral's four
 //!   `FROM_CPU` software-interrupt registers (Milestone 3 Task 4) — the
 //!   level sources FreeRTOS's `vPortYield` raises to request a context
-//!   switch.
+//!   switch — and its two CPU-clock registers, `CPU_PER_CONF` and
+//!   `SYSCLK_CONF`, with the frequency they select (Milestone 6 Task 2).
 //! - [`apb_ctrl`]: [`apb_ctrl::ApbCtrl`], SYSCON/APB_CTRL's hardware RNG
 //!   data register (`APB_CTRL_RND_DATA_REG`) as a fixed-seed xorshift32,
 //!   one value per word read, for `esp_random()` (Milestone 5 Task

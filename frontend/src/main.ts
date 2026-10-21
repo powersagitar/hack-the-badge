@@ -208,7 +208,14 @@ function main(): void {
       else if ("line" in st) text = st.line;
       else if ("reason" in st) text = `failed: ${st.reason}`;
     }
-    provisionControls.setStatus(text);
+    if (mode === "firmware" && firmwareRuntime) {
+      // The emulated/wall ratio: below 1x the step cap binds (slow motion).
+      const speed = firmwareRuntime.speed();
+      const prefix = speed > 0 ? `${speed.toFixed(1)}x` : "";
+      provisionControls.setStatus([prefix, text].filter(Boolean).join(" · "));
+    } else {
+      provisionControls.setStatus(text);
+    }
   }, 250);
 
   refreshModeToggle();
