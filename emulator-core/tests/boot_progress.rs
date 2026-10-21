@@ -1951,3 +1951,267 @@ fn run_until_ends_idle_frames_at_the_target() {
     }
     assert_eq!(rt.emulated_time_us() - start, 120 * BROWSER_FRAME_US);
 }
+
+// ---------------------------------------------------------------------
+// Milestone 7: equivalence rungs and the redraw benchmark.
+//
+// Milestone 7 is pure performance work: nothing the firmware can observe
+// may change. The two rungs below pin, at `6cd0a6e` (the Milestone 6
+// merge), what the core executes over early boot and where the longest
+// checkpoint chain ends. Their constants were measured at `6cd0a6e` and
+// must never be re-pinned in Milestone 7: a mismatch is a bug in the
+// change. `bench_redraws` (ignored) measures the busy redraws the
+// milestone is about; its results go in `docs/milestone-7-decisions.md`.
+// ---------------------------------------------------------------------
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x100_0000_01b3;
+
+/// FNV-1a (64-bit) over `bytes`, continuing from `h`.
+fn fnv1a_extend(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// FNV-1a (64-bit) over `bytes`.
+fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    fnv1a_extend(FNV_OFFSET, bytes)
+}
+
+/// How often [`execution_digest`] folds in the register file.
+const DIGEST_REGS_EVERY: u64 = 1_000_000;
+
+/// Boots blank flash and runs `steps` single steps, folding into an
+/// FNV-1a hash the `pc` after every step (4 little-endian bytes) and, every
+/// [`DIGEST_REGS_EVERY`] steps, all 32 registers (x0..x31, same encoding).
+fn execution_digest(steps: u64) -> u64 {
+    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut h = FNV_OFFSET;
+    for step in 1..=steps {
+        rt.run(1);
+        h = fnv1a_extend(h, &rt.pc().to_le_bytes());
+        if step % DIGEST_REGS_EVERY == 0 {
+            for r in 0..32 {
+                h = fnv1a_extend(h, &rt.cpu().regs.read(r).to_le_bytes());
+            }
+        }
+    }
+    h
+}
+
+/// [`execution_digest`] of the first 20,000,000 steps of blank-flash boot
+/// (through the console REPL's start), pinned at `6cd0a6e`. Never re-pin
+/// it in Milestone 7.
+const EXECUTION_DIGEST: u64 = 0x30e1_c4af_04a0_f326;
+
+/// Milestone 7 equivalence proof: FNV-1a over every step's `pc` for the
+/// first 20M steps of blank-flash boot, plus all 32 registers every
+/// 1,000,000 steps. Any change to what the core executes moves it.
+#[test]
+fn execution_digest_is_unchanged() {
+    assert_eq!(execution_digest(20_000_000), EXECUTION_DIGEST);
+}
+
+/// Total steps at hacker's launcher checkpoint ([`launcher_for`]), pinned
+/// at `6cd0a6e`. Never re-pin it in Milestone 7.
+const HACKER_LAUNCHER_STEPS: u64 = 372_597_011;
+/// Emulated time at hacker's launcher checkpoint, in microseconds, pinned
+/// at `6cd0a6e`. Never re-pin it in Milestone 7.
+const HACKER_LAUNCHER_US: u64 = 98_461_748;
+/// FNV-1a of the whole console output at hacker's launcher checkpoint,
+/// pinned at `6cd0a6e`. Never re-pin it in Milestone 7.
+const HACKER_LAUNCHER_CONSOLE_HASH: u64 = 0xd042_f54c_287b_c3ef;
+
+/// Milestone 7 equivalence proof at the end of the longest chain: hacker's
+/// launcher checkpoint (`launcher_for`).
+#[test]
+fn hacker_walk_totals_are_unchanged() {
+    let rt = launcher_for(OWN_ROLE);
+    assert_eq!(rt.total_steps(), HACKER_LAUNCHER_STEPS);
+    assert_eq!(rt.emulated_time_us(), HACKER_LAUNCHER_US);
+    assert_eq!(
+        fnv1a_bytes(rt.console_output().as_bytes()),
+        HACKER_LAUNCHER_CONSOLE_HASH
+    );
+}
+
+/// A press-driven redraw, measured by [`measure_redraw`] from the press:
+/// the last frame change within the window (`emulated_us` after the
+/// press, on the 1 ms sampling grid, and `steps` after the press) and the
+/// frame it changed to (`end_hash`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Redraw {
+    emulated_us: u64,
+    steps: u64,
+    end_hash: u64,
+}
+
+/// HOME from hacker's registered screen to the launcher (3 s window),
+/// pinned at `6cd0a6e`. Never re-pin it in Milestone 7.
+const HOME_REDRAW: Redraw = Redraw {
+    emulated_us: 254_000,
+    steps: 19_106_041,
+    end_hash: LAUNCHER_HASH,
+};
+/// DOWN on hacker's launcher (1.5 s window), pinned at `6cd0a6e`. Never
+/// re-pin it in Milestone 7.
+const DOWN_REDRAW: Redraw = Redraw {
+    emulated_us: 115_000,
+    steps: 6_858_235,
+    end_hash: LAUNCHER_AFTER_NAV_HASH,
+};
+/// A from onboarding page 1 to page 2 (role hacker, 3 s window), pinned
+/// at `6cd0a6e`. Never re-pin it in Milestone 7.
+const ONBOARDING_REDRAW: Redraw = Redraw {
+    emulated_us: 67_000,
+    steps: 3_018_254,
+    end_hash: TO_SHAKE_PAGE[0].1,
+};
+
+/// [`measure_redraw`]'s framebuffer sampling period, in emulated time.
+const REDRAW_SAMPLE_US: u64 = 1_000;
+/// How many unsampled timed runs [`measure_redraw`] makes.
+const REDRAW_TIMED_RUNS: usize = 5;
+
+/// SYSTIMER ticks spent executing (not fast-forwarding a WFI wait).
+fn busy_ticks(rt: &FirmwareRuntime) -> u64 {
+    rt.bus().clock.total_ticks() - rt.bus().clock.idle_ticks()
+}
+
+/// Steps per [`FirmwareRuntime::run_until`] call in the benchmark: far
+/// more than any 1 ms of emulated time takes (80,000 at 80 MHz).
+const BENCH_MAX_STEPS: u32 = u32::MAX;
+
+/// Measures the redraw that pressing `slot` on `base` starts.
+///
+/// Sampled pass, on a clone: press `slot`, then run in
+/// [`REDRAW_SAMPLE_US`] slices of emulated time (`run_until`) for
+/// `window_us`, hashing the framebuffer after each; the slot is released
+/// once [`PRESS_HOLD_US`] has run (before the slice that ends at
+/// `PRESS_HOLD_US` + 1,000 µs). The last slice whose frame differs from
+/// the one before gives the [`Redraw`], with its busy ticks.
+///
+/// Timed passes, [`REDRAW_TIMED_RUNS`] of them, each on a fresh clone and
+/// without sampling: the same press, run to the redraw's end time, with
+/// the release at [`PRESS_HOLD_US`] if the end lies past it (onboarding's
+/// does not). Each must end on the redraw's frame after the redraw's
+/// steps. Returns the redraw, its busy ticks and the timed passes' wall
+/// times (seconds, sorted).
+fn measure_redraw(base: &FirmwareRuntime, slot: usize, window_us: u64) -> (Redraw, u64, Vec<f64>) {
+    let mut rt = base.clone();
+    let t0 = rt.emulated_time_us();
+    let s0 = rt.total_steps();
+    let b0 = busy_ticks(&rt);
+    let mut last = framebuffer_fnv1a(rt.framebuffer());
+    let mut redraw = Redraw {
+        emulated_us: 0,
+        steps: 0,
+        end_hash: last,
+    };
+    let mut busy = 0;
+    rt.set_raw_button(slot, true);
+    let mut t = 0;
+    while t < window_us {
+        if t == PRESS_HOLD_US {
+            rt.set_raw_button(slot, false);
+        }
+        t += REDRAW_SAMPLE_US;
+        let s = rt.run_until(t0 + t, BENCH_MAX_STEPS);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        let h = framebuffer_fnv1a(rt.framebuffer());
+        if h != last {
+            last = h;
+            redraw = Redraw {
+                emulated_us: t,
+                steps: rt.total_steps() - s0,
+                end_hash: h,
+            };
+            busy = busy_ticks(&rt) - b0;
+        }
+    }
+    assert!(redraw.emulated_us > 0, "no frame change in {window_us} us");
+
+    let mut walls = Vec::with_capacity(REDRAW_TIMED_RUNS);
+    for _ in 0..REDRAW_TIMED_RUNS {
+        let mut rt = base.clone();
+        let start = std::time::Instant::now();
+        rt.set_raw_button(slot, true);
+        if redraw.emulated_us > PRESS_HOLD_US {
+            rt.run_until(t0 + PRESS_HOLD_US, BENCH_MAX_STEPS);
+            rt.set_raw_button(slot, false);
+        }
+        rt.run_until(t0 + redraw.emulated_us, BENCH_MAX_STEPS);
+        walls.push(start.elapsed().as_secs_f64());
+        assert_eq!(
+            framebuffer_fnv1a(rt.framebuffer()),
+            redraw.end_hash,
+            "the unsampled run ends on another frame"
+        );
+        // `run_until`'s slicing is invisible to the guest, so the
+        // unsampled run takes exactly the sampled run's steps.
+        assert_eq!(rt.total_steps() - s0, redraw.steps, "unsampled steps");
+    }
+    walls.sort_by(f64::total_cmp);
+    (redraw, busy, walls)
+}
+
+/// Milestone 7's native benchmark (`--ignored`; run it in release with
+/// `--nocapture`): times the walk to hacker's launcher, then measures the
+/// three busy redraws ([`HOME_REDRAW`], [`DOWN_REDRAW`],
+/// [`ONBOARDING_REDRAW`]) with [`measure_redraw`] and checks each against
+/// its pin. Prints one `BENCH` line per item; `factor` is emulated time
+/// over the median wall time (1.0 is the badge's speed).
+#[test]
+#[ignore]
+fn bench_redraws() {
+    let start = std::time::Instant::now();
+    let launcher = launcher_for(OWN_ROLE);
+    let wall = start.elapsed().as_secs_f64();
+    let steps = launcher.total_steps();
+    println!(
+        "BENCH walk steps={steps} wall_s={wall:.2} msteps_per_s={:.2}",
+        steps as f64 / wall / 1e6
+    );
+    let timer_hz = launcher.bus().clock.timer_hz();
+    let items: [(&str, FirmwareRuntime, usize, u64, Redraw); 3] = [
+        (
+            "home",
+            registered(OWN_ROLE),
+            TO_LAUNCHER_SLOT,
+            3_000_000,
+            HOME_REDRAW,
+        ),
+        ("down", launcher, NAV_SLOT, 1_500_000, DOWN_REDRAW),
+        (
+            "onboarding",
+            provisioned(OWN_ROLE),
+            TO_SHAKE_PAGE[0].0,
+            3_000_000,
+            ONBOARDING_REDRAW,
+        ),
+    ];
+    let mut measured = Vec::new();
+    for (name, base, slot, window_us, pinned) in items {
+        let (redraw, busy, walls) = measure_redraw(&base, slot, window_us);
+        let median = walls[walls.len() / 2];
+        let window_ticks = redraw.emulated_us as f64 * timer_hz as f64 / 1e6;
+        println!(
+            "BENCH {name} emulated_ms={:.1} steps={} busy_pct={:.1} wall_ms_median={:.1} \
+             wall_ms_min={:.1} factor={:.3} msteps_per_s={:.2}",
+            redraw.emulated_us as f64 / 1e3,
+            redraw.steps,
+            100.0 * busy as f64 / window_ticks,
+            median * 1e3,
+            walls[0] * 1e3,
+            redraw.emulated_us as f64 / 1e6 / median,
+            redraw.steps as f64 / median / 1e6,
+        );
+        measured.push((name, redraw, pinned));
+    }
+    for (name, redraw, pinned) in measured {
+        assert_eq!(redraw, pinned, "{name}");
+    }
+}
