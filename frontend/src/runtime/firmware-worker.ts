@@ -193,6 +193,8 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
     if (!rt) return;
     switch (msg.kind) {
       case "start":
+        // A fresh start has no previous slice to have been capped.
+        state.lastCapped = false;
         rt.start();
         break;
       case "stop":

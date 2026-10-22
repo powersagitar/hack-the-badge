@@ -16,6 +16,13 @@
  *   one waiting to be painted, so the Worker never waits on a frame the
  *   client will not paint, and a firmware frame never lands on the canvas
  *   after a switch to Lua mode.
+ * - While the page is hidden (`document.visibilitychange`) a started
+ *   runtime is paused: the client posts `stop` (which flushes any
+ *   deferred release) and posts `start` again when the page is visible.
+ *   A dedicated Worker is not throttled like main-thread
+ *   `requestAnimationFrame`, so without this the firmware (Snake) would
+ *   keep running unseen; this restores Milestone 6's pause (ruling
+ *   R-T8-10). A runtime the user stopped (a mode switch) stays stopped.
  * - `provision()` and `reset()` update the cached provisioning state (and
  *   `reset()` the speed) at once, as the in-thread runtime did; the next
  *   `status` replaces them. A `status` the Worker posted before it handled
@@ -33,7 +40,28 @@ export interface WorkerLike {
   terminate(): void;
 }
 
+/** Where the client learns whether the page is hidden; injectable for tests. */
+export interface VisibilitySource {
+  hidden(): boolean;
+  /** Calls `cb` whenever visibility changes; returns an unsubscribe function. */
+  subscribe(cb: () => void): () => void;
+}
+
+/** `document`'s visibility, or a never-hidden source where there is no `document`. */
+export function documentVisibility(): VisibilitySource {
+  if (typeof document === "undefined") return { hidden: () => false, subscribe: () => () => {} };
+  return {
+    hidden: () => document.visibilityState === "hidden",
+    subscribe(cb) {
+      document.addEventListener("visibilitychange", cb);
+      return () => document.removeEventListener("visibilitychange", cb);
+    },
+  };
+}
+
 export interface WorkerClientOptions {
+  /** Injectable for testing; defaults to {@link documentVisibility}. */
+  visibility?: VisibilitySource;
   /** Injectable for testing; defaults to the real `requestAnimationFrame`. */
   scheduleFrame?: FrameScheduler;
   /** Injectable for testing; defaults to the real `cancelAnimationFrame`. */
@@ -57,7 +85,11 @@ export function createWorkerFirmwareRuntime(
 
   let isReady = false;
   let disposed = false;
+  /** The user started the runtime (and has not stopped it). */
   let running = false;
+  /** Running, but paused because the page is hidden. */
+  let pausedHidden = false;
+  const visibility = options.visibility ?? documentVisibility();
   const queue: ToWorker[] = [];
   let lastSpeed = 0;
   let lastProvision: ProvisionState | null = null;
@@ -110,7 +142,7 @@ export function createWorkerFirmwareRuntime(
         break;
       }
       case "frame": {
-        if (!running) {
+        if (!running || pausedHidden) {
           send({ kind: "frameAck" });
           break;
         }
@@ -131,15 +163,32 @@ export function createWorkerFirmwareRuntime(
 
   worker.postMessage({ kind: "init", wasm, image }, [wasm, image]);
 
+  const unsubscribeVisibility = visibility.subscribe(() => {
+    if (disposed || !running) return;
+    const hidden = visibility.hidden();
+    if (hidden && !pausedHidden) {
+      pausedHidden = true;
+      send({ kind: "stop" });
+      dropPendingFrame();
+    } else if (!hidden && pausedHidden) {
+      pausedHidden = false;
+      send({ kind: "start" });
+    }
+  });
+
   return {
     ready,
     start(): void {
       if (disposed) throw new Error("runtime/firmware-worker-client: cannot start a disposed runtime");
+      if (running) return;
       running = true;
-      send({ kind: "start" });
+      pausedHidden = visibility.hidden();
+      if (!pausedHidden) send({ kind: "start" });
     },
     stop(): void {
       running = false;
+      pausedHidden = false;
+      // Sent even when paused or never started: stop() also flushes deferred releases.
       send({ kind: "stop" });
       dropPendingFrame();
     },
@@ -164,6 +213,7 @@ export function createWorkerFirmwareRuntime(
     dispose(): void {
       if (disposed) return;
       running = false;
+      unsubscribeVisibility();
       dropPendingFrame();
       if (isReady) worker.postMessage({ kind: "dispose" });
       disposed = true;

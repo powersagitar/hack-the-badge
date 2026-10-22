@@ -8,7 +8,7 @@ import {
   WORKER_STEPS_PER_SLICE,
 } from "../src/runtime/firmware-runtime";
 import { createWorkerState, handleMessage, type WorkerHost, type WorkerState } from "../src/runtime/firmware-worker";
-import { createWorkerFirmwareRuntime, type WorkerLike } from "../src/runtime/firmware-worker-client";
+import { createWorkerFirmwareRuntime, type VisibilitySource, type WorkerLike } from "../src/runtime/firmware-worker-client";
 import type { FromWorker, ToWorker } from "../src/runtime/firmware-worker-protocol";
 
 /** `bun test` has no `ImageData`; the client's paint blits with one (see test/framebuffer.test.ts). */
@@ -464,4 +464,130 @@ describe("firmware worker client", () => {
     expect(terminated()).toBe(1);
     expect(() => rt.start()).toThrow();
   });
+});
+
+/** A settable visibility source (see `VisibilitySource`). */
+function fakeVisibility(initiallyHidden = false) {
+  let hidden = initiallyHidden;
+  const subs = new Set<() => void>();
+  const source: VisibilitySource = {
+    hidden: () => hidden,
+    subscribe(cb) {
+      subs.add(cb);
+      return () => subs.delete(cb);
+    },
+  };
+  const set = (h: boolean) => {
+    hidden = h;
+    for (const cb of [...subs]) cb();
+  };
+  return { source, set, subscribers: () => subs.size };
+}
+
+describe("firmware worker client visibility", () => {
+  test("hidden tab pauses the worker and resumes on visible", async () => {
+    // The client wired to a real Worker state over a fake handle.
+    const fake = makeFakeHandle();
+    let wallMs = 0;
+    const slices: Array<() => void> = [];
+    const state = createWorkerState({
+      createHandle: () => fake.handle,
+      now: () => wallMs,
+      schedule: (cb) => {
+        slices.push(cb);
+      },
+    });
+    const sent: ToWorker[] = [];
+    const w: WorkerLike = {
+      postMessage: (m) => {
+        sent.push(m);
+        handleMessage(state, m, (out) => queueMicrotask(() => w.onmessage?.({ data: out })));
+      },
+      onmessage: null,
+      terminate: () => {},
+    };
+    const vis = fakeVisibility();
+    const rt = createWorkerFirmwareRuntime(w, makeCtx().ctx, new ArrayBuffer(8), new ArrayBuffer(8), {
+      scheduleFrame: () => 1,
+      cancelFrame: () => {},
+      visibility: vis.source,
+    });
+    await flush();
+    rt.start();
+    slices.shift()?.();
+    wallMs = 16;
+    slices.shift()?.();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released"); // deferred: inside PRESS_HOLD_US
+    expect(fake.buttonCalls).toEqual([[RAW_SLOT_BY_BUTTON.A, true]]);
+
+    vis.set(true);
+    expect(sent.at(-1)).toEqual({ kind: "stop" });
+    // The deferred release is flushed, and the scheduled slice is dead.
+    expect(fake.buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
+    const calls = fake.runUntilCalls.length;
+    for (const s of slices.splice(0)) s();
+    expect(fake.runUntilCalls).toHaveLength(calls);
+
+    // Visible again: a fresh start, whose first slice counts no hidden time.
+    wallMs = 60_000;
+    vis.set(false);
+    expect(sent.at(-1)).toEqual({ kind: "start" });
+    const before = fake.handle.emulatedTimeUs();
+    slices.shift()?.();
+    expect(fake.handle.emulatedTimeUs()).toBe(before);
+    wallMs = 60_016;
+    slices.shift()?.();
+    expect(fake.handle.emulatedTimeUs()).toBe(before + 16_000);
+  });
+
+  test("a runtime the user stopped is not started by a visible tab", () => {
+    const fw = fakeWorker();
+    const vis = fakeVisibility();
+    const rt = createWorkerFirmwareRuntime(fw.w, makeCtx().ctx, new ArrayBuffer(8), new ArrayBuffer(8), {
+      scheduleFrame: () => 1,
+      cancelFrame: () => {},
+      visibility: vis.source,
+    });
+    fw.reply({ kind: "ready" });
+    // Never started: visibility changes send nothing.
+    vis.set(true);
+    vis.set(false);
+    expect(fw.sent.map((m) => m.kind)).toEqual(["init"]);
+    rt.start();
+    rt.stop(); // a mode switch
+    vis.set(true);
+    vis.set(false);
+    expect(fw.sent.map((m) => m.kind)).toEqual(["init", "start", "stop"]);
+  });
+
+  test("starting while hidden waits for visible, and frames while paused are acknowledged", () => {
+    const fw = fakeWorker();
+    const vis = fakeVisibility(true);
+    const rt = createWorkerFirmwareRuntime(fw.w, makeCtx().ctx, new ArrayBuffer(8), new ArrayBuffer(8), {
+      scheduleFrame: () => 1,
+      cancelFrame: () => {},
+      visibility: vis.source,
+    });
+    fw.reply({ kind: "ready" });
+    rt.start();
+    expect(fw.sent.map((m) => m.kind)).toEqual(["init"]);
+    fw.reply(frameMsg());
+    expect(fw.sent.at(-1)).toEqual({ kind: "frameAck" });
+    vis.set(false);
+    expect(fw.sent.at(-1)).toEqual({ kind: "start" });
+    rt.dispose();
+    expect(vis.subscribers()).toBe(0);
+  });
+});
+
+test("a restart after a capped slice yields through the timer", async () => {
+  const { send, sliceAt, slices } = await bootedRig(0.0125);
+  send({ kind: "start" });
+  sliceAt(0);
+  sliceAt(50);
+  expect(slices.at(-1)!.immediate).toBe(true);
+  send({ kind: "stop" });
+  send({ kind: "start" });
+  expect(slices.at(-1)!.immediate).toBe(false);
 });
