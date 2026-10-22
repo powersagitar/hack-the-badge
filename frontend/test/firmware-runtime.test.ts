@@ -8,9 +8,11 @@ import {
   DEFAULT_STEPS_PER_FRAME,
   frameTargetUs,
   MAX_FRAME_DELTA_MS,
+  MAX_QUEUED_TAPS,
   PRESS_HOLD_US,
   PROVISION_TIMEOUT_STEPS,
   RAW_SLOT_BY_BUTTON,
+  RELEASE_GAP_US,
   SHAKE_HALF_US,
   shakeAcceleration,
   stepFirmwareFrame,
@@ -565,17 +567,146 @@ describe("FirmwareRuntime press hold", () => {
     expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.B, false]);
   });
 
-  test("a re-press before the deferred release cancels it", () => {
+  test("a re-press before the deferred release is a second tap, after RELEASE_GAP_US", () => {
     const { rt, buttonCalls, frame, setTimeUs } = rig();
+    const A = RAW_SLOT_BY_BUTTON.A;
     rt.start();
     rt.injectButton("A", "pressed");
     setTimeUs(10);
     rt.injectButton("A", "released");
     setTimeUs(20);
     rt.injectButton("A", "pressed");
-    setTimeUs(20 + PRESS_HOLD_US + 5);
+    setTimeUs(30);
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([[A, true]]);
+    setTimeUs(PRESS_HOLD_US);
     frame();
-    expect(buttonCalls.every(([, p]) => p)).toBe(true);
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    setTimeUs(PRESS_HOLD_US + RELEASE_GAP_US - 1);
+    frame();
+    expect(buttonCalls.length).toBe(2);
+    setTimeUs(PRESS_HOLD_US + RELEASE_GAP_US);
+    frame();
+    expect(buttonCalls.at(-1)).toEqual([A, true]);
+    setTimeUs(2 * PRESS_HOLD_US + RELEASE_GAP_US - 1);
+    frame();
+    expect(buttonCalls.length).toBe(3);
+    setTimeUs(2 * PRESS_HOLD_US + RELEASE_GAP_US);
+    frame();
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+      [A, true],
+      [A, false],
+    ]);
+  });
+
+  test("a press within RELEASE_GAP_US of a release waits for the gap", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    const B = RAW_SLOT_BY_BUTTON.B;
+    rt.start();
+    rt.injectButton("B", "pressed");
+    setTimeUs(PRESS_HOLD_US);
+    rt.injectButton("B", "released");
+    setTimeUs(PRESS_HOLD_US + 10);
+    rt.injectButton("B", "pressed");
+    expect(buttonCalls).toEqual([
+      [B, true],
+      [B, false],
+    ]);
+    setTimeUs(PRESS_HOLD_US + RELEASE_GAP_US);
+    frame();
+    expect(buttonCalls.at(-1)).toEqual([B, true]);
+    // Still held by the user: no release however long it runs.
+    setTimeUs(10 * PRESS_HOLD_US);
+    frame();
+    expect(buttonCalls.length).toBe(3);
+    rt.injectButton("B", "released");
+    expect(buttonCalls.at(-1)).toEqual([B, false]);
+  });
+
+  test("taps on different buttons do not wait for each other", () => {
+    const { rt, buttonCalls, setTimeUs } = rig();
+    rt.start();
+    rt.injectButton("UP", "pressed");
+    setTimeUs(10);
+    rt.injectButton("UP", "released");
+    rt.injectButton("DOWN", "pressed");
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.UP, true],
+      [RAW_SLOT_BY_BUTTON.DOWN, true],
+    ]);
+  });
+
+  test("a repeated press while held is ignored", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    rt.start();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    for (let t = 0; t <= 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.A, true],
+      [RAW_SLOT_BY_BUTTON.A, false],
+    ]);
+  });
+
+  test("at most MAX_QUEUED_TAPS taps are queued; later ones are dropped", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    rt.start();
+    for (let i = 0; i < MAX_QUEUED_TAPS + 3; i++) {
+      rt.injectButton("DOWN", "pressed");
+      rt.injectButton("DOWN", "released");
+    }
+    const span = (MAX_QUEUED_TAPS + 4) * (PRESS_HOLD_US + RELEASE_GAP_US);
+    for (let t = 0; t <= span; t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    const presses = buttonCalls.filter(([, p]) => p).length;
+    const releases = buttonCalls.filter(([, p]) => !p).length;
+    expect(presses).toBe(MAX_QUEUED_TAPS);
+    expect(releases).toBe(MAX_QUEUED_TAPS);
+  });
+
+  test("stop() drops queued taps", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    rt.start();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.stop();
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.A, true],
+      [RAW_SLOT_BY_BUTTON.A, false],
+    ]);
+    rt.start();
+    for (let t = 0; t <= 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    expect(buttonCalls.length).toBe(2);
+  });
+
+  test("a button still held across reset is released as soon as the user lets go", () => {
+    const { rt, buttonCalls, setTimeUs } = rig();
+    rt.start();
+    setTimeUs(5_000_000);
+    rt.injectButton("A", "pressed");
+    rt.reset();
+    setTimeUs(10);
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.A, true],
+      [RAW_SLOT_BY_BUTTON.A, false],
+    ]);
   });
 
   test("reset clears pending releases", () => {
