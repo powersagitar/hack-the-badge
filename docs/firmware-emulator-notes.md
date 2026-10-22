@@ -404,6 +404,15 @@ timed peripheral, the button holds and the browser's pacing read it.
 Decisions and measurements are in
 [`milestone-6-decisions.md`](milestone-6-decisions.md).
 
+**Milestone 7 changed no emulated timing.** It made the core faster and
+moved the browser's loop into a Web Worker
+([`milestone-7-decisions.md`](milestone-7-decisions.md)); every step
+count, emulated time and frame hash pinned at `6cd0a6e` is unchanged
+(the equivalence rule, guarded by `execution_digest_is_unchanged` and
+`hacker_walk_totals_are_unchanged`). The clock, CPI 1, the idle
+fast-forward and `run_until` below are as Milestone 6 left them; only
+the host side of "Pacing in the browser" changed, and only in wall time.
+
 **The clock.** `emulator-core/src/clock.rs`'s `Clock` is chip-agnostic:
 it converts executed steps into ticks of a fixed-rate timer at a CPU
 frequency that can change. For the ESP32-C3 the timer is SYSTIMER at
@@ -502,9 +511,33 @@ the move interval is the firmware's own timer period, with the CPU about
 been timed against the badge.
 
 **Pacing in the browser.** `frontend/src/runtime/firmware-runtime.ts`
-runs one `runUntil` per `requestAnimationFrame`, to the previous
-frame's emulated time plus the wall-clock delta since the previous
-frame:
+runs one `runUntil` per frame, to the previous frame's emulated time
+plus the wall-clock delta since the previous frame. Since Milestone 7
+Task 8 the app runs that runtime inside a dedicated Web Worker
+(`frontend/src/runtime/firmware-worker.ts`), where a "frame" is a
+*slice*:
+
+- A slice is scheduled with `setTimeout(…, 0)` after a slice that
+  reached its target, and through a `MessageChannel` message (no HTML
+  4 ms timer clamp) after a slice the step cap stopped short, so a busy
+  firmware runs slices back to back and an idle one does not spin a
+  core (ruling R-T8-1). Either way the Worker yields to its event loop
+  between slices, so a button message takes effect at the start of the
+  next slice.
+- The Worker's cap is `WORKER_STEPS_PER_SLICE` = 400,000 steps (about
+  10 ms at Chrome's 40.5M steps/s; not tuned in a browser, R-T8-2). It
+  bounds how long input waits behind a slice; the main thread does no
+  emulation, so a slice never delays the page's paint or input.
+- The Worker posts at most one frame in flight (the main thread's
+  `firmware-worker-client.ts` paints it on its next animation frame and
+  acknowledges it) and a `status` (speed, provisioning state) at most
+  every 250 ms. While the page is hidden the client stops the runtime
+  and restarts it when visible (R-T8-10), so the Worker does not run the
+  firmware unseen.
+
+The clamp, the debt rule and the speed readout below hold for both
+shapes; `DEFAULT_STEPS_PER_FRAME` is the in-thread
+(`requestAnimationFrame`) shape's cap, which the unit tests drive:
 
 - The delta is clamped to `MAX_FRAME_DELTA_MS` = 50 ms, so a tab back
   from the background gets 50 ms, not a catch-up burst. The first frame
@@ -535,9 +568,25 @@ and the frame rate to 60 fps, the screen repaints visibly top to bottom,
 and onboarding and the launcher show input lag. Core throughput is on
 the Milestone 7 backlog.
 
+After Milestone 7 (the human's browser gate, 2026-10-22) the core runs
+about 40M to 42M steps/s in the browsers (WASM) and about 69M natively
+(the bench's walk line), against the badge's 80M. In the benchmark's
+three redraws, HOME plays at about 0.6x in Chrome and Safari, DOWN at
+0.90x (Chrome) to 0.99x (Safari) and onboarding at 1.1x to 1.2x; natively
+all three are over 1.0x. Before the Worker a launcher DOWN gave a 64 ms
+INP; in the Worker the smoke test saw no main-thread long task and no
+key event of 16 ms or more (Chrome 155). The human accepted the speed
+(ruling R-T9-1); a block cache leads the Milestone 8 backlog. Per-host
+figures are in "Known limitations" below.
+
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 6)
+### Current state (end of Milestone 7)
+
+Milestone 7 was performance work only: what the firmware does, step for
+step, is exactly what Milestone 6 left (every pin unchanged), so the
+state below is Milestone 6's, now reached faster. Current throughput per
+host is limitation 1 below.
 
 Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
 synthetic flash through `app_main` to My Badge's first-run screen, and
@@ -628,7 +677,25 @@ above for how steps relate to emulated time):
   every 170.0 ms on average, 11 moves to the wall): they match. The
   after-eat frame was not compared (the badge's food comes from its real
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
-  like the badge (the human's check, 2026-10-20).
+  like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
+  the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 7** (details in
+[`milestone-7-decisions.md`](milestone-7-decisions.md) and the history
+below):
+
+- Core throughput, under the rule that no pin moves: release
+  `opt-level = 3` (Task 3); interrupt routing over pending bits and a
+  precomputed line gate, and an array for the USB-Serial-JTAG register
+  store (Task 4); a word-sized bus fast path over the XIP apertures and a
+  resolved RAM span map (Task 5); a ROM-stub range precheck and per-step
+  trims (Task 6); a decoded-instruction cache, `cpu/decode_cache.rs`
+  (Task 7). Native steps/s went from 13.4M to 69.4M, WASM from 11M to 12M
+  to 40M to 42M.
+- The emulator runs in a Web Worker (Task 8), so input never waits behind
+  emulation on the main thread.
+- The dev server (`bun run dev`) loads again (Task 9a: fengari's
+  `process.env` in Vite's dependency pre-bundle).
 
 **Resolved in Milestone 6** (details in "Timing model" above, the history
 below and [`milestone-6-decisions.md`](milestone-6-decisions.md)):
@@ -702,17 +769,28 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 7 candidates)** (the Milestone 7 backlog in
-`milestone-6-decisions.md` is the complete list):
+**Open limitations (Milestone 8 candidates)** (the Milestone 8 backlog in
+`milestone-7-decisions.md` is the complete list):
 
-1. **Busy screens run slower than real time.** The emulator core runs
-   about 10M to 12M steps per second (native release and the browser
-   alike) against the badge's 80M cycles per second, so a stretch where
-   the CPU is busy (a full-screen redraw, onboarding, the launcher)
-   plays back about 8x slower than on the badge. Idle-dominated apps such
-   as Snake keep real time (see "Timing model"). In the browser a
-   launcher move dips the readout to about 0.1x, the screen visibly
-   repaints top to bottom, and input waits behind the redraw. Only two
+1. **The launcher's HOME redraw runs slower than real time in the
+   browser.** The core runs about 40M to 42M steps per second in WASM
+   against the badge's 80M cycles per second (Milestone 7's bench, Apple
+   M5 Pro; the factor is the redraw's emulated time over its wall time,
+   1.0x is the badge):
+
+   | Host | Walk M steps/s | HOME | DOWN | Onboarding |
+   | --- | --- | --- | --- | --- |
+   | native, release | 69.4 | 1.08x | 1.40x | 1.76x |
+   | WASM, Bun 1.3.14 | 40.8 | 0.61x | 0.97x | 1.21x |
+   | WASM, Chrome 155 | 40.5 | 0.60x | 0.90x | 1.11x |
+   | WASM, Safari 27.0.1 | 41.8 | 0.63x | 0.99x | 1.23x |
+
+   So HOME (the registered screen to the launcher, 94 % busy) plays at
+   about 0.6x in the browsers and DOWN just short of 1.0x; onboarding's
+   page turns keep real time. Idle-dominated apps such as Snake keep real
+   time (see "Timing model"). Input no longer waits behind a redraw: the
+   emulator runs in a Web Worker. The human accepted this speed for
+   Milestone 7; a block cache leads the Milestone 8 backlog. Only two
    built-in apps (Dice and Snake) are checked; the others are untested.
 2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
@@ -2743,6 +2821,44 @@ it on move 17, and the after-eat frame (four cells long, new food at
 the badge, whose food comes from its real RNG). Open question: after an
 eat the game-over draw comes 50 to 134 ms after the tick instead of 22
 ms (Milestone 7 backlog).
+
+### Milestone 7: core throughput and the Worker host
+
+No emulated behaviour changed: every pin measured at `6cd0a6e` holds,
+and Task 1 added two whole-run pins (`execution_digest_is_unchanged`,
+20M steps' state digest; `hacker_walk_totals_are_unchanged`, the walk's
+steps, emulated time and console hash) plus the benchmark
+(`bench_redraws`, `bun run bench:wasm`, `bun run bench:safari`, the dev
+server's `bench.html`). The speed came from five changes, each profiled
+first (`milestone-7-decisions.md`'s Profiles):
+
+- Release `opt-level = 3` instead of `"s"` (Task 3): 1.65x native, 1.3x
+  WASM.
+- The interrupt poll visits only pending sources, against a line gate
+  recomputed when the intc's registers change (Task 4); the
+  USB-Serial-JTAG register store is an array, not a `HashMap`. 2x.
+- A word-sized bus fast path (Task 5): an access wholly inside one MMU
+  page of an XIP aperture, then one span of a resolved RAM map
+  (`FirmwareBus::rebuild_ram_spans`, which keeps the byte path's
+  first-match rule across overlapping regions), and the byte path for
+  everything else, so straddling and unaligned accesses behave and log
+  exactly as before. 1.3x.
+- The ROM-stub table answers outside its registered range with two
+  compares, the CPU clock is decoded on a clock-register write, and the
+  interrupt poll routes only sources that can reach a gated line
+  (Task 6). 1.3x.
+- `cpu/decode_cache.rs` (Task 7): a direct-mapped table of 16,384
+  decoded instructions (262,144 bytes per `Cpu`, so per
+  `FirmwareRuntime` clone), indexed by `pc` and validated by the raw
+  bits fetched on every step. The fetch still runs, so a store over
+  code, a flash write or an MMU remap runs as the new code with no
+  invalidation, and an unmapped fetch still traps. 1.10x to 1.14x
+  natively, measured against the cache switched off.
+
+Task 8 moved the browser's frame loop into a Web Worker (see "Timing
+model"); Task 9a fixed the dev server's `process is not defined`.
+Native HOME went from 0.18x to 1.08x of the badge, WASM HOME from 0.15x
+to 0.17x to about 0.6x.
 
 ## Emulated flash chip: what it contains
 

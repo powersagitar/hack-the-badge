@@ -14,6 +14,13 @@ model and the stall-by-stall history. This file records the rulings, the
 benchmark results and profiles, and what is deferred. Where the spec or
 plan disagree with this file or the code, this file and the code win.
 
+Outcome: in the browsers onboarding plays faster than the badge, DOWN
+just short of it and HOME at about 0.6x (Chrome 155 0.601x, Safari 27.0.1
+0.627x); natively all three are over 1.0x. The human partner accepted
+this speed at the Task 9 gate (R-T9-1), and a block cache leads the
+Milestone 8 backlog. The final numbers and suite times are under
+"Task 10" in Measurements.
+
 The equivalence pins are the ones Task 1 added to
 `emulator-core/tests/boot_progress.rs` (`execution_digest_is_unchanged`,
 `hacker_walk_totals_are_unchanged`, and the three `Redraw` constants that
@@ -366,9 +373,14 @@ under Profiles).
   bits; the module doc says the `pc` tag must come back then, and the
   debug check of R-T7-5 fails on the first such hit.
 - **R-T7-4, the table stays at `1 << 14` entries, 262,144 bytes per
-  `Cpu` and so per `FirmwareRuntime` clone.** Measured with the `pc` tag
-  (HOME factor): `1 << 10` 1.001x, `1 << 12` 1.033x, `1 << 14` 1.047x,
-  `1 << 16` 1.063x. The clone-heavy release suite got faster, not slower
+  `Cpu` and so per `FirmwareRuntime` clone.** The size sweep was
+  measured before R-T7-3 dropped the `pc` tag, so its factors are of the
+  tagged cache, with 20-byte entries (HOME factor): `1 << 10` 1.001x,
+  `1 << 12` 1.033x, `1 << 14` 1.047x, `1 << 16` 1.063x. It was not re-run
+  without the tag; at `1 << 14` the untagged cache read 1.110x and 1.125x
+  against the tagged 1.047x and 1.050x (R-T7-3). The 262,144 bytes are
+  the final, untagged table's (16-byte entries; `size_of` re-checked
+  natively in Task 10). The clone-heavy release suite got faster, not slower
   (9.7 s to 8.0 s wall; the table is one 256 KiB `memcpy` per clone, and
   the emulator state a clone already copies is larger), so clone cost is
   not material. If wrong: `1 << 16` would give about 1.5 % more for
@@ -546,6 +558,33 @@ under Profiles).
   real `process.env` in dev would see `{}`, as it already does in the
   production build.
 
+### Task 9 gate (the human partner, 2026-10-22)
+
+The browser gate (spec criterion 5), after Task 8's Worker and Task 9a's
+dev-server fix. Three answers:
+
+- **R-T9-1, the speed is accepted as it is after Task 7.** The human
+  partner's words: "the benchmark is not exactly there but ill call this
+  speed good enough". The accepted factors are the post-Task-7 bench rows
+  (Measurements): HOME about 0.6x (Chrome 155 0.601x, Safari 27.0.1
+  0.627x), DOWN just under 1.0x (Chrome 0.897x, Safari 0.990x),
+  onboarding over 1.0x (Chrome 1.113x, Safari 1.234x). This applies the
+  human's brainstorming ruling: if HOME stays short after the planned
+  work (Parts 1 to 3), Milestone 7 is done and a block cache leads the
+  Milestone 8 backlog (spec criterion 3: a redraw under 1.0x is written
+  up with its factor and reason, not chased further). If wrong: HOME and
+  DOWN repaint visibly slower than the badge until Milestone 8.
+- **R-T9-2, the Milestone 8 backlog leads with a block cache** (or
+  caching peripheral pending state, which needs spec Part 2's audit),
+  with HOME's measured factor: Chrome 0.601x, Safari 0.627x, Bun 0.609x,
+  native 1.077x. Written up under "Milestone 8 backlog" below.
+- **R-T9-3, the dev server is fixed in Milestone 7.** Task 8's smoke test
+  found `bun run dev` dead at load (pre-existing); the human chose to fix
+  it in this milestone rather than backlog it, and Task 9a did
+  (`34975c3`, R-T9a-1). The bench page (`bench.html`, port 5173) needs
+  the dev server; the app runs under `bun run dev` or `bun run build &&
+  bun run preview`. If wrong: none; the production build is unchanged.
+
 ## Measurements
 
 The native benchmark is
@@ -565,8 +604,8 @@ reads a little below the redraws' steps/s.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `6cd0a6e` (measured at `8165dd6` plus Task 1's tests) | 1 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = "s"` | 13.43 | 0.184 | 0.232 | 0.308 | 41.5 |
 | `6cd0a6e` core (Task 2's bench, measured at `b9a7336` plus Task 2) | 2 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.00 | 0.151 | 0.199 | 0.264 | n/a |
-| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.07 | 0.152 | 0.201 | 0.264 | — |
-| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 12.36 | 0.172 | 0.228 | 0.301 | — |
+| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.07 | 0.152 | 0.201 | 0.264 | n/a |
+| `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 12.36 | 0.172 | 0.228 | 0.301 | n/a |
 | Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 20.78 | 0.302 | 0.385 | 0.510 | 27.0 |
 | Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 13.75 | 0.191 | 0.257 | 0.340 | n/a |
 | Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 40.10 | 0.611 | 0.796 | 1.003 | 15.4 |
@@ -577,8 +616,8 @@ reads a little below the redraws' steps/s.
 | Task 6 (measured at `f23288a` plus Task 6's code) | 6 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 38.01 | 0.557 | 0.858 | 1.089 | n/a |
 | Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 69.43 | 1.077 | 1.400 | 1.756 | 8.0 |
 | Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.77 | 0.609 | 0.972 | 1.211 | n/a |
-| Task 7 (measured at `abd4c3a`, one run alone) | 7 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.51 | 0.601 | 0.897 | 1.113 | — |
-| Task 7 core (measured at `ea7a035`, core = `abd4c3a`, median of 3; R-T7-7) | 7 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 41.78 | 0.627 | 0.990 | 1.234 | — |
+| Task 7 (measured at `abd4c3a`, one run alone) | 7 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.51 | 0.601 | 0.897 | 1.113 | n/a |
+| Task 7 core (measured at `ea7a035`, core = `abd4c3a`, median of 3; R-T7-7) | 7 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 41.78 | 0.627 | 0.990 | 1.234 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -940,7 +979,9 @@ process is not defined`: fengari's `luaconf` reads
 not shim it. This is pre-existing (reproduced at `abd4c3a` and at
 `6cd0a6e`) and not fixed here; the human partner decides at Task 9. The
 smoke test therefore ran on the production build (`bun run build && bun
-run preview`):
+run preview`). (The human chose to fix the dev server in Milestone 7, and
+Task 9a did, `34975c3`, ruling R-T9a-1: `bun run dev` now serves both the
+app and the bench page.)
 
 - Real Firmware boots in the Worker to the first-run screen. Provision
   (hacker) reaches PROV OK in about 1 s; the full onboarding walk works,
@@ -958,6 +999,46 @@ run preview`):
 The browser bench rows after Task 7 (Chrome 155 and Safari 27.0.1) are in
 the table above; the bench page runs the bridge directly in its own
 Worker, not the app's Worker host, so they measure the core.
+
+### Task 10: final numbers and suite times
+
+No `emulator-core` or `emulator-wasm` change after Task 7 (`abd4c3a`;
+Tasks 8 and 9a changed only the frontend), so the final benchmark rows
+are the Task 7 rows of the table above, and the final profile is the
+Task 7 table under Profiles. At the end of the milestone, HOME is short
+of the badge in every WASM host and DOWN is just short of it in both
+browsers:
+
+| Host | Walk M steps/s | HOME x | DOWN x | Onboarding x |
+| --- | --- | --- | --- | --- |
+| native, release `opt-level = 3` | 69.43 | 1.077 | 1.400 | 1.756 |
+| WASM, Bun 1.3.14 | 40.77 | 0.609 | 0.972 | 1.211 |
+| WASM, Chrome 155 | 40.51 | 0.601 | 0.897 | 1.113 |
+| WASM, Safari 27.0.1 | 41.78 | 0.627 | 0.990 | 1.234 |
+
+Against the `6cd0a6e` baselines: native walk 5.2x the steps/s (13.43 to
+69.43 M), HOME 0.184x to 1.077x; Bun walk 3.7x (11.00 to 40.77 M);
+Chrome 3.3x (12.36 to 40.51 M); Safari 3.8x (11.07 to 41.78 M). WASM
+size 94,419 bytes at `6cd0a6e`, 110,768 bytes now.
+
+Check list at `34975c3`, before Task 10's docs edits, all
+green, Apple M5 Pro (18 cores), each suite run after its build:
+
+| Check | Result | Time |
+| --- | --- | --- |
+| `cargo fmt --all` | clean (no change) | |
+| `cargo test --workspace` (debug) | 549 lib + 95 integration tests pass (64 boot rungs, 1 ignored) | 12.6 s wall; `boot_progress` 11.6 s in the harness |
+| `cargo test -p emulator-core --release --test boot_progress` | 64 pass, 1 ignored | 7.9 s wall (7.8 s in the harness) |
+| `cargo clippy --workspace --all-targets` | 3 warnings, the same three as at `6cd0a6e` | |
+| `bun run build:wasm`, `bun run typecheck` | ok | |
+| `bun test` | 172 pass, 0 fail (15 files) | 10.6 s |
+| `bun run build` | ok; `dist/` holds `index.html`, `apps/`, `firmware/`, `assets/` and no bench page | |
+
+Against Milestone 6's end (release 41.8 s, debug workspace 31 s,
+`bun test` 37.1 s), the release suite is 5.3x faster, well under spec
+criterion 6's bar (about 42 s), the debug workspace run 2.5x and
+`bun test` 3.5x; the release suite is still one chain (hacker's walk to
+Dice).
 
 ## Profiles
 
@@ -1152,7 +1233,156 @@ Fetch (`fetch16`, 9.0 %) is under R-T7-1's 10 % bar (R-T7-6).
 
 ## Milestone 8 backlog
 
-Filled in by Task 10: what this milestone leaves (a block cache first if
-HOME is still short of 1.0x), plus everything carried from
-`docs/milestone-6-decisions.md`'s Milestone 7 backlog except the
-throughput item.
+What this milestone leaves first, then every item of
+`docs/milestone-6-decisions.md`'s Milestone 7 backlog except its two
+throughput items (core throughput, and the release `opt-level`, both
+done here), carried word for word under the same headings. One carried
+item is dropped because Milestone 7 resolved it (listed at the end).
+
+### Lead: a block cache (HOME is short of the badge)
+
+HOME (the registered screen to the launcher, 254 ms of emulated time,
+19.1M steps, 94 % busy) runs at **Chrome 155 0.601x, Safari 27.0.1
+0.627x, Bun 0.609x** of the badge's speed in WASM, and 1.077x native
+(Task 7 rows; ruling R-T9-1 accepts it for Milestone 7). DOWN is just
+short in the browsers (Chrome 0.897x, Safari 0.990x; Bun 0.972x);
+onboarding is over 1.0x everywhere. What is left per step is in the
+Task 7 profile: instruction execution and its dispatch (`execute`
+24.7 %, `Cpu::step` 15.3 %), the per-step interrupt sample and clock in
+`step_with_interrupts` (20.5 %) and `fetch16` (9.0 %). Two ways to attack
+it, either or both:
+
+- **A block cache**: decode a run of instructions up to a branch once and
+  execute it without the per-instruction fetch, ROM-stub check and
+  dispatch. It would remove the fetch cost R-T7-6 left (9.0 %) together
+  with dispatch, so it takes in the invalidation-based decode-cache
+  variant R-T7-6 kept off this backlog, but it cannot validate by raw
+  bits without fetching, so it needs invalidation on a store over cached
+  code, a flash erase or program and an MMU remap (Review Focus 1).
+  Inside a block, interrupts must still be taken at exactly the step the
+  per-step poll takes them (spec criterion 1).
+- **Caching peripheral pending state**, so the interrupt sample stops
+  loading every peripheral's pending bits each step (R-T6-7). This needs
+  spec Part 2's audit of every `pending_sources` contributor and a
+  debug cross-check against the full poll on every step; R-T4-1 and
+  R-T6-4 cached only register-derived state, which needs no audit.
+
+### Found in Milestone 7
+
+- The decode cache at `1 << 16` entries read about 1.5 % faster on HOME
+  than `1 << 14`, measured with the `pc` tag, for 1 MiB per runtime and
+  per clone (R-T7-4); not re-measured untagged.
+- `WORKER_STEPS_PER_SLICE` (400,000) was never tuned in a browser
+  (R-T8-2); a measured long-slice input lag would argue for 200,000.
+- The frontend and Rust provisioning hosts reach the launcher 740,001
+  steps apart (R-T2-4); the cause was not traced.
+- The status line can show a pre-reset state for up to one
+  `STATUS_INTERVAL_MS` (250 ms) after a reset or provision (R-T8-9).
+
+### Speed and timing
+
+- **Snake's game-over draw after an eat** comes 50 to 134 ms after the
+  tick that hits the wall, against about 22 ms with no eat (Task 8).
+  Unexplained; possibly a high-score save, unverified.
+- CPI 1 is calibrated only against a timer-paced app (Snake's move
+  period). Busy work (a redraw, the Dice roll animation, which played "a
+  bit faster" than the badge under the pre-Milestone-6 clock and was not
+  re-checked) has not been timed against the badge.
+- Zero-latency RMT, I2C0 and SPIMEM1 (carried).
+- The cycle counter counts one per working step; PCER/PCMR do not gate
+  it (carried).
+- `PROVISION_TIMEOUT_STEPS` (60M) in `frontend/src/runtime/firmware-runtime.ts`
+  is still counted in steps. Under wall-clock pacing an idle firmware
+  advances only about 0.5M steps/s in the browser, so a hung provision
+  takes minutes to time out. Add an emulated-time or wall-time bound.
+
+### Apps and UI
+
+- Other built-in apps are untested; only Dice and Snake are checked.
+- RNG: a browser-supplied seed for `APB_CTRL_RND_DATA_REG` (today fixed).
+- A console pane in the frontend (the firmware's REPL is reachable
+  through `serialInput`/`consoleOutput`); `serialInput` copies the whole
+  JS array before the 1 MiB cap is applied, so cap or chunk it on the JS
+  side when the pane lands.
+- Motion input beyond the Shake button (`DeviceMotionEvent` on a phone).
+- Milestone 5 Task 7 review minors still open: a fetch error message
+  lingers and can be masked by a stale provision state (clear it on a
+  successful `provision()` and on reset, `main.ts`); two fast clicks
+  start concurrent fetches and the last to resolve wins, not the last
+  click. (The third, flushing deferred releases in `stop()`, is done.)
+- Small Task 7 cleanups: `speed()` returns 0 as its "no reading yet"
+  sentinel; `main.ts` writes the status separator as a literal middle dot
+  where the file otherwise uses escapes; `pollShake` in
+  `firmware-runtime.ts` clears `lastShakeAccel` twice in a row.
+- Only role hacker's frames were compared with hardware; onboarding page 8
+  ("Bump to connect") is animated and not pinned; the six navigation
+  frames between the launcher and Dice and Snake's after-eat frame are
+  pinned but not compared.
+
+### Peripherals
+
+- RMT transmissions are consumed but not decoded, so the LEDs (including
+  `prov apply`'s green flashes and role colour) are never shown.
+- NFC is not modeled (the self-test waits for a card forever).
+- The busy phase after START on the first-run screen (about 6M steps
+  under the old clock; hot PCs `0x420b_ead4`, `0x420b_b6a4`) is not
+  traced.
+- SC7A20H: data ready is always set (no ODR time base); 1 mg/digit is
+  the typical sensitivity where the datasheet's table says 1024 counts/g;
+  the face-up rest orientation is an assumption.
+- I2C0: an `OP_WRITE` command with an empty TX FIFO leaves the address
+  phase armed (malformed command lists only; untested).
+- USB-Serial-JTAG: where the `put` task spends its CPU time per 64-byte
+  packet is not identified (a per-byte VFS read is the suspect); if it
+  is an emulator gap, `PUT_CHUNK_GAP_STEPS` could shrink.
+- `R_M5_3`'s closure follows direct calls only (indirect VFS, littlefs
+  and cJSON pointers were not followed).
+- ROM stubs: `strtol`/`atoi` do not set `errno`; the 8 MiB
+  `MAX_STUB_MEMORY_BYTES` cap of the string stubs has no test.
+- Unmapped accesses at the idle point: ASSIST_DEBUG (`0x600c_e0xx`) and
+  RTC_CNTL `0x6000_80bc` (SYSTEM's clock registers are modeled since
+  Task 2). Harmless so far.
+- Early log timestamps have not been compared with the badge's.
+
+### Build and tests
+
+- The release suite's wall time is one chain (hacker's walk to Dice,
+  about 487M steps); only a faster emulator shortens it.
+- Test minors left from Milestone 6's reviews: `snake_eats` could assert
+  growth of exactly one cell (`after * 3 == at_open * 4`) and that its
+  150 ms frame is `SNAKE_OPEN_HASH`, and its `SNAKE_DOWN_SLOT` = 4
+  duplicates `NAV_SLOT` without a cross-reference;
+  `run_until_a_past_target_runs_nothing` uses target 0 (always past),
+  where a mid-run target would test it properly; the
+  `DEFAULT_STEPS_PER_FRAME` test restates the constant;
+  `snake_moves_on_its_own`'s exact gap pin is as fine as `MOVE_SAMPLE_US`
+  (2 ms).
+
+### Carried from Milestones 3 and 4 (untouched)
+
+- ST7789 `MADCTL` (`0x20`, then `0x60`) is unmodeled; orientation is
+  human-confirmed for every pinned frame so far, Snake's included.
+- GPIO0 (the display D/C pin) is routed as SPI2 `FSPIWP`/`FSPIHD`; routing
+  is stored only.
+- eFuse block unmodeled: boot logs chip revision v0.0, the badge is v0.4.
+- Flagged ROM-stub guesses: `rom_i2c_readReg*` returning 0,
+  `Cache_Get_*` returning 0 (notes, history item 5).
+- Edge-type interrupts are simplified: `CPU_INT_TYPE_REG` and
+  `CPU_INT_CLEAR_REG` are plain storage.
+- GDMA: DMA spans that cross into an adjacent RAM region are rejected;
+  the RX in-link walk, CPU FIFO push/pop, the `OUT_DSCR*` pre-fetch
+  registers and transfer timing are not modeled; a trailing zero-length
+  `suc_eof` descriptor is never visited; `RESTART` with nothing to
+  restart leaves the channel active.
+- `boot_until_console_contains` checks in 250,000-step chunks, so rung
+  budgets are looser than they read; stable-frame steps are quantized
+  the same way.
+- Small duplications: the `memcpy`/`memset` and `memcmp`/`strncmp` stub
+  arms, and the `header_with_speed_size` test helper in `image.rs` and
+  `rom.rs`.
+
+Resolved from the Milestone 7 backlog in Milestone 7: core throughput
+(Tasks 3 to 7: about 5.2x native, 3.3x to 3.8x WASM; the Measurements
+table), the release `opt-level` (`3` since Task 3, with the WASM size
+checked), the Web Worker host (Task 8), and the dev server's
+`process is not defined` (Task 9a, R-T9a-1).

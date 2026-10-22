@@ -12,14 +12,14 @@ ESP32-C3 device), in two complementary modes:
    documented `badge.*` API. This repo emulates that with a Fengari
    (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
    surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestones 2–6): the badge's *built-in* apps (Snake,
+2. **Real-firmware mode** (Milestones 2–7): the badge's *built-in* apps (Snake,
    Dice, etc.) are native RISC-V machine code baked into one monolithic
    ESP-IDF app image — not extractable as Lua files (confirmed by
    flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
    runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
    a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
    minimal peripheral set) written in Rust and compiled to WebAssembly.
-   **Current state (end of Milestone 6):** emulated time follows the
+   **Current state (end of Milestone 7):** emulated time follows the
    firmware's own CPU clock (it switches between 40 and 80 MHz; one
    instruction per cycle against the 16 MHz SYSTIMER), and boot runs
    through the ESP-IDF
@@ -49,17 +49,24 @@ ESP32-C3 device), in two complementary modes:
    at the wall and restarts (`snake_hits_wall_game_over`), and eats
    (stretch, `snake_eats`); the start, after-turn and game-over frames
    and the speed were compared with the badge on 2026-10-20 and match
-   (the after-eat frame was not compared). In the browser the emulator
-   is paced to wall-clock time: Snake runs at about 1.0x, but busy
-   screens (the launcher, onboarding) run slower than real time, because
-   the core does about 10M to 12M steps/s against the badge's 80M
-   (Milestone 7 backlog). Read
+   (the after-eat frame was not compared). Milestone 7 made the core
+   faster without moving a single pin (every step count, emulated time
+   and frame hash is byte-identical to `6cd0a6e`) and moved the browser
+   emulator into a Web Worker. In the browser the emulator is paced to
+   wall-clock time: Snake runs at about 1.0x; the core does about 40M to
+   42M steps/s in WASM (Chrome 155, Safari 27.0.1, Bun) and about 69M
+   natively, against the badge's 80M, so of the benchmark's busy
+   redraws, onboarding plays at 1.1x to 1.2x, the launcher's DOWN at
+   0.90x (Chrome) to 0.99x (Safari) and HOME at about 0.6x (Chrome
+   0.601x, Safari 0.627x; native 1.08x). The human accepted that speed
+   (2026-10-22); a block cache leads the Milestone 8 backlog. Read
    `docs/firmware-emulator-notes.md`'s "Timing model" and "Known
    limitations" (current state, open limitations, and the stall-by-stall
    history) before assuming any other built-in app works in this mode.
    Design decisions (some override the plan text, e.g. interrupt
    threshold `>=`) are in `docs/milestone-3-decisions.md` through
-   `docs/milestone-6-decisions.md`; the last has the Milestone 7 backlog.
+   `docs/milestone-7-decisions.md`; the last has the benchmark results,
+   the profiles and the Milestone 8 backlog.
 
 Both modes share the same on-screen button pad/keyboard input and the same
 `<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
@@ -86,12 +93,17 @@ run from the repo root.
 
 - `bun install` (in `frontend/`) or `bun run install:frontend` (from root) —
   install dependencies into `frontend/node_modules/`
-- `bun run dev` — start the dev server
+- `bun run dev` — start the dev server (http://localhost:5173). The app
+  runs under it or under `bun run preview`; the bench page
+  (`/bench.html`) is served by the dev server only and is not in the
+  production build. (Vite's dependency pre-bundle gets the production
+  build's `process.env` define for fengari, Milestone 7 ruling R-T9a-1,
+  `frontend/vite.config.ts`.)
 - `bun run build` — production build to `frontend/dist/`
 - `bun run preview` — preview a production build
 - `bun test` — run unit tests (`bun test path/to/file.test.ts` for a single file;
-  the whole run takes about 37 s, most of it the WASM twin that provisions
-  and walks to the launcher, `test/cpu-wasm.test.ts`)
+  the whole run, 172 tests, takes about 11 s, most of it the WASM twin
+  that provisions and walks to the launcher, `test/cpu-wasm.test.ts`)
 - `bun run typecheck` — type-check without emitting (`tsc --noEmit`)
 
 For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
@@ -100,6 +112,12 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   target, plus `wasm-pack` (`cargo install wasm-pack`).
 - `cargo test -p emulator-core` — fast native unit tests for the CPU
   core/peripherals (no WASM round-trip; this is the primary iteration loop).
+- Build profiles (root `Cargo.toml`): release is `opt-level = 3` since
+  Milestone 7 (it was `"s"`; 1.65x native and 1.3x WASM steps/s for an
+  11 % larger `.wasm`, about 110.8 KB), and the dev profile builds
+  `emulator-core` at `opt-level = 3` with debug assertions on, so the
+  debug suite runs the debug-only cross-checks (the interrupt line gate,
+  the CPU clock decode, each decode-cache hit) on every step.
 - `bun run build:wasm` — rebuilds `frontend/src/cpu/wasm-pkg/` (gitignored
   generated glue + `.wasm` binary) from `emulator-wasm/`. **Must be re-run after any
   change under `emulator-core/`/`emulator-wasm/`**, before `bun run dev`,
@@ -118,14 +136,30 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   `first_run_screen_responds_to_start` still hold on blank flash). The
   identity walks are about 346M to 375M emulated steps each, so the suite
   shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s; the Snake
-  rungs branch from hacker's launcher) and its 62 rungs take about 42 s
-  on 18 cores (one chain of about 487M steps, hacker's walk to Dice, is
-  the floor). The debug
-  `cargo test --workspace` runs the same rungs in about 28 s (31 s wall
-  with the other tests), because the
+  rungs branch from hacker's launcher). Milestone 7 adds the equivalence
+  pins `execution_digest_is_unchanged` and
+  `hacker_walk_totals_are_unchanged`, which no optimization may move.
+  Its 64 rungs (plus the ignored `bench_redraws`) take about 8 s on 18
+  cores (one chain of about 487M steps, hacker's walk to Dice, is the
+  floor; Milestone 6's 62 took about 42 s). The debug
+  `cargo test --workspace` runs the same rungs in about 12 s (about 13 s
+  wall with the other tests), because the
   dev profile builds `emulator-core` at `opt-level = 3` (root
   `Cargo.toml`). When boot moves, update the rung whose budget it
   affects; the per-task history goes in the notes, not the test docs.
+  `cargo clippy --workspace --all-targets` reports 3 known warnings
+  (two doc-list indentations in `boot.rs`, one no-effect operation in a
+  `console.rs` test).
+- Benchmarks (Milestone 7; results in `docs/milestone-7-decisions.md`'s
+  Measurements, never part of a test run): native
+  `cargo test -p emulator-core --release --test boot_progress bench_redraws -- --ignored --nocapture`
+  (walks to hacker's launcher, then times the HOME, DOWN and onboarding
+  redraws from clones and checks their pinned end frames); WASM under
+  Bun `bun run bench:wasm` (three runs, median); Safari
+  `bun run bench:safari` (drives Safari through `safaridriver`, with
+  `bun run dev` running and remote automation allowed); any browser, the
+  dev server's `http://localhost:5173/bench.html`. Factor 1.0x is the
+  badge's speed; WASM rows compare only with WASM rows (ruling R-T2-1).
 - `cargo run -p emulator-core --release --example boot-probe -- [--steps N] [--window W] [--dump-frame PATH]`
   — the "why is boot stuck" diagnostic: console output, run summary, hot
   PCs, unmapped accesses, framebuffer diversity; `--dump-frame` writes a
@@ -167,15 +201,24 @@ frontend/             Vite + TypeScript web app (own package.json).
                       table, runs main.lua, drives the ~20ms tick loop,
                       dispatches on_enter/on_tick/on_button/on_exit.
   src/runtime/firmware-runtime.ts
-                      Firmware-mode runtime over the WASM handle: the
-                      frame loop, paced to wall-clock time (Milestone 6:
-                      each animation frame runUntil()s the emulator by
-                      the wall delta, clamped to MAX_FRAME_DELTA_MS =
-                      50 ms, at most DEFAULT_STEPS_PER_FRAME = 150,000
-                      steps; a capped frame drops its debt, so busy
-                      firmware runs in slow motion; speed() is the
-                      smoothed emulated/wall ratio the status line shows
-                      as "N.Nx"), the button-name -> raw-slot table, a
+                      Firmware-mode runtime over the WASM handle. In the
+                      app it runs inside the firmware Worker (below), not
+                      on the main thread. The frame loop, paced to
+                      wall-clock time (Milestone 6: each frame runUntil()s
+                      the emulator by the wall delta, clamped to
+                      MAX_FRAME_DELTA_MS = 50 ms, at most a step cap; a
+                      capped frame drops its debt, so busy firmware runs
+                      in slow motion; speed() is the smoothed
+                      emulated/wall ratio the status line shows as
+                      "N.Nx"). Its scheduler, clock (`now`), presenter
+                      callback and per-frame `onFrame` hook are
+                      injectable: in the Worker a frame is a slice capped
+                      at WORKER_STEPS_PER_SLICE = 400,000 steps whose
+                      presenter posts the framebuffer; the in-thread
+                      shape (requestAnimationFrame, a blit, the cap
+                      DEFAULT_STEPS_PER_FRAME = 150,000) is what the
+                      unit tests drive. Also the button-name -> raw-slot
+                      table (isButtonName checks own properties), a
                       minimum press hold (PRESS_HOLD_US, 100 ms of
                       emulated time; earlier releases are deferred and
                       flushed by stop()), provision()
@@ -183,6 +226,38 @@ frontend/             Vite + TypeScript web app (own package.json).
                       and shake() (the rungs' two-axis shake pattern,
                       SHAKE_HALF_US = 62.5 ms half-periods, then rest).
                       Reset abandons a provisioner and a shake.
+  src/runtime/firmware-worker.ts
+                      The firmware Worker (Milestone 7 Task 8): boots the
+                      WASM emulator from bytes the main thread transfers
+                      (compiled with initCpuWasmSync; the bridge is
+                      imported lazily), owns the whole FirmwareRuntime
+                      (pacing, press holds, shake, provisioner) and runs
+                      it as slices: setTimeout(…, 0) after a slice that
+                      reached its target, a MessageChannel yield (no 4 ms
+                      timer clamp) after a capped one (ruling R-T8-1).
+                      Messages are applied between slices; one frame in
+                      flight (the next waits for frameAck); `status`
+                      (speed, provisioning state) at most every 250 ms;
+                      an error in a slice is posted and stops the loop.
+                      handleMessage is pure over an injectable WorkerHost,
+                      so test/firmware-worker.test.ts runs it under Bun.
+  src/runtime/firmware-worker-client.ts
+                      Main-thread side: a FirmwareRuntime whose methods
+                      post to the Worker and whose speed()/
+                      provisionState() return the last `status`, so
+                      main.ts and shell.ts use it as before. Queues
+                      messages until `ready`, paints the latest frame on
+                      the next animation frame then acknowledges it (a
+                      frame while stopped is dropped and acknowledged),
+                      and stops the runtime while the page is hidden
+                      (document.visibilitychange), resuming when visible
+                      (ruling R-T8-10).
+  src/runtime/firmware-worker-protocol.ts
+                      The ToWorker/FromWorker message types (init with
+                      the transferred WASM and factory.bin, start, stop,
+                      button, provision, shake, reset, frameAck,
+                      dispose; ready, frame, status, error) and
+                      STATUS_INTERVAL_MS.
   src/runtime/provisioner.ts
                       Types the firmware's own provisioning commands into
                       the emulated USB console (wait for `badge> `,
@@ -207,10 +282,21 @@ frontend/             Vite + TypeScript web app (own package.json).
                       Owns both the Lua AppRuntime and the CPU
                       FirmwareRuntime (see emulator-core/ below), with a
                       mode toggle (src/ui/shell.ts) that switches which one
-                      drives the shared canvas/button pad. The `./cpu/bridge`
-                      import is dynamic, loaded lazily on first switch to
-                      firmware mode, so Lua-only usage has no static
-                      dependency on the Rust/WASM toolchain output.
+                      drives the shared canvas/button pad. On the first
+                      switch to firmware mode it fetches the .wasm and
+                      factory.bin, starts the firmware Worker and awaits
+                      its `ready` (a failed boot falls back to Lua mode).
+                      Only the Worker imports `./cpu/bridge` (lazily), so
+                      Lua-only usage never loads the Rust/WASM toolchain
+                      output.
+  src/bench/          The WASM redraw benchmark (Milestone 7):
+                      redraw-bench.ts (runRedrawBench, timeRedraw),
+                      walk.ts (the walk's constants and frame-sampling
+                      and press helpers, shared with test/cpu-wasm.test.ts),
+                      and the dev-only bench page's code (bench-page.ts,
+                      bench-worker.ts, for frontend/bench.html). The
+                      drivers are frontend/bench/bun-bench.ts
+                      (`bench:wasm`) and safari-bench.ts (`bench:safari`).
   public/apps/<slug>/ Static app bundles (main.lua + manifest.cfg), served
                       by Vite's public/ dir and fetched via a *synchronous*
                       XHR-based fileLoader (required because Lua require()
@@ -251,6 +337,18 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       back into firmware (qsort's comparator) are real
                       RV32 code instead; cpu/encode.rs is the const-fn
                       RV32IM encoder those code blobs are assembled with.
+                      cpu/decode_cache.rs (Milestone 7 Task 7) caches
+                      decoded instructions: a direct-mapped table of
+                      1 << 14 entries indexed by (pc >> 1), tagged by the
+                      raw bits alone (ruling R-T7-3). Every step still
+                      runs the ROM-stub check and fetches through
+                      Bus::fetch16 first; a hit needs the bits fetched
+                      now, so a store over code, a flash write or an MMU
+                      remap runs as the new code with no invalidation
+                      hook, and an unmapped fetch still traps. 262,144
+                      bytes per Cpu (16-byte entries), so per
+                      FirmwareRuntime clone; debug builds check every
+                      hit against a fresh decode.
   src/clock.rs        Chip-agnostic emulated time (Milestone 6): Clock
                       converts executed steps into ticks of a fixed-rate
                       timer at a CPU frequency that can change
@@ -300,6 +398,21 @@ emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
                       page windows and the bus's separate copy of the
                       image). An invalid entry reads 0 (logged) and a fetch
                       through it traps; DBUS is never fetchable.
+                      Word fast path (Milestone 7 Task 5): read16/read32,
+                      write16/write32 and fetch16 first try, in this
+                      order, an access wholly inside one 64 KiB MMU page
+                      of an XIP aperture (reads and IBUS fetches through
+                      a valid entry only; an aperture write goes to the
+                      byte path, which drops it), then one span
+                      of a resolved RAM span map (`RamSpan`, rebuilt by
+                      `FirmwareBus::rebuild_ram_spans` whenever the RAM
+                      regions change, so a word over overlapping
+                      segment/scratch regions resolves as the byte path's
+                      first-match rule would; a last-hit span hint, then
+                      a binary search); anything else (straddling a span
+                      or page edge, unaligned across them, peripherals,
+                      ROM blobs, unmapped space) takes the byte path,
+                      which logs and traps exactly as before.
                       mem/image.rs parses the ESP-IDF app-image format;
                       mem/soc.rs holds the ESP32-C3 address-space ranges
                       plus the ESP32-C3's fixed 64 KiB MMU page size.
@@ -474,10 +587,11 @@ emulator-wasm/        Thin wasm-bindgen shim over emulator-core — logic-free
                       via `bun run build:wasm` into
                       frontend/src/cpu/wasm-pkg/ (gitignored). Consumed by
                       frontend/'s src/cpu/bridge.ts,
-                      src/runtime/firmware-runtime.ts, and
+                      src/runtime/firmware-runtime.ts (run inside
+                      src/runtime/firmware-worker.ts), and
                       src/render/framebuffer.ts (the CPU-emulator analogs of
                       the Lua-mode files above), wired up by src/main.ts's
-                      mode toggle.
+                      mode toggle; also by src/bench/.
 ```
 
 See `docs/firmware-emulator-notes.md` for the forensic findings behind this
