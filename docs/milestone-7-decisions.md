@@ -153,6 +153,52 @@ R-T*n*-*k* rulings are made in Task *n*.
   If wrong: the browser baselines are off by a few %, below the effect
   sizes Tasks 3 to 7 measure.
 
+### Task 4
+
+- **R-T4-2, the intc write hook sees every change to the line gate's
+  inputs.** The gate derives from `cpu_int_enable`, `cpu_int_pri[0..32]`
+  and `cpu_int_thresh` (all private to `InterruptController`).
+  `/usr/bin/grep` over `emulator-core/src` and `emulator-wasm/src` finds
+  exactly these assignments: the `Default` initializer (all 0, with
+  `line_gate: 0`, consistent: nothing enabled) and three `set_byte` calls
+  in `InterruptController::write_byte` (`CPU_INT_ENABLE_REG`,
+  `CPU_INT_THRESH_REG`, `CPU_INT_PRI_<n>_REG`). No `&mut` to them escapes
+  the module. Every write reaches `write_byte` through
+  `FirmwareBus::write_byte`'s `INTERRUPT_CORE0_RANGE` branch: guest
+  stores, and the six ROM-stub effects (`intr_matrix_set`,
+  `esprv_intc_int_*`), which `Cpu::apply_bus_register_op` performs as
+  `Bus::read32`/`write32` on the bus. A reset builds a fresh controller
+  (`InterruptController::new`), and `Clone` copies `line_gate` with the
+  registers. `write_byte` recomputes the gate after every byte it
+  accepts, so a byte-split word write is consistent after each byte and
+  the next step's `poll` sees the last one. The `debug_assert_eq!` in
+  `poll` ran on every step of the debug `cargo test --workspace` (536 lib
+  + 95 integration tests, the 64 boot rungs included) without firing. If
+  wrong: a stale gate would deliver the wrong lines; debug builds panic
+  on the first such step, release builds would diverge from a pin.
+- **R-T4-3, the gate is recomputed on every intc write, not only on
+  enable, priority and threshold writes.** MAP, TYPE and CLEAR writes
+  recompute it too (a 32-line loop; intc writes happen during interrupt
+  setup and in the FreeRTOS port's threshold changes, far rarer than
+  steps, and the Task 4 profile shows `InterruptController::write_byte`
+  at 0.1 %).
+  It keeps the hook one line with no per-register case to get wrong. If
+  wrong: a negligible cost per intc write.
+- **R-T4-4, routing ORs `1 << (MAP[src] & 0x1F)` and clears bit 0.** The
+  set-bit loop has no branch on the route; a line-0 route ("not routed")
+  sets bit 0, cleared once at the end, which is what skipping it did.
+  `eip_status` shares `routed_lines`, so `CPU_INT_EIP_STATUS_REG` reads
+  as before. If wrong: line 0 could appear asserted; the existing
+  `unrouted_source_line_zero_never_fires` pins it.
+- **R-T4-5, the USB-Serial-JTAG store is one boxed array over the whole
+  4 KiB window.** `regs: Box<[u32; 1024]>` indexed by `offset / 4`
+  (`REG_WORDS`), rather than named fields: the module doc promises plain
+  storage for every unnamed offset, which named fields cannot keep. Boxed
+  so `FirmwareBus` stays small; a checkpoint clone copies 4 KiB more than
+  an empty map. An offset past the window (the bus never sends one) reads
+  0 and drops the write rather than panicking. The file's existing tests
+  are unchanged. If wrong: 4 KiB per runtime and per clone.
+
 ## Measurements
 
 The native benchmark is
@@ -176,6 +222,8 @@ reads a little below the redraws' steps/s.
 | `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 12.36 | 0.172 | 0.228 | 0.301 | — |
 | Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 20.78 | 0.302 | 0.385 | 0.510 | 27.0 |
 | Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 13.75 | 0.191 | 0.257 | 0.340 | n/a |
+| Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 40.10 | 0.611 | 0.796 | 1.003 | 15.4 |
+| Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 25.80 | 0.377 | 0.550 | 0.707 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -296,6 +344,55 @@ Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
 (41.5 s at `"s"`); clippy the same 3 warnings; `bun run build:wasm` and
 `bun run typecheck` ok; `bun test` 149 pass, 0 fail, 29.4 s.
 
+### Task 4: interrupt routing over pending bits, precomputed line gate
+
+`InterruptController::routed_lines` visits only the set bits of
+`pending_sources` (a `trailing_zeros` loop, the spec's prototype);
+`poll` is `routed_lines(pending) & line_gate`, where `line_gate` (lines
+enabled, priority != 0, priority >= threshold) is recomputed on every
+intc write and checked against a fresh computation by a
+`debug_assert_eq!` on every `poll` (R-T4-1 to R-T4-4).
+`UsbSerialJtag`'s `HashMap<u32, u32>` register store is a fixed array
+(R-T4-5), so the per-step `pending_sources` reads `INT_ENA` without
+hashing. Every pin held. Native `BENCH` lines:
+
+```
+BENCH walk steps=372597011 wall_s=9.29 msteps_per_s=40.10
+BENCH home emulated_ms=254.0 steps=19106041 busy_pct=94.0 wall_ms_median=415.7 wall_ms_min=414.8 factor=0.611 msteps_per_s=45.96
+BENCH down emulated_ms=115.0 steps=6858235 busy_pct=74.6 wall_ms_median=144.4 wall_ms_min=144.4 factor=0.796 msteps_per_s=47.48
+BENCH onboarding emulated_ms=67.0 steps=3018254 busy_pct=56.4 wall_ms_median=66.8 wall_ms_min=66.7 factor=1.003 msteps_per_s=45.18
+```
+
+A second native run read within 4 % (walk 39.42 Msteps/s, factors
+0.607, 0.774, 0.995).
+
+Bun (`bun run bench:wasm`, median of 3; the runs agreed within 3 % on
+the walk and 4 % on every redraw):
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=7e7b1f0+dirty profile=release opt-level=3
+BENCH median runs=3 walk msteps_per_s=25.80
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=679.7 factor=0.515 msteps_per_s=28.38 pin_factor=0.377
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=210.5 factor=0.549 msteps_per_s=32.81 pin_factor=0.550
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=104.8 factor=2.291 msteps_per_s=31.84 pin_factor=0.707
+```
+
+(`+dirty`: Task 4's uncommitted code.) Against Task 3: native redraws
+2.0x to 2.1x the steps/s (HOME 22.75 to 45.96 M), the walk 1.93x; Bun
+redraws 1.98x to 2.14x (pin factors 0.191, 0.257, 0.340 to 0.377,
+0.550, 0.707), the walk 1.88x. Native onboarding reaches 1.0x.
+
+WASM size: 105,110 bytes at Task 3, 100,002 bytes now (-5,108 bytes;
+the USB store's `HashMap` code is gone).
+
+Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
+536 lib (Task 4's two new intc tests) + 95 integration pass (64 boot
+rungs, 1 ignored), 18.3 s wall, `boot_progress` 15.5 s with the gate
+cross-check on every step; release `boot_progress` 64 pass, 1 ignored,
+15.4 s wall (14.1 s in the harness); clippy the same 3 warnings;
+`bun run build:wasm` and `bun run typecheck` ok; `bun test` 149 pass,
+0 fail, 15.9 s.
+
 ## Profiles
 
 Procedure (every optimization task follows it):
@@ -340,6 +437,51 @@ Below the top 10: `tick_peripherals` 2.1 %, `write_byte` 1.5 %,
 the interrupt poll dominates even more than in the spec's
 `opt-level = 3` brainstorming profile (40 % `step_with_interrupts` self
 time), because less of the rest is inlined and fast.
+
+### Task 3 (`7e7b1f0`, release `opt-level = 3`), before Task 4
+
+28,981 samples on the `bench_redraws` thread (this run: walk 20.40
+Msteps/s, HOME 0.291x).
+
+| Share | Symbol |
+| --- | --- |
+| 38.8 % | `FirmwareBus::asserted_lines` (with `InterruptController::poll` and the 64-source `routed_lines` scan inlined into it) |
+| 9.6 % | `FirmwareBus::read_byte` |
+| 7.5 % | `cpu::decode::decode_16` |
+| 5.7 % | `UsbSerialJtag::pending_sources` (the `HashMap` lookup of `INT_ENA`) |
+| 5.6 % | `Cpu::step` |
+| 5.6 % | `RomStubTable::lookup` |
+| 4.9 % | `FirmwareBus::tick_peripherals` |
+| 4.7 % | `cpu::decode::decode_32` |
+| 4.1 % | `FirmwareBus::fetch16` |
+| 3.8 % | `cpu::execute::execute` |
+
+Below the top 10: the `bench_redraws` closure 3.6 %, `write_byte` 2.6 %,
+`SysTimer::advance_by` 1.0 %, `step_with_interrupts` 0.7 %.
+
+### Task 4 (interrupt routing and line gate, release `opt-level = 3`)
+
+14,894 samples on the `bench_redraws` thread (this run: walk 40.16
+Msteps/s, HOME 0.634x).
+
+| Share | Symbol |
+| --- | --- |
+| 17.0 % | `FirmwareBus::read_byte` |
+| 12.5 % | `Cpu::step` |
+| 11.3 % | `RomStubTable::lookup` |
+| 9.6 % | `FirmwareBus::tick_peripherals` |
+| 9.1 % | `FirmwareBus::asserted_lines` (now with `UsbSerialJtag::pending_sources` inlined) |
+| 9.1 % | `cpu::decode::decode_16` |
+| 7.3 % | `FirmwareBus::fetch16` |
+| 7.0 % | the `bench_redraws` closure (the benchmark's own framebuffer hashing) |
+| 5.5 % | `cpu::decode::decode_32` |
+| 4.6 % | `FirmwareBus::write_byte` |
+
+Below the top 10: `SysTimer::advance_by` 2.3 %, `step_with_interrupts`
+1.3 %, `FirmwareRuntime::run_impl` 1.0 %. The interrupt path (poll plus
+the USB source) went from 44.5 % to 9.1 %; the profile is now the flat
+one the spec predicted, led by byte-wise bus access (Task 5) and the
+ROM-stub lookup and decode on every fetch (Tasks 6 and 7).
 
 ## Milestone 8 backlog
 

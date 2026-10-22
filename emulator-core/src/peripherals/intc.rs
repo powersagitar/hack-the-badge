@@ -158,6 +158,12 @@ pub struct InterruptController {
     cpu_int_clear: u32,
     cpu_int_pri: [u32; LINE_COUNT as usize],
     cpu_int_thresh: u32,
+    /// Lines that are enabled, have a non-zero priority and a priority
+    /// `>=` the threshold: the register-derived half of [`Self::poll`],
+    /// recomputed by [`Self::recompute_line_gate`] after every
+    /// [`Self::write_byte`] (the only writer of the registers it derives
+    /// from; ROM-stub writes reach it through the bus). Milestone 7 Task 4.
+    line_gate: u32,
 }
 
 impl Default for InterruptController {
@@ -169,6 +175,7 @@ impl Default for InterruptController {
             cpu_int_clear: 0,
             cpu_int_pri: [0; LINE_COUNT as usize],
             cpu_int_thresh: 0,
+            line_gate: 0, // nothing enabled at reset
         }
     }
 }
@@ -202,17 +209,38 @@ impl InterruptController {
     /// Mask of CPU lines with at least one asserted, routed source
     /// (`pending_sources` bit `s` set and `MAP[s] & 0x1F != 0`), before any
     /// enable/priority gating.
+    ///
+    /// Visits only the set bits of `pending_sources` (Milestone 7 Task 4);
+    /// a line-0 route sets bit 0, which no `line_gate` or caller treats as
+    /// a line, so it is cleared at the end.
     fn routed_lines(&self, pending_sources: u64) -> u32 {
         let mut lines = 0u32;
-        for (src, map) in self.map.iter().enumerate() {
-            if pending_sources & (1u64 << src) != 0 {
-                let line = map & LINE_MASK;
-                if line != 0 {
-                    lines |= 1 << line;
-                }
+        let mut pending = pending_sources;
+        while pending != 0 {
+            let src = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            lines |= 1 << (self.map[src] & LINE_MASK);
+        }
+        lines & !1 // line 0 means "not routed"
+    }
+
+    /// The register-derived line gate, computed from scratch: enabled,
+    /// priority != 0 (priority 0 is "disabled") and priority >= threshold.
+    fn computed_line_gate(&self) -> u32 {
+        let thresh = self.cpu_int_thresh & PRIO_MASK;
+        let mut gate = 0u32;
+        for (line, pri) in self.cpu_int_pri.iter().enumerate() {
+            let pri = pri & PRIO_MASK;
+            if pri != 0 && pri >= thresh {
+                gate |= 1 << line;
             }
         }
-        lines
+        gate & self.cpu_int_enable
+    }
+
+    /// Refreshes [`Self::line_gate`] after a register write.
+    fn recompute_line_gate(&mut self) {
+        self.line_gate = self.computed_line_gate();
     }
 
     /// The set of CPU lines currently asserted *to the CPU*: routed pending,
@@ -220,21 +248,20 @@ impl InterruptController {
     /// is "disabled"), and with priority greater than or equal to
     /// `CPU_INT_THRESH_REG` (only priorities strictly below the threshold are
     /// masked). See the module doc.
+    ///
+    /// The enable/priority/threshold half is the precomputed
+    /// [`Self::line_gate`]; debug builds check it against a fresh
+    /// computation on every call. Pending sources are never cached.
     pub fn poll(&self, pending_sources: u64) -> u32 {
+        debug_assert_eq!(
+            self.line_gate,
+            self.computed_line_gate(),
+            "stale interrupt line gate"
+        );
         if pending_sources == 0 {
-            return 0; // the common case, every step: skip the scans
+            return 0; // the common case, every step: skip the scan
         }
-        let candidates = self.routed_lines(pending_sources) & self.cpu_int_enable;
-        let thresh = self.cpu_int_thresh & PRIO_MASK;
-        let mut out = 0u32;
-        for line in 0..LINE_COUNT {
-            let pri = self.cpu_int_pri[line as usize] & PRIO_MASK;
-            // Priority 0 = line disabled (module doc), whatever `thresh` is.
-            if candidates & (1 << line) != 0 && pri != 0 && pri >= thresh {
-                out |= 1 << line;
-            }
-        }
-        out
+        self.routed_lines(pending_sources) & self.line_gate
     }
 
     /// Each CPU line's 4-bit `CPU_INT_PRI_n` priority, for the core's
@@ -288,6 +315,7 @@ impl InterruptController {
             // register) is likewise accepted and dropped.
             _ => {}
         }
+        self.recompute_line_gate();
     }
 }
 
@@ -495,5 +523,63 @@ mod tests {
         arm(&mut ic, 50, 4, 1);
         assert_eq!(ic.poll(1u64 << 50), 1 << 4);
         assert_eq!(ic.poll(0), 0, "no latching: level follows the source");
+    }
+
+    /// Routing visits only the set bits of `pending_sources` (Milestone 7
+    /// Task 4): a routed source that is not pending contributes nothing,
+    /// and the top source (63) routes like any other.
+    #[test]
+    fn routed_lines_visits_only_pending_sources() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 19 * 4, 3);
+        write_word(&mut ic, 44 * 4, 9);
+        assert_eq!(ic.routed_lines(1u64 << 44), 1 << 9);
+        assert_eq!(
+            ic.routed_lines((1u64 << 19) | (1u64 << 44)),
+            (1 << 3) | (1 << 9)
+        );
+        assert_eq!(ic.routed_lines(0), 0);
+        write_word(&mut ic, 63 * 4, 21);
+        assert_eq!(ic.routed_lines(1u64 << 63), 1 << 21);
+        assert_eq!(ic.routed_lines(u64::MAX), (1 << 3) | (1 << 9) | (1 << 21));
+    }
+
+    /// Review Focus 3 (Milestone 7): the precomputed line gate follows every
+    /// enable, priority and threshold write, so the very next `poll` sees it,
+    /// exactly as the per-register scan it replaced did.
+    #[test]
+    fn line_gate_follows_enable_priority_and_threshold_writes() {
+        let src = 1u64 << 19;
+        let fresh = || {
+            let mut ic = InterruptController::new();
+            write_word(&mut ic, 19 * 4, 5);
+            write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 5);
+            write_word(&mut ic, CPU_INT_PRI_BASE_REG + 5 * 4, 3);
+            write_word(&mut ic, CPU_INT_THRESH_REG, 1);
+            assert_eq!(ic.poll(src), 1 << 5);
+            assert_eq!(ic.line_gate, ic.computed_line_gate());
+            ic
+        };
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_THRESH_REG, 4);
+        assert_eq!(ic.poll(src), 0, "threshold 4 above priority 3");
+        write_word(&mut ic, CPU_INT_THRESH_REG, 3);
+        assert_eq!(ic.poll(src), 1 << 5, "threshold 3 == priority 3 (>=)");
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 5 * 4, 0);
+        assert_eq!(ic.poll(src), 0, "priority 0 disables the line");
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 0);
+        assert_eq!(ic.poll(src), 0, "enable bit cleared");
+
+        // A single byte write (as a `sb`, or one lane of a byte-split word)
+        // takes effect on its own.
+        let mut ic = fresh();
+        ic.write_byte(CPU_INT_THRESH_REG, 4);
+        assert_eq!(ic.poll(src), 0);
+        assert_eq!(ic.line_gate, ic.computed_line_gate());
     }
 }

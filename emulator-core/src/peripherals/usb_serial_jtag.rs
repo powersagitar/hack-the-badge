@@ -59,7 +59,7 @@
 //!   holds bytes and disables it when drained).
 //! - Every other offset (`CONF0_REG`, `MISC_CONF_REG`, the various `*_ST`
 //!   status registers, …): plain read/write word
-//!   storage, keyed by word-aligned offset in [`UsbSerialJtag::regs`], so a
+//!   storage, indexed by word offset in [`UsbSerialJtag::regs`], so a
 //!   driver that pokes at USB-Serial-JTAG's interrupt/config plumbing
 //!   during setup doesn't get lost (reads back whatever was last written,
 //!   defaulting to 0) without this module needing to name every one of
@@ -85,12 +85,14 @@
 //! spans therefore follows the firmware's own CPU frequency switches. No
 //! USB bus reset, JTAG or EP2 is modeled.
 //!
-//! This mirrors the pattern `crate::peripherals::intc` used for its MAP
-//! registers until Milestone 3 Task 4 (concrete named registers get real
-//! behavior; everything else in the peripheral's address window is a
-//! generic word-storage `HashMap`) rather than introducing a new idiom.
+//! This mirrors the pattern `crate::peripherals::intc` uses for its MAP
+//! registers (concrete named registers get real behavior; everything else
+//! in the peripheral's address window is generic word storage). Until
+//! Milestone 7 Task 4 that storage was a `HashMap<u32, u32>`; it is now a
+//! fixed array over the whole 4 KiB window ([`REG_WORDS`] words), because
+//! the per-step interrupt poll reads `INT_ENA` out of it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use super::console::Console;
 use super::set_byte;
@@ -147,12 +149,18 @@ pub const HOST_QUEUE_CAPACITY: usize = 1 << 20;
 /// Raw bits this model holds set on every read (see the module doc).
 const FORCED_RAW: u32 = SERIAL_IN_EMPTY_INT_RAW | SOF_INT_RAW;
 
+/// Words of plain register storage: the peripheral's whole 4 KiB window
+/// (`crate::mem::soc::USB_SERIAL_JTAG_RANGE`).
+pub const REG_WORDS: usize = 0x1000 / 4;
+
 /// The USB-Serial-JTAG peripheral. See the module doc for what's modeled.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct UsbSerialJtag {
     /// Plain word storage for every register offset not given real
-    /// behavior above, keyed by word-aligned offset.
-    regs: HashMap<u32, u32>,
+    /// behavior above (including `INT_ENA`), indexed by `offset / 4`.
+    /// Offsets past the window (none reach here from the bus) read 0 and
+    /// drop writes.
+    regs: Box<[u32; REG_WORDS]>,
     /// Latched (non-forced) `INT_RAW` bits.
     int_raw: u32,
     /// Bytes the host has buffered and not yet sent as a packet.
@@ -163,9 +171,29 @@ pub struct UsbSerialJtag {
     ticks_to_next_packet: u64,
 }
 
+impl Default for UsbSerialJtag {
+    fn default() -> Self {
+        Self {
+            regs: Box::new([0; REG_WORDS]),
+            int_raw: 0,
+            host_queue: VecDeque::new(),
+            out_fifo: VecDeque::new(),
+            ticks_to_next_packet: 0,
+        }
+    }
+}
+
 impl UsbSerialJtag {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The plain-storage word at `word_offset` (0 past the window).
+    fn reg(&self, word_offset: u32) -> u32 {
+        self.regs
+            .get((word_offset / 4) as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Queues bytes the USB host sends; returns how many were accepted
@@ -206,7 +234,7 @@ impl UsbSerialJtag {
     }
 
     fn int_ena(&self) -> u32 {
-        self.regs.get(&INT_ENA_REG).copied().unwrap_or(0)
+        self.regs[(INT_ENA_REG / 4) as usize]
     }
 
     fn int_st(&self) -> u32 {
@@ -240,7 +268,7 @@ impl UsbSerialJtag {
             INT_RAW_REG => self.int_raw | FORCED_RAW,
             INT_ST_REG => self.int_st(),
             INT_CLR_REG => 0,
-            _ => self.regs.get(&word_offset).copied().unwrap_or(0),
+            _ => self.reg(word_offset),
         };
         word.to_le_bytes()[idx]
     }
@@ -262,9 +290,9 @@ impl UsbSerialJtag {
             // forced bits re-assert on the next read.
             INT_RAW_REG | INT_CLR_REG => self.int_raw &= !(u32::from(val) << (8 * idx)),
             _ => {
-                let mut word = self.regs.get(&word_offset).copied().unwrap_or(0);
-                set_byte(&mut word, idx, val);
-                self.regs.insert(word_offset, word);
+                if let Some(word) = self.regs.get_mut((word_offset / 4) as usize) {
+                    set_byte(word, idx, val);
+                }
             }
         }
     }
