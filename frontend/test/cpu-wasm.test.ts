@@ -47,13 +47,13 @@ describe("emulator-wasm firmware-boot boundary", () => {
   // this whole branch: booting the real dumped firmware through the WASM CPU
   // emulator and reading back a run summary + framebuffer through the same
   // `src/cpu/bridge.ts` surface `src/runtime/firmware-runtime.ts` uses.
-  test("boots factory.bin, runs a bounded budget, and exposes a full framebuffer", () => {
+  test("boots firmware.bin, runs a bounded budget, and exposes a full framebuffer", () => {
     const wasmBytes = readFileSync(
       new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
     );
     initCpuWasmSync(wasmBytes);
 
-    const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+    const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
     const handle = createFirmwareEmulator(new Uint8Array(image));
     try {
       const report = handle.run(500_000);
@@ -76,13 +76,13 @@ describe("emulator-wasm firmware-boot boundary", () => {
   // little-endian bytes. Uses the raw wasm-bindgen class (not the bridge
   // handle), which also covers the generated glue directly.
   test(
-    "boots factory.bin to the same first real frame as the native finish-line test",
+    "boots firmware.bin to the same first real frame as the native finish-line test",
     () => {
       const wasmBytes = readFileSync(
         new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
       );
       initSync({ module: wasmBytes });
-      const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+      const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
       const emu = new FirmwareEmulator(new Uint8Array(image));
       try {
         for (let done = 0; done < 5_500_000; done += 250_000) {
@@ -107,13 +107,13 @@ describe("emulator-wasm firmware-boot boundary", () => {
   // first frame that is not uniform, not the splash, and unchanged for
   // 1,000,000 steps, capped at 17,250,000 steps; same hash.
   test(
-    "boots factory.bin to the same first-run screen as the native finish-line test",
+    "boots firmware.bin to the same first-run screen as the native finish-line test",
     () => {
       const wasmBytes = readFileSync(
         new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
       );
       initSync({ module: wasmBytes });
-      const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+      const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
       const emu = new FirmwareEmulator(new Uint8Array(image));
       try {
         let hash = fnv1a(emu.framebuffer());
@@ -152,7 +152,7 @@ describe("emulator-wasm firmware-boot boundary", () => {
       new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
     );
     initCpuWasmSync(wasmBytes);
-    const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+    const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
     const handle = createFirmwareEmulator(new Uint8Array(image));
     try {
       expect(handle.emulatedTimeUs()).toBe(0);
@@ -177,7 +177,7 @@ describe("emulator-wasm provisioned boot", () => {
       initCpuWasmSync(
         readFileSync(new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url)),
       );
-      const image = readFileSync(new URL("../public/firmware/factory.bin", import.meta.url));
+      const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
       const handle = createFirmwareEmulator(new Uint8Array(image));
       try {
         expect(runUntilStable(handle, FIRST_RUN_MAX_STEPS, BOOT_STABLE_FOR, [SPLASH_HASH])).toBe(

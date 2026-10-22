@@ -1,5 +1,5 @@
 //! `boot-probe`: a standalone diagnostic CLI that boots the real dumped
-//! firmware (`frontend/public/firmware/factory.bin`) through
+//! firmware (`frontend/public/firmware/firmware.bin`) through
 //! [`emulator_core::runtime::FirmwareRuntime`] for a configurable number of
 //! steps and prints everything Task 2's "why is boot stuck" investigation
 //! needs: the firmware's own console output, a run summary (traps, ROM stub
@@ -254,13 +254,13 @@ fn main() {
     });
 
     let image_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/factory.bin");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/firmware.bin");
     let image = fs::read(&image_path).unwrap_or_else(|e| {
         panic!("could not read firmware image at {image_path:?}: {e}");
     });
 
     let mut rt =
-        FirmwareRuntime::from_image(&image).expect("factory.bin should parse as an app image");
+        FirmwareRuntime::from_image(&image).expect("firmware.bin should parse as an app image");
 
     let window = args.window.min(args.steps);
     let non_traced = args.steps - window;

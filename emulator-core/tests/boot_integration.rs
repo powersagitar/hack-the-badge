@@ -1,36 +1,36 @@
 //! Integration test: boot the *real* dumped firmware
-//! (`frontend/public/firmware/factory.bin`) through `boot_from_factory_image` and run
+//! (`frontend/public/firmware/firmware.bin`) through `boot_from_firmware_image` and run
 //! it for a bounded number of `cpu.step()` calls, asserting it doesn't hang
 //! or panic. This is the primary evidence for whether the "shortcut boot"
 //! approach (skip the ROM/2nd-stage bootloader, jump straight to the app
 //! image's `entry_addr`) is viable — see the task report for a detailed
 //! account of what was observed.
 //!
-//! Reads `factory.bin` directly from `../frontend/public/firmware/factory.bin`
+//! Reads `firmware.bin` directly from `../frontend/public/firmware/firmware.bin`
 //! (relative to this crate) rather than duplicating the 2.7 MB file into
 //! `tests/fixtures/`.
 
-use emulator_core::boot::boot_from_factory_image;
+use emulator_core::boot::boot_from_firmware_image;
 use emulator_core::cpu::exception_code;
 use emulator_core::mem::Bus;
 use std::path::PathBuf;
 
-fn factory_bin_path() -> PathBuf {
+fn firmware_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("frontend/public/firmware/factory.bin")
+        .join("frontend/public/firmware/firmware.bin")
 }
 
 #[test]
-fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
-    let image = std::fs::read(factory_bin_path()).expect(
-        "reading frontend/public/firmware/factory.bin \
+fn boots_real_firmware_image_without_panicking_and_reaches_step_budget() {
+    let image = std::fs::read(firmware_bin_path()).expect(
+        "reading frontend/public/firmware/firmware.bin \
          (expected to be committed at the repo's frontend/public/firmware/)",
     );
-    assert_eq!(image.len(), 2_752_512, "unexpected factory.bin size");
+    assert_eq!(image.len(), 2_752_512, "unexpected firmware.bin size");
 
     let (mut cpu, mut bus) =
-        boot_from_factory_image(&image).expect("real factory.bin should parse and boot");
+        boot_from_firmware_image(&image).expect("real firmware.bin should parse and boot");
 
     assert_eq!(
         cpu.regs.pc, 0x403803fc,
@@ -106,7 +106,7 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
 /// cpu_start.c`) reads the running app's `esp_image_header_t` from
 /// `fhdr_src_addr = &_rodata_reserved_start - sizeof(esp_image_header_t) -
 /// sizeof(esp_image_segment_header_t)` -- a linker symbol that resolves to
-/// the DROM segment's own `load_addr` (confirmed against `factory.bin`'s
+/// the DROM segment's own `load_addr` (confirmed against `firmware.bin`'s
 /// real segment table: segment 0's `load_addr` is `0x3c13_0020`), so
 /// `fhdr_src_addr` is `0x3c13_0000` -- 32 bytes *before* `load_addr`, not
 /// `SOC_DROM_LOW` (`0x3c00_0000`) as the task brief's initial, unverified
@@ -121,13 +121,13 @@ fn boots_real_factory_image_without_panicking_and_reaches_step_budget() {
 /// test pins directly:
 /// this test is that same rule's real-image regression check.
 #[test]
-fn real_factory_image_exposes_cpu_starts_header_bytes_at_the_page_aligned_drom_address() {
-    let image = std::fs::read(factory_bin_path()).expect(
-        "reading frontend/public/firmware/factory.bin \
+fn real_firmware_image_exposes_cpu_starts_header_bytes_at_the_page_aligned_drom_address() {
+    let image = std::fs::read(firmware_bin_path()).expect(
+        "reading frontend/public/firmware/firmware.bin \
          (expected to be committed at the repo's frontend/public/firmware/)",
     );
     let (_cpu, mut bus) =
-        boot_from_factory_image(&image).expect("real factory.bin should parse and boot");
+        boot_from_firmware_image(&image).expect("real firmware.bin should parse and boot");
 
     const FHDR_SRC_ADDR: u32 = 0x3c13_0000;
 

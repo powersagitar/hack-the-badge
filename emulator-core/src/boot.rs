@@ -1,5 +1,5 @@
 //! "Shortcut boot": load a real ESP-IDF app image (as dumped from a
-//! physical badge into `frontend/public/firmware/factory.bin`) directly into a
+//! physical badge into `frontend/public/firmware/firmware.bin`) directly into a
 //! [`Cpu`]/[`FirmwareBus`] pair, skipping the ROM/2nd-stage-bootloader
 //! entirely.
 //!
@@ -21,7 +21,7 @@
 //! re-created by [`apply_ram_initializers`] (Milestone 3 Task D10): a
 //! generic list of boot-time `(address, bytes)` writes, with the ESP32-C3
 //! data in [`crate::rom`] (applied by
-//! [`boot_from_factory_image_with_rom_stubs`] only, since it is ROM state).
+//! [`boot_from_firmware_image_with_rom_stubs`] only, since it is ROM state).
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use crate::mem::image::{parse_image, ImageParseError};
 use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, RTC_RANGE};
 
 /// Parses `image` (expected to be the raw bytes of an ESP-IDF app image,
-/// e.g. `frontend/public/firmware/factory.bin`), builds the [`FirmwareBus`] memory
+/// e.g. `frontend/public/firmware/firmware.bin`), builds the [`FirmwareBus`] memory
 /// map from its segments, and returns a [`Cpu`] with `pc` set to the
 /// image's `entry_addr` — ready for the caller to start calling
 /// `cpu.step(&mut bus)`.
@@ -85,7 +85,7 @@ use crate::mem::soc::{DRAM_RANGE, IRAM_RANGE, ROM_STACK_SIZE, ROM_STACK_START, R
 /// stack/heap boundary is unknown. What's asserted here is narrower and
 /// checkable: this `sp` is inside real backed RAM, above `.bss`, and outside
 /// the ROM's reserved window.
-pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), ImageParseError> {
+pub fn boot_from_firmware_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), ImageParseError> {
     let parsed = parse_image(image)?;
 
     let flash: Arc<[u8]> = Arc::from(image.to_vec().into_boxed_slice());
@@ -106,7 +106,7 @@ pub fn boot_from_factory_image(image: &[u8]) -> Result<(Cpu, FirmwareBus), Image
     Ok((cpu, bus))
 }
 
-/// The seeded initial `sp` — see [`boot_from_factory_image`]'s doc. Kept as a
+/// The seeded initial `sp` — see [`boot_from_firmware_image`]'s doc. Kept as a
 /// named function so tests can assert the value without restating the
 /// arithmetic.
 pub fn initial_stack_pointer() -> u32 {
@@ -116,7 +116,7 @@ pub fn initial_stack_pointer() -> u32 {
     (ROM_STACK_START - ROM_STACK_SIZE) & !0xf
 }
 
-/// Same as [`boot_from_factory_image`], plus the ESP32-C3 mask-ROM
+/// Same as [`boot_from_firmware_image`], plus the ESP32-C3 mask-ROM
 /// high-level-emulation stub table ([`crate::rom::esp32c3_rom_stubs`])
 /// installed on the returned [`Cpu`], and the ESP32-C3's guest-executed ROM
 /// code blobs ([`crate::rom::install_esp32c3_rom_code`] -- currently ROM
@@ -141,20 +141,20 @@ pub fn initial_stack_pointer() -> u32 {
 /// Real ESP-IDF firmware calls fixed-address on-chip mask-ROM functions
 /// within its first ~20 instructions (see [`crate::rom`] and
 /// [`crate::cpu::rom_stubs`] for the whole story), so *any* attempt to
-/// actually run `factory.bin` needs these stubs. But installing them changes
+/// actually run `firmware.bin` needs these stubs. But installing them changes
 /// observable behavior — most obviously, boot no longer stops at the
 /// `INSTRUCTION_ACCESS_FAULT` that Task 2.1's plain-boot integration test
-/// exists specifically to pin down. Keeping [`boot_from_factory_image`]
+/// exists specifically to pin down. Keeping [`boot_from_firmware_image`]
 /// stub-free preserves that test (and every other pre-existing one) exactly
 /// as written, and makes "are ROM stubs in play?" an explicit property of the
 /// call site rather than a hidden global.
 ///
 /// This is the entry point `crate::runtime::FirmwareRuntime` (and therefore
 /// the browser's real-firmware mode) uses.
-pub fn boot_from_factory_image_with_rom_stubs(
+pub fn boot_from_firmware_image_with_rom_stubs(
     image: &[u8],
 ) -> Result<(Cpu, FirmwareBus), ImageParseError> {
-    let (mut cpu, mut bus) = boot_from_factory_image(image)?;
+    let (mut cpu, mut bus) = boot_from_firmware_image(image)?;
     cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs());
     crate::rom::install_esp32c3_rom_code(&mut bus);
     crate::rom::install_esp32c3_rom_data(&mut bus);
@@ -350,7 +350,7 @@ mod tests {
         );
 
         let (mut cpu, mut bus) =
-            boot_from_factory_image(&image).expect("synthetic image should parse and boot");
+            boot_from_firmware_image(&image).expect("synthetic image should parse and boot");
 
         assert_eq!(cpu.regs.pc, 0x4200_0020);
         // XIP: the code we baked into the image is readable at its address.
@@ -378,7 +378,7 @@ mod tests {
             &[(0x4200_0020, &code), (0x3fc99c00, &dram_data)],
         );
 
-        let (cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
+        let (cpu, mut bus) = boot_from_firmware_image(&image).expect("should boot");
 
         let sp = cpu.regs.read(2);
         assert_eq!(sp, initial_stack_pointer());
@@ -410,7 +410,7 @@ mod tests {
             0x4200_0020,
             &[(0x4200_0020, &code), (0x3fc99c00, &dram_data)],
         );
-        let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
+        let (_cpu, mut bus) = boot_from_firmware_image(&image).expect("should boot");
 
         for addr in [
             DRAM_RANGE.start,
@@ -442,7 +442,7 @@ mod tests {
         // still gets a usable stack.
         let code = [0x13, 0x00, 0x00, 0x00];
         let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
-        let (cpu, _bus) = boot_from_factory_image(&image).expect("should boot");
+        let (cpu, _bus) = boot_from_firmware_image(&image).expect("should boot");
         assert_eq!(cpu.regs.read(2), initial_stack_pointer());
     }
 
@@ -450,7 +450,7 @@ mod tests {
     fn ram_initializers_are_written_in_order_into_backed_ram() {
         let code = [0x13, 0x00, 0x00, 0x00];
         let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
-        let (_cpu, mut bus) = boot_from_factory_image(&image).expect("should boot");
+        let (_cpu, mut bus) = boot_from_firmware_image(&image).expect("should boot");
 
         apply_ram_initializers(
             &mut bus,
@@ -484,8 +484,8 @@ mod tests {
     fn rom_stub_boot_seeds_the_rom_spiflash_legacy_data_before_the_first_instruction() {
         let code = [0x13, 0x00, 0x00, 0x00];
         let mut image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
-        image[3] = 0x2f; // factory.bin's spi_speed_size: 4 MB flash
-        let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
+        image[3] = 0x2f; // firmware.bin's spi_speed_size: 4 MB flash
+        let (_cpu, mut bus) = boot_from_firmware_image_with_rom_stubs(&image).expect("should boot");
 
         // rom_spiflash_legacy_data -> rom_default_spiflash_legacy_data
         assert_eq!(bus.read32(0x3fcd_fff0), 0x3fcd_f5c0);
@@ -497,7 +497,7 @@ mod tests {
         );
 
         // The plain (ROM-less) boot models no ROM, so seeds nothing.
-        let (_cpu, mut plain) = boot_from_factory_image(&image).expect("should boot");
+        let (_cpu, mut plain) = boot_from_firmware_image(&image).expect("should boot");
         assert_eq!(plain.read32(0x3fcd_fff0), 0);
     }
 
@@ -505,20 +505,20 @@ mod tests {
     fn rom_stub_boot_seeds_rtc_xtal_freq_reg_through_the_rtc_cntl_model() {
         let code = [0x13, 0x00, 0x00, 0x00];
         let image = build_synthetic_image(0x4200_0020, &[(0x4200_0020, &code)]);
-        let (_cpu, mut bus) = boot_from_factory_image_with_rom_stubs(&image).expect("should boot");
+        let (_cpu, mut bus) = boot_from_firmware_image_with_rom_stubs(&image).expect("should boot");
         // RTC_XTAL_FREQ_REG (RTC_CNTL_STORE4_REG) as the bootloader's
         // clk_ll_xtal_store_freq_mhz(40) left it.
         assert_eq!(bus.read32(0x6000_80b8), 0x0028_0028);
 
         // The plain (ROM-less) boot stands in for no bootloader: reset value.
-        let (_cpu, mut plain) = boot_from_factory_image(&image).expect("should boot");
+        let (_cpu, mut plain) = boot_from_firmware_image(&image).expect("should boot");
         assert_eq!(plain.read32(0x6000_80b8), 0);
     }
 
     #[test]
     fn boot_propagates_parse_errors_instead_of_panicking() {
         let bad_image = [0x00u8; 24]; // wrong magic
-        let result = boot_from_factory_image(&bad_image);
+        let result = boot_from_firmware_image(&bad_image);
         assert!(matches!(
             result,
             Err(ImageParseError::BadMagic { found: 0x00 })

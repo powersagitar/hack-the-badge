@@ -13,7 +13,7 @@ wired in `frontend/src/main.ts`):
    `manifest.cfg`) against a JS implementation of the badge's `badge.*`
    API, in a Fengari (pure-JS Lua 5.3) sandbox.
 2. **Real-firmware mode:** runs the badge's actual dumped firmware
-   (`frontend/public/firmware/factory.bin`) on a from-scratch ESP32-C3
+   (`frontend/public/firmware/firmware.bin`) on a from-scratch ESP32-C3
    emulator (RV32IMC core + a minimal peripheral set) written in Rust and
    compiled to WebAssembly. The built-in apps (Snake, Dice, …) are native
    RISC-V code in one ESP-IDF image and cannot be extracted as Lua.
@@ -71,7 +71,7 @@ plus `wasm-pack`.
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
   real-firmware boot ratchet, about 8 s.
-  - Each rung boots `factory.bin` and asserts a console line, a no-fault
+  - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
@@ -130,7 +130,7 @@ plus `wasm-pack`.
 The rules for this data:
 - Never commit anything from `local/`.
 - Never quote the boot log's identity lines anywhere.
-- Committed tests depend only on `factory.bin` and committed synthetic data.
+- Committed tests depend only on `firmware.bin` and committed synthetic data.
   Code that needs the full dump reads `BADGE_FULL_DUMP` and skips when it is
   unset.
 - The only committed identity data is the eleven obviously fake identities
@@ -188,8 +188,9 @@ frontend/src/
 frontend/public/
   apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
                         because require() must return synchronously.
-  firmware/             factory.bin (publication approved by the organizers)
-                        and test-identities/.
+  firmware/             firmware.bin (official v0.1.2-335 at this commit; public;
+                        publication approved by the organizers) and
+                        test-identities/.
 
 emulator-core/src/
   cpu/                  Generic RV32IMC core: CSRs, traps, WFI, the cycle
@@ -222,7 +223,7 @@ emulator-core/src/
                         guest-executed ROM code blobs (qsort, strdup, the
                         CPU-frequency pair), the ROM data tables and the
                         boot-time RAM initializers.
-  boot.rs               "Shortcut boot": loads factory.bin straight from its
+  boot.rs               "Shortcut boot": loads firmware.bin straight from its
                         header, skipping ROM and bootloader emulation.
                         step_with_interrupts runs one step, with WFI
                         fast-forward.

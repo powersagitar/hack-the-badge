@@ -1,4 +1,4 @@
-//! Boot-progress ratchet for the real firmware (`factory.bin`, shortcut
+//! Boot-progress ratchet for the real firmware (`firmware.bin`, shortcut
 //! boot, blank synthetic flash). Each rung asserts one of:
 //!
 //! - a console line within a step budget (generic ESP-IDF log lines only,
@@ -44,18 +44,18 @@ use std::sync::OnceLock;
 mod common;
 use common::provision::{self, Outcome};
 
-fn factory() -> Vec<u8> {
+fn firmware() -> Vec<u8> {
     std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/factory.bin"),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/public/firmware/firmware.bin"),
     )
-    .expect("factory.bin")
+    .expect("firmware.bin")
 }
 
 /// Runs the real firmware in 250,000-step chunks, checking the console after
 /// each, until `needle` appears in [`FirmwareRuntime::console_output`] or
 /// `max_steps` is exhausted. Returns the runtime and whether it appeared.
 pub fn boot_until_console_contains(needle: &str, max_steps: u64) -> (FirmwareRuntime, bool) {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     const CHUNK: u32 = 250_000;
     while rt.total_steps() < max_steps {
         rt.run(CHUNK);
@@ -90,7 +90,7 @@ const SPIN_THRESHOLD: u64 = 1_000;
 
 #[test]
 fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let mut hist: HashMap<u32, u64> = HashMap::new();
     // 3,000,000 steps: the same budget Task 2's boot-probe report used to
     // measure the pre-fix stall, so this is an apples-to-apples comparison.
@@ -122,7 +122,7 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 /// scheduler-start spin at `0x4200_0cd2` is gone.
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(528_312);
     assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
     let summary = rt.run(1);
@@ -160,7 +160,7 @@ fn boot_reaches_main_task_calling_app_main() {
 /// text prints, and `main_task: Calling app_main()` is in the console.
 #[test]
 fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(596_000);
     assert_eq!(
         summary.last_instruction_fault,
@@ -194,7 +194,7 @@ fn boot_no_longer_faults_or_panics_at_the_pre_task_d11_gpio_matrix_out_call_site
 /// Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     // 401,761: the exact step the pre-Task-D2 `memcpy` fault occurred at,
     // 401,982 after Milestone 6's 221-step shift. Running exactly that
     // many steps and finding zero traps proves the call that used to fault
@@ -214,7 +214,7 @@ fn boot_no_longer_faults_at_the_pre_task_d2_memcpy_call_site() {
 /// fault at (402,113) plus the 221-step Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     // 402,113: the exact step the pre-Task-D3 `ets_efuse_get_spiconfig`
     // fault occurred at, 402,334 after Milestone 6's 221-step shift. Running
     // exactly that many steps and finding zero
@@ -237,7 +237,7 @@ fn boot_no_longer_faults_at_the_pre_task_d3_ets_efuse_get_spiconfig_call_site() 
 /// Milestone 6 shift.
 #[test]
 fn boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     // 405,806: the exact step the pre-fix-round-1 `esprv_intc_int_enable`
     // fault occurred at, 406,027 after Milestone 6's 221-step shift. Running
     // exactly that many steps and finding zero
@@ -260,7 +260,7 @@ fn boot_no_longer_faults_at_the_pre_fix_round_1_esprv_intc_int_enable_call_site(
 /// not by normal boot; the abort's cause was fixed later.)
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d4_itoa_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     // 407,471: the exact step the pre-Task-D4 `itoa` fault occurred at,
     // 407,692 after Milestone 6's 221-step shift. Running exactly that many steps
     // and finding zero traps proves the
@@ -311,7 +311,7 @@ fn boot_reports_the_badges_80_mhz_cpu_clock() {
 /// it moves whenever anything before `qsort` changes.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d6_qsort_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(408_988);
     assert_eq!(
         summary.traps, 0,
@@ -364,7 +364,7 @@ fn boot_reaches_heap_inits_last_region_line_past_the_libgcc_helpers() {
 /// 417,992.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(440_000);
     assert_eq!(
         summary.traps,
@@ -403,7 +403,7 @@ fn boot_reaches_spi_flash_detected_chip_generic() {
 /// past the old fault on step 490,128, with the `sleep_gpio` lines printed.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(493_000);
     assert_eq!(
         summary.traps,
@@ -425,7 +425,7 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
 /// 528,311, the step before FreeRTOS's first yield request.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(528_311);
     assert_eq!(
         summary.traps,
@@ -437,7 +437,7 @@ fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_
 }
 
 /// The shortcut boot seeds the ROM's SPI-flash legacy data
-/// (`g_rom_flashchip.chip_size` = 4 MiB, from factory.bin's header), so
+/// (`g_rom_flashchip.chip_size` = 4 MiB, from firmware.bin's header), so
 /// flash init no longer warns that the image header says 0k (the physical
 /// badge's log has no such warning). Checked once the `sleep_gpio` line is
 /// out.
@@ -466,7 +466,7 @@ const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=
 /// times and no exception is taken.
 #[test]
 fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     rt.run(583_000);
     let mut hist: HashMap<u32, u64> = HashMap::new();
     let summary = rt.run_traced(596_000 - 583_000, &mut hist);
@@ -499,7 +499,7 @@ const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
 /// returns to its caller, and no exception is taken.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     rt.run(590_000);
     let mut hist: HashMap<u32, u64> = HashMap::new();
     let summary = rt.run_traced(596_608 - 590_000, &mut hist);
@@ -523,7 +523,7 @@ fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
 /// to step 596,000, past the SPI2 setup.
 #[test]
 fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     rt.run(596_000);
     let console = rt.console_output();
     assert!(
@@ -552,7 +552,7 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 ///   kept ticking after the first wake.
 #[test]
 fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(5_550_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
@@ -590,7 +590,7 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
 /// `MD5Init` stall it mentions is gone.)
 #[test]
 fn boot_draws_frames_through_gdma_before_the_md5init_stall() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     rt.run(1_100_000);
     assert!(
         rt.framebuffer().iter().all(|px| *px == 0),
@@ -617,7 +617,7 @@ fn boot_draws_frames_through_gdma_before_the_md5init_stall() {
 /// text prints, and the framebuffer still holds the splash.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site() {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let summary = rt.run(5_560_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
     assert_eq!(
@@ -650,7 +650,7 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
     const LOAD_PARTITIONS_EPILOGUE: u32 = 0x420f_a878;
     const ESP_OK: u32 = 0;
 
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("firmware.bin boots");
     // MD5Init is first called on step 4,450,328 (Milestone 6 Task D-M6-1;
     // 5,560,533 before Milestone 6).
     let summary = rt.run(4_000_000);
@@ -729,7 +729,7 @@ fn boot_formats_the_blank_storage_partition_with_littlefs() {
     let has_magic = |rt: &FirmwareRuntime, block: u32| {
         (0..8u32).all(|i| rt.bus().flash_chip.read(block + 8 + i) == LFS_MAGIC[i as usize])
     };
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     while !(has_magic(&rt, 0x2b_0000) && has_magic(&rt, 0x2b_1000)) {
         assert!(
             rt.total_steps() < MAX,
@@ -926,7 +926,7 @@ fn assert_no_panic_text(rt: &FirmwareRuntime) {
 #[test]
 fn boots_to_first_real_frame() {
     const MAX: u64 = 8_900_000;
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let (hash, step) = run_until_stable_frame(&mut rt, MAX, BOOT_STABLE_FOR, &[]);
     let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
     assert_eq!(
@@ -1072,7 +1072,7 @@ static FIRST_RUN: OnceLock<FirmwareRuntime> = OnceLock::new();
 fn first_run_screen() -> FirmwareRuntime {
     FIRST_RUN
         .get_or_init(|| {
-            let mut rt = FirmwareRuntime::from_image(&factory()).expect("factory.bin boots");
+            let mut rt = FirmwareRuntime::from_image(&firmware()).expect("firmware.bin boots");
             let (hash, step) = run_until_stable_frame(
                 &mut rt,
                 FIRST_RUN_MAX_STEPS,
@@ -1988,7 +1988,7 @@ const DIGEST_REGS_EVERY: u64 = 1_000_000;
 /// FNV-1a hash the `pc` after every step (4 little-endian bytes) and, every
 /// [`DIGEST_REGS_EVERY`] steps, all 32 registers (x0..x31, same encoding).
 fn execution_digest(steps: u64) -> u64 {
-    let mut rt = FirmwareRuntime::from_image(&factory()).expect("boot");
+    let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let mut h = FNV_OFFSET;
     for step in 1..=steps {
         rt.run(1);

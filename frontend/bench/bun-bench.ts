@@ -27,7 +27,7 @@ if (import.meta.main) {
     readFileSync(new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url)),
   );
   const image = new Uint8Array(
-    readFileSync(new URL("../public/firmware/factory.bin", import.meta.url)),
+    readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url)),
   );
   const identity = readFileSync(
     new URL(`../public/firmware/test-identities/${OWN_ROLE}.json`, import.meta.url),

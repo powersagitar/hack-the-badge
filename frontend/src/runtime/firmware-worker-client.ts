@@ -5,7 +5,7 @@
  * last `status` the Worker posted, so `main.ts` and `shell.ts` use it
  * exactly as they used the in-thread runtime.
  *
- * - `init` (the WASM bytes and `factory.bin`, transferred) is posted at
+ * - `init` (the WASM bytes and `firmware.bin`, transferred) is posted at
  *   once; every other message sent before the Worker's `ready` is queued
  *   and posted in order on `ready`. A press, a release and a `stop()` sent
  *   while the Worker boots therefore reach it in that order, and the

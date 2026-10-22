@@ -11,7 +11,7 @@
 //! The ranges below are the flash MMU cache apertures and RAM regions of the
 //! ESP32-C3 memory map, as documented in ESP-IDF's `soc/soc.h` /
 //! `esp32c3.peripherals.ld` for this target (chip ID 5, confirmed against
-//! `factory.bin`'s own header — see `crate::mem::image`). We keep the ranges
+//! `firmware.bin`'s own header — see `crate::mem::image`). We keep the ranges
 //! generous (whole documented apertures, not "just wide enough for today's
 //! six segments") on purpose: a future firmware revision can shift segment
 //! boundaries within the same aperture without silently getting
@@ -42,7 +42,7 @@ pub const DROM_MASK_RANGE: Range<u32> = 0x3FF0_0000..0x3FF2_0000;
 /// `.bss`/heap/stack occupy the rest of this same aperture without any
 /// bytes present in the flash image (they don't need init data), so
 /// `crate::boot` backs the whole aperture with zeroed RAM — see
-/// `boot::boot_from_factory_image`'s doc comment.
+/// `boot::boot_from_firmware_image`'s doc comment.
 ///
 /// Matches `SOC_DRAM_LOW`/`SOC_DRAM_HIGH` in ESP-IDF v5.5.3's
 /// `components/soc/esp32c3/include/soc/soc.h` exactly.

@@ -8,7 +8,7 @@
  * That's this file, now. It starts in Lua-sandbox mode (the smoke-test app,
  * as before), and the mode toggle `shell.ts` mounts (`#mode-toggle`) lets the
  * user switch to real-firmware mode, which lazily boots
- * `public/firmware/factory.bin` through the WASM CPU emulator in a Web
+ * `public/firmware/firmware.bin` through the WASM CPU emulator in a Web
  * Worker (`src/runtime/firmware-worker.ts`, driven from here through
  * `src/runtime/firmware-worker-client.ts`) the first time
  * it's selected, then reuses that same booted instance on every later
@@ -40,7 +40,7 @@ import { TEST_IDENTITY_ROLES, testIdentityUrl } from "./runtime/test-identities"
 import { mountShell, type ButtonInjector, type EmulatorMode } from "./ui/shell";
 
 const APP_DIR = "smoke-test";
-const FIRMWARE_IMAGE_URL = "/firmware/factory.bin";
+const FIRMWARE_IMAGE_URL = "/firmware/firmware.bin";
 /**
  * The WASM module the Worker boots, at the URL the generated glue
  * (`src/cpu/wasm-pkg/emulator_wasm.js`) resolves for itself: the `.wasm`
@@ -106,7 +106,7 @@ function main(): void {
 
   // Real-firmware mode is constructed lazily (on first switch to it) rather
   // than eagerly at startup, so a user who stays in Lua-sandbox mode never
-  // pays the cost of fetching/booting factory.bin through WASM. Once built,
+  // pays the cost of fetching/booting firmware.bin through WASM. Once built,
   // it's kept alive (not disposed) across later mode switches so switching
   // back doesn't re-boot from scratch.
   //

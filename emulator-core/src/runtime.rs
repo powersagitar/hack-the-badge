@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::boot::{boot_from_factory_image_with_rom_stubs, idle_until, step_with_interrupts};
+use crate::boot::{boot_from_firmware_image_with_rom_stubs, idle_until, step_with_interrupts};
 use crate::cpu::{exception_code, Cpu};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
@@ -106,11 +106,11 @@ pub struct FirmwareRuntime {
 
 impl FirmwareRuntime {
     /// Boots `image` (the raw bytes of an ESP-IDF app image, i.e.
-    /// `frontend/public/firmware/factory.bin`) through
-    /// [`boot_from_factory_image_with_rom_stubs`].
+    /// `frontend/public/firmware/firmware.bin`) through
+    /// [`boot_from_firmware_image_with_rom_stubs`].
     pub fn from_image(image: &[u8]) -> Result<Self, ImageParseError> {
         let image: Arc<[u8]> = Arc::from(image.to_vec().into_boxed_slice());
-        let (cpu, bus) = boot_from_factory_image_with_rom_stubs(&image)?;
+        let (cpu, bus) = boot_from_firmware_image_with_rom_stubs(&image)?;
         Ok(Self {
             image,
             cpu,
@@ -130,7 +130,7 @@ impl FirmwareRuntime {
     /// image that already parsed once — but the error is propagated rather
     /// than unwrapped so this stays panic-free across the WASM boundary.
     pub fn reset(&mut self) -> Result<(), ImageParseError> {
-        let (cpu, bus) = boot_from_factory_image_with_rom_stubs(&self.image)?;
+        let (cpu, bus) = boot_from_firmware_image_with_rom_stubs(&self.image)?;
         let accel = self.acceleration();
         self.cpu = cpu;
         self.bus = bus;
@@ -548,9 +548,9 @@ mod tests {
     fn a_clone_runs_exactly_like_its_original() {
         let image = std::fs::read(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../frontend/public/firmware/factory.bin"),
+                .join("../frontend/public/firmware/firmware.bin"),
         )
-        .expect("factory.bin");
+        .expect("firmware.bin");
         let mut original = FirmwareRuntime::from_image(&image).expect("boot");
         original.run(1_100_000);
         let mut clone = original.clone();

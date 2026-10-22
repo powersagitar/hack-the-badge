@@ -136,7 +136,7 @@ export function isCpuWasmReady(): boolean {
 }
 
 /**
- * Boots `image` (the bytes of `public/firmware/factory.bin`) on the emulated
+ * Boots `image` (the bytes of `public/firmware/firmware.bin`) on the emulated
  * ESP32-C3. Throws if the WASM module hasn't been initialized, or if the bytes
  * aren't a parseable ESP-IDF app image.
  */

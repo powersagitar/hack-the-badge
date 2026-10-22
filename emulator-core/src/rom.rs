@@ -354,7 +354,7 @@
 //!     already-active error path. **Corrected in Task D4 fix round 1**
 //!     (a review found the original conclusion wrong — see below): it is
 //!     the *latter*. Disassembling the call site (IRAM, `0x40397262`) and
-//!     its caller chain, cross-checked against `factory.bin`'s own bytes at
+//!     its caller chain, cross-checked against `firmware.bin`'s own bytes at
 //!     every address, shows this is newlib's `abort()`
 //!     (`components/newlib/abort.c`, ESP-IDF's override, not the ROM
 //!     libc): `mv s0, ra` captures `abort()`'s own return address, then
@@ -365,7 +365,7 @@
 //!     `strcat`-only: it concatenates a fixed 4-piece message —
 //!     `"abort() was called at PC 0x"`, `addr_buf`, `" on core "`,
 //!     `core_buf` (all four confirmed by reading the actual string bytes
-//!     out of `factory.bin` at their literal addresses) — then calls
+//!     out of `firmware.bin` at their literal addresses) — then calls
 //!     `esp_system_abort` → `panic_abort` (the `c.unimp` trap described
 //!     below).
 //!
@@ -456,7 +456,7 @@
 //!     408,481. Step 1 of that task captured the call: `a0 = 0x3fcdc4d0`
 //!     (a stack array), `a1 = 5` (`nmemb`), `a2 = 8` (`size`), `a3 =
 //!     0x420029bc` (`compar`), `ra = 0x42002a18`. The comparator's bytes in
-//!     `factory.bin` are `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5;
+//!     `firmware.bin` are `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5;
 //!     c.ret`, and the 5 elements are `{start, end}` address pairs. That
 //!     matches ESP-IDF v5.5.3's `s_prepare_reserved_regions()`
 //!     (`components/heap/port/memory_layout_utils.c`): `qsort(reserved,
@@ -494,7 +494,7 @@
 //!       executable region in `FirmwareBus`'s ordered region list. The
 //!       ESP32-C3 data is [`ESP32C3_ROM_CODE`] here, installed by
 //!       [`install_esp32c3_rom_code`] from
-//!       `crate::boot::boot_from_factory_image_with_rom_stubs`.
+//!       `crate::boot::boot_from_firmware_image_with_rom_stubs`.
 //!
 //!     With `qsort` running, the call returns to the caller (step 408,906)
 //!     with the array correctly sorted. **The next stall is not a ROM libc
@@ -517,7 +517,7 @@
 //!     *data* this emulator backs; everything above is ROM code.
 //!
 //!     **Which code reads it, and which fields** (disassembled from
-//!     `factory.bin`'s IROM segment): `s_prepare_reserved_regions()` at
+//!     `firmware.bin`'s IROM segment): `s_prepare_reserved_regions()` at
 //!     `0x4200_29c4` does `lui a5, 0x3ff20; lw a5, -4(a5)` (loads
 //!     `ets_rom_layout_p` at `0x3ff1_fffc`), then `lw a5, 4(a5)` (loads the
 //!     struct's second field, byte offset 4) and stores it as
@@ -570,7 +570,7 @@
 //!     a jump into ROM data still traps, like unmapped space. The ESP32-C3
 //!     data is [`ESP32C3_ROM_DATA`], installed by
 //!     [`install_esp32c3_rom_data`] from
-//!     `crate::boot::boot_from_factory_image_with_rom_stubs`.
+//!     `crate::boot::boot_from_firmware_image_with_rom_stubs`.
 //!
 //!     With it, the overlap check passes: entry 0 becomes `0x3fcdf060 -
 //!     0x3fce0000` and sorts last. Boot prints `I (0) heap_init:
@@ -704,7 +704,7 @@
 //!     (`esp_rom_spiflash.h`); the bootloader's overwrite from
 //!     `bootloader_flash_config_esp32c3.c` `update_flash_config()` and the
 //!     ROM body of `esp_rom_spiflash_config_param` (`0x4004e22e`, six `sw`
-//!     through the pointer); `chip_size` from factory.bin's own header
+//!     through the pointer); `chip_size` from firmware.bin's own header
 //!     (byte 3 `0x2f`: `ESP_IMAGE_FLASH_SIZE_4MB`, `esp_app_format.h`),
 //!     `device_id` `0x464016` from `bootloader_read_flash_id()`'s byte swap
 //!     of the badge's JEDEC ID. With this, the warning is gone and no
@@ -1129,7 +1129,7 @@
 //! `boot_currently_faults_on_the_unstubbed_clzsi2_call_and_reaches_the_panic_handlers_reboot_message`.
 //! The rest of this section is the Task 7 snapshot, kept as history.
 //!
-//! With this table installed (as of Task 7), the real `factory.bin` runs
+//! With this table installed (as of Task 7), the real `firmware.bin` runs
 //! past the mask-ROM wall, `.bss` clear, flash cache/MMU bring-up, analog/
 //! PLL config, SoC clock init, RTC_CNTL's RTC-timer delay loop (Task D1),
 //! the `memcpy` call (Task D2), the eFuse queries, the UART flush, and the
@@ -1905,7 +1905,7 @@ pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
 
 /// Maps every [`ESP32C3_ROM_CODE`] blob onto `bus` as read-only executable
 /// memory ([`FirmwareBus::map_rom_code`]). The ROM-code counterpart of
-/// [`esp32c3_rom_stubs`]; `crate::boot::boot_from_factory_image_with_rom_stubs`
+/// [`esp32c3_rom_stubs`]; `crate::boot::boot_from_firmware_image_with_rom_stubs`
 /// installs both.
 pub fn install_esp32c3_rom_code(bus: &mut FirmwareBus) {
     for blob in ESP32C3_ROM_CODE {
@@ -1992,7 +1992,7 @@ pub const ESP32C3_ROM_DATA: &[RomDataBlob] = &[
 /// Maps every [`ESP32C3_ROM_DATA`] blob onto `bus` as read-only,
 /// non-executable memory ([`FirmwareBus::map_rom_data`]). The ROM-data
 /// counterpart of [`install_esp32c3_rom_code`];
-/// `crate::boot::boot_from_factory_image_with_rom_stubs` installs both.
+/// `crate::boot::boot_from_firmware_image_with_rom_stubs` installs both.
 pub fn install_esp32c3_rom_data(bus: &mut FirmwareBus) {
     for blob in ESP32C3_ROM_DATA {
         bus.map_rom_data(*blob);
@@ -2472,7 +2472,7 @@ const CACHE_FAMILY: &[(u32, &str)] = &[
 /// Builds the ESP32-C3 mask-ROM HLE stub table described in this module's
 /// doc, ready to hand to [`crate::cpu::Cpu::set_rom_stubs`].
 ///
-/// `crate::boot::boot_from_factory_image_with_rom_stubs` is the normal way to
+/// `crate::boot::boot_from_firmware_image_with_rom_stubs` is the normal way to
 /// get a `Cpu` with this installed; constructing it directly is for tests and
 /// for callers that want to extend it.
 pub fn esp32c3_rom_stubs() -> RomStubTable {
@@ -3226,7 +3226,7 @@ mod tests {
 
     #[test]
     fn rom_ram_initializers_seed_the_spiflash_legacy_data_as_rom_then_bootloader_leave_it() {
-        // factory.bin's header byte 3 is 0x2f (ESP_IMAGE_FLASH_SIZE_4MB).
+        // firmware.bin's header byte 3 is 0x2f (ESP_IMAGE_FLASH_SIZE_4MB).
         let words = net_words(&esp32c3_rom_ram_initializers(&header_with_speed_size(0x2f)));
         let expected: std::collections::BTreeMap<u32, u32> = [
             // rom_spiflash_legacy_data -> rom_default_spiflash_legacy_data
@@ -4403,7 +4403,7 @@ mod tests {
     enum Comparator {
         /// 32-bit words, written into RAM as-is.
         Words(Vec<u32>),
-        /// Raw 16-bit (RVC) halfwords, as they appear in `factory.bin`.
+        /// Raw 16-bit (RVC) halfwords, as they appear in `firmware.bin`.
         Halfwords(Vec<u16>),
     }
 
@@ -4567,7 +4567,7 @@ mod tests {
         // `s_prepare_reserved_regions()` (components/heap/port/
         // memory_layout_utils.c) sorting 5 `soc_reserved_region_t {start,
         // end}` (size 8) with `s_compare_reserved_regions`, whose compiled
-        // body in factory.bin at 0x420029bc is these four RVC halfwords:
+        // body in firmware.bin at 0x420029bc is these four RVC halfwords:
         // `c.lw a0,0(a0); c.lw a5,0(a1); c.sub a0,a5; c.ret` --
         // `(int)r_a->start - (int)r_b->start`. The input is the array's
         // exact contents at the observed call.

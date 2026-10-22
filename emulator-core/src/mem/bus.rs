@@ -343,12 +343,12 @@ pub struct FirmwareBus {
     last_ram_span: usize,
     /// Read-only executable ROM code blobs ([`RomCodeBlob`]), installed by
     /// [`FirmwareBus::map_rom_code`]. Empty unless a caller installs some
-    /// (`crate::boot::boot_from_factory_image_with_rom_stubs` installs
+    /// (`crate::boot::boot_from_firmware_image_with_rom_stubs` installs
     /// `crate::rom`'s ESP32-C3 set).
     rom_code: Vec<RomCodeBlob>,
     /// Read-only, non-executable ROM data blobs ([`RomDataBlob`]),
     /// installed by [`FirmwareBus::map_rom_data`]. Empty unless a caller
-    /// installs some (`crate::boot::boot_from_factory_image_with_rom_stubs`
+    /// installs some (`crate::boot::boot_from_firmware_image_with_rom_stubs`
     /// installs `crate::rom`'s ESP32-C3 set).
     rom_data: Vec<RomDataBlob>,
     /// Emulated time. Starts at the XTAL clock the ROM leaves; follows
@@ -449,14 +449,14 @@ impl FirmwareBus {
     /// derives it from `file_offset`, so a segment whose flash offset and
     /// `load_addr` disagree modulo 64 KiB cannot be mapped faithfully and is
     /// left unmapped (its fetches trap). Esptool-built images -- including
-    /// `factory.bin` -- always agree.
+    /// `firmware.bin` -- always agree.
     ///
     /// Mapping whole pages matters concretely: ESP-IDF's `cpu_start`
     /// (`components/esp_system/port/cpu_start.c`) reads the running app's own
     /// `esp_image_header_t` from `&_rodata_reserved_start -
     /// sizeof(esp_image_header_t) - sizeof(esp_image_segment_header_t)`, i.e.
     /// 32 bytes *before* the DROM segment's `load_addr` (`0x3c13_0020` in
-    /// `factory.bin`), in the same page. Those bytes are simply the chip's
+    /// `firmware.bin`), in the same page. Those bytes are simply the chip's
     /// bytes at `APP_OFFSET`, visible because the whole page is mapped.
     ///
     /// All arithmetic on segment-derived values is checked: a browser-supplied
@@ -471,7 +471,7 @@ impl FirmwareBus {
             } else {
                 // `seg.file_offset + seg.len` used to be unchecked here. It
                 // was safe when this function's only caller was
-                // `boot::boot_from_factory_image`'s pre-validated internal
+                // `boot::boot_from_firmware_image`'s pre-validated internal
                 // path (`parse_image` already rejects a segment whose data
                 // runs past the image), but `FirmwareEmulator::new`
                 // (emulator-wasm) now reaches this constructor directly with
@@ -680,7 +680,7 @@ impl FirmwareBus {
     /// derived from) any image segment. Used by `crate::boot` to reserve a
     /// scratch stack/bss area in DRAM that the flash image itself carries
     /// no bytes for (uninitialized memory doesn't need to be stored in
-    /// flash) — see `boot::boot_from_factory_image`'s doc comment.
+    /// flash) — see `boot::boot_from_firmware_image`'s doc comment.
     pub fn add_scratch_ram(&mut self, load_addr: u32, len: usize) {
         self.ram_regions.push(RamRegion {
             load_addr,
@@ -1458,7 +1458,7 @@ mod tests {
 
     #[test]
     fn seeding_maps_each_xip_segment_like_the_bootloader() {
-        // factory.bin's shape: DROM at 0x3c13_0020, IROM at 0x4200_0020.
+        // firmware.bin's shape: DROM at 0x3c13_0020, IROM at 0x4200_0020.
         let drom = vec![0xA1; 0x30];
         let irom = vec![0xB2; 0x30];
         let bus = bus_with(vec![(0x3c13_0020, drom), (0x4200_0020, irom)]);

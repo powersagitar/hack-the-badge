@@ -1,5 +1,5 @@
 //! Integration test: boot the *real* dumped firmware
-//! (`frontend/public/firmware/factory.bin`) with the ESP32-C3 mask-ROM
+//! (`frontend/public/firmware/firmware.bin`) with the ESP32-C3 mask-ROM
 //! high-level-emulation stub table installed, and record exactly how far it
 //! gets.
 //!
@@ -13,30 +13,30 @@
 //! history behind each budget and phase is in
 //! `docs/firmware-emulator-notes.md` ("History").
 
-use emulator_core::boot::{boot_from_factory_image_with_rom_stubs, step_with_interrupts};
+use emulator_core::boot::{boot_from_firmware_image_with_rom_stubs, step_with_interrupts};
 use emulator_core::cpu::exception_code;
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-fn factory_bin_path() -> PathBuf {
+fn firmware_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("frontend/public/firmware/factory.bin")
+        .join("frontend/public/firmware/firmware.bin")
 }
 
-fn read_factory_bin() -> Vec<u8> {
-    std::fs::read(factory_bin_path()).expect(
-        "reading frontend/public/firmware/factory.bin \
+fn read_firmware_bin() -> Vec<u8> {
+    std::fs::read(firmware_bin_path()).expect(
+        "reading frontend/public/firmware/firmware.bin \
          (expected to be committed at the repo's frontend/public/firmware/)",
     )
 }
 
 #[test]
 fn rom_stubbed_boot_gets_past_the_mask_rom_wall() {
-    let image = read_factory_bin();
+    let image = read_firmware_bin();
     let (mut cpu, mut bus) =
-        boot_from_factory_image_with_rom_stubs(&image).expect("real factory.bin should boot");
+        boot_from_firmware_image_with_rom_stubs(&image).expect("real firmware.bin should boot");
 
     // Past the first real log line's `ets_get_cpu_frequency`/`ets_printf`
     // calls (steps ~400,910/~400,932), so every ROM call asserted below is
@@ -226,8 +226,8 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
     const FSPID_IN_IDX: u32 = 65;
     const SIG_IN_SEL: u32 = 1 << 6;
 
-    let image = read_factory_bin();
-    let mut rt = FirmwareRuntime::from_image(&image).expect("real factory.bin should boot");
+    let image = read_firmware_bin();
+    let mut rt = FirmwareRuntime::from_image(&image).expect("real firmware.bin should boot");
 
     // Phase 1: fault-free up to and including vPortYield's write of the
     // cross-core software-interrupt register, which lands in the modeled
@@ -418,13 +418,13 @@ fn boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash() {
 #[test]
 fn rom_spiflash_legacy_data_is_seeded_and_no_null_legacy_data_access_remains() {
     use emulator_core::mem::Bus;
-    let image = read_factory_bin();
+    let image = read_firmware_bin();
     let (mut cpu, mut bus) =
-        boot_from_factory_image_with_rom_stubs(&image).expect("real factory.bin should boot");
+        boot_from_firmware_image_with_rom_stubs(&image).expect("real firmware.bin should boot");
 
     // Before the first instruction: the mask ROM's .data init plus the
     // bootloader's esp_rom_spiflash_config_param(), with chip_size from
-    // factory.bin's own header (byte 3 = 0x2f: 4 MB).
+    // firmware.bin's own header (byte 3 = 0x2f: 4 MB).
     assert_eq!(bus.read32(0x3fcd_fff0), 0x3fcd_f5c0);
     let chip = |bus: &mut emulator_core::mem::bus::FirmwareBus| -> Vec<u32> {
         (0..7).map(|i| bus.read32(0x3fcd_f5c0 + 4 * i)).collect()

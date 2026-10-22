@@ -93,12 +93,12 @@ pub struct FirmwareEmulator {
 
 #[wasm_bindgen]
 impl FirmwareEmulator {
-    /// Boots `image` — the raw bytes of `frontend/public/firmware/factory.bin`.
+    /// Boots `image` — the raw bytes of `frontend/public/firmware/firmware.bin`.
     /// Throws if the bytes aren't a parseable ESP-IDF app image.
     #[wasm_bindgen(constructor)]
     pub fn new(image: &[u8]) -> Result<FirmwareEmulator, JsError> {
         let inner = FirmwareRuntime::from_image(image).map_err(|e| {
-            JsError::new(&format!("factory.bin is not a parseable app image: {e:?}"))
+            JsError::new(&format!("firmware.bin is not a parseable app image: {e:?}"))
         })?;
         Ok(Self { inner })
     }

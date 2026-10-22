@@ -40,10 +40,10 @@ and forensic analysis disproved this:
   path needed no rework.
 
 Given this, Milestone 2 built a real ESP32-C3 processor emulator (RV32IMC
-core + a minimal peripheral set) that boots `frontend/public/firmware/factory.bin`
+core + a minimal peripheral set) that boots `frontend/public/firmware/firmware.bin`
 unmodified, rather than trying to hand-extract or recreate any built-in app.
 
-### `factory.bin` segment table
+### `firmware.bin` segment table
 
 File offsets are relative to 0x10000 (the partition's flash offset).
 
@@ -57,7 +57,7 @@ File offsets are relative to 0x10000 (the partition's flash offset).
 | 5 | RTC/LP | 0x50000000 | 0x29a16c–0x29a18c | 32 B |
 
 Entry point is `0x403803fc` (bytes 4-7 of the image header, confirmed by
-directly reading `factory.bin`'s raw bytes). `emulator-core/src/mem/image.rs`
+directly reading `firmware.bin`'s raw bytes). `emulator-core/src/mem/image.rs`
 parses this format from scratch (shape only, not a copy of ESP-IDF source);
 `emulator-core/src/mem/soc.rs` categorizes each segment as XIP vs. RAM-copied
 by address range, matching how the real 2nd-stage bootloader does it.
@@ -201,7 +201,7 @@ emulated ROM address space, and the CPU runs it like any other code:
   `emulator-core/src/mem/bus.rs`'s `RomCodeBlob`/`FirmwareBus::map_rom_code`
   is a generic read-only, executable region in the bus's ordered region
   list. `rom.rs`'s `ESP32C3_ROM_CODE` names the addresses and words.
-  `boot_from_factory_image_with_rom_stubs` installs both. Every other ROM
+  `boot_from_firmware_image_with_rom_stubs` installs both. Every other ROM
   address still traps on fetch, exactly as before.
 - Equal elements may end up in a different order than on real silicon
   (`qsort` isn't stable either way). The one observed caller has no equal
@@ -251,14 +251,14 @@ so a read-only `RomDataBlob` doesn't fit. Instead:
   is a generic list of `(address, bytes)` writes applied, in order, to the
   already-backed RAM before the first instruction.
 - `rom.rs`'s `esp32c3_rom_ram_initializers(header)` holds the ESP32-C3
-  data, which `boot_from_factory_image_with_rom_stubs` applies. Currently
+  data, which `boot_from_firmware_image_with_rom_stubs` applies. Currently
   it holds only the SPI-flash legacy data, the one piece of ROM `.data` boot
   is observed to read: `rom_spiflash_legacy_data` (`0x3fcd_fff0`) pointing
   at `rom_default_spiflash_legacy_data` (`0x3fcd_f5c0`, 28 bytes, the ROM
   ELF's initializer), then the bootloader's
   `esp_rom_spiflash_config_param(device_id 0x464016, chip_size, 0x10000,
   0x1000, 0x100, 0xffff)` over its `chip` fields. `chip_size` is decoded
-  from factory.bin's own header flash-size nibble (`0x2f` → 4 MB,
+  from firmware.bin's own header flash-size nibble (`0x2f` → 4 MB,
   `esp_app_format.h`), falling back to 2 MB as the bootloader's
   `update_flash_config()` does. `device_id` is the badge's JEDEC ID
   byte-swapped the way `bootloader_read_flash_id()` does it.
@@ -589,7 +589,7 @@ step, is exactly what Milestone 6 left (every pin unchanged), so the
 state below is Milestone 6's, now reached faster. Current throughput per
 host is limitation 1 below.
 
-Real-firmware boot runs from the shortcut boot of `factory.bin` on blank
+Real-firmware boot runs from the shortcut boot of `firmware.bin` on blank
 synthetic flash through `app_main` to My Badge's first-run screen, and
 from there, provisioned through the firmware's own USB console with a
 committed fake identity, through the onboarding app to the app launcher,
@@ -2901,7 +2901,7 @@ It is **synthetic**, never a copy of the physical chip:
   badge's four entries (`nvs` 0x9000/0x4000, `phy_init` 0xd000/0x1000,
   `factory` 0x10000/0x2a0000, `storage` 0x2b0000/0x140000) followed by the
   `0xEBEB` MD5 entry (`CONFIG_PARTITION_TABLE_MD5`); and
-- `factory.bin` at `0x10000`.
+- `firmware.bin` at `0x10000`.
 
 So `nvs`, `phy_init` and `storage` start blank, as on a freshly erased
 chip, and no personal data from the physical badge is involved. The
@@ -2922,21 +2922,21 @@ The firmware learns the chip's size and ID not from the chip but from the
 ROM's SPI-flash legacy data (`g_rom_flashchip`), which the shortcut boot
 seeds (Task D10, "ROM writable `.data`" above): `device_id` `0x464016`
 (this chip's JEDEC ID `0x46 0x40 0x16`, as the bootloader byte-swaps it) and
-`chip_size` 4 MiB (from factory.bin's header), which matches this model's
+`chip_size` 4 MiB (from firmware.bin's header), which matches this model's
 size, so `esp_flash` no longer warns about a size mismatch.
 
 ## Data-handling note: what NOT to re-add
 
 An earlier commit on the Milestone 2 branch briefly included
 `frontend/public/firmware/full_flash_dump.bin` (the complete 4MB flash dump, as
-opposed to `factory.bin`, just the app partition). That file was found to
+opposed to `firmware.bin`, just the app partition). That file was found to
 contain the dumping device owner's personal identity data, a likely
 credential, and other people's contact information (received via badge
 "bump" exchanges) living in the `nvs`/`storage` partitions — none of which
 organizer approval for firmware publication actually covered. It was
 removed from the branch's git history entirely before merge (verified never
 pushed to any remote). **Do not commit a full flash dump to this
-repository** — only `factory.bin` (the app partition alone, confirmed clean
+repository** — only `firmware.bin` (the app partition alone, confirmed clean
 of personal data) belongs here. If a full dump is ever genuinely needed for
 future bootloader/OTA work, it must have the `nvs` (0x9000–0xD000) and
 `storage` (0x2b0000–0x3f0000) partition ranges zeroed/redacted first.
@@ -2946,7 +2946,7 @@ log, the esptool Python venv (`local/.venv/`) and any frames dumped with
 `boot-probe --dump-frame` live in the repo-root `local/` directory, which
 is gitignored (as is `*flash*dump*.bin`). Never commit them, and never
 quote the boot log's identity lines anywhere committed (code, tests, docs
-or commit messages). Committed tests depend only on `factory.bin`. Code
+or commit messages). Committed tests depend only on `firmware.bin`. Code
 that needs the full dump reads its path from the `BADGE_FULL_DUMP` env var
 and skips when it is unset (`emulator-core/tests/flash_partition_table.rs`,
 and `boot-probe`, which prints only the dump's partition table). Only two

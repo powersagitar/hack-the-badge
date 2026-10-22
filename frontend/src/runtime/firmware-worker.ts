@@ -48,7 +48,7 @@ export type Post = (m: FromWorker, transfer?: Transferable[]) => void;
 
 /** What the Worker needs from its environment; injectable for tests. */
 export interface WorkerHost {
-  /** Boots the emulator from the WASM module's bytes and `factory.bin`. */
+  /** Boots the emulator from the WASM module's bytes and `firmware.bin`. */
   createHandle(
     wasm: ArrayBuffer,
     image: ArrayBuffer,

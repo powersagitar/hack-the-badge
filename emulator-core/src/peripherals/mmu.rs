@@ -121,7 +121,7 @@ mod tests {
         write_word(&mut m, 39 * 4, 0);
         assert_eq!(read_word(&m, 39 * 4), 0);
         assert_eq!(m.translate(0x3c27_8000), Some(0x0000_8000));
-        // Entry 19 -> page 1 (factory.bin's DROM: vaddr 0x3c130020, paddr 0x10020).
+        // Entry 19 -> page 1 (firmware.bin's DROM: vaddr 0x3c130020, paddr 0x10020).
         write_word(&mut m, 19 * 4, 1);
         assert_eq!(m.translate(0x3c13_0020), Some(0x0001_0020));
     }

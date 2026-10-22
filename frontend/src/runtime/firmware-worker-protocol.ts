@@ -2,7 +2,7 @@
  * The messages between the main thread (`./firmware-worker-client.ts`) and
  * the firmware Worker (`./firmware-worker.ts`), Milestone 7 Task 8.
  *
- * - `init` carries the WASM module's bytes and `factory.bin`, both fetched
+ * - `init` carries the WASM module's bytes and `firmware.bin`, both fetched
  *   on the main thread and transferred. The Worker answers `ready` once the
  *   emulator is booted, or `error`.
  * - `frame` carries one framebuffer (RGB565, `width * height` elements) in

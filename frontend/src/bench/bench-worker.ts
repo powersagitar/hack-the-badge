@@ -1,5 +1,5 @@
 /**
- * The bench page's Worker: fetches the WASM, `factory.bin` and the hacker
+ * The bench page's Worker: fetches the WASM, `firmware.bin` and the hacker
  * fixture, runs `runRedrawBench` once, unpaced, and posts its log lines
  * and result to `./bench-page.ts`.
  */
@@ -20,7 +20,7 @@ async function fetchOk(url: string): Promise<Response> {
 async function main(): Promise<void> {
   const [, image, identity] = await Promise.all([
     initCpuWasm(),
-    fetchOk("/firmware/factory.bin").then((r) => r.arrayBuffer()),
+    fetchOk("/firmware/firmware.bin").then((r) => r.arrayBuffer()),
     fetchOk(testIdentityUrl(OWN_ROLE)).then((r) => r.text()),
   ]);
   const handle = createFirmwareEmulator(new Uint8Array(image));

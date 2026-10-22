@@ -17,7 +17,7 @@
 //! - everything blank (`0xFF`, NOR flash's erased state), except
 //! - a synthesized partition table at [`PARTITION_TABLE_OFFSET`] listing
 //!   exactly the badge's four partitions ([`PARTITIONS`]), and
-//! - the app image (`factory.bin`) at [`APP_OFFSET`], the `factory`
+//! - the app image (`firmware.bin`) at [`APP_OFFSET`], the `factory`
 //!   partition's own offset.
 //!
 //! So `nvs`, `phy_init` and `storage` start out blank, as on a freshly
@@ -171,7 +171,7 @@
 //!   phase", [`DEDICATED_COMMAND_BASE`]` | bit` for a dedicated bit), which
 //!   `boot-probe` prints.
 //!
-//! **Observed write path (boot-probe and disassembly of `factory.bin`,
+//! **Observed write path (boot-probe and disassembly of `firmware.bin`,
 //! Milestone 4 Task 5)**: `esp_littlefs` formatting the blank `storage`
 //! partition polls `CMD` in `spi_flash_hal_poll_cmd_done` (`0x4039_3916`)
 //! after `spi_flash_hal_set_write_protect` (`0x4039_3e2a`) sets
@@ -202,7 +202,7 @@ pub const FLASH_SIZE: usize = 4 * 1024 * 1024;
 pub const PARTITION_TABLE_OFFSET: u32 = 0x8000;
 /// `ESP_PARTITION_TABLE_MAX_LEN` (`esp_flash_partitions.h`).
 pub const PARTITION_TABLE_MAX_LEN: u32 = 0xC00;
-/// The `factory` app partition's offset: where `factory.bin` is placed.
+/// The `factory` app partition's offset: where `firmware.bin` is placed.
 pub const APP_OFFSET: u32 = 0x1_0000;
 /// The erase granule of the flash's sector-erase command (`0x20`, 4 KiB).
 pub const SECTOR_SIZE: u32 = 0x1000;
