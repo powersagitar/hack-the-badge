@@ -189,7 +189,8 @@ export function createWorkerFirmwareRuntime(
     stop(): void {
       running = false;
       pausedHidden = false;
-      // Sent even when paused or never started: stop() also flushes deferred releases and queued taps.
+      // Sent even when paused or never started: stop() also flushes deferred
+      // releases and queued taps.
       send({ kind: "stop" });
       dropPendingFrame();
     },

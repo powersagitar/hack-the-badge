@@ -728,10 +728,16 @@ describe("FirmwareRuntime press hold", () => {
   });
 
   test("a release with no press before it is ignored", () => {
-    const { rt, buttonCalls } = rig();
+    const { rt, buttonCalls, setTimeUs } = rig();
     rt.start();
     rt.injectButton("A", "released");
     expect(buttonCalls).toEqual([]);
+    // The next press is a fresh tap, and its release is not taken as done.
+    rt.injectButton("A", "pressed");
+    expect(buttonCalls).toEqual([[RAW_SLOT_BY_BUTTON.A, true]]);
+    setTimeUs(PRESS_HOLD_US);
+    rt.injectButton("A", "released");
+    expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
   });
 
   test("a press is accepted again once the full queue has room", () => {

@@ -15,7 +15,7 @@
  * (or an immediate yield while the core is behind, ruling R-T8-1), capped
  * at `WORKER_STEPS_PER_SLICE` steps, timed by the `now` option, and
  * `present` posts the framebuffer to the main thread, where
- * `./firmware-worker-client.ts` paints it. The press-hold deferral, the
+ * `./firmware-worker-client.ts` paints it. The button tap queue, the
  * shake schedule and the provisioner below therefore all live in the
  * Worker, unchanged. The in-thread shape (a `requestAnimationFrame` loop
  * whose `present` blits with `src/render/framebuffer.ts`, capped at
