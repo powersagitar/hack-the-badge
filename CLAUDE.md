@@ -22,14 +22,16 @@ wired in `frontend/src/main.ts`):
 provisions a fake test identity through its own USB console, walks the
 11-page onboarding app, and reaches the launcher. Dice and Snake work, and
 their key frames were compared with the physical badge. In the browser the
-emulator runs in a Web Worker, paced to wall-clock time. Snake plays at
-about 1.0x, but the launcher's HOME redraw plays at about 0.6x, because the
-WASM core does about 40M steps/s against the badge's 80M. Before assuming
-anything else works, read `docs/firmware-emulator-notes.md`, its "Timing
-model" and "Known limitations" sections in particular. Design decisions are
-in `docs/milestone-3-decisions.md` through `docs/milestone-7-decisions.md`;
-the last one has the benchmark results and the Milestone 8 backlog, which a
-block cache leads.
+emulator runs in a Web Worker, paced to wall-clock time. Snake and
+launcher navigation play at about 1.0x, and every tap of a quick burst
+registers (a per-button tap queue in the browser). Entering the launcher
+(the HOME redraw) plays at about 0.6x, because the WASM core does about
+40M steps/s against the badge's 80M. Before assuming anything else works,
+read `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
+limitations" sections in particular. Design decisions are in
+`docs/milestone-3-decisions.md` through `docs/milestone-8-decisions.md`.
+Milestone 7's has the benchmark results and profiles; Milestone 8's has
+the Milestone 9 backlog, with no lead chosen and the block cache shelved.
 
 ## Repository layout
 
