@@ -2041,4 +2041,165 @@ mod tests {
             "invalid CPUPERIOD_SEL keeps the rate"
         );
     }
+
+    // ---- Milestone 7 Task 5: the word fast path must equal the byte path ----
+
+    /// `n` little-endian bytes at `addr`, read one `read8` at a time.
+    fn bytes_le(bus: &mut FirmwareBus, addr: u32, n: u32) -> u32 {
+        (0..n).fold(0u32, |acc, i| {
+            acc | (bus.read8(addr.wrapping_add(i)) as u32) << (8 * i)
+        })
+    }
+
+    /// Writes `n` little-endian bytes of `val` at `addr`, one `write8` at a
+    /// time.
+    fn write_bytes_le(bus: &mut FirmwareBus, addr: u32, val: u32, n: u32) {
+        for i in 0..n {
+            bus.write8(addr.wrapping_add(i), (val >> (8 * i)) as u8);
+        }
+    }
+
+    /// Drives `word` through `read16/read32/write16/write32` and `byte`
+    /// through `read8/write8` at `addr`, asserting the same values and the
+    /// same unmapped log after every access.
+    fn assert_word_matches_bytes(word: &mut FirmwareBus, byte: &mut FirmwareBus, addr: u32) {
+        let log = |b: &FirmwareBus| b.unmapped_log().iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "read32 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "log after read32 {addr:#x}");
+        assert_eq!(
+            word.read16(addr) as u32,
+            bytes_le(byte, addr, 2),
+            "read16 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "log after read16 {addr:#x}");
+        word.write32(addr, 0xA1B2_C3D4);
+        write_bytes_le(byte, addr, 0xA1B2_C3D4, 4);
+        assert_eq!(log(word), log(byte), "log after write32 {addr:#x}");
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "after write32 {addr:#x}"
+        );
+        word.write16(addr, 0x5E6F);
+        write_bytes_le(byte, addr, 0x5E6F, 2);
+        assert_eq!(log(word), log(byte), "log after write16 {addr:#x}");
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "after write16 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "final log {addr:#x}");
+    }
+
+    #[test]
+    fn word_access_across_a_region_edge_matches_the_byte_path() {
+        // A word starting 2 bytes before the end of a RAM region: two bytes
+        // are RAM, two fall through to the catch-all (read 0, logged, writes
+        // dropped).
+        let make = || bus_with(vec![(0x3fc9_0000, (1..=8).collect())]);
+        let (mut word, mut byte) = (make(), make());
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0006);
+        assert!(!word.unmapped_log().is_empty(), "the edge was reached");
+        // And one starting 1 and 3 bytes before the end.
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0007);
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0005);
+
+        // First-match edges between overlapping regions: an image segment
+        // inside a scratch aperture added after it (as `crate::boot` does).
+        // A word across either edge of the segment mixes the two regions
+        // byte by byte, and the segment's bytes must win.
+        let make = || {
+            let mut bus = bus_with(vec![(0x3fc9_0010, (1..=8).collect())]);
+            bus.add_scratch_ram(0x3fc9_0000, 0x40);
+            bus
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in [0x3fc9_000e, 0x3fc9_000f, 0x3fc9_0016, 0x3fc9_0017] {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        // The scratch region's own end, against the catch-all.
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_003e);
+        // The very top of the address space must not wrap into address 0.
+        assert_word_matches_bytes(&mut word, &mut byte, u32::MAX - 1);
+    }
+
+    #[test]
+    fn word_fetch_across_an_mmu_page_edge_matches_the_byte_path() {
+        // Exactly one IBUS page mapped; the next one is invalid.
+        let make = || {
+            let code: Vec<u8> = (0..MMU_PAGE_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+            bus_with(vec![(0x4200_0000, code)])
+        };
+        let (mut word, mut byte) = (make(), make());
+        assert_eq!(
+            word.fetch16(0x4200_ffff),
+            None,
+            "half the fetch is unmapped"
+        );
+        assert_eq!(
+            word.fetch16(0x4200_fffe).map(u32::from),
+            Some(bytes_le(&mut byte, 0x4200_fffe, 2))
+        );
+        assert_eq!(
+            word.fetch16(0x4200_fffd).map(u32::from),
+            Some(bytes_le(&mut byte, 0x4200_fffd, 2))
+        );
+        assert_eq!(word.fetch16(0x4201_0000), None);
+        // Data reads across the same edge: the invalid page's bytes read 0
+        // and are logged, byte by byte. (XIP writes are dropped either way.)
+        for addr in [0x4200_fffd, 0x4200_fffe, 0x4200_ffff] {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        assert!(word
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == 0x4201_0000 && !a.is_write));
+        // And across the DBUS end of the aperture into unmapped space.
+        let make = || bus_with(vec![(0x3c7f_0000, vec![0x5a; MMU_PAGE_SIZE as usize])]);
+        let (mut word, mut byte) = (make(), make());
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3c7f_fffe);
+    }
+
+    #[test]
+    fn unaligned_word_read_in_ram_matches_the_byte_path() {
+        let make = || {
+            bus_with(vec![(
+                0x3fc9_0000,
+                (0..64u32).map(|i| (i * 3) as u8).collect(),
+            )])
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in 0x3fc9_0001..0x3fc9_0008 {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        assert!(word.unmapped_log().is_empty());
+        // Unaligned in XIP too, inside one page.
+        let make = || {
+            bus_with(vec![(
+                0x3c00_0000,
+                (0..64u32).map(|i| (i * 5) as u8).collect(),
+            )])
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in 0x3c00_0001..0x3c00_0008 {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+    }
+
+    #[test]
+    fn dbus_is_still_not_fetchable() {
+        let mut bus = bus_with(vec![
+            (0x3c00_0000, vec![0x13, 0x00, 0x00, 0x00, 0x13, 0x00]),
+            (0x4200_0000, vec![0x13, 0x00, 0x00, 0x00]),
+        ]);
+        for addr in 0x3c00_0000..0x3c00_0006 {
+            assert_eq!(bus.fetch16(addr), None, "DBUS {addr:#x}");
+        }
+        assert_eq!(bus.read16(0x3c00_0000), 0x0013, "DBUS stays readable");
+        assert_eq!(bus.fetch16(0x4200_0000), Some(0x0013), "IBUS fetches");
+    }
 }
