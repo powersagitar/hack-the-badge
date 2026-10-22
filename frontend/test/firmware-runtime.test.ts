@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { BUTTON_NAMES } from "../src/badge/input";
 import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
+import { blitFramebuffer } from "../src/render/framebuffer";
 import {
+  type FramePresenter,
   createFirmwareRuntime,
   DEFAULT_STEPS_PER_FRAME,
   frameTargetUs,
@@ -39,7 +41,11 @@ function makeStubCtx() {
       putImageDataCalls++;
     },
   };
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, getPutImageDataCalls: () => putImageDataCalls };
+  const canvas = ctx as unknown as CanvasRenderingContext2D;
+  // Milestone 7 Task 8: the runtime presents frames through a callback; the
+  // in-thread presenter is the old path, a blit to the canvas.
+  const present: FramePresenter = (fb, width, height) => blitFramebuffer(canvas, fb, width, height);
+  return { ctx: canvas, present, getPutImageDataCalls: () => putImageDataCalls };
 }
 
 interface FakeHandleOptions extends Partial<FirmwareEmulatorHandle> {
@@ -173,20 +179,20 @@ describe("frameTargetUs", () => {
 describe("stepFirmwareFrame", () => {
   test("runs to the frame target and blits once", () => {
     const { handle, runUntilCalls } = makeFakeHandle();
-    const { ctx, getPutImageDataCalls } = makeStubCtx();
-    const r = stepFirmwareFrame(handle, ctx, 16, 1_000_000);
+    const { present, getPutImageDataCalls } = makeStubCtx();
+    const r = stepFirmwareFrame(handle, present, 16, 1_000_000);
     expect(runUntilCalls).toEqual([[16_000, 1_000_000]]);
     expect(r).toEqual({ emulatedDeltaUs: 16_000, capped: false });
     expect(getPutImageDataCalls()).toBe(1);
   });
   test("a capped frame drops its debt", () => {
     const { handle, runUntilCalls } = makeFakeHandle({ usPerStep: 0.0125 });
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     // 100 steps at 80 MHz = 1.25 µs of the 16,000 µs asked for.
-    const r = stepFirmwareFrame(handle, ctx, 16, 100);
+    const r = stepFirmwareFrame(handle, present, 16, 100);
     expect(r.capped).toBe(true);
     // The next frame targets now + 16 ms, not the missed time.
-    stepFirmwareFrame(handle, ctx, 16, 100);
+    stepFirmwareFrame(handle, present, 16, 100);
     expect(handle.emulatedTimeUs()).toBeCloseTo(2.5, 5);
     // Debt carried over would target 16,000 + 16,000 or the old target + 16 ms.
     expect(runUntilCalls).toHaveLength(2);
@@ -195,9 +201,9 @@ describe("stepFirmwareFrame", () => {
   });
   test("a fractional target the emulator truncates to whole µs is not capped", () => {
     const { handle } = makeFakeHandle();
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     // A 60 Hz rAF delta (16.667 ms): target 16,666.67 µs, run to 16,666.
-    const r = stepFirmwareFrame(handle, ctx, 1000 / 60, 1_000_000);
+    const r = stepFirmwareFrame(handle, present, 1000 / 60, 1_000_000);
     expect(handle.emulatedTimeUs()).toBe(16_666);
     expect(r.capped).toBe(false);
   });
@@ -206,9 +212,9 @@ describe("stepFirmwareFrame", () => {
 describe("createFirmwareRuntime", () => {
   test("start() schedules frames via the injected scheduler, capped at DEFAULT_STEPS_PER_FRAME by default", () => {
     const { handle, runUntilCalls } = makeFakeHandle();
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     const scheduledCbs: Array<(t: number) => void> = [];
-    const runtime = createFirmwareRuntime(handle, ctx, {
+    const runtime = createFirmwareRuntime(handle, present, {
       scheduleFrame: (cb) => {
         scheduledCbs.push(cb);
         return scheduledCbs.length;
@@ -228,9 +234,9 @@ describe("createFirmwareRuntime", () => {
 
   test("start() is idempotent while already running", () => {
     const { handle } = makeFakeHandle();
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     let scheduleCalls = 0;
-    const runtime = createFirmwareRuntime(handle, ctx, {
+    const runtime = createFirmwareRuntime(handle, present, {
       scheduleFrame: () => {
         scheduleCalls++;
         return scheduleCalls;
@@ -245,10 +251,10 @@ describe("createFirmwareRuntime", () => {
 
   test("stop() cancels the pending frame and further callbacks do not reschedule", () => {
     const { handle, runUntilCalls } = makeFakeHandle();
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     const scheduledCbs: Array<(t: number) => void> = [];
     const canceled: number[] = [];
-    const runtime = createFirmwareRuntime(handle, ctx, {
+    const runtime = createFirmwareRuntime(handle, present, {
       scheduleFrame: (cb) => {
         scheduledCbs.push(cb);
         return scheduledCbs.length;
@@ -270,8 +276,8 @@ describe("createFirmwareRuntime", () => {
   test("injectButton maps a button name to its raw slot and press/release state", () => {
     let timeUsNow = 0;
     const { handle, buttonCalls } = makeFakeHandle({ emulatedTimeUs: () => timeUsNow });
-    const { ctx } = makeStubCtx();
-    const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
+    const { present } = makeStubCtx();
+    const runtime = createFirmwareRuntime(handle, present, { scheduleFrame: () => 1, cancelFrame: () => {} });
 
     runtime.injectButton("UP", "pressed");
     timeUsNow = PRESS_HOLD_US;
@@ -287,24 +293,24 @@ describe("createFirmwareRuntime", () => {
 
   test("reset() delegates to the handle", () => {
     const fake = makeFakeHandle();
-    const { ctx } = makeStubCtx();
-    const runtime = createFirmwareRuntime(fake.handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
+    const { present } = makeStubCtx();
+    const runtime = createFirmwareRuntime(fake.handle, present, { scheduleFrame: () => 1, cancelFrame: () => {} });
     runtime.reset();
     expect(fake.counters.resetCalls).toBe(1);
   });
 
   test("isExitRequested is always false (no Lua-style exit-to-launcher in real-firmware mode)", () => {
     const { handle } = makeFakeHandle();
-    const { ctx } = makeStubCtx();
-    const runtime = createFirmwareRuntime(handle, ctx, { scheduleFrame: () => 1, cancelFrame: () => {} });
+    const { present } = makeStubCtx();
+    const runtime = createFirmwareRuntime(handle, present, { scheduleFrame: () => 1, cancelFrame: () => {} });
     expect(runtime.isExitRequested()).toBe(false);
   });
 
   test("dispose() stops the loop and releases the handle exactly once, and forbids restart", () => {
     const fake = makeFakeHandle();
-    const { ctx } = makeStubCtx();
+    const { present } = makeStubCtx();
     let canceled = 0;
-    const runtime = createFirmwareRuntime(fake.handle, ctx, {
+    const runtime = createFirmwareRuntime(fake.handle, present, {
       scheduleFrame: () => 1,
       cancelFrame: () => {
         canceled++;
@@ -345,7 +351,7 @@ function rig() {
     },
   });
   const queued: Array<(t: number) => void> = [];
-  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().ctx, {
+  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().present, {
     scheduleFrame: (cb) => queued.push(cb),
     cancelFrame: () => {},
   });
@@ -370,7 +376,7 @@ function rig() {
 function pacedRig(opts: { usPerStep?: number; stepsPerFrame?: number } = {}) {
   const fake = makeFakeHandle({ usPerStep: opts.usPerStep });
   const queued: Array<(t: number) => void> = [];
-  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().ctx, {
+  const rt = createFirmwareRuntime(fake.handle, makeStubCtx().present, {
     stepsPerFrame: opts.stepsPerFrame,
     scheduleFrame: (cb) => queued.push(cb),
     cancelFrame: () => {},

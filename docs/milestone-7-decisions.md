@@ -389,6 +389,102 @@ under Profiles).
   skips fetch (Task 10's backlog lead if HOME needs it) would remove it
   together with the dispatch cost below.
 
+### Task 8
+
+- **R-T8-1, a slice the step cap stopped short yields through a
+  `MessageChannel`, any other slice through `setTimeout(…, 0)`.** The
+  brief schedules every slice on `setTimeout(…, 0)`. HTML clamps a timer
+  nested five or more deep to 4 ms, and the Worker's loop reschedules
+  itself from inside its own timer, so every slice after the fifth waits
+  at least 4 ms. When the core is behind the badge (every busy slice),
+  that wait is pure loss: at Chrome's 40.5M steps/s (Task 7) a
+  400,000-step slice takes about 9.9 ms, so the core would run 9.9 of
+  every 13.9 ms, and a busy screen would play at about 0.71 of the speed
+  the core can reach (HOME 0.601x would show as about 0.43x). A
+  `MessageChannel` message is not a timer and is not clamped, and it
+  still yields to the event loop, so button and `frameAck` messages are
+  handled between slices exactly as with a timer. A slice that reached
+  its target keeps `setTimeout` (about 250 slices/s once clamped), so an
+  idle firmware (Snake between moves, a static screen) does not spin a
+  CPU core. The choice is `WorkerHost.schedule(cb, immediate)` in
+  `runtime/firmware-worker.ts`, with `immediate` = the last slice was
+  capped (`FirmwareRuntimeOptions.onFrame` reports it); pinned by
+  `worker slice is capped at WORKER_STEPS_PER_SLICE` and `an uncapped
+  slice yields through the timer`. If wrong: if a browser ran the
+  channel's messages ahead of the parent's, input would lag on busy
+  screens (the smoke test's launcher DOWN checks it); the fix is
+  `setTimeout` for every slice, at the throughput cost above.
+- **R-T8-2, `WORKER_STEPS_PER_SLICE` stays at the brief's 400,000.** It
+  was not tuned: the implementer has no browser, and Bun's
+  JavaScriptCore is not the browser's engine. With R-T8-1 the slice
+  length no longer trades against throughput (a capped slice is followed
+  at once by the next), so its only costs are how long a button or
+  `frameAck` message waits behind a running slice (at most one slice,
+  about 9.9 ms in Chrome and 9.8 ms in Bun at the Task 7 rates) and the
+  per-slice overhead (one `framebuffer()` copy of 153,600 bytes and the
+  wall-clock reads). A press is held at least `PRESS_HOLD_US` (100 ms
+  emulated) anyway. If wrong: a measured long-slice input lag would argue
+  for 200,000; the smoke test's INP and the status line's speed show it.
+- **R-T8-3, the Worker applies a message when it receives it, which is
+  between slices.** A slice runs to completion on the Worker's one
+  thread, so a message handled when it arrives takes effect at the start
+  of the next slice, as the brief requires, with no queue in the Worker.
+  Messages other than `init` that reach the Worker before the emulator
+  has booted are ignored: the client queues everything it sends before
+  `ready` and posts it in order on `ready` (pinned by `messages before
+  the worker is ready are queued in order`), and `main.ts` hands out the
+  runtime only after `ready`. If wrong: none while the client is the
+  Worker's only sender.
+- **R-T8-4, three additions to the brief's interfaces.**
+  `FirmwareRuntimeOptions` gains `onFrame(result, wallDeltaMs)` beside
+  `now` (the Worker reads each slice's `capped` for R-T8-1 and posts its
+  status from it); `createWorkerFirmwareRuntime` takes an optional fifth
+  `options` argument (an injectable `requestAnimationFrame`, for tests);
+  and it returns a `WorkerFirmwareRuntime`, the `FirmwareRuntime` plus a
+  `ready` promise. `main.ts` awaits `ready` (and the Worker's `error`
+  event), so a failed boot (a missing WASM, a bad image) falls back to Lua
+  mode exactly as before the Worker. If wrong: only interface shape.
+- **R-T8-5, the client acknowledges a frame it does not paint.** A frame
+  that arrives while the client is stopped, and one waiting for its
+  animation frame at `stop()`, is dropped and acknowledged at once.
+  Otherwise the Worker's one frame in flight would never be acknowledged
+  after a mode switch and the firmware would never paint again, and a
+  late firmware frame would land on the canvas after a switch to Lua
+  mode. Only the latest frame is painted. If wrong: none.
+- **R-T8-6, button names are checked with `hasOwnProperty`.**
+  `FirmwareRuntime.injectButton` checked `RAW_SLOT_BY_BUTTON[button] ===
+  undefined`, which a name like `toString` passes (it finds
+  `Object.prototype.toString`). Input now crosses a message boundary, so
+  both the Worker and the runtime check `isButtonName` (own property of
+  `RAW_SLOT_BY_BUTTON`), and the Worker treats `pressed` as `=== true`;
+  pinned by `a button message for an unknown name is ignored without
+  throwing`. A valid name behaves exactly as before. If wrong: none.
+- **R-T8-7, the WASM bytes are fetched on the main thread from the
+  glue's own URL and compiled synchronously in the Worker.** `main.ts`
+  fetches `new URL("./cpu/wasm-pkg/emulator_wasm_bg.wasm",
+  import.meta.url)`, the `.wasm` beside the generated glue, which is
+  where the glue's default `init()` looks; Vite emits one hashed asset for
+  both references (the build's `dist/assets/` holds one `.wasm`). The
+  Worker initializes with `initCpuWasmSync` (Chrome forbids synchronous
+  compilation of a module over 4 KB only on the main thread) and imports
+  the bridge lazily, so the bridge and the glue are a separate chunk the
+  Worker chunk loads. Vite's `worker.format` is `"es"`, since the default
+  `"iife"` cannot code-split. If wrong: a failed fetch or compile shows
+  as a fallback to Lua mode with the error in the console.
+- **R-T8-8, an error in a slice stops the loop and is posted.** A WASM
+  trap (a Rust panic) inside `runUntil` is caught in the slice, posted as
+  `error` (the client logs it to the console) and the loop stops; nothing
+  reschedules a failed emulator. Boot failures are posted the same way.
+  If wrong: none; before the Worker the same panic threw out of the
+  `requestAnimationFrame` callback and the loop died silently.
+- **R-T8-9, the status line can show a pre-reset state for one status
+  interval.** `provision()` and `reset()` update the client's cached
+  provisioning state (and `reset()` the speed) at once, as the in-thread
+  runtime did, but a `status` the Worker posted before it handled the
+  message can arrive after and show the old state until the next one, at
+  most `STATUS_INTERVAL_MS` (250 ms) later. If wrong: a status line that
+  is stale for a quarter second after a reset.
+
 ## Measurements
 
 The native benchmark is
@@ -751,6 +847,29 @@ rungs, 1 ignored), 14.9 s wall, `boot_progress` 11.6 s; release
 `boot_progress` 64 pass, 1 ignored, 8.0 s wall (7.9 s in the harness);
 clippy the same 3 warnings; `bun run build:wasm` and `bun run typecheck`
 ok; `bun test` 149 pass, 0 fail, 10.8 s.
+
+### Task 8: Web Worker host
+
+The firmware emulator runs in a dedicated module Worker
+(`frontend/src/runtime/firmware-worker.ts`); the main thread fetches the
+WASM bytes and `factory.bin`, forwards input and paints the frames the
+Worker posts (`firmware-worker-client.ts`). Slices: wall delta clamped to
+`MAX_FRAME_DELTA_MS` (50 ms), at most `WORKER_STEPS_PER_SLICE` (400,000)
+steps, debt dropped; a capped slice yields through a `MessageChannel`,
+any other through `setTimeout(…, 0)` (R-T8-1); one frame in flight;
+`status` at most every 250 ms. No `emulator-core` or `emulator-wasm`
+change, so no benchmark row: the core's numbers are Task 7's.
+
+Check list (frontend only), all green: `bun test` 167 pass, 0 fail,
+10.1 s (Task 8 adds 18 in `test/firmware-worker.test.ts`); `bun run
+typecheck` ok; `bun run build` ok, `dist/` holds `index.html`, `apps/`,
+`firmware/` and `assets/` (the main chunk, `firmware-worker-*.js`,
+`bridge-*.js`, one `emulator_wasm_bg-*.wasm`, the CSS) and no bench page.
+
+Browser smoke test and main-thread measurements (Chrome 155, `bun run
+dev`): to be added by the orchestrator (INP for a launcher DOWN, long
+tasks over 50 ms during a launcher redraw, the status line's speed on
+the launcher, onboarding and Snake).
 
 ## Profiles
 

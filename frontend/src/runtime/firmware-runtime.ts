@@ -2,12 +2,24 @@
  * Real-firmware runtime: mirrors `src/runtime/lifecycle.ts`'s role, but for
  * the CPU-emulator side (Milestone 2) instead of the Lua sandbox
  * (Milestone 1). Owns a `FirmwareEmulatorHandle` (`src/cpu/bridge.ts`), drives
- * a `requestAnimationFrame` loop that runs the CPU to the frame's wall-clock
- * time target and blits the reconstructed framebuffer (`src/render/framebuffer.ts`)
- * onto the same `<canvas>` `src/ui/shell.ts` already owns, and exposes an
+ * a frame loop that runs the CPU to the frame's wall-clock time target and
+ * hands the reconstructed framebuffer to a `present` callback, and exposes an
  * `injectButton`-shaped API close enough to `lifecycle.ts`'s `AppRuntime` that
  * `shell.ts`'s existing button-pad/keyboard wiring can drive either runtime
  * without knowing which one it's holding.
+ *
+ * ## Where it runs (Milestone 7 Task 8)
+ *
+ * In the app this runtime runs inside a dedicated Web Worker
+ * (`./firmware-worker.ts`): its loop is driven by slices on `setTimeout`
+ * (or an immediate yield while the core is behind, ruling R-T8-1), capped
+ * at `WORKER_STEPS_PER_SLICE` steps, timed by the `now` option, and
+ * `present` posts the framebuffer to the main thread, where
+ * `./firmware-worker-client.ts` paints it. The press-hold deferral, the
+ * shake schedule and the provisioner below therefore all live in the
+ * Worker, unchanged. The in-thread shape (a `requestAnimationFrame` loop
+ * whose `present` blits with `src/render/framebuffer.ts`, capped at
+ * `DEFAULT_STEPS_PER_FRAME`) is what the unit tests drive.
  *
  * ## Why `requestAnimationFrame`, unlike `lifecycle.ts`'s `setInterval`
  *
@@ -72,7 +84,6 @@
  */
 import type { ButtonName } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
-import { blitFramebuffer } from "../render/framebuffer";
 import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
 
 /** Largest wall-clock delta (ms) one frame advances emulated time by; see "Pacing" above. */
@@ -80,6 +91,18 @@ export const MAX_FRAME_DELTA_MS = 50;
 
 /** Most instruction steps one frame runs; see "Pacing" above. */
 export const DEFAULT_STEPS_PER_FRAME = 150_000;
+
+/**
+ * Most instruction steps one Worker slice runs (Milestone 7 Task 8): about
+ * 5 ms of work at the badge's 80M steps/s, about 10 ms at Chrome's measured
+ * 40.5M steps/s (Task 7). A slice that reaches its target needs far fewer
+ * steps, so the cap binds only when the core is slower than the badge; it
+ * bounds how long a button message or a frame acknowledgement waits behind
+ * a slice. The Worker does no painting, so a slice longer than one 60 Hz
+ * frame does not delay the page. See `docs/milestone-7-decisions.md`'s
+ * Task 8 rulings.
+ */
+export const WORKER_STEPS_PER_SLICE = 400_000;
 
 /**
  * Human button name -> raw slot index, as consumed by
@@ -146,6 +169,8 @@ export function shakeAcceleration(elapsedUs: number): [number, number, number] |
 
 export type FrameScheduler = (cb: (timeMs: number) => void) => number;
 export type FrameCanceler = (handle: number) => void;
+/** Receives a frame's framebuffer: RGB565, row-major, `width * height` elements. */
+export type FramePresenter = (fb: Uint16Array, width: number, height: number) => void;
 
 export interface FirmwareRuntimeOptions {
   /** Most instruction steps to run per animation frame. Default: {@link DEFAULT_STEPS_PER_FRAME}. */
@@ -154,6 +179,18 @@ export interface FirmwareRuntimeOptions {
   scheduleFrame?: FrameScheduler;
   /** Injectable for testing; defaults to the real `cancelAnimationFrame`. */
   cancelFrame?: FrameCanceler;
+  /**
+   * Wall-clock time (ms) a frame is timed by. When set, the loop reads it
+   * instead of the time the scheduler passes (the Worker's `setTimeout`
+   * passes none). Default: the scheduler's time argument.
+   */
+  now?: () => number;
+  /**
+   * Called after each frame's polls with what the frame did and its real
+   * (unclamped) wall delta. The Worker uses it to choose how to yield and
+   * to post its status.
+   */
+  onFrame?: (result: FrameResult, wallDeltaMs: number) => void;
 }
 
 /**
@@ -176,15 +213,14 @@ export interface FrameResult {
 /**
  * Runs one frame's worth of work: run the CPU until its emulated clock has
  * advanced by `wallDeltaMs` (clamped, see {@link frameTargetUs}) or
- * `stepsPerFrame` steps have run, then blit its current framebuffer to `ctx`.
- * Pure with respect to scheduling (no `requestAnimationFrame` involved) so
- * it's directly unit-testable against a fake `FirmwareEmulatorHandle` and a
- * fake canvas context, the same way `test/canvas.test.ts`/
- * `test/framebuffer.test.ts` already stub those.
+ * `stepsPerFrame` steps have run, then hand its current framebuffer to
+ * `present`. Pure with respect to scheduling (no `requestAnimationFrame`
+ * involved) so it's directly unit-testable against a fake
+ * `FirmwareEmulatorHandle` and a fake presenter.
  */
 export function stepFirmwareFrame(
   handle: FirmwareEmulatorHandle,
-  ctx: CanvasRenderingContext2D,
+  present: FramePresenter,
   wallDeltaMs: number,
   stepsPerFrame: number,
 ): FrameResult {
@@ -192,7 +228,7 @@ export function stepFirmwareFrame(
   const target = frameTargetUs(before, wallDeltaMs);
   handle.runUntil(target, stepsPerFrame);
   const after = handle.emulatedTimeUs();
-  blitFramebuffer(ctx, handle.framebuffer(), handle.screenWidth, handle.screenHeight);
+  present(handle.framebuffer(), handle.screenWidth, handle.screenHeight);
   // The wasm shim truncates the target to whole µs (`target_us as u64`), so
   // an uncapped frame with a fractional rAF delta ends at floor(target).
   return { emulatedDeltaUs: after - before, capped: after < Math.floor(target) };
@@ -235,13 +271,22 @@ export interface FirmwareRuntime {
 }
 
 /**
+ * `true` when `name` is one of the badge's buttons. Guards input that
+ * crossed a message boundary: `RAW_SLOT_BY_BUTTON["toString"]` is not
+ * `undefined`, so a lookup alone is not a check.
+ */
+export function isButtonName(name: unknown): name is ButtonName {
+  return typeof name === "string" && Object.prototype.hasOwnProperty.call(RAW_SLOT_BY_BUTTON, name);
+}
+
+/**
  * Builds a {@link FirmwareRuntime} around an already-constructed
  * `FirmwareEmulatorHandle` (see `src/cpu/bridge.ts`'s `createFirmwareEmulator`)
- * and the `<canvas>` 2D context to paint into.
+ * and the callback each frame's framebuffer goes to.
  */
 export function createFirmwareRuntime(
   handle: FirmwareEmulatorHandle,
-  ctx: CanvasRenderingContext2D,
+  present: FramePresenter,
   options: FirmwareRuntimeOptions = {},
 ): FirmwareRuntime {
   const stepsPerFrame = options.stepsPerFrame ?? DEFAULT_STEPS_PER_FRAME;
@@ -260,6 +305,8 @@ export function createFirmwareRuntime(
     ((id) => {
       if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(id);
     });
+  const now = options.now;
+  const onFrame = options.onFrame;
 
   let frameHandle: number | null = null;
   let disposed = false;
@@ -330,9 +377,10 @@ export function createFirmwareRuntime(
     // scheduler before stop() canceled it — a race a test's fake scheduler
     // can also simulate by invoking a "canceled" callback directly.
     if (frameHandle === null) return;
-    const delta = lastWallMs === null ? 0 : timeMs - lastWallMs;
-    lastWallMs = timeMs;
-    const r = stepFirmwareFrame(handle, ctx, delta, stepsPerFrame);
+    const wallMs = now ? now() : timeMs;
+    const delta = lastWallMs === null ? 0 : wallMs - lastWallMs;
+    lastWallMs = wallMs;
+    const r = stepFirmwareFrame(handle, present, delta, stepsPerFrame);
     if (delta > 0) {
       // The real frame time, not the clamped one: see "Pacing" above.
       const ratio = r.emulatedDeltaUs / (delta * 1000);
@@ -343,6 +391,7 @@ export function createFirmwareRuntime(
     const nowUs = handle.emulatedTimeUs();
     pollShake(nowUs);
     pollReleases(nowUs);
+    onFrame?.(r, delta);
     if (frameHandle !== null) {
       frameHandle = scheduleFrame(loop);
     }
@@ -366,8 +415,8 @@ export function createFirmwareRuntime(
   }
 
   function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
+    if (!isButtonName(button)) return;
     const slot = RAW_SLOT_BY_BUTTON[button];
-    if (slot === undefined) return;
     const now = handle.emulatedTimeUs();
     if (kind === "pressed") {
       pendingRelease.delete(button);
