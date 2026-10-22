@@ -2,7 +2,13 @@
 //! trait with an app image's parsed segments (see `crate::mem::image`).
 //!
 //! An ordered sequence of named address ranges, checked in this order on
-//! every access:
+//! every access. Multi-byte accesses behave exactly as their bytes in
+//! address order; a word fast path (Milestone 7 Task 5,
+//! [`FirmwareBus::read_fast`]/[`FirmwareBus::write_fast`] and
+//! [`Bus::fetch16`]) runs only tiers 1 and 2 below, in that order, for an
+//! access wholly inside one MMU page of an aperture or one resolved RAM
+//! span ([`RamSpan`], which keeps tier 2's first-match rule), and hands
+//! everything else to the byte path:
 //! 1. **XIP** (the flash-cache apertures, [`crate::mem::soc::DBUS_CACHE_RANGE`]
 //!    and [`crate::mem::soc::IBUS_CACHE_RANGE`], 8 MiB each): every access
 //!    translates through the flash MMU ([`FirmwareBus::mmu`]) to a physical
@@ -227,6 +233,23 @@ impl RamRegion {
     }
 }
 
+/// One span of the *resolved* RAM map the word fast path (Milestone 7
+/// Task 5) looks addresses up in: every byte of `[start, end)` lies outside
+/// both cache apertures and resolves, in [`FirmwareBus::read_byte`]'s
+/// first-match region lookup, to `ram_regions[region]`, whose `load_addr`
+/// is `base`. The spans are sorted, disjoint and end at or below 2^32, so an
+/// access that lies wholly inside one span touches exactly the bytes the
+/// byte path would, in the same region, with no catch-all byte among them
+/// (and nothing to log). Rebuilt whenever a region is added
+/// ([`FirmwareBus::rebuild_ram_spans`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RamSpan {
+    start: u64,
+    end: u64,
+    region: usize,
+    base: u32,
+}
+
 /// A small, fixed, read-only, **executable** code blob mapped at a fixed
 /// address: `[base, base + 4 * words.len())` reads (and fetches) `words` as
 /// little-endian 32-bit instruction words. Writes are dropped, like XIP flash
@@ -311,6 +334,13 @@ pub struct FirmwareBus {
     /// access translates through it to [`FirmwareBus::flash_chip`].
     pub mmu: FlashMmu,
     ram_regions: Vec<RamRegion>,
+    /// The resolved RAM map ([`RamSpan`]) over `ram_regions`, for the word
+    /// fast path. Derived data: rebuilt by [`FirmwareBus::rebuild_ram_spans`]
+    /// whenever `ram_regions` changes.
+    ram_spans: Vec<RamSpan>,
+    /// Index into `ram_spans` of the last span a fast-path access hit; a
+    /// hint only, always re-checked against the access's bounds before use.
+    last_ram_span: usize,
     /// Read-only executable ROM code blobs ([`RomCodeBlob`]), installed by
     /// [`FirmwareBus::map_rom_code`]. Empty unless a caller installs some
     /// (`crate::boot::boot_from_factory_image_with_rom_stubs` installs
@@ -470,6 +500,8 @@ impl FirmwareBus {
         let mut bus = Self {
             mmu: FlashMmu::new(),
             ram_regions,
+            ram_spans: Vec::new(),
+            last_ram_span: 0,
             rom_code: Vec::new(),
             rom_data: Vec::new(),
             // Starts at the XTAL clock the ROM leaves; follows
@@ -493,6 +525,7 @@ impl FirmwareBus {
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         };
+        bus.rebuild_ram_spans();
         bus.seed_mmu_like_bootloader(segments);
         bus
     }
@@ -640,6 +673,119 @@ impl FirmwareBus {
             load_addr,
             data: vec![0u8; len],
         });
+        self.rebuild_ram_spans();
+    }
+
+    /// Recomputes [`FirmwareBus::ram_spans`] from `ram_regions`: cuts the
+    /// address space at every region edge and every cache-aperture edge,
+    /// and gives each piece outside the apertures to the *first* region
+    /// containing it, the same first-match rule as
+    /// [`FirmwareBus::read_byte`]/[`FirmwareBus::write_byte`] (so an image
+    /// segment inside a later scratch aperture keeps its own bytes).
+    /// Adjacent pieces of the same region merge. A handful of regions, so
+    /// the quadratic walk is nothing; it runs only at construction.
+    fn rebuild_ram_spans(&mut self) {
+        const TOP: u64 = 1 << 32;
+        let mut cuts: Vec<u64> = vec![0, TOP];
+        for r in &self.ram_regions {
+            let start = r.load_addr as u64;
+            cuts.push(start);
+            cuts.push((start + r.data.len() as u64).min(TOP));
+        }
+        for range in [&DBUS_CACHE_RANGE, &IBUS_CACHE_RANGE] {
+            cuts.push(range.start as u64);
+            cuts.push(range.end as u64);
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut spans: Vec<RamSpan> = Vec::new();
+        for pair in cuts.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            // `start < TOP` because `TOP` is the last cut.
+            let first = start as u32;
+            if Self::in_cache_aperture(first) {
+                continue;
+            }
+            let Some(region) = self.ram_regions.iter().position(|r| r.contains(first)) else {
+                continue;
+            };
+            match spans.last_mut() {
+                Some(last) if last.end == start && last.region == region => last.end = end,
+                _ => spans.push(RamSpan {
+                    start,
+                    end,
+                    region,
+                    base: self.ram_regions[region].load_addr,
+                }),
+            }
+        }
+        self.ram_spans = spans;
+        self.last_ram_span = 0;
+    }
+
+    /// The `(region index, offset)` of an `len`-byte access at `addr` when
+    /// the whole access lies inside one resolved RAM span, else `None`.
+    /// Tries the last span hit first (re-checked), then a binary search.
+    #[inline(always)]
+    fn ram_span_for(&mut self, addr: u32, len: u32) -> Option<(usize, usize)> {
+        let start = addr as u64;
+        let end = start + len as u64;
+        if let Some(s) = self.ram_spans.get(self.last_ram_span) {
+            if s.start <= start && end <= s.end {
+                return Some((s.region, (addr - s.base) as usize));
+            }
+        }
+        let i = self.ram_spans.partition_point(|s| s.end <= start);
+        let s = self.ram_spans.get(i)?;
+        if s.start <= start && end <= s.end {
+            self.last_ram_span = i;
+            Some((s.region, (addr - s.base) as usize))
+        } else {
+            None
+        }
+    }
+
+    /// The `N`-byte little-endian read fast path (Milestone 7 Task 5): the
+    /// XIP-aperture check, then the RAM-region check, in that order, as
+    /// [`FirmwareBus::read_byte`] runs them. `None` means "use the byte
+    /// path": an access that is not wholly inside one MMU page of an
+    /// aperture, whose page is invalid (the byte path logs it), or that is
+    /// not wholly inside one resolved RAM span. Every byte a `Some` covers
+    /// would have been read from the same place by the byte path, and
+    /// none of them would have been logged.
+    #[inline(always)]
+    fn read_fast<const N: usize>(&mut self, addr: u32) -> Option<[u8; N]> {
+        if Self::in_cache_aperture(addr) {
+            // The apertures are whole pages, so an access inside one page
+            // that starts in an aperture stays in it.
+            if (addr % MMU_PAGE_SIZE) as usize > MMU_PAGE_SIZE as usize - N {
+                return None;
+            }
+            // `FLASH_SIZE` is a whole number of pages, so `p + i` stays
+            // inside the same physical page: exactly `read_byte`'s
+            // `translate(addr + i) % FLASH_SIZE`.
+            let p = self.mmu.translate(addr)? % FLASH_SIZE as u32;
+            return Some(std::array::from_fn(|i| self.flash_chip.read(p + i as u32)));
+        }
+        let (r, off) = self.ram_span_for(addr, N as u32)?;
+        self.ram_regions[r].data[off..off + N].try_into().ok()
+    }
+
+    /// The `N`-byte write fast path: RAM only (an aperture write keeps the
+    /// byte path, which drops it). `false` means "use the byte path".
+    #[inline(always)]
+    fn write_fast<const N: usize>(&mut self, addr: u32, bytes: [u8; N]) -> bool {
+        if Self::in_cache_aperture(addr) {
+            return false;
+        }
+        match self.ram_span_for(addr, N as u32) {
+            Some((r, off)) => {
+                self.ram_regions[r].data[off..off + N].copy_from_slice(&bytes);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Maps a read-only, executable [`RomCodeBlob`] onto the bus (see that
@@ -1147,12 +1293,18 @@ impl Bus for FirmwareBus {
     }
 
     fn read16(&mut self, addr: u32) -> u16 {
+        if let Some(b) = self.read_fast::<2>(addr) {
+            return u16::from_le_bytes(b);
+        }
         let b0 = self.read_byte(addr);
         let b1 = self.read_byte(addr.wrapping_add(1));
         u16::from_le_bytes([b0, b1])
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        if let Some(b) = self.read_fast::<4>(addr) {
+            return u32::from_le_bytes(b);
+        }
         let mut buf = [0u8; 4];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = self.read_byte(addr.wrapping_add(i as u32));
@@ -1165,18 +1317,42 @@ impl Bus for FirmwareBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16) {
+        if self.write_fast(addr, val.to_le_bytes()) {
+            return;
+        }
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             self.write_byte(addr.wrapping_add(i as u32), *b);
         }
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        if self.write_fast(addr, val.to_le_bytes()) {
+            return;
+        }
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             self.write_byte(addr.wrapping_add(i as u32), *b);
         }
     }
 
     fn fetch16(&mut self, addr: u32) -> Option<u16> {
+        // Fast path (Milestone 7 Task 5): the IBUS half of the aperture
+        // within one page (DBUS is never fetchable), then RAM. Both mean
+        // `is_mapped` holds for both bytes and `read16` reads them from
+        // the same place. An invalid page, a page-straddling fetch, DBUS,
+        // ROM code blobs and everything else take the original path.
+        if IBUS_CACHE_RANGE.contains(&addr) {
+            if addr % MMU_PAGE_SIZE != MMU_PAGE_SIZE - 1 {
+                if let Some(p) = self.mmu.translate(addr) {
+                    let p = p % FLASH_SIZE as u32;
+                    let lo = self.flash_chip.read(p);
+                    let hi = self.flash_chip.read(p + 1);
+                    return Some(u16::from_le_bytes([lo, hi]));
+                }
+            }
+        } else if let Some((r, off)) = self.ram_span_for(addr, 2) {
+            let d = &self.ram_regions[r].data;
+            return Some(u16::from_le_bytes([d[off], d[off + 1]]));
+        }
         let hi_addr = addr.wrapping_add(1);
         if self.is_mapped(addr) && self.is_mapped(hi_addr) {
             Some(self.read16(addr))

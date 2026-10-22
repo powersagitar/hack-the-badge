@@ -199,6 +199,54 @@ R-T*n*-*k* rulings are made in Task *n*.
   0 and drops the write rather than panicking. The file's existing tests
   are unchanged. If wrong: 4 KiB per runtime and per clone.
 
+### Task 5
+
+- **R-T5-1, the RAM fast path looks addresses up in a resolved span map,
+  not in the first region containing the access's first byte.**
+  `crate::boot` backs the whole DRAM, IRAM and RTC apertures with scratch
+  RAM appended after the image's segments, so regions overlap by design
+  and the byte path's first-match rule decides each byte separately: a
+  word across a segment's edge reads segment bytes on one side and
+  scratch bytes on the other. `FirmwareBus::rebuild_ram_spans` cuts the
+  address space at every region edge and every cache-aperture edge, gives
+  each piece outside the apertures to the first region containing it,
+  merges neighbours of the same region and caps the map at 2^32 (so a
+  word at `0xffff_fffe` never wraps into a span). An access wholly inside
+  one span reads or writes exactly the bytes the byte path would, in the
+  same region, with nothing to log; anything else takes the byte path.
+  It is still only the XIP-aperture check, then the RAM-region check, in
+  that order (common.md's rule); no other tier is reordered or bypassed.
+  The map is rebuilt by the only two places `ram_regions` changes,
+  `from_segments` and `add_scratch_ram`. If wrong: a word whose bytes
+  resolve to different regions would read or write the wrong one;
+  `word_access_across_a_region_edge_matches_the_byte_path` pins both
+  edges of a segment inside a later scratch region.
+- **R-T5-2, the last-hit hint is a span index, re-checked against the
+  whole access.** The brief allows a last-hit RAM region index re-checked
+  with `contains`; with spans, the equivalent check is
+  `span.start <= addr && addr + len <= span.end`, then a
+  `partition_point` binary search on a miss. If wrong: only speed (the
+  hint is never trusted unchecked).
+- **R-T5-3, writes run the aperture check before the RAM spans** even
+  though the spans already exclude both apertures, to keep the
+  XIP-then-RAM order literally; an aperture write takes the byte path,
+  which drops it as before. If wrong: one range compare per write.
+- **R-T5-4, `fetch16`'s fast path is IBUS within one page, else (outside
+  IBUS) one RAM span, else the original `is_mapped` path.** An IBUS hit
+  through a valid entry is exactly `is_mapped` true for both bytes plus
+  `read16`'s XIP read; an invalid entry, a fetch at page offset `0xffff`,
+  DBUS, ROM code blobs and unmapped space all fall through unchanged, so
+  DBUS stays unfetchable and an unmapped fetch still returns `None`.
+  If wrong: a fetch that should trap would run;
+  `word_fetch_across_an_mmu_page_edge_matches_the_byte_path` and
+  `dbus_is_still_not_fetchable` pin it.
+- **R-T5-5, the regression pins go in a commit of their own, before the
+  code** (`c54e8c8`), and pass at `5236bd1`. Beyond the brief's cases
+  they cover words 1, 2 and 3 bytes before a region's end, both edges of
+  a segment inside a later scratch region, the top of the address space,
+  unaligned XIP words, and the DBUS aperture's end. If wrong: none; they
+  only add coverage.
+
 ## Measurements
 
 The native benchmark is
@@ -224,6 +272,8 @@ reads a little below the redraws' steps/s.
 | Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 13.75 | 0.191 | 0.257 | 0.340 | n/a |
 | Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 40.10 | 0.611 | 0.796 | 1.003 | 15.4 |
 | Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 25.80 | 0.377 | 0.550 | 0.707 | n/a |
+| Task 5 (measured at `c54e8c8` plus Task 5's code) | 5 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 52.25 | 0.788 | 1.026 | 1.289 | 10.6 |
+| Task 5 (measured at `c54e8c8` plus Task 5's code) | 5 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 32.39 | 0.476 | 0.709 | 0.886 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -393,6 +443,55 @@ cross-check on every step; release `boot_progress` 64 pass, 1 ignored,
 `bun run build:wasm` and `bun run typecheck` ok; `bun test` 149 pass,
 0 fail, 15.9 s.
 
+### Task 5: word-sized bus fast path
+
+`FirmwareBus`'s `read16`/`read32` try the XIP aperture (an access inside
+one 64 KiB MMU page, translated once; an invalid entry falls back to the
+byte path, which logs as before), then one resolved RAM span (R-T5-1);
+`write16`/`write32` try RAM spans only; `fetch16` tries IBUS within one
+page, then a RAM span, then the original `is_mapped` path (R-T5-4).
+Everything else is the byte path, unchanged. Every pin held. Native
+`BENCH` lines:
+
+```
+BENCH walk steps=372597011 wall_s=7.13 msteps_per_s=52.25
+BENCH home emulated_ms=254.0 steps=19106041 busy_pct=94.0 wall_ms_median=322.3 wall_ms_min=321.3 factor=0.788 msteps_per_s=59.29
+BENCH down emulated_ms=115.0 steps=6858235 busy_pct=74.6 wall_ms_median=112.1 wall_ms_min=112.1 factor=1.026 msteps_per_s=61.17
+BENCH onboarding emulated_ms=67.0 steps=3018254 busy_pct=56.4 wall_ms_median=52.0 wall_ms_min=51.8 factor=1.289 msteps_per_s=58.08
+```
+
+A second native run read within 2 % (walk 53.09 Msteps/s, factors
+0.795, 1.031, 1.311). The profiled run (the same code built with debug
+info, under samply) read faster still: walk 55.86, factors 0.856, 1.110,
+1.388; the table keeps the plain build.
+
+Bun (`bun run bench:wasm`, median of 3; three invocations agreed within
+1 % on the walk and 1.5 % on every pin factor; this is the third):
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=c54e8c8+dirty profile=release opt-level=3
+BENCH median runs=3 walk msteps_per_s=32.39
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=539.0 factor=0.649 msteps_per_s=35.78 pin_factor=0.476
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=163.4 factor=0.708 msteps_per_s=42.28 pin_factor=0.709
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=83.5 factor=2.873 msteps_per_s=39.93 pin_factor=0.886
+```
+
+(`+dirty`: Task 5's uncommitted code.) Against Task 4: native redraws
+1.29x the steps/s (HOME 45.96 to 59.29 M), the walk 1.30x; Bun redraws
+1.25x to 1.29x (pin factors 0.377, 0.550, 0.707 to 0.476, 0.709, 0.886),
+the walk 1.26x. Native DOWN and onboarding now beat the badge; HOME is at
+0.79x.
+
+WASM size: 100,002 bytes at Task 4, 106,475 bytes now (+6,473 bytes;
+the fast paths are inlined into the four word accessors and `fetch16`).
+
+Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
+540 lib (Task 5's four bus tests) + 95 integration pass (64 boot rungs,
+1 ignored), 13.0 s wall, `boot_progress` 12.3 s; release `boot_progress`
+64 pass, 1 ignored, 10.6 s wall; clippy the same 3 warnings;
+`bun run build:wasm` and `bun run typecheck` ok; `bun test` 149 pass,
+0 fail, 13.0 s.
+
 ## Profiles
 
 Procedure (every optimization task follows it):
@@ -482,6 +581,32 @@ Below the top 10: `SysTimer::advance_by` 2.3 %, `step_with_interrupts`
 the USB source) went from 44.5 % to 9.1 %; the profile is now the flat
 one the spec predicted, led by byte-wise bus access (Task 5) and the
 ROM-stub lookup and decode on every fetch (Tasks 6 and 7).
+
+### Task 5 (word-sized bus fast path, release `opt-level = 3`)
+
+11,025 samples on the `bench_redraws` thread (this run: walk 55.86
+Msteps/s, HOME 0.856x).
+
+| Share | Symbol |
+| --- | --- |
+| 15.7 % | `RomStubTable::lookup` |
+| 13.4 % | `Cpu::step` |
+| 12.3 % | `FirmwareBus::tick_peripherals` |
+| 11.3 % | `cpu::decode::decode_16` |
+| 11.1 % | `FirmwareBus::asserted_lines` |
+| 9.3 % | the `bench_redraws` closure (the benchmark's own framebuffer hashing) |
+| 7.4 % | `FirmwareBus::fetch16` |
+| 5.8 % | `cpu::decode::decode_32` |
+| 2.4 % | `SysTimer::advance_by` |
+| 1.8 % | `step_with_interrupts` |
+
+Below the top 10: `write_byte` 1.6 %, `read32` 1.6 %, `read_byte` 1.3 %,
+`run_until_stable_frame` 1.3 %, `FirmwareRuntime::run_impl` 1.1 %,
+`write32` 1.1 %. Byte-wise bus access (`read_byte` plus `write_byte`)
+went from 21.6 % to 2.9 % of a shorter profile (14,894 to 11,025
+samples); `fetch16` now reads through the fast path and costs about
+what it did as a share, about a quarter less in samples. The ROM-stub
+lookup on every fetch (Task 6) and decode (Task 7) lead what is left.
 
 ## Milestone 8 backlog
 
