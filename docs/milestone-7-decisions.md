@@ -388,6 +388,13 @@ under Profiles).
   wrong: fetch stays a per-step cost of about 9 %; a block cache that
   skips fetch (Task 10's backlog lead if HOME needs it) would remove it
   together with the dispatch cost below.
+- **R-T7-7, Safari's post-core row was taken after Task 8, when the
+  human partner attended** (orchestrator). The Safari bench needs the
+  human at the machine, so Task 7's row was deferred; it was measured at
+  `ea7a035`, whose core is `abd4c3a` (Task 8 changed only the frontend,
+  and the bench page drives the bridge directly, not the Worker), and is
+  the Measurements table's Safari row after Task 7. If wrong: none; the
+  core under test is the same.
 
 ### Task 8
 
@@ -484,6 +491,25 @@ under Profiles).
   message can arrive after and show the old state until the next one, at
   most `STATUS_INTERVAL_MS` (250 ms) later. If wrong: a status line that
   is stale for a quarter second after a reset.
+- **R-T8-10, a started runtime pauses while the page is hidden**
+  (review finding, fix round 1). A dedicated Worker is not paused like
+  main-thread `requestAnimationFrame`, so after the move the firmware
+  kept running in a background tab: Snake played on unseen and died, and
+  a busy screen kept a core busy, while only the painting stopped. The
+  client now listens to `document.visibilitychange` (an injectable
+  `VisibilitySource`): on hidden it posts `stop` (the Worker's
+  `FirmwareRuntime.stop()` flushes any deferred release) and drops any
+  frame waiting to be painted; on visible it posts `start`, whose first
+  slice counts no hidden time. Only a runtime the user started is paused
+  and resumed: a runtime stopped by a mode switch stays stopped, and
+  `start()` while hidden waits for visible. This restores Milestone 6's
+  behaviour. The Worker also clears `lastCapped` on `start`, so a restart
+  yields through the timer (reviewer Minor 2). Pinned by `hidden tab
+  pauses the worker and resumes on visible`, `a runtime the user stopped
+  is not started by a visible tab`, `starting while hidden waits for
+  visible, and frames while paused are acknowledged` and `a restart after
+  a capped slice yields through the timer`. If wrong: none; the
+  alternative is firmware that runs unseen.
 
 ## Measurements
 
@@ -516,6 +542,8 @@ reads a little below the redraws' steps/s.
 | Task 6 (measured at `f23288a` plus Task 6's code) | 6 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 38.01 | 0.557 | 0.858 | 1.089 | n/a |
 | Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 69.43 | 1.077 | 1.400 | 1.756 | 8.0 |
 | Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.77 | 0.609 | 0.972 | 1.211 | n/a |
+| Task 7 (measured at `abd4c3a`, one run alone) | 7 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.51 | 0.601 | 0.897 | 1.113 | — |
+| Task 7 core (measured at `ea7a035`, core = `abd4c3a`, median of 3; R-T7-7) | 7 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 41.78 | 0.627 | 0.990 | 1.234 | — |
 
 The baseline's `BENCH` lines:
 
@@ -866,10 +894,35 @@ typecheck` ok; `bun run build` ok, `dist/` holds `index.html`, `apps/`,
 `firmware/` and `assets/` (the main chunk, `firmware-worker-*.js`,
 `bridge-*.js`, one `emulator_wasm_bg-*.wasm`, the CSS) and no bench page.
 
-Browser smoke test and main-thread measurements (Chrome 155, `bun run
-dev`): to be added by the orchestrator (INP for a launcher DOWN, long
-tasks over 50 ms during a launcher redraw, the status line's speed on
-the launcher, onboarding and Snake).
+Fix round 1 (`34625ff`, R-T8-10): the client pauses a started runtime
+while the page is hidden. `bun test` 171 pass, 0 fail, 10.2 s;
+`bun run typecheck` and `bun run build` ok, no bench page in `dist/`.
+
+Browser smoke test (orchestrator, Apple M5 Pro, Chrome 155, `ea7a035`).
+The dev server (`bun run dev`) page dies with `Uncaught ReferenceError:
+process is not defined`: fengari's `luaconf` reads
+`process.env.FENGARICONF`, and Vite 8.3.0's dependency pre-bundle does
+not shim it. This is pre-existing (reproduced at `abd4c3a` and at
+`6cd0a6e`) and not fixed here; the human partner decides at Task 9. The
+smoke test therefore ran on the production build (`bun run build && bun
+run preview`):
+
+- Real Firmware boots in the Worker to the first-run screen. Provision
+  (hacker) reaches PROV OK in about 1 s; the full onboarding walk works,
+  including Shake; Finished setup leads to the registered screen, HOME to
+  the launcher, and DOWN moves the selection.
+- Snake opens and runs at a steady 1.0x to game over. Switching to Lua
+  with DOWN held and back resumes painting, and A restarts Snake.
+- Status-line minimum speed (250 ms smoothed, so coarse): onboarding page
+  turns 0.7x to 1.0x, HOME 0.7x, launcher DOWN 0.7x to 0.8x.
+- A `PerformanceObserver` over the whole session saw 0 long tasks
+  (> 50 ms) on the main thread and 0 key event-timing entries of 16 ms
+  or more: the INP for a launcher DOWN is under 16 ms (synthetic key
+  events), against 64 ms before the Worker (spec criterion 4).
+
+The browser bench rows after Task 7 (Chrome 155 and Safari 27.0.1) are in
+the table above; the bench page runs the bridge directly in its own
+Worker, not the app's Worker host, so they measure the core.
 
 ## Profiles
 
