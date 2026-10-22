@@ -30,17 +30,18 @@ export function fnv1a(fb: Uint16Array): bigint {
 }
 
 /** boot_progress.rs's SPLASH_HASH (boots_to_first_real_frame). */
-export const SPLASH_HASH = 0x5599c270ab0429fan;
+export const SPLASH_HASH = 0xfb305408a9e50e98n;
 /** boot_progress.rs's FIRST_RUN_HASH (boots_to_first_run_screen). */
 export const FIRST_RUN_HASH = 0x8c5027cec0f79490n;
 
 /*
  * boot_progress.rs's constants, copied (same names and values; see that
- * file for where each was measured, re-measured in Milestone 6).
+ * file for where each was measured, re-measured in Milestone 6 and
+ * re-pinned for v392 in Milestone 9).
  * The finish line walks OWN_ROLE from boot through provisioning and
  * onboarding to the launcher.
  */
-export const FIRST_RUN_MAX_STEPS = 17_250_000;
+export const FIRST_RUN_MAX_STEPS = 16_500_000;
 export const BOOT_STABLE_FOR = 1_000_000;
 export const AFTER_PRESS_STABLE_FOR = 8_000_000;
 /** Button hold: 100 ms of emulated time (boot_progress.rs's PRESS_HOLD_US). */
@@ -51,20 +52,19 @@ export const PROVISION_DEADLINE = 36_000_000;
 export const ONBOARDING_RESPONSE_MARGIN = 16_000_000;
 export const OWN_ROLE = "hacker";
 /** ROLE_ROWS' hacker row: onboarding page 1, and the registered screen. */
-export const OWN_ROLE_PAGE1_HASH = 0xd36476617b1a89b5n;
+export const OWN_ROLE_PAGE1_HASH = 0xbf9ccb7e80b44b1an;
 export const OWN_ROLE_REGISTERED_HASH = 0xbd6d761308a7bf24n;
 export const TO_SHAKE_PAGE: Array<[number, bigint]> = [
   [1, 0xe788a78193281b08n], // A: page 2 "This is you"
-  [1, 0x9621b8aa8b040d38n], // A: page 3 "Try every button"
-  [1, 0xa283f1b3a862abffn], // A lit
-  [2, 0x8522bf8dfccb6084n], // B
-  [7, 0xb9e7b94ddd899859n], // UP
-  [5, 0x362f61206bea4a4fn], // LEFT
-  [6, 0x16eb495bb805251an], // RIGHT
-  [4, 0x8a7a4dff645446d3n], // DOWN
-  [8, 0xc6fba44d81322795n], // Aux1
-  [3, 0x824afde3f915a562n], // HOME (captured on page 3)
-  [0, 0x3a725bc10083f74an], // START: all nine done
+  [1, 0x38a9d040707cc4e8n], // A: page 3 "Try every button"
+  [1, 0x8a6896e1b5c95d6bn], // A lit
+  [2, 0x8b0b8358e2b5d6e8n], // B
+  [7, 0xf38f281c4b05dabdn], // UP
+  [5, 0xb1850f5c89312eb3n], // LEFT
+  [6, 0x526668ba6df4b25en], // RIGHT
+  [4, 0x3d7be2d172657413n], // DOWN
+  [3, 0x1fd715c46f187c4cn], // HOME (captured on page 3)
+  [0, 0xc2ebc5fd53532d8cn], // START: all eight done
   [1, 0xc1ad004ba5f77b78n], // A: page 4 "Lights"
   [1, 0x7598def30e838832n], // A: page 5 "Tap to unlock"
   [1, 0x4a54e5a40d669898n], // A: page 6 "Shake it!"
@@ -84,8 +84,8 @@ export const AFTER_SHAKE_PAGES: Array<[number, bigint | null]> = [
 export const ANIMATED_PAGE_STEPS = 9_000_000;
 export const REGISTERED_RESPONSE_STEPS = AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
 export const TO_LAUNCHER_SLOT = 3;
-export const LAUNCHER_RESPONSE_STEPS = 26_000_000;
-export const LAUNCHER_HASH = 0xb694a61febfd62ffn;
+export const LAUNCHER_RESPONSE_STEPS = 25_000_000;
+export const LAUNCHER_HASH = 0x94d7a7a85fa93ea3n;
 /** boot_progress.rs's NAV_SLOT: DOWN moves the launcher's selection one row. */
 export const NAV_SLOT = 4;
 /** boot_progress.rs's LAUNCHER_AFTER_NAV_HASH: the launcher after one DOWN. */

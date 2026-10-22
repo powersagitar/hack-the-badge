@@ -81,9 +81,9 @@ describe("timeRedraw", () => {
       factor: 0.125,
       mStepsPerS: 10,
     });
-    // The pinned DOWN redraw's 115 ms over its 6,858,235 steps at 10M/s.
-    expect(DOWN_REDRAW.emulatedUs).toBe(115_000);
-    expect(pinFactor).toBeCloseTo(0.115 / (6_858_235 / 10e6), 12);
+    // The pinned DOWN redraw's 109 ms over its 7,942,619 steps at 10M/s.
+    expect(DOWN_REDRAW.emulatedUs).toBe(109_000);
+    expect(pinFactor).toBeCloseTo(0.109 / (7_942_619 / 10e6), 12);
     // The settle still ran to the stable frame (8M more steps).
     expect(handle.totalSteps()).toBe(1_000_000 + REDRAW_AT + 8_000_000);
   });

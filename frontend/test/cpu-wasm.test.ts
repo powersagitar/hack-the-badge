@@ -105,7 +105,7 @@ describe("emulator-wasm firmware-boot boundary", () => {
   // The WASM-path twin of boot_progress.rs's boots_to_first_run_screen
   // (its run_until_stable_frame): 250,000-step chunks, stopping at the
   // first frame that is not uniform, not the splash, and unchanged for
-  // 1,000,000 steps, capped at 17,250,000 steps; same hash.
+  // 1,000,000 steps, capped at 16,500,000 steps; same hash.
   test(
     "boots firmware.bin to the same first-run screen as the native finish-line test",
     () => {
@@ -119,7 +119,7 @@ describe("emulator-wasm firmware-boot boundary", () => {
         let hash = fnv1a(emu.framebuffer());
         let hashSince = 0;
         let stable: bigint | undefined;
-        for (let done = 0; done < 17_250_000 && stable === undefined; ) {
+        for (let done = 0; done < 16_500_000 && stable === undefined; ) {
           const report = emu.run(250_000);
           const fault = report.lastInstructionFault;
           report.free();
@@ -170,7 +170,7 @@ describe("emulator-wasm provisioned boot", () => {
   // The WASM-path twin of boot_progress.rs's boots_to_launcher, provisioned
   // by the frontend's own provisioner (src/runtime/provisioner.ts) rather
   // than the Rust test helper, so it also proves the provisioner against
-  // the real firmware. About 373M steps.
+  // the real firmware. About 343M steps.
   test(
     "provisions the test identity through the console, walks onboarding, and reaches the same launcher as the native finish line",
     () => {

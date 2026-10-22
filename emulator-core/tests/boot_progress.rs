@@ -36,6 +36,16 @@
 //! step plus those 221 steps, so it still covers the same code; its doc
 //! keeps the historical step. Windows and budgets given in round numbers
 //! are unchanged.
+//!
+//! Milestone 9 swapped the image from the dumped v335 to the official v392
+//! (`v0.1.2-392-gd3089c4`) and re-pinned every rung that moved; each
+//! change and its reason is in `docs/milestone-9-decisions.md`, "Re-pins
+//! (v335 → v392)". Step numbers in the docs below written with "~" are
+//! v392's; a measured number that moved is given for both versions.
+//! Every comparison with the physical badge named below was made on v335
+//! (the human partner's badge stays on v335); a v392 frame with the same
+//! hash is the same frame, and v392's changed frames were checked by eye
+//! in Milestone 9, never on hardware.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -114,21 +124,28 @@ fn timg_calibration_escapes_the_pre_fix_rtc_clk_cal_spin_loop() {
 }
 
 /// The SYSTEM `FROM_CPU_0` software interrupt reaches the core: the first
-/// trap of the whole boot is vPortYield's request (written on step
-/// 528,312), taken on the next step as an interrupt on CPU line 4 (where
-/// the firmware routes `ETS_FROM_CPU_INTR0_SOURCE`), and no exception
-/// follows through step 571,933 (the pre-Task-D11 `gpio_matrix_out`
-/// fault's step, 571,712, plus the 221-step shift). The
+/// trap of the whole boot is vPortYield's request, taken on the next step
+/// as an interrupt on CPU line 4 (where the firmware routes
+/// `ETS_FROM_CPU_INTR0_SOURCE`), and no exception follows through step
+/// 571,933 (v335's pre-Task-D11 `gpio_matrix_out` fault step, 571,712,
+/// plus the 221-step shift; kept as a no-fault horizon). The
 /// scheduler-start spin at `0x4200_0cd2` is gone.
+///
+/// v392 (Milestone 9): the request is the `sw` of 1 to
+/// `SYSTEM_CPU_INTR_FROM_CPU_0_REG` (`0x600c_0028`) at `0x4038_9662`,
+/// executed on step 527,878 (528,312 on v335); the trap is taken on step
+/// 527,879 with `mepc` = `0x4038_9664`, the next instruction. The
+/// scheduler-start `j .` after the call to `vTaskStartScheduler` is still
+/// at `0x4200_0cd2` in v392 (same bytes as v335's).
 #[test]
 fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
-    let summary = rt.run(528_312);
+    let summary = rt.run(527_878);
     assert_eq!(summary.traps, 0, "got {summary:?}, pc=0x{:08x}", rt.pc());
     let summary = rt.run(1);
     assert_eq!(summary.traps, 1, "the yield must be taken on the next step");
     assert_eq!(rt.cpu().csr.mcause, 0x8000_0004);
-    let summary = rt.run(571_933 - 528_313);
+    let summary = rt.run(571_933 - 527_879);
     assert_eq!(
         summary.last_instruction_fault, None,
         "no exception through step 571,933 (the pre-Task-D11 gpio_matrix_out fault was next); got {summary:?}"
@@ -142,7 +159,7 @@ fn first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line() {
 
 /// The first context switch works, so FreeRTOS runs `main_task`, which
 /// prints `main_task: Started on CPU0` and `main_task: Calling app_main()`
-/// (step ~556,000; both are in the physical badge's log too).
+/// (step ~555,000; both are in the physical badge's log too).
 #[test]
 fn boot_reaches_main_task_calling_app_main() {
     let (rt, ok) = boot_until_console_contains("I (6) main_task: Calling app_main()", 750_000);
@@ -382,7 +399,7 @@ fn boot_no_longer_faults_at_the_pre_task_d9_newlib_init_common_mutexes_call_site
 
 /// The SPI1 flash controller answers JEDEC RDID with the badge's ID, so
 /// flash-chip detection succeeds (`spi_flash: detected chip: generic`, step
-/// ~447,000; in the physical badge's log too) instead of logging `memspi: no
+/// ~448,000; in the physical badge's log too) instead of logging `memspi: no
 /// response`.
 #[test]
 fn boot_reaches_spi_flash_detected_chip_generic() {
@@ -422,11 +439,12 @@ fn boot_no_longer_faults_at_the_pre_task_8_memchr_call_site() {
 
 /// `ets_apb_backup_init_lock_func`, `esp_coex_rom_version_get` and
 /// `esprv_intc_int_set_threshold` are real stubs: zero traps through step
-/// 528,311, the step before FreeRTOS's first yield request.
+/// 527,877, the step before FreeRTOS's first yield request (v392; 528,311
+/// on v335; see [`first_trap_is_the_from_cpu_0_yield_interrupt_on_its_routed_line`]).
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d10_ets_apb_backup_init_lock_func_call_site() {
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
-    let summary = rt.run(528_311);
+    let summary = rt.run(527_877);
     assert_eq!(
         summary.traps,
         0,
@@ -457,11 +475,15 @@ fn boot_no_longer_warns_that_the_image_header_says_0k_of_flash() {
 
 /// `spi_ll_apply_config()`'s `while (hw->cmd.update);` poll in
 /// `spi_hal_init()` (a Milestone 3 stall: tens of thousands of hits per
-/// address).
-const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x420f_d6fc..=0x420f_d702;
+/// address). v392 (Milestone 9): `0x4210_010a..=0x4210_0110`, found by
+/// v335's 52 bytes around the poll (`lw a5, 0(a4)`; `srli a5, a5, 23`;
+/// `andi a5, a5, 1`; `bnez`, after the `lui a3, 0x800`/`or`/`sw` that sets
+/// `SPI_UPDATE`), which occur once in v392 (v335: `0x420f_d6fc..=0x420f_d702`).
+const PRE_TASK_9_SPI_UPDATE_POLL: std::ops::RangeInclusive<u32> = 0x4210_010a..=0x4210_0110;
 
 /// SPI2's `SPI_UPDATE` reads back 0 at once, so the `spi_hal_init()` poll
-/// (first reached on step 584,140) runs but does not spin: over steps
+/// (first reached on step 585,551 in v392; 584,140 in v335) runs but does
+/// not spin (each address hit once): over steps
 /// 583,000..596,000 each poll address is hit fewer than [`SPIN_THRESHOLD`]
 /// times and no exception is taken.
 #[test]
@@ -492,11 +514,17 @@ fn boot_escapes_the_pre_task_9_spi_update_poll_into_spi_clock_setup() {
 /// ROM libgcc `__bswapsi2` (`esp32c3.rom.libgcc.ld`).
 const ROM_BSWAPSI2: u32 = 0x4000_0788;
 /// The return address of `spi_ll_set_command()`'s `__bswapsi2` call.
-const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_45fa;
+/// v392 (Milestone 9): `0x4039_463a`, the `ra` of every `__bswapsi2` call
+/// in boot; v335's 40 bytes from its return address (`lw a5, 12(sp)`;
+/// `slli`/`srli a0, 16`; the 16-bit field merge) occur once in v392, at
+/// this address (v335: `0x4039_45fa`).
+const SPI_LL_SET_COMMAND_BSWAP_RA: u32 = 0x4039_463a;
 
 /// ROM `__bswapsi2` is a real stub: over steps 590,000..596,608 it is
-/// entered exactly once (step 594,724, from `spi_ll_set_command()`),
-/// returns to its caller, and no exception is taken.
+/// entered exactly once (v392: `pc` is at it after step 594,523 and back at
+/// the return address after 594,524; the next call is on step 603,354;
+/// v335: step 594,724), from `spi_ll_set_command()`, returns to its
+/// caller, and no exception is taken.
 #[test]
 fn boot_no_longer_faults_at_the_pre_task_d12_bswapsi2_call_site() {
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
@@ -545,10 +573,11 @@ fn boot_no_longer_warns_that_rtc_xtal_freq_reg_is_invalid() {
 ///   SYSTIMER ran 1,827,060 ticks ahead of the step count: the 12
 ///   fast-forward steps are charged as idle, not as steps; 1,825,445 after
 ///   Task 2's stateful ROM CPU frequency; 2,262,240 since Milestone 6
-///   Task D-M6-1);
+///   Task D-M6-1; 2,312,365 on v392);
 /// - counter 1, the FreeRTOS tick's, is past 20 tick periods of 160,000
-///   (measured 3,269,013, 20.4 periods; 42.8 before Milestone 6 Task 3,
-///   when a busy step was a whole tick, not a fifth), so the scheduler
+///   (measured 3,269,013, 20.4 periods; 3,319,346, 20.7, on v392; 42.8
+///   before Milestone 6 Task 3, when a busy step was a whole tick, not a
+///   fifth), so the scheduler
 ///   kept ticking after the first wake.
 #[test]
 fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
@@ -584,7 +613,7 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
 
 /// GDMA's TX out-link feeds SPI2, so LVGL's flushes reach the ST7789 model:
 /// the framebuffer is still blank at step 1,100,000 (first pixels land at
-/// ~1,124,900) and by step 5,550,000 holds a drawn frame of at least 2,000
+/// ~1,137,900) and by step 5,550,000 holds a drawn frame of at least 2,000
 /// distinct colors (the splash has 2,340), sent through GDMA channel 0,
 /// with no exception and no panic text. (The name is Milestone 3's; the
 /// `MD5Init` stall it mentions is gone.)
@@ -642,18 +671,26 @@ fn boot_no_longer_faults_at_the_pre_task_d13_md5init_call_site() {
 /// partition table through its own `spi_flash_mmap` window, feeds the
 /// entries to ROM `MD5Update`, checks the digest with `MD5Final`, and
 /// returns `ESP_OK`, and no DBUS read goes through an invalid MMU entry.
+///
+/// v392 (Milestone 9): the epilogue is `mv a0, s4` at `0x420f_d282`
+/// (v335: `0x420f_a878`). Found by shape: the function whose first
+/// `MD5Init` call returns to `0x420f_d0f4` ends, as v335's does, with the
+/// `ESP_ERR_NOT_FOUND` (0x105) and `ESP_ERR_INVALID_STATE` (0x103) error
+/// paths setting `s4`, a list-free loop, `jal` to the same cleanup
+/// (`310010ef`, same offset), then `mv a0, s4` and the 0xb0-byte frame's
+/// restore; the epilogue bytes from `mv a0, s4` to `ret` are identical.
 #[test]
 fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
     const ROM_MD5_INIT: u32 = 0x4000_0614;
     const ROM_MD5_UPDATE: u32 = 0x4000_0618;
     const ROM_MD5_FINAL: u32 = 0x4000_061c;
-    const LOAD_PARTITIONS_EPILOGUE: u32 = 0x420f_a878;
+    const LOAD_PARTITIONS_EPILOGUE: u32 = 0x420f_d282;
     const ESP_OK: u32 = 0;
 
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("firmware.bin boots");
-    // MD5Init is first called on step 4,450,328 (Milestone 6 Task D-M6-1;
-    // 5,560,533 before Milestone 6).
-    let summary = rt.run(4_000_000);
+    // MD5Init is first called on step 1,855,883 in v392 (Milestone 9;
+    // 4,450,328 in v335 since Milestone 6 Task D-M6-1, 5,560,533 before).
+    let summary = rt.run(1_500_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
 
     // Single-step to load_partitions()'s first MD5Init, then to its epilogue.
@@ -692,14 +729,14 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
 /// USB-Serial-JTAG model reports SOF frames from an attached host, so
 /// ESP-IDF's connection monitor keeps the port "connected" and the VFS
 /// write does not drop `stdout` (`LVGL: Starting LVGL task`, step
-/// ~672,000).
+/// ~669,000).
 #[test]
 fn boot_prints_console_output_after_the_scheduler_starts() {
     assert_reaches("LVGL: Starting LVGL task", 1_000_000);
 }
 
 /// The emulated `storage` partition is blank, so `esp_littlefs` fails to
-/// mount it and starts formatting it (step ~4,508,000), without a panic. An
+/// mount it and starts formatting it (step ~1,908,000), without a panic. An
 /// emulator-only line: the physical badge's flash holds a filesystem.
 #[test]
 fn boot_reaches_littlefs_formatting_the_blank_storage_partition() {
@@ -721,7 +758,7 @@ const LFS_MAGIC: &[u8; 8] = b"littlefs";
 
 /// SPIMEM1 erases, programs and reads the chip, so the format writes the
 /// littlefs superblock into both blocks of the root metadata pair (`storage`
-/// blocks 0 and 1, at `0x2b_0000`/`0x2b_1000`, by step ~4,574,000) without a
+/// blocks 0 and 1, at `0x2b_0000`/`0x2b_1000`, by step ~1,978,000) without a
 /// fault, with no unmodeled SPIMEM1 command and no write left enabled.
 #[test]
 fn boot_formats_the_blank_storage_partition_with_littlefs() {
@@ -761,7 +798,7 @@ fn boot_reaches_hal_buttons_ready() {
 
 /// The SC7A20H accelerometer answers on I2C0 (address 0x19): `hal_accel`
 /// reads `WHO_AM_I` = 0x11 and prints the detection line the physical badge
-/// prints (step ~4.95M), then configures the sensor and starts its cache
+/// prints (step ~4.64M), then configures the sensor and starts its cache
 /// task, whose sample reads and ROM `__floatsisf` calls then run for
 /// 1,000,000 steps without a fault or panic text. (Until Milestone 5 Task
 /// D-M5-2 the bus had no device and this rung pinned `hal_accel`'s
@@ -786,7 +823,7 @@ fn boot_detects_the_sc7a20h_accelerometer_on_i2c0() {
 
 /// RMT completes the LED driver's ping-pong transmission on TX channel 0
 /// (`TX_END` reaches the driver's ISR through `SRC_RMT`), so `hal_sleep`
-/// starts (step ~5.04M; the physical badge prints this line too) and the
+/// starts (step ~4.73M; the physical badge prints this line too) and the
 /// channel is no longer running.
 #[test]
 fn boot_reaches_hal_sleep_after_the_rmt_transmission_completes() {
@@ -803,7 +840,7 @@ fn boot_reaches_hal_sleep_after_the_rmt_transmission_completes() {
 
 /// ROM `strdup`, `strchr` and `strcpy` are real, so the app registry
 /// launches its first app, My Badge (`app_reg: launched My Badge`, step
-/// ~10.99M), and runs without a fault or panic text to step 20,000,000, by
+/// ~10.54M), and runs without a fault or panic text to step 20,000,000, by
 /// which point the framebuffer is no longer the splash ([`SPLASH_HASH`]).
 #[test]
 fn boot_launches_the_first_app_and_leaves_the_splash_without_faulting() {
@@ -844,8 +881,10 @@ fn framebuffer_fnv1a(fb: &[u16]) -> u64 {
 }
 
 /// The boot splash's hash: the first stable frame
-/// ([`boots_to_first_real_frame`]).
-const SPLASH_HASH: u64 = 0x5599_c270_ab04_29fa;
+/// ([`boots_to_first_real_frame`]). v392's splash ("Hack the North x
+/// SOLANA", footer "FW v0.1.2-392-gd3089c4"); v335's was
+/// `0x5599_c270_ab04_29fa`.
+const SPLASH_HASH: u64 = 0xfb30_5408_a9e5_0e98;
 
 /// The sampling chunk of [`run_until_stable_frame`].
 const FRAME_CHUNK: u32 = 250_000;
@@ -909,23 +948,25 @@ fn assert_no_panic_text(rt: &FirmwareRuntime) {
 
 /// Milestone 3's finish line: the real firmware boots to its first stable
 /// ST7789 frame, the boot splash, pinned by hash. The first non-blank
-/// frame (about step 1.125M) is not the finished splash; the framebuffer
-/// changes many times before it settles (from step ~4.43M), so the test
-/// pins the first frame that holds for [`BOOT_STABLE_FOR`] steps (found at
-/// the 5,500,000-step sample). `MAX` is the stable step × 2, rounded up.
+/// frame (about step 1.138M) is not the finished splash; the framebuffer
+/// changes many times before it settles (v392: from step 4,250,000), so
+/// the test pins the first frame that holds for [`BOOT_STABLE_FOR`] steps
+/// (found at the 5,250,000-step sample). `MAX` is the stable step × 2,
+/// rounded up.
 ///
 /// The hash is of this framebuffer's row/column order. MADCTL is not
 /// modeled (the notes' "Known limitations"); the splash and the first-run
-/// screen were compared by eye with the physical badge and match in
-/// orientation, so a MADCTL model that keeps the image as the badge shows
-/// it would leave the hash unchanged.
+/// screen were compared by eye with the physical badge on v335
+/// (2026-10-06 and 2026-10-07) and match in orientation, so a MADCTL model
+/// that keeps the image as the badge shows it would leave the hash
+/// unchanged. v392's splash was checked by eye in Milestone 9.
 ///
 /// Inspect a failing frame with
 /// `cargo run -p emulator-core --release --example boot-probe -- --steps 5000000 --dump-frame first-frame.png`
 /// (writes under the gitignored `local/`).
 #[test]
 fn boots_to_first_real_frame() {
-    const MAX: u64 = 8_900_000;
+    const MAX: u64 = 8_500_000;
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("boot");
     let (hash, step) = run_until_stable_frame(&mut rt, MAX, BOOT_STABLE_FOR, &[]);
     let distinct: std::collections::HashSet<u16> = rt.framebuffer().iter().copied().collect();
@@ -945,8 +986,9 @@ fn boots_to_first_real_frame() {
 const FIRST_RUN_HASH: u64 = 0x8c50_27ce_c0f7_9490;
 
 /// [`boots_to_first_run_screen`]'s cap: the frame is first sampled at step
-/// 15,250,000; that + 2,000,000, rounded up to a 250,000 multiple.
-const FIRST_RUN_MAX_STEPS: u64 = 17_250_000;
+/// 14,500,000 (v392; 15,250,000 on v335); that + 2,000,000, rounded up to
+/// a 250,000 multiple.
+const FIRST_RUN_MAX_STEPS: u64 = 16_500_000;
 
 /// Milestone 4's finish line: blank-flash boot reaches the first app's
 /// screen and it holds. The emulated flash has no identity
@@ -954,8 +996,8 @@ const FIRST_RUN_MAX_STEPS: u64 = 17_250_000;
 /// shows its unregistered first-run screen; on an unprovisioned badge it
 /// keeps HOME for itself, so the app launcher is reached only after
 /// provisioning ([`boots_to_launcher`]). Compared by eye with the physical
-/// badge after a factory reset on 2026-10-07: content and orientation
-/// match.
+/// badge after a factory reset on v335 (2026-10-07): content and
+/// orientation match. v392 draws the same frame (same hash).
 #[test]
 fn boots_to_first_run_screen() {
     let rt = first_run_screen();
@@ -1001,10 +1043,11 @@ fn run_for_us(rt: &mut FirmwareRuntime, us: u64) {
 }
 
 /// [`first_run_screen_responds_to_start`]'s cap: the self-test frame is
-/// first sampled at step 22,158,230 (the 100 ms hold took 5,658,230
-/// steps); that + [`AFTER_PRESS_STABLE_FOR`] + 1,000,000, rounded up to a
-/// 250,000 multiple.
-const SELF_TEST_MAX_STEPS: u64 = 31_250_000;
+/// first sampled at step 20,683,077 (v392: the 100 ms hold took 5,183,077
+/// steps from the first-run checkpoint at 15,500,000); that +
+/// [`AFTER_PRESS_STABLE_FOR`] + 1,000,000, rounded up to a 250,000
+/// multiple.
+const SELF_TEST_MAX_STEPS: u64 = 29_750_000;
 
 /// Button input reaches the firmware: from the stable first-run screen, a
 /// press and release of slot 0 (START) starts My Badge's hardware
@@ -1031,25 +1074,25 @@ fn first_run_screen_responds_to_start() {
 /// flash, as on the physical badge (the line follows `app_reg: launched My
 /// Badge`); the console runs the interrupt-driven USB-Serial-JTAG driver,
 /// so this needs Task 2's interrupt source. First printed at step
-/// 16,050,000 (10,000-step sampling); budget = that + 25%, rounded up to
-/// 1,000,000.
+/// 15,200,000 (v392, 10,000-step sampling; 16,050,000 on v335); budget =
+/// that + 25%, rounded up to 1,000,000.
 #[test]
 fn boot_starts_the_console() {
-    assert_reaches("hal_console: console started", 21_000_000);
+    assert_reaches("hal_console: console started", 19_000_000);
 }
 
 /// [`console_answers_prov_show_on_the_first_run_screen`] and later
-/// provisioning rungs: total-step deadline. Measured (Milestone 6 Task
-/// D-M6-1): the prompt appears at 16.04M (1,000-step sampling), `put` is
-/// READY at 16.55M, `prov apply` answers by 17.00M, and the stable-frame
-/// check after it ends at 18.20M (50,000-step sampling); that + 25%,
-/// rounded up to 1,000,000.
-const CONSOLE_DEADLINE: u64 = 23_000_000;
+/// provisioning rungs: total-step deadline. Measured on v392 (Milestone
+/// 9): the prompt is out by 15.12M (10,000-step sampling), before the
+/// first-run checkpoint at 15.50M; [`console_rejects_an_empty_identity`]'s
+/// `prov apply` answers at 19.30M and its stable-frame check ends at
+/// 20.30M (50,000-step sampling); that + 25%, rounded up to 1,000,000.
+const CONSOLE_DEADLINE: u64 = 26_000_000;
 
 /// [`put_accepts_a_payload_larger_than_the_rx_ring`]: total-step deadline.
-/// Measured (Milestone 6 Task D-M6-1): finished at 17.18M (50,000-step
+/// Measured on v392 (Milestone 9): finished at 16.43M (50,000-step
 /// sampling, host-paced chunks); that + 25%, rounded up to 1,000,000.
-const RING_TEST_DEADLINE: u64 = 22_000_000;
+const RING_TEST_DEADLINE: u64 = 21_000_000;
 
 // ---------------------------------------------------------------------
 // Checkpoints. A `FirmwareRuntime` clone is a full snapshot (pinned by
@@ -1144,16 +1187,20 @@ fn console_rejects_an_empty_identity() {
 // HOME to the launcher. The identities are the committed fake fixtures
 // (`provision::identity_fixture`, R-M5-2: permission relayed 2026-10-08).
 // Measured with every role (Task 4); the input sequence is the same for
-// every role. Frame comparison with the physical badge (2026-10-08, the
-// human partner's badge, role hacker): the registered screen, every
-// onboarding page, the launcher and the launcher after DOWN match. The
-// other roles' frames were not compared on hardware.
+// every role. Frame comparison with the physical badge, on v335
+// (2026-10-08, the human partner's badge, role hacker): the registered
+// screen, every onboarding page, the launcher and the launcher after DOWN
+// match. The other roles' frames were not compared on hardware. On v392
+// (Milestone 9) the registered screens, onboarding pages 2 and 4 to 11,
+// the shaken page and the launcher after DOWN keep their v335 hashes;
+// page 1, page 3's button frames and the launcher changed and were
+// checked by eye in Milestone 9, not on hardware.
 // ---------------------------------------------------------------------
 
 /// Total-step deadline for provisioning from the first-run screen: the
-/// slowest role (workshop_lead) prints `PROV OK` at 28.39M (all roles
-/// 28.19M..28.39M, host-paced `put`, 50,000-step sampling); + 25%,
-/// rounded up to 1,000,000.
+/// slowest role (workshop_lead) prints `PROV OK` at 28.74M on v392 (all
+/// roles 28.54M..28.74M, host-paced `put`, 50,000-step sampling; v335:
+/// 28.39M); + 25%, rounded up to 1,000,000.
 const PROVISION_DEADLINE: u64 = 36_000_000;
 /// How long after a press (or the shake) a response may take to start:
 /// page 7 settled about 9M steps after A under the pre-Milestone-6 clock
@@ -1161,19 +1208,20 @@ const PROVISION_DEADLINE: u64 = 36_000_000;
 /// 3), so a response's cap is [`AFTER_PRESS_STABLE_FOR`] plus this.
 const ONBOARDING_RESPONSE_MARGIN: u64 = 16_000_000;
 /// Raw slots from onboarding page 1 to page 6, each with the stable frame
-/// it leads to (role hacker).
+/// it leads to (role hacker). v392's page 3 asks for 8 buttons ("Press all
+/// 8 buttons once"): v335's Aux1 tile (raw slot 8) is gone, and a press of
+/// slot 8 leaves the frame unchanged, so the walk no longer presses it.
 const TO_SHAKE_PAGE: &[(usize, u64)] = &[
     (1, 0xe788_a781_9328_1b08), // A: page 2 "This is you"
-    (1, 0x9621_b8aa_8b04_0d38), // A: page 3 "Try every button"
-    (1, 0xa283_f1b3_a862_abff), // A lit
-    (2, 0x8522_bf8d_fccb_6084), // B
-    (7, 0xb9e7_b94d_dd89_9859), // UP
-    (5, 0x362f_6120_6bea_4a4f), // LEFT
-    (6, 0x16eb_495b_b805_251a), // RIGHT
-    (4, 0x8a7a_4dff_6454_46d3), // DOWN
-    (8, 0xc6fb_a44d_8132_2795), // Aux1
-    (3, 0x824a_fde3_f915_a562), // HOME (captured on page 3)
-    (0, 0x3a72_5bc1_0083_f74a), // START: all nine done
+    (1, 0x38a9_d040_707c_c4e8), // A: page 3 "Try every button"
+    (1, 0x8a68_96e1_b5c9_5d6b), // A lit
+    (2, 0x8b0b_8358_e2b5_d6e8), // B
+    (7, 0xf38f_281c_4b05_dabd), // UP
+    (5, 0xb185_0f5c_8931_2eb3), // LEFT
+    (6, 0x5266_68ba_6df4_b25e), // RIGHT
+    (4, 0x3d7b_e2d1_7265_7413), // DOWN
+    (3, 0x1fd7_15c4_6f18_7c4c), // HOME (captured on page 3)
+    (0, 0xc2eb_c5fd_5353_2d8c), // START: all eight done
     (1, 0xc1ad_004b_a5f7_7b78), // A: page 4 "Lights"
     (1, 0x7598_def3_0e83_8832), // A: page 5 "Tap to unlock"
     (1, 0x4a54_e5a4_0d66_9898), // A: page 6 "Shake it!", G-force 1000 mg
@@ -1202,48 +1250,53 @@ const AFTER_SHAKE_PAGES: &[(usize, Option<u64>)] = &[
 /// firmware work, not a human's timing).
 const ANIMATED_PAGE_STEPS: u32 = 9_000_000;
 /// Setup's last press (START) to My Badge's registered screen: first
-/// stable 4.5M..5.5M steps after the release, for every role.
+/// stable 3.75M..4.25M steps after the release, for every role (v392;
+/// 4.5M..5.5M on v335).
 const REGISTERED_RESPONSE_STEPS: u64 = AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
 /// The role on the human partner's physical badge (Task 5).
 const OWN_ROLE: &str = "hacker";
 /// Raw slot from the registered screen to the launcher: HOME alone. The
-/// launcher draws about 12.25M steps after the release (the console says
-/// `launched Launcher` about 2.6M after the release, while the registered
-/// frame is still on screen).
+/// launcher draws about 11.5M steps after the release (v392; 12.25M on
+/// v335; the console says `launched Launcher` about 2.75M after the
+/// release, 2.6M on v335, while the registered frame is still on screen).
 const TO_LAUNCHER_SLOT: usize = 3;
-/// HOME's response: release to first stable launcher 12.25M (role hacker
-/// and workshop_lead, the roles the rungs walk there), then
-/// [`AFTER_PRESS_STABLE_FOR`] more to confirm, 20.25M; + 25%, rounded up to
-/// 1,000,000.
-const LAUNCHER_RESPONSE_STEPS: u64 = 26_000_000;
+/// HOME's response: release to first stable launcher 11.5M on v392 (role
+/// hacker and workshop_lead, the roles the rungs walk there; 12.25M on
+/// v335), then [`AFTER_PRESS_STABLE_FOR`] more to confirm, 19.5M; + 25%,
+/// rounded up to 1,000,000.
+const LAUNCHER_RESPONSE_STEPS: u64 = 25_000_000;
 /// The launcher: a 4x4 icon grid titled "My Badge", first icon selected.
-/// The same for all 11 roles (measured).
-const LAUNCHER_HASH: u64 = 0xb694_a61f_ebfd_62ff;
+/// The same for all 11 roles (measured on v335 and on v392). v392's
+/// differs from v335's (`0xb694_a61f_ebfd_62ff`) in a few pixels, with
+/// the same grid and order.
+const LAUNCHER_HASH: u64 = 0x94d7_a7a8_5fa9_3ea3;
 /// DOWN: moves the launcher's selection one row (My Badge to "Share").
 const NAV_SLOT: usize = 4;
-/// The launcher after one DOWN (first stable 1.25M steps after release).
+/// The launcher after one DOWN (first stable 0.75M steps after release on
+/// v392; 1.25M on v335). Unchanged from v335.
 const LAUNCHER_AFTER_NAV_HASH: u64 = 0xa2b9_da1f_0e36_757c;
 
 /// (role, onboarding page 1 hash, registered My Badge screen hash), in
 /// `ROLE_TABLE` order. Both screens show the fake identity's name (and the
 /// role colour), so every role differs. Only hacker's were compared with
-/// the physical badge.
+/// the physical badge, on v335 (2026-10-08). v392 re-pinned every page 1
+/// (checked by eye in Milestone 9); the registered screens are unchanged.
 const ROLE_ROWS: &[(&str, u64, u64)] = &[
-    ("hacker", 0xd364_7661_7b1a_89b5, 0xbd6d_7613_08a7_bf24),
-    ("organizer", 0x5dba_66e0_b019_1c24, 0x1974_c49f_a562_08a3),
-    ("sponsor", 0x997d_dc94_a332_cb23, 0x0bc2_dee2_1a99_c4c0),
-    ("judge", 0xa681_3acc_1906_5c12, 0x54f8_e3d0_65a3_04c1),
-    ("mentor", 0x2619_ad73_bf0d_7e86, 0x03a9_7611_bf45_9332),
-    ("volunteer", 0x05f0_cede_9341_fc3f, 0xfd95_a0e7_844f_4019),
-    ("media", 0x49ee_edbe_2a64_a1d6, 0x5092_210f_e8d8_f1d2),
-    ("staff", 0xc270_f7ca_eb37_28d3, 0xc68e_18b7_16ef_40ea),
-    ("general", 0xa6a3_0959_d158_ab93, 0x4574_d9ed_d13c_330a),
+    ("hacker", 0xbf9c_cb7e_80b4_4b1a, 0xbd6d_7613_08a7_bf24),
+    ("organizer", 0x3c31_f95a_a12e_406f, 0x1974_c49f_a562_08a3),
+    ("sponsor", 0xc5ba_681b_7473_21bc, 0x0bc2_dee2_1a99_c4c0),
+    ("judge", 0x192b_1f45_de51_5d49, 0x54f8_e3d0_65a3_04c1),
+    ("mentor", 0x4929_00a1_98c0_3e4d, 0x03a9_7611_bf45_9332),
+    ("volunteer", 0xd370_a34f_7bc7_d738, 0xfd95_a0e7_844f_4019),
+    ("media", 0xa0b0_7c3c_ff8f_289d, 0x5092_210f_e8d8_f1d2),
+    ("staff", 0xe912_c748_aab7_152c, 0xc68e_18b7_16ef_40ea),
+    ("general", 0x0c04_ea57_eeb8_f8ec, 0x4574_d9ed_d13c_330a),
     (
         "workshop_lead",
-        0xf723_ec7a_d14b_c6e3,
+        0x96a7_9955_fffc_187c,
         0xf8e2_3246_19a6_4d76,
     ),
-    ("visitor", 0x6e32_6aa6_bcd6_c3f1, 0x647a_71d4_5ab8_cf23),
+    ("visitor", 0x2770_ab89_5a47_e576, 0x647a_71d4_5ab8_cf23),
 ];
 
 fn role_row(role: &str) -> (u64, u64) {
@@ -1480,7 +1533,8 @@ fn launcher_for(role: &str) -> FirmwareRuntime {
 
 /// Milestone 5 finish line: a provisioned badge reaches the app launcher.
 /// The input sequence and every pinned frame on the way were compared
-/// with the physical badge on 2026-10-08 (role hacker).
+/// with the physical badge on v335 (2026-10-08, role hacker); v392's
+/// changed frames were checked by eye in Milestone 9.
 #[test]
 fn boots_to_launcher() {
     let rt = launcher_for(OWN_ROLE);
@@ -1498,7 +1552,8 @@ fn launcher_is_role_independent() {
 }
 
 /// The launcher takes input: one [`NAV_SLOT`] press moves the selection,
-/// as on the badge (compared 2026-10-08).
+/// as on the badge (compared on v335, 2026-10-08; v392 draws the same
+/// frame).
 #[test]
 fn launcher_responds_to_navigation() {
     let mut rt = launcher_for(OWN_ROLE);
@@ -1519,7 +1574,7 @@ const TO_DICE: &[(usize, u64)] = &[
     (6, 0x3043_c575_7906_740d),   // RIGHT: "Dice"
 ];
 /// Dice's first stable frame: title "Dice", "d20", "--", footer
-/// "L/R: die   A or SHAKE: roll" (stable about 3.25M steps after A's
+/// "L/R: die   A or SHAKE: roll" (stable about 2.75M steps after A's
 /// release).
 const DICE_OPEN_HASH: u64 = 0x9be3_a420_5d54_f3ff;
 /// Dice after one A: a d20 roll showing "2". The value comes from
@@ -1530,7 +1585,7 @@ const DICE_ROLLED_HASH: u64 = 0x692c_6023_de06_d917;
 
 /// Milestone 5 stretch: a built-in app opens from the launcher. A on Dice
 /// launches it (`launched Dice`), its first frame is pinned, and A rolls.
-/// The open frame and the roll were compared with the physical badge on
+/// The open frame and the roll were compared with the physical badge on v335,
 /// 2026-10-08 (layout, not the rolled value); the navigation frames on the
 /// way were not.
 #[test]
@@ -1623,14 +1678,14 @@ const SNAKE_OPEN_FRAME_US: u64 = 150_000;
 /// Snake's start screen: title "Snake", "Start to pause", "Score 0 Hi 0",
 /// the empty play area with the snake and one food dot (its position comes
 /// from the emulator's fixed-seed RNG, `peripherals::apb_ctrl::RNG_SEED`,
-/// so it is not the badge's). Compared with the physical badge on
+/// so it is not the badge's). Compared with the physical badge on v335,
 /// 2026-10-20 (Task 5): the layout matches; the food position differs.
 const SNAKE_OPEN_HASH: u64 = 0xe7d5_38c7_42f1_9d89;
 
 /// Milestone 6: Snake opens from the launcher. Its frame
 /// [`SNAKE_OPEN_FRAME_US`] after A's release is pinned (Snake moves without
 /// waiting for a key, so no frame is stable for [`AFTER_PRESS_STABLE_FOR`]);
-/// the frame was compared with the physical badge on 2026-10-20 (Task 5).
+/// the frame was compared with the physical badge on v335, 2026-10-20 (Task 5).
 #[test]
 fn launcher_opens_snake() {
     let mut rt = snake_open();
@@ -1689,11 +1744,11 @@ const SNAKE_TO_WALL_WINDOW_US: u64 = 3_000_000;
 /// 11 moves right (one cell per 170 ms tick, from the middle of the area to
 /// the right-most column), then the game-over redraw on the 12th tick,
 /// which [`move_times`] counts as the 12th change. The badge also makes
-/// 11 moves to the wall (compared on 2026-10-20, Task 5).
+/// 11 moves to the wall (compared on v335, 2026-10-20, Task 5).
 const SNAKE_MOVES_TO_WALL: usize = 12;
 /// The game-over frame: a "Game over / A to restart" box over the play
 /// area, the snake's head in the right-most column. Compared with the
-/// physical badge on 2026-10-20 (Task 5).
+/// physical badge on v335, 2026-10-20 (Task 5).
 const SNAKE_GAME_OVER_HASH: u64 = 0x3582_df91_6283_9f3a;
 /// The physical badge's time between Snake moves: the mean over 10
 /// intervals of an untouched run into the wall, measured frame by frame
@@ -1716,7 +1771,7 @@ const SNAKE_RESTART_WINDOW_US: u64 = 600_000;
 
 /// With no input the snake runs into the wall: "Game over / A to
 /// restart" after [`SNAKE_MOVES_TO_WALL`] changes of the play area (the
-/// count and the frame were compared with the badge on 2026-10-20, Task
+/// count and the frame were compared with the badge on v335, 2026-10-20, Task
 /// 5); A restarts, and the new game moves at the badge's pace.
 #[test]
 fn snake_hits_wall_game_over() {
@@ -1818,7 +1873,7 @@ fn snake_moves_on_its_own() {
 const SNAKE_TURN_SLOT: usize = 7;
 /// The frame after one turn UP: the snake is an L, its head one cell
 /// above the second cell (head at (172, 126)). The human compared this
-/// frame with the badge on 2026-10-20 (Task 5's `after-turn` frame).
+/// frame with the badge on v335, 2026-10-20 (Task 5's `after-turn` frame).
 const SNAKE_TURNED_HASH: u64 = 0xcccb_b8c5_d80a_93e9;
 
 /// A direction press turns the snake on the next move. Timing, from A's
@@ -1960,7 +2015,10 @@ fn run_until_ends_idle_frames_at_the_target() {
 // merge), what the core executes over early boot and where the longest
 // checkpoint chain ends. Their constants were measured at `6cd0a6e` and
 // must never be re-pinned in Milestone 7: a mismatch is a bug in the
-// change. `bench_redraws` (ignored) measures the busy redraws the
+// change. Milestone 9 swapped the firmware to v392 and re-pinned them
+// once, from the fully re-pinned walk (Task 2; the values are in
+// `docs/milestone-9-decisions.md`, "Re-pins"); from then on the same
+// rule holds. `bench_redraws` (ignored) measures the busy redraws the
 // milestone is about; its results go in `docs/milestone-7-decisions.md`.
 // ---------------------------------------------------------------------
 
@@ -2003,9 +2061,10 @@ fn execution_digest(steps: u64) -> u64 {
 }
 
 /// [`execution_digest`] of the first 20,000,000 steps of blank-flash boot
-/// (through the console REPL's start), pinned at `6cd0a6e`. Never re-pin
-/// it in Milestone 7.
-const EXECUTION_DIGEST: u64 = 0x30e1_c4af_04a0_f326;
+/// (through the console REPL's start), pinned at `6cd0a6e` and re-pinned for
+/// v392 in Milestone 9 (v335: `0x30e1_c4af_04a0_f326`). Never re-pin
+/// it for a performance change.
+const EXECUTION_DIGEST: u64 = 0x0ae0_2ec4_374c_d285;
 
 /// Milestone 7 equivalence proof: FNV-1a over every step's `pc` for the
 /// first 20M steps of blank-flash boot, plus all 32 registers every
@@ -2016,14 +2075,17 @@ fn execution_digest_is_unchanged() {
 }
 
 /// Total steps at hacker's launcher checkpoint ([`launcher_for`]), pinned
-/// at `6cd0a6e`. Never re-pin it in Milestone 7.
-const HACKER_LAUNCHER_STEPS: u64 = 372_597_011;
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
+/// performance change.
+const HACKER_LAUNCHER_STEPS: u64 = 342_600_776;
 /// Emulated time at hacker's launcher checkpoint, in microseconds, pinned
-/// at `6cd0a6e`. Never re-pin it in Milestone 7.
-const HACKER_LAUNCHER_US: u64 = 98_461_748;
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
+/// performance change.
+const HACKER_LAUNCHER_US: u64 = 94_521_615;
 /// FNV-1a of the whole console output at hacker's launcher checkpoint,
-/// pinned at `6cd0a6e`. Never re-pin it in Milestone 7.
-const HACKER_LAUNCHER_CONSOLE_HASH: u64 = 0xd042_f54c_287b_c3ef;
+/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin
+/// it for a performance change.
+const HACKER_LAUNCHER_CONSOLE_HASH: u64 = 0xabcd_cc17_7a35_80fe;
 
 /// Milestone 7 equivalence proof at the end of the longest chain: hacker's
 /// launcher checkpoint (`launcher_for`).
@@ -2050,24 +2112,27 @@ struct Redraw {
 }
 
 /// HOME from hacker's registered screen to the launcher (3 s window),
-/// pinned at `6cd0a6e`. Never re-pin it in Milestone 7.
+/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin
+/// it for a performance change.
 const HOME_REDRAW: Redraw = Redraw {
-    emulated_us: 254_000,
-    steps: 19_106_041,
+    emulated_us: 244_000,
+    steps: 18_292_336,
     end_hash: LAUNCHER_HASH,
 };
-/// DOWN on hacker's launcher (1.5 s window), pinned at `6cd0a6e`. Never
-/// re-pin it in Milestone 7.
+/// DOWN on hacker's launcher (1.5 s window), pinned at `6cd0a6e`,
+/// re-pinned for v392 in Milestone 9. Never re-pin it for a performance
+/// change.
 const DOWN_REDRAW: Redraw = Redraw {
-    emulated_us: 115_000,
-    steps: 6_858_235,
+    emulated_us: 109_000,
+    steps: 7_942_619,
     end_hash: LAUNCHER_AFTER_NAV_HASH,
 };
 /// A from onboarding page 1 to page 2 (role hacker, 3 s window), pinned
-/// at `6cd0a6e`. Never re-pin it in Milestone 7.
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
+/// performance change.
 const ONBOARDING_REDRAW: Redraw = Redraw {
-    emulated_us: 67_000,
-    steps: 3_018_254,
+    emulated_us: 52_000,
+    steps: 2_547_134,
     end_hash: TO_SHAKE_PAGE[0].1,
 };
 

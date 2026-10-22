@@ -7,7 +7,7 @@
 //! account of what was observed.
 //!
 //! Reads `firmware.bin` directly from `../frontend/public/firmware/firmware.bin`
-//! (relative to this crate) rather than duplicating the 2.7 MB file into
+//! (relative to this crate) rather than duplicating the 2.65 MB file into
 //! `tests/fixtures/`.
 
 use emulator_core::boot::boot_from_firmware_image;
@@ -27,7 +27,7 @@ fn boots_real_firmware_image_without_panicking_and_reaches_step_budget() {
         "reading frontend/public/firmware/firmware.bin \
          (expected to be committed at the repo's frontend/public/firmware/)",
     );
-    assert_eq!(image.len(), 2_752_512, "unexpected firmware.bin size");
+    assert_eq!(image.len(), 2_651_840, "unexpected firmware.bin size");
 
     let (mut cpu, mut bus) =
         boot_from_firmware_image(&image).expect("real firmware.bin should parse and boot");
