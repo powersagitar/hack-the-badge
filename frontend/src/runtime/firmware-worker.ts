@@ -1,7 +1,7 @@
 /**
  * The firmware Worker (Milestone 7 Task 8): owns the WASM emulator and the
- * whole of `./firmware-runtime.ts`'s `FirmwareRuntime` (pacing, press-hold
- * deferral, shake schedule, provisioner), so the main thread does no
+ * whole of `./firmware-runtime.ts`'s `FirmwareRuntime` (pacing, the button
+ * tap queue, shake schedule, provisioner), so the main thread does no
  * emulation. `./firmware-worker-client.ts` is the main-thread side; the
  * messages are `./firmware-worker-protocol.ts`.
  *

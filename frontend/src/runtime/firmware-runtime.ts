@@ -407,20 +407,25 @@ export function createFirmwareRuntime(
   }
 
   /**
-   * Drops every queued tap and releases a held button the user has let go
-   * of. A button the user is still holding stays down, as its only tap.
+   * Drops every queued tap and releases a button held down in the emulator
+   * that the user has let go of. One the user is still holding stays down,
+   * as its only tap. Release times are kept: emulated time does not move
+   * while the loop is stopped, so the next press still waits
+   * `RELEASE_GAP_US`.
    */
   function flushTaps(): void {
     for (const [button, state] of buttonTaps) {
       if (state.downSince !== null && !state.taps[0]) {
         state.taps.length = 1;
-      } else {
-        // Don't strand a button whose deferred release we are dropping.
-        if (state.downSince !== null) handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
-        state.taps.length = 0;
-        state.downSince = null;
+        continue;
       }
-      state.upSince = null;
+      if (state.downSince !== null) {
+        // Don't strand a button whose deferred release we are dropping.
+        handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+        state.upSince = handle.emulatedTimeUs();
+      }
+      state.taps.length = 0;
+      state.downSince = null;
     }
   }
 
@@ -504,9 +509,11 @@ export function createFirmwareRuntime(
     lastShakeAccel = null;
     flushTaps();
     // Emulated time restarts at zero: a still-held tap counts as held long
-    // enough, so it is released as soon as the user lets go.
+    // enough, so it is released as soon as the user lets go, and the
+    // firmware boots with no release to keep a gap from.
     for (const state of buttonTaps.values()) {
       if (state.downSince !== null) state.downSince = -PRESS_HOLD_US;
+      state.upSince = null;
     }
     speed = 0;
     lastWallMs = null;

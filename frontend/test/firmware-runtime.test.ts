@@ -695,6 +695,64 @@ describe("FirmwareRuntime press hold", () => {
     expect(buttonCalls.length).toBe(2);
   });
 
+  test("a tap right after stop() and start() still waits RELEASE_GAP_US", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    rt.start();
+    setTimeUs(1_000);
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.stop(); // releases A at 1,000 µs; emulated time does not move while stopped
+    rt.start();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    setTimeUs(1_000 + RELEASE_GAP_US);
+    frame();
+    expect(buttonCalls.at(-1)).toEqual([A, true]);
+  });
+
+  test("stop() keeps a button the user still holds, and the release frees it", () => {
+    const { rt, buttonCalls, setTimeUs } = rig();
+    rt.start();
+    rt.injectButton("A", "pressed");
+    rt.stop();
+    expect(buttonCalls).toEqual([[RAW_SLOT_BY_BUTTON.A, true]]);
+    rt.start();
+    setTimeUs(PRESS_HOLD_US);
+    rt.injectButton("A", "released");
+    expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
+  });
+
+  test("a release with no press before it is ignored", () => {
+    const { rt, buttonCalls } = rig();
+    rt.start();
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([]);
+  });
+
+  test("a press is accepted again once the full queue has room", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    rt.start();
+    for (let i = 0; i < MAX_QUEUED_TAPS; i++) {
+      rt.injectButton("DOWN", "pressed");
+      rt.injectButton("DOWN", "released");
+    }
+    setTimeUs(PRESS_HOLD_US);
+    frame(); // the first tap is released: one slot free
+    rt.injectButton("DOWN", "pressed");
+    rt.injectButton("DOWN", "released");
+    const span = (MAX_QUEUED_TAPS + 2) * (PRESS_HOLD_US + RELEASE_GAP_US);
+    for (let t = PRESS_HOLD_US; t <= span; t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    expect(buttonCalls.filter(([, p]) => p).length).toBe(MAX_QUEUED_TAPS + 1);
+  });
+
   test("a button still held across reset is released as soon as the user lets go", () => {
     const { rt, buttonCalls, setTimeUs } = rig();
     rt.start();
