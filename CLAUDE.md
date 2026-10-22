@@ -157,9 +157,9 @@ frontend/src/
                         Firmware runtime over the WASM handle: wall-clock
                         pacing (runUntil by the wall delta, clamped and
                         step-capped; a capped frame drops its debt), the
-                        button name -> raw slot table, the minimum press
-                        hold, provision() and shake(). It runs inside the
-                        Worker.
+                        button name -> raw slot table, the per-button tap
+                        queue (press hold, release gap), provision() and
+                        shake(). It runs inside the Worker.
   runtime/firmware-worker.ts
                         Web Worker that owns the runtime and runs it in
                         capped slices: one frame in flight, a throttled

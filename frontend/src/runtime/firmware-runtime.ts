@@ -15,7 +15,7 @@
  * (or an immediate yield while the core is behind, ruling R-T8-1), capped
  * at `WORKER_STEPS_PER_SLICE` steps, timed by the `now` option, and
  * `present` posts the framebuffer to the main thread, where
- * `./firmware-worker-client.ts` paints it. The press-hold deferral, the
+ * `./firmware-worker-client.ts` paints it. The button tap queue, the
  * shake schedule and the provisioner below therefore all live in the
  * Worker, unchanged. The in-thread shape (a `requestAnimationFrame` loop
  * whose `present` blits with `src/render/framebuffer.ts`, capped at
@@ -149,6 +149,24 @@ export const PROVISION_TIMEOUT_STEPS = 60_000_000;
  */
 export const PRESS_HOLD_US = 100_000;
 
+/**
+ * Minimum emulated time a button stays released before its next press:
+ * 40 ms. The firmware's debouncer posts a change after two equal scans, so
+ * a shorter gap merges two taps into one press. Measured from the launcher
+ * (Milestone 8): two 100 ms DOWN presses move the selection twice from a
+ * 20 ms gap up, at ten scan phases, and once from 15 ms down; 40 ms is
+ * twice the measured minimum.
+ */
+export const RELEASE_GAP_US = 40_000;
+
+/**
+ * Most taps one button queues, the held one included. Each takes at least
+ * `PRESS_HOLD_US` + `RELEASE_GAP_US` (140 ms) of emulated time, so the cap
+ * bounds how long a burst of taps keeps replaying after the hand stops;
+ * taps beyond it are dropped.
+ */
+export const MAX_QUEUED_TAPS = 8;
+
 /** Emulated µs per shake half-period (`SHAKE_HALF_US` in boot_progress.rs). */
 export const SHAKE_HALF_US = 62_500;
 const SHAKE_HALF_PERIODS = 6;
@@ -238,8 +256,9 @@ export interface FirmwareRuntime {
   /** Begins the per-frame step+blit loop. Idempotent while already running. */
   start(): void;
   /**
-   * Stops the loop and releases any button whose release was deferred (see
-   * `PRESS_HOLD_US`). Does not dispose the underlying emulator handle.
+   * Stops the loop, releases any button whose release was deferred (see
+   * `PRESS_HOLD_US`) and drops queued taps (see `MAX_QUEUED_TAPS`). Does
+   * not dispose the underlying emulator handle.
    */
   stop(): void;
   /** Mirrors `lifecycle.ts`'s `AppRuntime.injectButton` signature. */
@@ -322,11 +341,17 @@ export function createFirmwareRuntime(
   let shakeStartedAt: number | null = null;
   let lastShakeAccel: string | null = null;
   /**
-   * Per button: emulated time (µs) of its latest press, and a release
-   * deferred to an emulated time.
+   * Per button: its taps in order, each `true` once the user has let go
+   * (at most `MAX_QUEUED_TAPS`). The first is the one held in the emulator
+   * while `downSince` is set; the rest wait their turn. `upSince` is the
+   * emulated time (µs) of the button's last release, for `RELEASE_GAP_US`.
    */
-  const pressedAt = new Map<ButtonName, number>();
-  const pendingRelease = new Map<ButtonName, number>();
+  interface ButtonTaps {
+    taps: boolean[];
+    downSince: number | null;
+    upSince: number | null;
+  }
+  const buttonTaps = new Map<ButtonName, ButtonTaps>();
 
   function pollProvisioner(now: number): void {
     if (!provisioner) return;
@@ -354,22 +379,54 @@ export function createFirmwareRuntime(
     handle.setAcceleration(...a);
   }
 
-  function pollReleases(now: number): void {
-    for (const [button, at] of pendingRelease) {
-      if (now < at) continue;
-      pendingRelease.delete(button);
-      pressedAt.delete(button);
-      handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+  /**
+   * Plays `button`'s taps up to emulated time `now`: releases the held tap
+   * once the user has let go and it has been down `PRESS_HOLD_US`, and
+   * presses the next once the button has been up `RELEASE_GAP_US`.
+   */
+  function serviceTaps(button: ButtonName, state: ButtonTaps, now: number): void {
+    const slot = RAW_SLOT_BY_BUTTON[button];
+    for (;;) {
+      if (state.downSince !== null) {
+        if (!state.taps[0] || now - state.downSince < PRESS_HOLD_US) return;
+        handle.setRawButton(slot, false);
+        state.taps.shift();
+        state.downSince = null;
+        state.upSince = now;
+      } else {
+        if (state.taps.length === 0) return;
+        if (state.upSince !== null && now - state.upSince < RELEASE_GAP_US) return;
+        handle.setRawButton(slot, true);
+        state.downSince = now;
+      }
     }
   }
 
-  function releaseAllPending(): void {
-    // Don't strand a button whose deferred release we are dropping.
-    for (const button of pendingRelease.keys()) {
-      handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
-      pressedAt.delete(button);
+  function pollTaps(now: number): void {
+    for (const [button, state] of buttonTaps) serviceTaps(button, state, now);
+  }
+
+  /**
+   * Drops every queued tap and releases a button held down in the emulator
+   * that the user has let go of. One the user is still holding stays down,
+   * as its only tap. Release times are kept: emulated time does not move
+   * while the loop is stopped, so the next press still waits
+   * `RELEASE_GAP_US`.
+   */
+  function flushTaps(): void {
+    for (const [button, state] of buttonTaps) {
+      if (state.downSince !== null && !state.taps[0]) {
+        state.taps.length = 1;
+        continue;
+      }
+      if (state.downSince !== null) {
+        // Don't strand a button whose deferred release we are dropping.
+        handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+        state.upSince = handle.emulatedTimeUs();
+      }
+      state.taps.length = 0;
+      state.downSince = null;
     }
-    pendingRelease.clear();
   }
 
   function loop(timeMs: number): void {
@@ -390,7 +447,7 @@ export function createFirmwareRuntime(
     pollProvisioner(handle.totalSteps());
     const nowUs = handle.emulatedTimeUs();
     pollShake(nowUs);
-    pollReleases(nowUs);
+    pollTaps(nowUs);
     onFrame?.(r, delta);
     if (frameHandle !== null) {
       frameHandle = scheduleFrame(loop);
@@ -410,28 +467,28 @@ export function createFirmwareRuntime(
       cancelFrame(frameHandle);
       frameHandle = null;
     }
-    // With the loop stopped nothing would poll a deferred release.
-    releaseAllPending();
+    // With the loop stopped nothing would play the queued taps.
+    flushTaps();
   }
 
   function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
     if (!isButtonName(button)) return;
-    const slot = RAW_SLOT_BY_BUTTON[button];
-    const now = handle.emulatedTimeUs();
+    let state = buttonTaps.get(button);
+    if (!state) {
+      state = { taps: [], downSince: null, upSince: null };
+      buttonTaps.set(button, state);
+    }
+    const last = state.taps.length - 1;
     if (kind === "pressed") {
-      pendingRelease.delete(button);
-      pressedAt.set(button, now);
-      handle.setRawButton(slot, true);
-      return;
+      // A press while the last tap is still held is a repeat, not a tap.
+      if (last >= 0 && !state.taps[last]) return;
+      if (state.taps.length >= MAX_QUEUED_TAPS) return;
+      state.taps.push(false);
+    } else {
+      if (last < 0 || state.taps[last]) return;
+      state.taps[last] = true;
     }
-    const since = pressedAt.get(button);
-    if (since !== undefined && now - since < PRESS_HOLD_US) {
-      pendingRelease.set(button, since + PRESS_HOLD_US);
-      return;
-    }
-    pendingRelease.delete(button);
-    pressedAt.delete(button);
-    handle.setRawButton(slot, false);
+    serviceTaps(button, state, handle.emulatedTimeUs());
   }
 
   function provision(identityJson: string): void {
@@ -450,8 +507,14 @@ export function createFirmwareRuntime(
     lastState = null;
     shakeStartedAt = null;
     lastShakeAccel = null;
-    releaseAllPending();
-    pressedAt.clear();
+    flushTaps();
+    // Emulated time restarts at zero: a still-held tap counts as held long
+    // enough, so it is released as soon as the user lets go, and the
+    // firmware boots with no release to keep a gap from.
+    for (const state of buttonTaps.values()) {
+      if (state.downSince !== null) state.downSince = -PRESS_HOLD_US;
+      state.upSince = null;
+    }
     speed = 0;
     lastWallMs = null;
     // The emulator's acceleration survives a reset; put it back at rest.

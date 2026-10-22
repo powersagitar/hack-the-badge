@@ -497,8 +497,9 @@ nothing armed (negligible either way).
 Before `idle_until`, every 8.3 ms browser frame ended on the next 10 ms
 FreeRTOS tick, 1,667 us late, and the badge ran at 1.2x. The rungs, the
 WASM twin and the browser hold a button press for `PRESS_HOLD_US` =
-100 ms and shake in `SHAKE_HALF_US` = 62.5 ms half-periods of emulated
-time (`run_for_us` over `run_until`).
+100 ms (the browser also leaves `RELEASE_GAP_US` = 40 ms between
+taps of one button) and shake in `SHAKE_HALF_US` = 62.5 ms
+half-periods of emulated time (`run_for_us` over `run_until`).
 
 **CPI.** `cycles_per_step` = 1 says every instruction takes one CPU
 cycle. The real core takes more for some (loads, taken branches, divides,
@@ -2859,6 +2860,34 @@ Task 8 moved the browser's frame loop into a Web Worker (see "Timing
 model"); Task 9a fixed the dev server's `process is not defined`.
 Native HOME went from 0.18x to 1.08x of the badge, WASM HOME from 0.15x
 to 0.17x to about 0.6x.
+
+### Milestone 8: double taps
+
+The human reported that a quick second tap on a launcher arrow was
+dropped. The browser runtime held each press for `PRESS_HOLD_US` and
+deferred an early release, but a second press inside that hold cancelled
+the deferred release, so the firmware saw one long press with no release
+between the taps. The same happens natively: from the launcher, two
+100 ms DOWN presses with no gap move the selection once.
+
+Measured (release `boot_progress` scratch probes, not committed): two
+100 ms DOWN presses separated by a release gap move the selection twice
+from 20 ms up, at ten scan phases 1.1 ms apart, and once from 15 ms down,
+consistent with the debouncer's two equal scans. The browser now queues
+taps per button (`frontend/src/runtime/firmware-runtime.ts`): each is
+held at least `PRESS_HOLD_US`, the next is pressed after
+`RELEASE_GAP_US` = 40 ms (twice the measured minimum), at most
+`MAX_QUEUED_TAPS` = 8 wait. `stop()` and `reset()` drop the queue but
+keep a button the user still holds; `stop()` keeps the last release
+time, so a tap right after a resume still waits the gap. A double tap
+takes 240 ms of emulated time. No emulator-core change; every
+pin holds.
+
+Re-measured at the start (`96fe58c`): the launcher's DOWN redraw runs at
+0.97x in Bun's WASM and 1.44x natively, so moving around the launcher is
+at about the badge's speed; only entering it (HOME, 0.61x WASM) is slow.
+The block cache was deferred until the human judges the launcher after
+this fix.
 
 ## Emulated flash chip: what it contains
 

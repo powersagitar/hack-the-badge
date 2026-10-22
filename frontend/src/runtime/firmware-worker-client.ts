@@ -9,7 +9,8 @@
  *   once; every other message sent before the Worker's `ready` is queued
  *   and posted in order on `ready`. A press, a release and a `stop()` sent
  *   while the Worker boots therefore reach it in that order, and the
- *   Worker's `stop()` flushes the deferred release (no stranded button).
+ *   Worker's `stop()` flushes the deferred release and the queued taps
+ *   (no stranded button).
  * - Frames are painted on the next animation frame and then acknowledged
  *   (`frameAck`); only the latest is painted. While stopped, a frame is
  *   dropped and acknowledged at once, and `stop()` drops and acknowledges
@@ -18,7 +19,7 @@
  *   after a switch to Lua mode.
  * - While the page is hidden (`document.visibilitychange`) a started
  *   runtime is paused: the client posts `stop` (which flushes any
- *   deferred release) and posts `start` again when the page is visible.
+ *   deferred release and queued taps) and posts `start` again when the page is visible.
  *   A dedicated Worker is not throttled like main-thread
  *   `requestAnimationFrame`, so without this the firmware (Snake) would
  *   keep running unseen; this restores Milestone 6's pause (ruling
@@ -188,7 +189,8 @@ export function createWorkerFirmwareRuntime(
     stop(): void {
       running = false;
       pausedHidden = false;
-      // Sent even when paused or never started: stop() also flushes deferred releases.
+      // Sent even when paused or never started: stop() also flushes deferred
+      // releases and queued taps.
       send({ kind: "stop" });
       dropPendingFrame();
     },
