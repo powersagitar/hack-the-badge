@@ -5,604 +5,227 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A browser-based emulator for the "Hack the North 2026" hacker badge (an
-ESP32-C3 device), in two complementary modes:
+ESP32-C3 device), in two modes that share one `<canvas>`, one on-screen
+button pad/keyboard input, and a mode switch (`frontend/src/ui/shell.ts`,
+wired in `frontend/src/main.ts`):
 
-1. **Lua sandbox mode** (Milestone 1): the real badge runs hacker-sideloaded
-   apps as sandboxed Lua scripts (`main.lua` + `manifest.cfg`) against a
-   documented `badge.*` API. This repo emulates that with a Fengari
-   (pure-JS Lua 5.3) VM sandbox, a JS implementation of the `badge.*` API
-   surface, and a `<canvas>` renderer for the LVGL-ish widget tree.
-2. **Real-firmware mode** (Milestones 2–7): the badge's *built-in* apps (Snake,
-   Dice, etc.) are native RISC-V machine code baked into one monolithic
-   ESP-IDF app image — not extractable as Lua files (confirmed by
-   flash-dump forensics; see `docs/firmware-emulator-notes.md`). This mode
-   runs the actual dumped firmware (`frontend/public/firmware/factory.bin`) against
-   a from-scratch ESP32-C3 processor emulator (RV32IMC RISC-V core + a
-   minimal peripheral set) written in Rust and compiled to WebAssembly.
-   **Current state (end of Milestone 7):** emulated time follows the
-   firmware's own CPU clock (it switches between 40 and 80 MHz; one
-   instruction per cycle against the 16 MHz SYSTIMER), and boot runs
-   through the ESP-IDF
-   startup log, FreeRTOS and `app_main` (the boot splash is final from
-   about step 4.43M, `boots_to_first_real_frame`), formats and mounts
-   littlefs on the blank `storage` partition, and launches My Badge, which
-   on blank flash shows its unregistered **first-run screen**
-   (`boots_to_first_run_screen`; START opens the hardware self-test,
-   `first_run_screen_responds_to_start`). `app_main` then starts the
-   firmware's USB console REPL (`badge> ` at about step 16.0M). The **app
-   launcher is reached by provisioning a fake test identity through that
-   console** (the firmware's own `put /littlefs/identity.json <size>` and
-   `prov apply`), then walking the on-badge onboarding app ("Setup", 11
-   pages, including a shake on page 6) to My Badge's registered screen,
-   and pressing HOME (`boots_to_launcher`, about 365M steps for role
-   hacker; DOWN moves the selection, `launcher_responds_to_navigation`).
-   Every role's walk is a rung (`provisions_<role>_through_the_console`).
-   The registered, onboarding, launcher and navigation frames were
-   compared with the physical badge on 2026-10-08 (role hacker) and match.
-   From the launcher, Dice opens and rolls (`launcher_opens_dice`; the
-   open and roll frames and the roll animation were compared with the badge on
-   2026-10-08, the six navigation frames between the launcher and Dice are
-   pinned but not compared; the roll value comes from the emulator's
-   fixed-seed RNG). **Snake is playable** (DOWN x3, RIGHT x2, A): it
-   opens (`launcher_opens_snake`), moves at the badge's 170 ms per move
-   (`snake_moves_on_its_own`), steers (`snake_steers`), reaches game over
-   at the wall and restarts (`snake_hits_wall_game_over`), and eats
-   (stretch, `snake_eats`); the start, after-turn and game-over frames
-   and the speed were compared with the badge on 2026-10-20 and match
-   (the after-eat frame was not compared). Milestone 7 made the core
-   faster without moving a single pin (every step count, emulated time
-   and frame hash is byte-identical to `6cd0a6e`) and moved the browser
-   emulator into a Web Worker. In the browser the emulator is paced to
-   wall-clock time: Snake runs at about 1.0x; the core does about 40M to
-   42M steps/s in WASM (Chrome 155, Safari 27.0.1, Bun) and about 69M
-   natively, against the badge's 80M, so of the benchmark's busy
-   redraws, onboarding plays at 1.1x to 1.2x, the launcher's DOWN at
-   0.90x (Chrome) to 0.99x (Safari) and HOME at about 0.6x (Chrome
-   0.601x, Safari 0.627x; native 1.08x). The human accepted that speed
-   (2026-10-22); a block cache leads the Milestone 8 backlog. Read
-   `docs/firmware-emulator-notes.md`'s "Timing model" and "Known
-   limitations" (current state, open limitations, and the stall-by-stall
-   history) before assuming any other built-in app works in this mode.
-   Design decisions (some override the plan text, e.g. interrupt
-   threshold `>=`) are in `docs/milestone-3-decisions.md` through
-   `docs/milestone-7-decisions.md`; the last has the benchmark results,
-   the profiles and the Milestone 8 backlog.
+1. **Lua sandbox mode:** runs hacker-sideloaded apps (`main.lua` +
+   `manifest.cfg`) against a JS implementation of the badge's `badge.*`
+   API, in a Fengari (pure-JS Lua 5.3) sandbox.
+2. **Real-firmware mode:** runs the badge's actual dumped firmware
+   (`frontend/public/firmware/factory.bin`) on a from-scratch ESP32-C3
+   emulator (RV32IMC core + a minimal peripheral set) written in Rust and
+   compiled to WebAssembly. The built-in apps (Snake, Dice, …) are native
+   RISC-V code in one ESP-IDF image and cannot be extracted as Lua.
 
-Both modes share the same on-screen button pad/keyboard input and the same
-`<canvas>` element, toggled via a mode switch in `frontend/src/ui/shell.ts` — that
-wiring has landed (see `frontend/src/main.ts`).
+**Current state:** the firmware boots to My Badge's first-run screen,
+provisions a fake test identity through its own USB console, walks the
+11-page onboarding app, and reaches the launcher. Dice and Snake work, and
+their key frames were compared with the physical badge. In the browser the
+emulator runs in a Web Worker, paced to wall-clock time. Snake plays at
+about 1.0x, but the launcher's HOME redraw plays at about 0.6x, because the
+WASM core does about 40M steps/s against the badge's 80M. Before assuming
+anything else works, read `docs/firmware-emulator-notes.md`, its "Timing
+model" and "Known limitations" sections in particular. Design decisions are
+in `docs/milestone-3-decisions.md` through `docs/milestone-7-decisions.md`;
+the last one has the benchmark results and the Milestone 8 backlog, which a
+block cache leads.
 
 ## Repository layout
 
-The repo root holds three sibling modules plus shared docs:
-
-- `frontend/` — the Vite/TypeScript web app (its own `package.json`,
-  `src/`, `public/`, `test/`, `index.html`, configs).
+- `frontend/` — the Vite/TypeScript web app (its own `package.json`).
 - `emulator-core/` — the pure-Rust CPU/peripheral emulator crate.
 - `emulator-wasm/` — the wasm-bindgen shim crate over `emulator-core`.
-
-The root `Cargo.toml` is the Cargo workspace for the two Rust crates.
+- Root `Cargo.toml` — the Cargo workspace for the two crates, and the
+  build profiles: release at `opt-level = 3`, and the dev profile builds
+  `emulator-core` at `opt-level = 3` with debug assertions, so debug runs
+  its per-step cross-checks.
 
 ## Commands
 
-Use **Bun** for everything JS/TS — do not use npm/yarn/pnpm/node directly.
-The real package lives in `frontend/`; the root `package.json` is a thin
-proxy whose scripts forward to it (`bun run --cwd frontend ...`), so every
-command below works from the repo root or from `frontend/`. Cargo commands
-run from the repo root.
+Use **Bun** for everything JS/TS, never npm/yarn/pnpm/node. The root
+`package.json` forwards to `frontend/` (`bun run --cwd frontend ...`), so
+every command below works from the repo root or from `frontend/`. Run Cargo
+commands from the repo root.
 
-- `bun install` (in `frontend/`) or `bun run install:frontend` (from root) —
-  install dependencies into `frontend/node_modules/`
-- `bun run dev` — start the dev server (http://localhost:5173). The app
-  runs under it or under `bun run preview`; the bench page
-  (`/bench.html`) is served by the dev server only and is not in the
-  production build. (Vite's dependency pre-bundle gets the production
-  build's `process.env` define for fengari, Milestone 7 ruling R-T9a-1,
-  `frontend/vite.config.ts`.)
-- `bun run build` — production build to `frontend/dist/`
-- `bun run preview` — preview a production build
-- `bun test` — run unit tests (`bun test path/to/file.test.ts` for a single file;
-  the whole run, 172 tests, takes about 11 s, most of it the WASM twin
-  that provisions and walks to the launcher, `test/cpu-wasm.test.ts`)
-- `bun run typecheck` — type-check without emitting (`tsc --noEmit`)
+- `bun run install:frontend` (from root) or `bun install` (in `frontend/`).
+- `bun run dev`: dev server at http://localhost:5173. It also serves the
+  dev-only bench page `/bench.html`.
+- `bun run build`: production build to `frontend/dist/`. `bun run preview`
+  serves that build on port 4173.
+- `bun test`: unit tests, about 11 s. Most of that is the WASM twin that
+  provisions and walks to the launcher, `test/cpu-wasm.test.ts`. Run one
+  file with `bun test path/to/file.test.ts`.
+- `bun run typecheck`: `tsc --noEmit`.
 
-For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
+Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` target,
+plus `wasm-pack`.
 
-- Requires a Rust toolchain (`rustup`) with the `wasm32-unknown-unknown`
-  target, plus `wasm-pack` (`cargo install wasm-pack`).
-- `cargo test -p emulator-core` — fast native unit tests for the CPU
-  core/peripherals (no WASM round-trip; this is the primary iteration loop).
-- Build profiles (root `Cargo.toml`): release is `opt-level = 3` since
-  Milestone 7 (it was `"s"`; 1.65x native and 1.3x WASM steps/s for an
-  11 % larger `.wasm` at Task 3, 105.1 KB; 110.8 KB at the end of Milestone 7), and the dev profile builds
-  `emulator-core` at `opt-level = 3` with debug assertions on, so the
-  debug suite runs the debug-only cross-checks (the interrupt line gate,
-  the CPU clock decode, each decode-cache hit) on every step.
-- `bun run build:wasm` — rebuilds `frontend/src/cpu/wasm-pkg/` (gitignored
-  generated glue + `.wasm` binary) from `emulator-wasm/`. **Must be re-run after any
-  change under `emulator-core/`/`emulator-wasm/`**, before `bun run dev`,
-  `bun run build`, or `bun test` — nothing else regenerates it automatically.
-- `cargo test -p emulator-core --release --test boot_progress` — the
-  real-firmware boot ratchet: each test boots `factory.bin` and asserts a
-  console line, a no-fault point, or a framebuffer state. The finish line
-  is provisioning plus the launcher: `provisions_<role>_through_the_console`
-  (11 roles), `boots_to_launcher` and `launcher_responds_to_navigation`,
-  plus the stretch rung `launcher_opens_dice`; Milestone 6 adds Snake
-  (`launcher_opens_snake`, `snake_moves_on_its_own`, `snake_steers`,
-  `snake_hits_wall_game_over`, stretch `snake_eats`), the clock's
-  `boot_reports_the_badges_80_mhz_cpu_clock` and the pacing rung
-  `run_until_ends_idle_frames_at_the_target`
-  (Milestone 4's `boots_to_first_run_screen` and
-  `first_run_screen_responds_to_start` still hold on blank flash). The
-  identity walks are about 346M to 375M emulated steps each, so the suite
-  shares checkpoints (cloned `FirmwareRuntime`s in `OnceLock`s; the Snake
-  rungs branch from hacker's launcher). Milestone 7 adds the equivalence
-  pins `execution_digest_is_unchanged` and
-  `hacker_walk_totals_are_unchanged`, which no optimization may move.
-  Its 64 rungs (plus the ignored `bench_redraws`) take about 8 s on 18
-  cores (one chain of about 487M steps, hacker's walk to Dice, is the
-  floor; Milestone 6's 62 took about 42 s). The debug
-  `cargo test --workspace` runs the same rungs in about 12 s (about 13 s
-  wall with the other tests), because the
-  dev profile builds `emulator-core` at `opt-level = 3` (root
-  `Cargo.toml`). When boot moves, update the rung whose budget it
-  affects; the per-task history goes in the notes, not the test docs.
-  `cargo clippy --workspace --all-targets` reports 3 known warnings
-  (two doc-list indentations in `boot.rs`, one no-effect operation in a
-  `console.rs` test).
-- Benchmarks (Milestone 7; results in `docs/milestone-7-decisions.md`'s
-  Measurements, never part of a test run): native
-  `cargo test -p emulator-core --release --test boot_progress bench_redraws -- --ignored --nocapture`
-  (walks to hacker's launcher, then times the HOME, DOWN and onboarding
-  redraws from clones and checks their pinned end frames); WASM under
-  Bun `bun run bench:wasm` (three runs, median); Safari
-  `bun run bench:safari` (drives Safari through `safaridriver`, with
-  `bun run dev` running and remote automation allowed); any browser, the
-  dev server's `http://localhost:5173/bench.html`. Factor 1.0x is the
-  badge's speed; WASM rows compare only with WASM rows (ruling R-T2-1).
-- `cargo run -p emulator-core --release --example boot-probe -- [--steps N] [--window W] [--dump-frame PATH]`
-  — the "why is boot stuck" diagnostic: console output, run summary, hot
-  PCs, unmapped accesses, framebuffer diversity; `--dump-frame` writes a
-  PNG under `local/` (relative paths are confined there).
+- `cargo test -p emulator-core`: fast native unit tests, the primary
+  iteration loop.
+- `bun run build:wasm`: rebuilds `frontend/src/cpu/wasm-pkg/` (gitignored)
+  from `emulator-wasm/`. **Re-run it after any change under
+  `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
+  `bun run build` or `bun test`. Nothing else regenerates it.
+- `cargo test -p emulator-core --release --test boot_progress`: the
+  real-firmware boot ratchet, about 8 s.
+  - Each rung boots `factory.bin` and asserts a console line, a no-fault
+    point or a framebuffer hash.
+  - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
+  - When boot moves, update the rung whose budget it affects, and put the
+    history in the notes, not the test docs.
+  - `cargo test --workspace` runs the same rungs in debug, about 12 s.
+- `cargo clippy --workspace --all-targets` has 3 known warnings (two in
+  `boot.rs`, one in a `console.rs` test).
+- Benchmarks are never part of a test run; results go in
+  `docs/milestone-7-decisions.md`:
+  - `cargo test -p emulator-core --release --test boot_progress bench_redraws -- --ignored --nocapture`
+    (native);
+  - `bun run bench:wasm` (Bun);
+  - `bun run bench:safari` (needs `bun run dev` running and Safari's
+    remote automation enabled);
+  - any browser at `/bench.html`.
 
-Local-only data (`local/`, gitignored): the full flash dump, the real
-serial boot log and the esptool venv (`local/.venv/bin/python`; use it for
-any Python, never the system `python3`). Never commit anything from
-`local/`, and never quote the boot log's identity lines in code, tests,
-docs or commits. Committed tests depend only on `factory.bin` and committed
-synthetic data; code that needs the full dump reads `BADGE_FULL_DUMP` and
-skips when it is unset. The one committed identity data is the eleven
-obviously fake test identities in
-`frontend/public/firmware/test-identities/` (one per firmware role,
-written by hand from the traced schema), committed with the Hack the North
-organizers' permission relayed on 2026-10-08; a real attendee's identity
-never goes there. See the notes' "Data-handling note".
+  A factor of 1.0x is the badge's speed. Compare WASM rows only with WASM
+  rows.
+- `cargo run -p emulator-core --release --example boot-probe -- [--steps N] [--window W] [--dump-frame PATH]`:
+  the "why is boot stuck" diagnostic. It prints console output, hot PCs,
+  unmapped accesses and framebuffer diversity. `--dump-frame` writes a PNG
+  under `local/`.
+
+## Rules
+
+- **Performance work must not change emulated behaviour.** Every step
+  count, console needle, emulated time and frame hash in the suites stays
+  byte-identical. A pin that moves is a bug in the change, never something
+  to re-pin. The equivalence rungs `execution_digest_is_unchanged` and
+  `hacker_walk_totals_are_unchanged` guard this.
+- **Keep the core chip-agnostic.** `emulator-core/src/cpu/` and
+  `clock.rs` hold no ESP32-C3 constant. Chip data lives in `rom.rs`,
+  `mem/soc.rs` and `peripherals/`.
+- `FirmwareBus` uses ordered, concrete named fields, with no `dyn` dispatch.
+  SPI reads GPIO's D/C pin directly.
+- **Unmapped *data* access never panics** (it reads 0 and drops writes,
+  logged). An **unmapped instruction fetch always traps**. This asymmetry
+  is load-bearing. Browser input never panics the emulator.
+- `emulator-core` has no wasm-bindgen dependency. `emulator-wasm` stays
+  logic-free: one-line passthroughs only. `framebuffer()` returns an owned
+  `Vec`, to avoid a use-after-free across WASM heap growth.
+- Recorded decisions in `docs/milestone-*-decisions.md` stand unless the
+  human partner agrees to override one.
+- Register layouts come from ESP-IDF v5.5.3 headers, and ROM addresses from
+  ESP-IDF's linker scripts. Cite them in the module doc, and never guess.
+
+## Local data
+
+`local/` is gitignored. It holds:
+- the full flash dump;
+- the real serial boot log;
+- badge recordings;
+- the esptool venv. Use `local/.venv/bin/python` for any Python, never the
+  system `python3`.
+
+The rules for this data:
+- Never commit anything from `local/`.
+- Never quote the boot log's identity lines anywhere.
+- Committed tests depend only on `factory.bin` and committed synthetic data.
+  Code that needs the full dump reads `BADGE_FULL_DUMP` and skips when it is
+  unset.
+- The only committed identity data is the eleven obviously fake identities
+  in `frontend/public/firmware/test-identities/`, committed with the
+  organizers' permission. A real attendee's identity never goes there.
+- Never add a full flash dump to `public/firmware/`.
+
+See the notes' "Data-handling note".
 
 ## Architecture
 
 ```
-frontend/             Vite + TypeScript web app (own package.json).
-  src/lua/vm.ts       Sandboxed Fengari Lua env: base+table+string+math+utf8
-                      only; os/io/package/debug/coroutine never opened; custom
-                      cycle-safe require() (max depth 8, max 16 modules/app);
-                      64 KiB cap on main.lua.
-  src/lua/interop.ts  Generic JS<->Lua value bridge (luaToJs, pushJsValue,
-                      pushNamespace) used by the simple badge.* modules.
-  src/badge/ui.ts     badge.ui: retained-mode widget tree + Lua bindings.
-                      Widgets are pushed to Lua as fresh table-of-closures
-                      per instance (not metatable userdata) — see the
-                      file-level comment for why.
-  src/badge/*.ts      Other badge.* namespaces (input, led, sensor, sys,
-                      store, me, contacts, app, fs, nfc, radio). Most use
-                      lua/interop.ts's generic namespace bridge; radio.ts
-                      hand-rolls on_recv() to retain a real Lua function ref.
-  src/runtime/lifecycle.ts
-                      Parses manifest.cfg, assembles the `badge` global
-                      table, runs main.lua, drives the ~20ms tick loop,
-                      dispatches on_enter/on_tick/on_button/on_exit.
-  src/runtime/firmware-runtime.ts
-                      Firmware-mode runtime over the WASM handle. In the
-                      app it runs inside the firmware Worker (below), not
-                      on the main thread. The frame loop, paced to
-                      wall-clock time (Milestone 6: each frame runUntil()s
-                      the emulator by the wall delta, clamped to
-                      MAX_FRAME_DELTA_MS = 50 ms, at most a step cap; a
-                      capped frame drops its debt, so busy firmware runs
-                      in slow motion; speed() is the smoothed
-                      emulated/wall ratio the status line shows as
-                      "N.Nx"). Its scheduler, clock (`now`), presenter
-                      callback and per-frame `onFrame` hook are
-                      injectable: in the Worker a frame is a slice capped
-                      at WORKER_STEPS_PER_SLICE = 400,000 steps whose
-                      presenter posts the framebuffer; the in-thread
-                      shape (requestAnimationFrame, a blit, the cap
-                      DEFAULT_STEPS_PER_FRAME = 150,000) is what the
-                      unit tests drive. Also the button-name -> raw-slot
-                      table (isButtonName checks own properties), a
-                      minimum press hold (PRESS_HOLD_US, 100 ms of
-                      emulated time; earlier releases are deferred and
-                      flushed by stop()), provision()
-                      with a 60M-step timeout (PROVISION_TIMEOUT_STEPS),
-                      and shake() (the rungs' two-axis shake pattern,
-                      SHAKE_HALF_US = 62.5 ms half-periods, then rest).
-                      Reset abandons a provisioner and a shake.
-  src/runtime/firmware-worker.ts
-                      The firmware Worker (Milestone 7 Task 8): boots the
-                      WASM emulator from bytes the main thread transfers
-                      (compiled with initCpuWasmSync; the bridge is
-                      imported lazily), owns the whole FirmwareRuntime
-                      (pacing, press holds, shake, provisioner) and runs
-                      it as slices: setTimeout(…, 0) after a slice that
-                      reached its target, a MessageChannel yield (no 4 ms
-                      timer clamp) after a capped one (ruling R-T8-1).
-                      Messages are applied between slices; one frame in
-                      flight (the next waits for frameAck); `status`
-                      (speed, provisioning state) at most every 250 ms;
-                      an error in a slice is posted and stops the loop.
-                      handleMessage is pure over an injectable WorkerHost,
-                      so test/firmware-worker.test.ts runs it under Bun.
-  src/runtime/firmware-worker-client.ts
-                      Main-thread side: a FirmwareRuntime whose methods
-                      post to the Worker and whose speed()/
-                      provisionState() return the last `status`, so
-                      main.ts and shell.ts use it as before. Queues
-                      messages until `ready`, paints the latest frame on
-                      the next animation frame then acknowledges it (a
-                      frame while stopped is dropped and acknowledged),
-                      and stops the runtime while the page is hidden
-                      (document.visibilitychange), resuming when visible
-                      (ruling R-T8-10).
-  src/runtime/firmware-worker-protocol.ts
-                      The ToWorker/FromWorker message types (init with
-                      the transferred WASM and factory.bin, start, stop,
-                      button, provision, shake, reset, frameAck,
-                      dispose; ready, frame, status, error) and
-                      STATUS_INTERVAL_MS.
-  src/runtime/provisioner.ts
-                      Types the firmware's own provisioning commands into
-                      the emulated USB console (wait for `badge> `,
-                      `put /littlefs/identity.json <size>`, the JSON in
-                      64-byte chunks 48,000 steps apart after `READY`,
-                      then `prov apply`); a state machine polled between
-                      run() calls, mirroring emulator-core's
-                      tests/common/provision.rs.
-  src/runtime/test-identities.ts
-                      The 11 fixture roles (firmware role-table order)
-                      and their URLs under public/firmware/test-identities/.
-  src/render/canvas.ts
-                      Pure function: walks a Widget tree, paints it to a
-                      2D canvas context. No Lua/DOM coupling — testable
-                      with a fake CanvasRenderingContext2D.
-  src/ui/shell.ts     Page chrome: on-screen button pad + keyboard bindings
-                      that call runtime.injectButton(); LED HUD; the
-                      firmware-mode provisioning controls (role picker,
-                      "Provision test badge", "Shake", status line and
-                      onboarding hint).
-  src/main.ts         Wires it all together; loads public/apps/smoke-test.
-                      Owns both the Lua AppRuntime and the CPU
-                      FirmwareRuntime (see emulator-core/ below), with a
-                      mode toggle (src/ui/shell.ts) that switches which one
-                      drives the shared canvas/button pad. On the first
-                      switch to firmware mode it fetches the .wasm and
-                      factory.bin, starts the firmware Worker and awaits
-                      its `ready` (a failed boot falls back to Lua mode).
-                      Only the Worker imports `./cpu/bridge` (lazily), so
-                      Lua-only usage never loads the Rust/WASM toolchain
-                      output.
-  src/bench/          The WASM redraw benchmark (Milestone 7):
-                      redraw-bench.ts (runRedrawBench, timeRedraw),
-                      walk.ts (the walk's constants and frame-sampling
-                      and press helpers, shared with test/cpu-wasm.test.ts),
-                      and the dev-only bench page's code (bench-page.ts,
-                      bench-worker.ts, for frontend/bench.html). The
-                      drivers are frontend/bench/bun-bench.ts
-                      (`bench:wasm`) and safari-bench.ts (`bench:safari`).
-  public/apps/<slug>/ Static app bundles (main.lua + manifest.cfg), served
-                      by Vite's public/ dir and fetched via a *synchronous*
-                      XHR-based fileLoader (required because Lua require()
-                      must return synchronously).
-  public/firmware/    The dumped real badge firmware: factory.bin, the app
-                      partition the CPU emulator boots. Captured read-only
-                      via esptool from a physical badge; publication
-                      approved by Hack the North organizers ahead of their
-                      own open-sourcing of this firmware. Do not add a full
-                      flash dump here — see docs/firmware-emulator-notes.md's
-                      "Data-handling note."
-  public/firmware/test-identities/
-                      Eleven obviously fake identity records, one per
-                      firmware role, typed in by the provisioner and read
-                      by the Rust rungs; committed with the organizers'
-                      permission (2026-10-08). Never a real identity.
+frontend/src/
+  lua/vm.ts             Sandboxed Fengari env: base, table, string, math and
+                        utf8 only; a cycle-safe require() (depth 8, 16
+                        modules); 64 KiB main.lua cap.
+  lua/interop.ts        Generic JS<->Lua value bridge for badge.* modules.
+  badge/*.ts            badge.* namespaces. ui.ts holds the retained widget
+                        tree, with each widget a fresh table of closures (see
+                        its file comment). radio.ts keeps a Lua function ref.
+                        storage.ts falls back to an in-memory shim under
+                        `bun test`.
+  runtime/lifecycle.ts  Lua mode: manifest parse, the `badge` global, the
+                        ~20 ms tick loop, on_enter/tick/button/exit.
+  runtime/firmware-runtime.ts
+                        Firmware runtime over the WASM handle: wall-clock
+                        pacing (runUntil by the wall delta, clamped and
+                        step-capped; a capped frame drops its debt), the
+                        button name -> raw slot table, the minimum press
+                        hold, provision() and shake(). It runs inside the
+                        Worker.
+  runtime/firmware-worker.ts
+                        Web Worker that owns the runtime and runs it in
+                        capped slices: one frame in flight, a throttled
+                        `status`, and messages applied between slices.
+  runtime/firmware-worker-client.ts
+                        Main-thread proxy with the same API. It queues
+                        messages until ready, paints frames on rAF and acks
+                        them, and pauses while the page is hidden.
+  runtime/firmware-worker-protocol.ts
+                        The message types.
+  runtime/provisioner.ts
+                        Types `put /littlefs/identity.json` and `prov apply`
+                        into the emulated USB console, paced in 64-byte
+                        chunks. Mirrors emulator-core's
+                        tests/common/provision.rs.
+  render/canvas.ts      Pure widget-tree painter, testable with a fake 2D
+                        context.
+  render/framebuffer.ts Blits the firmware's framebuffer.
+  cpu/bridge.ts         Loads the wasm-pkg. Only the Worker imports it, and
+                        lazily, so Lua-only use never loads the WASM.
+  bench/                The WASM redraw benchmark and the dev-only bench page.
+  ui/shell.ts, main.ts  Page chrome, input bindings, the mode toggle and the
+                        provisioning controls; main.ts wires it together.
+frontend/public/
+  apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
+                        because require() must return synchronously.
+  firmware/             factory.bin (publication approved by the organizers)
+                        and test-identities/.
 
-emulator-core/        Pure Rust (no wasm-bindgen deps) — cargo-testable
-                      natively; the primary iteration loop for this half of
-                      the codebase.
-  src/cpu/            Generic RV32IMC decode/execute core (registers, CSRs,
-                      M-mode trap entry/mret, WFI wait state, and an
-                      optional free-running cycle counter whose CSR
-                      addresses chip setup supplies: ESP32-C3 `mpccr`
-                      0x7e2, Task D-M5-3; one count per working step). Deliberately
-                      knows nothing about ESP32-C3 specifics — see
-                      cpu/mod.rs's module doc. cpu/rom_stubs.rs is the
-                      chip-agnostic *mechanism*
-                      for intercepting fetches to fixed ROM addresses and
-                      running a stub's effect in place of the real
-                      instruction — a return value, a real memcpy/memset,
-                      or (as of Milestone 3's Task D3 fix round) a
-                      runtime-computed peripheral-register write via
-                      `RomStubEffect::BusRegisterWrite` (or a sequence of
-                      them, `BusRegisterWrites`, Task D11) — paired with the
-                      chip-specific data in src/rom.rs, below. A stub
-                      can't run guest code, so ROM routines that call
-                      back into firmware (qsort's comparator) are real
-                      RV32 code instead; cpu/encode.rs is the const-fn
-                      RV32IM encoder those code blobs are assembled with.
-                      cpu/decode_cache.rs (Milestone 7 Task 7) caches
-                      decoded instructions: a direct-mapped table of
-                      1 << 14 entries indexed by (pc >> 1), tagged by the
-                      raw bits alone (ruling R-T7-3). Every step still
-                      runs the ROM-stub check and fetches through
-                      Bus::fetch16 first; a hit needs the bits fetched
-                      now, so a store over code, a flash write or an MMU
-                      remap runs as the new code with no invalidation
-                      hook, and an unmapped fetch still traps. 262,144
-                      bytes per Cpu (16-byte entries), so per
-                      FirmwareRuntime clone; debug builds check every
-                      hit against a fresh decode.
-  src/clock.rs        Chip-agnostic emulated time (Milestone 6): Clock
-                      converts executed steps into ticks of a fixed-rate
-                      timer at a CPU frequency that can change
-                      (cycles_per_step = 1, CPI 1), carrying the sub-tick
-                      remainder and rescaling it on a frequency switch,
-                      so time never drifts; idle fast-forward time is
-                      charged in whole ticks and counted apart
-                      (idle_ticks). FirmwareBus::clock runs it against
-                      the 16 MHz SYSTIMER (mem/soc.rs SYSTIMER_HZ) at
-                      the frequency System::cpu_hz selects: one tick per
-                      five steps at 80 MHz, two per five at 40 MHz.
-                      SYSTIMER, the USB packet timing, the RTC timer,
-                      emulated_time_us and run_until all read this one
-                      clock. Knows no ESP32-C3 constant.
-  src/md5.rs          Chip-agnostic MD5 in Colin Plumb's context shape
-                      (the ROM's md5_context_t layout), shared by the ROM
-                      MD5 stubs (RomStubEffect::Md5, Task D13) and
-                      peripherals/flash.rs's partition-table MD5 check.
-  src/mem/            mem/mod.rs defines the Bus trait the CPU core is
-                      generic over. mem/bus.rs's FirmwareBus is the real
-                      ESP32-C3 memory map: an ordered sequence of named
-                      regions (XIP flash, RAM-copied segments, ROM code
-                      and data blobs, then one concrete named field per
-                      peripheral, then a
-                      never-panics catch-all) checked in order on every
-                      access — no trait-object dispatch table (a deliberate
-                      choice; SPI needs a direct cross-peripheral read of
-                      GPIO's D/C pin state, which a trait object would
-                      fight). Unmapped *data* access never panics (reads 0,
-                      writes drop); unmapped *instruction fetches* always
-                      trap — this asymmetry is load-bearing, not an
-                      oversight (see docs/firmware-emulator-notes.md).
-                      A `RomCodeBlob` region (Milestone 3 Task D6,
-                      `FirmwareBus::map_rom_code`) maps small read-only,
-                      executable code blobs at fixed ROM addresses; only
-                      the blob's own bytes become fetchable. A
-                      `RomDataBlob` region (Task D7,
-                      `FirmwareBus::map_rom_data`) maps read-only ROM
-                      *data* the same way, but is never fetchable. XIP
-                      (the 8 MiB DBUS/IBUS cache apertures) translates
-                      every access through the flash MMU
-                      (`FirmwareBus::mmu`, peripherals/mmu.rs) to a
-                      physical page of `flash_chip`, the only flash store;
-                      `FirmwareBus::from_segments` seeds the table by
-                      replaying the 2nd-stage bootloader's page-granular
-                      mapping (Milestone 4; it replaced Milestone 3's D5
-                      page windows and the bus's separate copy of the
-                      image). An invalid entry reads 0 (logged) and a fetch
-                      through it traps; DBUS is never fetchable.
-                      Word fast path (Milestone 7 Task 5): read16/read32,
-                      write16/write32 and fetch16 first try, in this
-                      order, an access wholly inside one 64 KiB MMU page
-                      of an XIP aperture (reads and IBUS fetches through
-                      a valid entry only; an aperture write goes to the
-                      byte path, which drops it), then one span
-                      of a resolved RAM span map (`RamSpan`, rebuilt by
-                      `FirmwareBus::rebuild_ram_spans` whenever the RAM
-                      regions change, so a word over overlapping
-                      segment/scratch regions resolves as the byte path's
-                      first-match rule would; a last-hit span hint, then
-                      a binary search); anything else (straddling a span
-                      or page edge, unaligned across them, peripherals,
-                      ROM blobs, unmapped space) takes the byte path,
-                      which logs and traps exactly as before.
-                      mem/image.rs parses the ESP-IDF app-image format;
-                      mem/soc.rs holds the ESP32-C3 address-space ranges
-                      plus the ESP32-C3's fixed 64 KiB MMU page size.
-  src/peripherals/    SYSTIMER (2 counters, 3 comparators, HAL-faithful
-                      alarm sequencing; advance_by/ticks_until_next_alarm
-                      for fast-forward, Task 5) + the ESP32-C3 interrupt
-                      matrix (not a standard PLIC: 64 source MAP registers
-                      onto 32 CPU lines, gated by enable and priority >=
-                      threshold, priority 0 = disabled, delivered as levels
-                      sampled every step by boot::step_with_interrupts; the
-                      core takes the highest-priority pending line, ties to
-                      the lowest; while the core waits in WFI that loop
-                      fast-forwards SYSTIMER to its next alarm, Task 6;
-                      since Milestone 6 time comes from clock.rs's Clock,
-                      which converts steps to 16 MHz ticks at the CPU
-                      frequency System::cpu_hz selects),
-                      SYSTEM's FROM_CPU software-interrupt registers
-                      and its CPU_PER_CONF/SYSCLK_CONF clock registers
-                      (system.rs, Milestone 6; the rest of SYSTEM is
-                      unmapped): System::cpu_hz decodes them as
-                      rtc_clk_cpu_freq_get_config does (XTAL 40 MHz /
-                      (PRE_DIV_CNT + 1), PLL 80/160 MHz, RC_FAST 20 MHz),
-                      the bus applies it to the clock once per step,
-                      after the instruction (never a byte-split half
-                      write), and an invalid encoding keeps the previous
-                      frequency,
-                      SYSCON/APB_CTRL's RNG data register (apb_ctrl.rs:
-                      a fixed-seed xorshift32, one value per word read,
-                      for esp_random(); Task D-M5-3), GPIO
-                      (including the GPIO matrix's FUNCn_IN/OUT_SEL_CFG
-                      routing registers, stored but not yet consulted,
-                      Task D11) + an emulated
-                      74HC165 button shift register, SPI2/GPSPI2 (UPDATE
-                      self-clear, TRANS_DONE interrupt, Task 9) + an ST7789
-                      command/pixel-stream interpreter that reconstructs a
-                      framebuffer, and GDMA (gdma.rs, Task 10: the TX
-                      out-link that feeds SPI2 when SPI_DMA_TX_ENA is set;
-                      the descriptor walk reads RAM, so it is
-                      FirmwareBus::gdma_pull), TIMG0/TIMG1 (timg.rs: RTC
-                      slow-clock calibration, inert watchdog storage) and
-                      RTC_CNTL (rtc_cntl.rs: the RTC timer, which counts
-                      SYSTIMER time in RC slow-clock cycles since
-                      Milestone 6, and the RTC_XTAL_FREQ_REG store).
-                      console.rs is the capped
-                      byte sink for firmware output. Its one feed is the
-                      USB-Serial-JTAG EP1 TX FIFO (usb_serial_jtag.rs, the
-                      badge's real console), written both by firmware
-                      directly and by the ROM ets_printf HLE stub. UART0
-                      and the ROM putc functions are not modeled. The
-                      USB-Serial-JTAG model reports SOF frames from an
-                      attached host (Milestone 4), so post-scheduler log
-                      output reaches the console. Since Milestone 5 it also
-                      receives: a host queue (1 MiB cap, excess refused)
-                      feeds the 64-byte OUT FIFO one packet at a time,
-                      PACKET_TICKS = 821 SYSTIMER ticks apart (51.3 us of
-                      full-speed bus; Milestone 6); INT_ST/INT_ENA/INT_CLR
-                      are real and drive interrupt source 26, which the
-                      firmware's interrupt-driven console driver needs;
-                      the WFI fast-forward stops at the next packet. The
-                      driver drops a packet that does not fit its 256-byte
-                      RX ring, so hosts also pace large payloads (64-byte
-                      chunks 48,000 steps apart, PUT_CHUNK_GAP_STEPS; a
-                      host property, not a bus one). mmu.rs is the flash MMU
-                      table (`0x600c_5000`); i2c.rs is I2C0 as a master
-                      whose bus holds one device, sc7a20h.rs (the SC7A20H
-                      accelerometer at 0x19, acceleration set by the host
-                      through FirmwareRuntime::set_acceleration; Milestone
-                      5), every other address byte NACKed; rmt.rs is RMT
-                      as a zero-latency TX engine (Milestone 4; decisions
-                      in docs/milestone-4-decisions.md).
-                      Each module's doc comment cites the
-                      exact ESP-IDF v5.5.3 header its register layout came
-                      from.
-  src/peripherals/flash.rs
-                      EmulatedFlash (Milestone 3 Task 8): the badge's 4 MiB
-                      flash chip as an in-memory array. Synthetic: blank
-                      (0xFF) except a partition table at 0x8000 built from
-                      committed constants, plus factory.bin at 0x10000.
-                      Erase/program use NOR semantics and stay in memory.
-                      Never a copy of the physical chip (see the notes'
-                      "Emulated flash chip" section). Also Spimem1, the
-                      SPI1 flash controller (0x6000_2000): user-command
-                      transactions fire on the SPI_MEM_USR byte of CMD and
-                      self-clear: RDID (the badge's JEDEC ID), RDSR and
-                      the read family; the dedicated SPI_MEM_FLASH_* bits
-                      run WREN/WRDI (a modeled write-enable latch), sector
-                      erase and page program (Milestone 4 Task 5), always
-                      completing at once. The bus holds both as named
-                      fields (spimem1, flash_chip); XIP reads flash_chip
-                      through the MMU, so programmed data is visible there.
-  src/rom.rs          The ESP32-C3-specific mask-ROM HLE stub table (which
-                      fixed addresses to intercept + what each pretends to
-                      have done — including, for the six interrupt-matrix/
-                      interrupt-controller ROM calls, a real read/write of
-                      the `peripherals::intc` registers those calls target,
-                      and for ROM `gpio_matrix_out`/`gpio_matrix_in`, of
-                      the `peripherals::gpio` matrix registers, with indexed
-                      calls bounds-checked),
-                      paired with cpu/rom_stubs.rs's generic mechanism
-                      above. Also the guest-executed ROM code blobs
-                      (`ESP32C3_ROM_CODE`: the one-`jal` jump-table slot
-                      plus body of qsort (insertion sort), of strdup,
-                      and of the ets_get/update_cpu_frequency pair,
-                      stateful over the ROM .data s_ticks_per_us as in
-                      the real ROM (Milestone 6; the firmware's own
-                      bookkeeping, not the clock's source; there is no
-                      CPU_FREQ_MHZ constant any more),
-                      in ROM ranges no linker-script symbol points into;
-                      strdup reaches the firmware's `_malloc_r` through
-                      the ROM `.bss` `syscall_table_ptr` word at
-                      0x3fcd_ffe0, which the firmware's libc init fills) and the ROM data
-                      tables (`ESP32C3_ROM_DATA`: the `ets_rom_layout_p`
-                      layout table, values from Espressif's ROM ELF),
-                      and the ROM's writable `.data` boot reads
-                      (`esp32c3_rom_ram_initializers`: the SPI-flash legacy
-                      data, `chip_size` from the image header, the
-                      bootloader's `RTC_XTAL_FREQ_REG` store, Task D12,
-                      and since Milestone 6 the clock state the
-                      bootloader leaves: `SYSCLK_CONF` = PLL, 80 MHz, and
-                      `s_ticks_per_us` = 80), all
-                      installed by boot.rs alongside the stub table. Addresses
-                      sourced from ESP-IDF's own linker scripts, not
-                      guessed — see docs/firmware-emulator-notes.md.
-                      Milestone 5 added real stubs for the calls the
-                      console, provisioning and onboarding reach:
-                      strlcpy, strtol, strrchr, strcasecmp, atoi and the
-                      libgcc soft-fp helpers (__gedf2, __ledf2,
-                      __fixdfsi, __adddf3, __mulsf3, __addsf3, __subsf3,
-                      __unordsf2, __ltsf2, __gtsf2, __floatsisf).
-  src/boot.rs         "Shortcut boot": loads factory.bin directly into a
-                      Cpu/FirmwareBus pair via the app image's own header,
-                      skipping mask-ROM/2nd-stage-bootloader emulation
-                      entirely (see docs/firmware-emulator-notes.md for
-                      why this is safe to skip). What those skipped steps leave
-                      in RAM for the app is re-created by a generic list
-                      of boot-time (address, bytes) writes
-                      (`apply_ram_initializers`, Task D10); the ESP32-C3
-                      data (the ROM's SPI-flash legacy data, and the
-                      RTC_CNTL register the bootloader stores the XTAL
-                      frequency in, written through the bus) lives in
-                      rom.rs. boot::step_with_interrupts runs one step
-                      (interrupt delivery, then WFI fast-forward or an
-                      instruction);
-                      boot::idle_until bounds an idle wait at a
-                      run_until target (Milestone 6 Task 7).
-  src/runtime.rs      FirmwareRuntime: the whole emulator as one owned,
-                      driveable object. Buttons are addressed by raw slot
-                      index here (0 = direct-GPIO START, 1..=8 = shift-
-                      register bits) — the human button-name mapping is a
-                      UI-layer concern that lives in
-                      frontend/src/runtime/firmware-runtime.ts, not here.
-                      Host input beyond buttons (Milestone 5):
-                      serial_input/serial_pending (bytes a USB host sends
-                      to the console) and set_acceleration (what the
-                      SC7A20H reports, in mg; default face up, (0, 0,
-                      +1000); survives reset). Emulated time (Milestone
-                      6): emulated_time_us (the clock's time since boot
-                      or reset) and run_until(target_us, max_steps),
-                      which runs until that time or the step cap; an idle
-                      wait stops exactly at the target. The rungs' and
-                      the browser's holds and pacing use it.
-                      FirmwareRuntime is Clone:
-                      a clone is a full snapshot, which the boot rungs use
-                      as shared checkpoints.
-emulator-wasm/        Thin wasm-bindgen shim over emulator-core — logic-free
-                      by design (see its module doc re: why framebuffer()
-                      returns an owned Vec, not a borrowed slice, to avoid a
-                      use-after-free across WASM-heap-growing calls;
-                      serialInput, serialPending, setAcceleration,
-                      runUntil and emulatedTimeUs are one-line
-                      passthroughs too). Built
-                      via `bun run build:wasm` into
-                      frontend/src/cpu/wasm-pkg/ (gitignored). Consumed by
-                      frontend/'s src/cpu/bridge.ts,
-                      src/runtime/firmware-runtime.ts (run inside
-                      src/runtime/firmware-worker.ts), and
-                      src/render/framebuffer.ts (the CPU-emulator analogs of
-                      the Lua-mode files above), wired up by src/main.ts's
-                      mode toggle; also by src/bench/.
+emulator-core/src/
+  cpu/                  Generic RV32IMC core: CSRs, traps, WFI, the cycle
+                        counter. Also rom_stubs.rs (the mechanism that
+                        intercepts ROM-address fetches), encode.rs (a const
+                        RV32IM encoder for ROM code blobs) and
+                        decode_cache.rs (a direct-mapped table validated by
+                        the raw bits on every fetch, so it needs no
+                        invalidation; 256 KiB per clone).
+  clock.rs              Converts steps to 16 MHz SYSTIMER ticks at the
+                        firmware-selected CPU frequency, without drift. Every
+                        timer reads it.
+  md5.rs                MD5 shared by the ROM stubs and the partition table.
+  mem/bus.rs            FirmwareBus, the ESP32-C3 memory map: ordered regions
+                        (XIP through the flash MMU, RAM segments, ROM code and
+                        data blobs, the peripherals, a catch-all). A word fast
+                        path tries XIP within one MMU page, then a RAM span
+                        map, and otherwise takes the byte path.
+  mem/image.rs, soc.rs  App-image parser; the address ranges.
+  peripherals/          SYSTIMER, the interrupt matrix (not a PLIC: 64
+                        sources onto 32 lines, priority >= threshold), SYSTEM
+                        (clock registers, software interrupts), APB_CTRL's
+                        RNG (fixed seed), GPIO plus the 74HC165 button shift
+                        register, SPI2 plus the ST7789 framebuffer, GDMA,
+                        TIMG, RTC_CNTL, USB-Serial-JTAG (the console, in both
+                        directions), I2C0 plus the SC7A20H accelerometer, RMT,
+                        the flash MMU, and flash.rs (a synthetic 4 MiB flash
+                        and the SPI1 controller).
+  rom.rs                The ESP32-C3 mask-ROM HLE stub table, the
+                        guest-executed ROM code blobs (qsort, strdup, the
+                        CPU-frequency pair), the ROM data tables and the
+                        boot-time RAM initializers.
+  boot.rs               "Shortcut boot": loads factory.bin straight from its
+                        header, skipping ROM and bootloader emulation.
+                        step_with_interrupts runs one step, with WFI
+                        fast-forward.
+  runtime.rs            FirmwareRuntime: the whole emulator as one Clone-able
+                        object. Buttons by raw slot; serial input; the
+                        acceleration; run_until and emulated_time_us.
+emulator-wasm/          The logic-free wasm-bindgen shim.
 ```
-
-See `docs/firmware-emulator-notes.md` for the forensic findings behind this
-design (why built-in apps can't be extracted as Lua, the firmware's segment
-layout, the physical button/display pin map and its sourcing), the
-mask-ROM HLE stub strategy in more detail, and the emulator's current known
-limitations (where real-firmware boot stalls today, and what's next).
-
-Module boundaries are intentionally pure where feasible (manifest parsing,
-require() path/cycle logic, sandbox global-table construction, widget-tree
-mutations, canvas painting) so they're unit-testable without a live browser.
-`frontend/src/badge/storage.ts` falls back to an in-memory `Storage` shim when
-`localStorage` isn't available (e.g. under `bun test`), so `store.ts`/`fs.ts`
-stay testable outside a browser too.
