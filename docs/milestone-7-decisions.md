@@ -177,7 +177,7 @@ R-T*n*-*k* rulings are made in Task *n*.
   wrong: a stale gate would deliver the wrong lines; debug builds panic
   on the first such step, release builds would diverge from a pin.
 - **R-T4-3, the gate is recomputed on every intc write, not only on
-  enable, priority and threshold writes.** MAP, TYPE and CLEAR writes
+  enable, priority and threshold writes.** (Superseded by R-T6-5.) MAP, TYPE and CLEAR writes
   recompute it too (a 32-line loop; intc writes happen during interrupt
   setup and in the FreeRTOS port's threshold changes, far rarer than
   steps, and the Task 4 profile shows `InterruptController::write_byte`
@@ -247,6 +247,106 @@ R-T*n*-*k* rulings are made in Task *n*.
   unaligned XIP words, and the DBUS aperture's end. If wrong: none; they
   only add coverage.
 
+### Task 6
+
+Shares below are of the `bench_redraws` thread in the Task 5 profile
+re-taken at `f23288a` before any Task 6 change (11,051 samples; table
+under Profiles).
+
+- **R-T6-1, the ROM-stub table answers `None` outside its registered
+  address range before hashing** (addressed `RomStubTable::lookup`,
+  16.2 %). `RomStubTable` keeps the lowest and highest registered
+  address, widened on every `insert`; `lookup` compares against both,
+  then looks the map up. An empty table has an empty range
+  (`min_addr = u32::MAX > max_addr = 0`), which replaces the old
+  `is_empty()` short-circuit. Identical: no registered address lies
+  outside the range, and inside it the map decides as before (a gap
+  still misses). The range is learned from the inserted addresses, so
+  `cpu/` gains no chip constant. On the badge every fetch from flash
+  (IBUS, `0x42...`) or IRAM (`0x4037...`) lies above the highest ROM stub
+  and costs two compares. Tests
+  `lookup_outside_the_registered_range_is_none` (both ends, a gap, a
+  widening insert, a re-insert) and
+  `a_single_entry_table_matches_only_its_address`. If wrong: a stub
+  outside the learned range would not run; the boot rungs reach every
+  stub the firmware calls.
+- **R-T6-2, `System` decodes the CPU clock when a clock register is
+  written, not every step** (addressed `FirmwareBus::tick_peripherals`,
+  11.5 %, whose per-step `sync_cpu_clock` decoded `SYSCLK_CONF` and
+  `CPU_PER_CONF`). `System::write_byte` is the only writer of the two
+  registers; after each byte it stores the decode in `selected_hz`, and
+  `cpu_hz()` returns it (debug builds assert it equals a fresh decode on
+  every call, so every step of the debug suite checks it). Milestone 6's
+  clock rulings hold unchanged: the bus still samples `cpu_hz()` once per
+  step after the instruction (and at the start of an idle fast-forward)
+  and calls `Clock::set_cpu_hz` with it; after a byte-split word write
+  the stored value is the decode of the whole word, because the sample
+  comes after the last byte; an invalid encoding is still `None`, which
+  keeps the previous frequency. If wrong: the clock would run at a stale
+  rate; the debug assertion fires on the first such step, and
+  `boot_reports_the_badges_80_mhz_cpu_clock` and every time pin would move.
+- **R-T6-3, `Clock::step` returns 0 before dividing when the remainder
+  is still below one tick** (also `tick_peripherals`). At 80 MHz against
+  the 16 MHz SYSTIMER four steps in five complete no tick; for them the
+  division gives 0 and the modulo leaves the remainder as it is, which the
+  early return does without dividing. Pure arithmetic identity, still
+  chip-agnostic. If wrong: none possible beyond the identity.
+- **R-T6-4, the interrupt poll routes only sources that can reach a
+  gated line** (addressed `FirmwareBus::asserted_lines`, 11.5 %; its
+  per-source routing loop ran on most busy steps, because some source is
+  pending while its line is masked). `InterruptController` keeps
+  `gated_sources`, the sources whose MAP route is a non-zero line in
+  `line_gate`; `poll` is `routed_lines(pending & gated_sources) &
+  line_gate`, 0 without the loop when that is empty. Identical: a pending
+  source outside the mask routes to line 0 (cleared) or to a line the
+  gate masks, so it cannot change the result. The mask is derived from
+  the intc's registers only (MAP and the gate), like `line_gate` (R-T4-1),
+  never from peripheral state, so spec Part 2's audit does not apply; no
+  pending state is cached. Debug builds check the result against the
+  unfiltered `routed_lines(pending) & line_gate` on every poll, and the
+  mask against a scan of all 64 MAP registers whenever it is rebuilt;
+  Task 4's `debug_assert_eq!` on `line_gate` in `poll` is unchanged. Test
+  `gated_sources_follow_map_and_gate_writes` (reroutes to a masked line,
+  to line 0 and back; a gate opening under a routed source; two sources on
+  one line). If wrong: a deliverable line would be dropped; debug builds
+  panic at that step, release builds would move a pin.
+- **R-T6-5, the line gate is rebuilt only when one of its inputs
+  changes, and the gated sources from per-line source sets; this
+  replaces R-T4-3.** With R-T6-4's mask, rebuilding on every intc byte
+  write (R-T4-3) added a 64-source scan to each one, and
+  `InterruptController::write_byte` rose from 0.3 % to 2.1 % (the FreeRTOS
+  port writes `CPU_INT_THRESH` in every critical section, as four byte
+  writes). Now `write_byte` rebuilds only when an enable, priority or
+  threshold word, or a MAP register's 5-bit route, actually changed
+  value (both are pure functions of those registers, so an unchanged
+  value leaves them correct; TYPE and CLEAR never feed them), and
+  `line_sources[line]` (kept in step with each MAP write; every source
+  starts on line 0) makes `gated_sources` the union over the gate's
+  lines. `write_byte` is back to 0.2 %. Review Focus 3 holds: a changed
+  enable, priority or threshold rebuilds before the write returns, so the
+  next step's poll sees it (`line_gate_follows_enable_priority_and_threshold_writes`
+  passes unchanged). If wrong: a stale gate or mask; R-T6-4's debug checks
+  and Task 4's catch it.
+- **R-T6-6, `tick_peripherals` and `asserted_lines` are inlined into the
+  step loop; the timed peripherals' advance is out of line.** The two
+  were separate calls on every step (together 23.0 % with
+  `step_with_interrupts`'s own 1.8 %); `#[inline]` on both, with
+  `SysTimer::advance_by` and the USB host's advance moved into
+  `advance_timed_peripherals` (`#[inline(never)]`, reached on a step that
+  completes a tick), keeps the order of every operation and only removes
+  call overhead. If wrong: none observable; only code size (WASM 106,475
+  to 110,286 bytes for the whole task).
+- **R-T6-7, what Task 6 left alone.** `line_priorities()` builds its
+  array only when several lines are asserted at once, inside
+  `step_with_interrupts` (1.8 % in total), below the 5 % bar; unchanged.
+  An `#[inline]` `fetch16` with its fallback out of line measured no gain
+  (the trait method stayed a call) and was reverted; fetch and decode are
+  Task 7's (R-T7-1 still fetches every step). `Cpu::step` and `execute`
+  are instruction execution. What remains of the interrupt sample is the
+  per-step loads of every peripheral's pending state, which only caching
+  that state would remove (spec Part 2's audit); not done here. If wrong:
+  speed left on the table, a Milestone 8 item if HOME needs it.
+
 ## Measurements
 
 The native benchmark is
@@ -274,6 +374,8 @@ reads a little below the redraws' steps/s.
 | Task 4 (measured at `7e7b1f0` plus Task 4's code) | 4 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 25.80 | 0.377 | 0.550 | 0.707 | n/a |
 | Task 5 (measured at `c54e8c8` plus Task 5's code) | 5 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 52.25 | 0.788 | 1.026 | 1.289 | 10.6 |
 | Task 5 (measured at `c54e8c8` plus Task 5's code) | 5 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 32.39 | 0.476 | 0.709 | 0.886 | n/a |
+| Task 6 (measured at `f23288a` plus Task 6's code) | 6 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 66.74 | 1.020 | 1.313 | 1.649 | 9.7 |
+| Task 6 (measured at `f23288a` plus Task 6's code) | 6 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 38.01 | 0.557 | 0.858 | 1.089 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -492,6 +594,56 @@ Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
 `bun run build:wasm` and `bun run typecheck` ok; `bun test` 149 pass,
 0 fail, 13.0 s.
 
+### Task 6: ROM-stub range precheck and per-step trims
+
+`RomStubTable::lookup` answers outside its registered range with two
+compares (R-T6-1); `System` decodes the CPU clock on a clock-register
+write (R-T6-2); `Clock::step` skips the division on a step that
+completes no tick (R-T6-3); the interrupt poll routes only sources that
+can reach a gated line (R-T6-4), with the gate and that mask rebuilt
+only when an input changes (R-T6-5); `tick_peripherals` and
+`asserted_lines` are inlined into the step loop (R-T6-6). Every pin
+held. Native `BENCH` lines:
+
+```
+BENCH walk steps=372597011 wall_s=5.58 msteps_per_s=66.74
+BENCH home emulated_ms=254.0 steps=19106041 busy_pct=94.0 wall_ms_median=249.1 wall_ms_min=248.4 factor=1.020 msteps_per_s=76.70
+BENCH down emulated_ms=115.0 steps=6858235 busy_pct=74.6 wall_ms_median=87.6 wall_ms_min=87.3 factor=1.313 msteps_per_s=78.32
+BENCH onboarding emulated_ms=67.0 steps=3018254 busy_pct=56.4 wall_ms_median=40.6 wall_ms_min=40.5 factor=1.649 msteps_per_s=74.29
+```
+
+A second native run read within 2 % (walk 67.03 Msteps/s, factors
+1.028, 1.337, 1.664); the profiled build read walk 67.26, factors 1.038,
+1.342, 1.671. The table keeps the first plain run.
+
+Bun (`bun run bench:wasm`, median of 3; a second invocation agreed
+within 2 % on the walk and every pin factor: 38.59, 0.563, 0.867, 1.103):
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=f23288a+dirty profile=release opt-level=3
+BENCH median runs=3 walk msteps_per_s=38.01
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=460.3 factor=0.760 msteps_per_s=41.90 pin_factor=0.557
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=135.1 factor=0.856 msteps_per_s=51.15 pin_factor=0.858
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=68.0 factor=3.529 msteps_per_s=49.04 pin_factor=1.089
+```
+
+(`+dirty`: Task 6's uncommitted code.) Against Task 5: native redraws
+1.28x to 1.29x the steps/s (HOME 59.29 to 76.70 M), the walk 1.28x; Bun
+pin factors 1.17x to 1.23x (0.476, 0.709, 0.886 to 0.557, 0.858, 1.089),
+the walk 1.17x. Native HOME now reaches the badge's speed (1.02x); under
+Bun, onboarding does (1.09x) and HOME is at 0.56x.
+
+WASM size: 106,475 bytes at Task 5, 110,286 bytes now (+3,811 bytes;
+mostly R-T6-6's inlining).
+
+Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
+543 lib (Task 6's three new tests: two in `cpu::rom_stubs`, one in
+`peripherals::intc`) + 95 integration pass (64 boot rungs, 1 ignored),
+14.0 s wall, `boot_progress` 10.9 s with the debug cross-checks on every
+step; release `boot_progress` 64 pass, 1 ignored, 9.7 s wall (8.4 s in
+the harness); clippy the same 3 warnings; `bun run build:wasm` and
+`bun run typecheck` ok; `bun test` 149 pass, 0 fail, 11.4 s.
+
 ## Profiles
 
 Procedure (every optimization task follows it):
@@ -607,6 +759,52 @@ went from 21.6 % to 2.9 % of a shorter profile (14,894 to 11,025
 samples); `fetch16` now reads through the fast path and costs about
 what it did as a share, about a quarter less in samples. The ROM-stub
 lookup on every fetch (Task 6) and decode (Task 7) lead what is left.
+
+### Task 6 (ROM-stub precheck and per-step trims, release `opt-level = 3`)
+
+Before: Task 5's code re-profiled at `f23288a` (11,051 samples; this run:
+walk 55.69 Msteps/s, HOME 0.858x), within a point of the Task 5 table
+above:
+
+| Share | Symbol |
+| --- | --- |
+| 16.2 % | `RomStubTable::lookup` |
+| 13.8 % | `Cpu::step` |
+| 11.5 % | `FirmwareBus::tick_peripherals` |
+| 11.5 % | `FirmwareBus::asserted_lines` |
+| 11.2 % | `cpu::decode::decode_16` |
+| 9.2 % | the `bench_redraws` closure (the benchmark's own framebuffer hashing) |
+| 6.9 % | `FirmwareBus::fetch16` |
+| 5.9 % | `cpu::decode::decode_32` |
+| 2.4 % | `SysTimer::advance_by` |
+| 1.8 % | `FirmwareBus::read32` |
+
+Below the top 10: `step_with_interrupts` 1.8 %, `write_byte` 1.6 %,
+`InterruptController::write_byte` 0.3 %.
+
+After: 9,329 samples (this run: walk 67.26 Msteps/s, HOME 1.038x).
+
+| Share | Symbol |
+| --- | --- |
+| 23.6 % | `step_with_interrupts` (now with `tick_peripherals` and `asserted_lines` inlined into it) |
+| 13.0 % | `cpu::decode::decode_16` |
+| 12.8 % | `Cpu::step` (with `RomStubTable::lookup`'s range check inlined) |
+| 11.0 % | the `bench_redraws` closure (the benchmark's own framebuffer hashing) |
+| 9.1 % | `cpu::execute::execute` (no longer inlined into `Cpu::step`) |
+| 8.8 % | `FirmwareBus::fetch16` |
+| 6.6 % | `cpu::decode::decode_32` |
+| 2.9 % | `SysTimer::advance_by` |
+| 1.9 % | `FirmwareBus::read32` |
+| 1.9 % | `FirmwareBus::write_byte` |
+
+Below the top 10: `read_byte` 1.5 %, `run_until_stable_frame` 1.4 %,
+`FirmwareRuntime::run_impl` 1.4 %, `write32` 1.3 %,
+`advance_timed_peripherals` 0.8 %, `InterruptController::write_byte`
+0.2 %. In samples: the ROM-stub lookup (1,790) is gone into `Cpu::step`'s
+two compares; the interrupt sample, the clock tick and the step glue went
+from 2,741 samples (24.8 %) to 2,202 (23.6 % of a shorter profile).
+Fetch and decode (`decode_16`, `decode_32`, `fetch16`: 28.4 %) lead
+what is left, which is Task 7's decode cache.
 
 ## Milestone 8 backlog
 

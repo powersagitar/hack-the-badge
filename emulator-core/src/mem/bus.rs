@@ -607,6 +607,7 @@ impl FirmwareBus {
     /// A pure function of live peripheral state -- this is what
     /// `crate::boot::step_with_interrupts` samples into
     /// `Cpu::set_pending_interrupts` at the start of every step.
+    #[inline]
     pub fn asserted_lines(&self) -> u32 {
         self.intc.poll(self.pending_sources())
     }
@@ -616,6 +617,11 @@ impl FirmwareBus {
     /// once the CPU runs faster than SYSTIMER). Call exactly once per
     /// `Cpu::step()` that is not an idle fast-forward -- see
     /// `crate::boot::step_with_interrupts`.
+    ///
+    /// Inlined into the step loop, with the timed peripherals' advance (a
+    /// step that completes a tick, one in five at 80 MHz) out of line
+    /// (Milestone 7 Task 6); the order of the work is unchanged.
+    #[inline]
     pub fn tick_peripherals(&mut self) {
         // The CPU clock the SYSTEM registers select now, sampled after the
         // step so a word write's byte-split halves are never seen alone.
@@ -625,14 +631,21 @@ impl FirmwareBus {
         self.sync_cpu_clock();
         let ticks = self.clock.step();
         if ticks > 0 {
-            self.systimer.advance_by(ticks);
-            self.usb_serial_jtag.advance(ticks);
+            self.advance_timed_peripherals(ticks);
         }
+    }
+
+    /// The timed peripherals' share of [`FirmwareBus::tick_peripherals`].
+    #[inline(never)]
+    fn advance_timed_peripherals(&mut self, ticks: u64) {
+        self.systimer.advance_by(ticks);
+        self.usb_serial_jtag.advance(ticks);
     }
 
     /// Points the clock at the CPU frequency the SYSTEM clock registers
     /// select ([`System::cpu_hz`]); an invalid encoding (`None`) keeps the
     /// previous rate, so the clock never runs at zero.
+    #[inline]
     fn sync_cpu_clock(&mut self) {
         if let Some(hz) = self.system.cpu_hz() {
             self.clock.set_cpu_hz(hz);

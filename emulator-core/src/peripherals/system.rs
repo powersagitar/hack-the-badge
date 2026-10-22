@@ -87,15 +87,24 @@ pub struct System {
     cpu_per_conf: u32,
     /// `SYSTEM_SYSCLK_CONF_REG`, R/W bits only.
     sysclk_conf: u32,
+    /// [`System::cpu_hz`]'s value, decoded from the two clock registers
+    /// whenever a byte of either is written (Milestone 7 Task 6), so the
+    /// bus's once-per-step sample is a load instead of a decode. The two
+    /// registers change only in [`System::write_byte`]; debug builds check
+    /// this against a fresh decode on every read.
+    selected_hz: Option<u64>,
 }
 
 impl Default for System {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             from_cpu: [false; FROM_CPU_COUNT],
             cpu_per_conf: CPU_PER_CONF_RESET,
             sysclk_conf: SYSCLK_CONF_RESET,
-        }
+            selected_hz: None,
+        };
+        s.selected_hz = s.decode_cpu_hz();
+        s
     }
 }
 
@@ -144,6 +153,7 @@ impl System {
         if let Some((reg, rw)) = self.clock_reg(offset & !0b11) {
             let mask = rw & (0xff << lane);
             *reg = (*reg & !mask) | ((u32::from(val) << lane) & mask);
+            self.selected_hz = self.decode_cpu_hz();
             return;
         }
         if offset & 0b11 != 0 {
@@ -156,7 +166,22 @@ impl System {
     /// The CPU frequency these registers select, in Hz, decoded as ESP-IDF
     /// v5.5.3 `rtc_clk_cpu_freq_get_config` does; `None` for an encoding it
     /// would abort on. See the module doc.
+    ///
+    /// Read from the value decoded at the last clock-register write
+    /// (`selected_hz`); after a byte-split word write that is the decode of
+    /// the whole word once its last byte has landed, as before.
+    #[inline]
     pub fn cpu_hz(&self) -> Option<u64> {
+        debug_assert_eq!(
+            self.selected_hz,
+            self.decode_cpu_hz(),
+            "stale decoded CPU clock"
+        );
+        self.selected_hz
+    }
+
+    /// Decodes the two clock registers (see [`System::cpu_hz`]).
+    fn decode_cpu_hz(&self) -> Option<u64> {
         match (self.sysclk_conf >> 10) & 0b11 {
             0 => Some(XTAL_HZ / (u64::from(self.sysclk_conf & 0x3ff) + 1)),
             1 => match self.cpu_per_conf & 0b11 {
