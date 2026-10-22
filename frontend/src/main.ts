@@ -8,8 +8,9 @@
  * That's this file, now. It starts in Lua-sandbox mode (the smoke-test app,
  * as before), and the mode toggle `shell.ts` mounts (`#mode-toggle`) lets the
  * user switch to real-firmware mode, which lazily boots
- * `public/firmware/factory.bin` through the WASM CPU emulator
- * (`src/cpu/bridge.ts` + `src/runtime/firmware-runtime.ts`) the first time
+ * `public/firmware/factory.bin` through the WASM CPU emulator in a Web
+ * Worker (`src/runtime/firmware-worker.ts`, driven from here through
+ * `src/runtime/firmware-worker-client.ts`) the first time
  * it's selected, then reuses that same booted instance on every later
  * switch back to it (switching away just pauses its frame loop — it isn't
  * re-booted or disposed until the page unloads).
@@ -32,13 +33,26 @@
  * restarting `main.lua` from `on_enter`), not a bug.
  */
 import { renderFrame } from "./render/canvas";
-import { createFirmwareRuntime, type FirmwareRuntime } from "./runtime/firmware-runtime";
+import type { FirmwareRuntime } from "./runtime/firmware-runtime";
+import { createWorkerFirmwareRuntime, type WorkerLike } from "./runtime/firmware-worker-client";
 import { createHttpFileLoader, loadApp } from "./runtime/lifecycle";
 import { TEST_IDENTITY_ROLES, testIdentityUrl } from "./runtime/test-identities";
 import { mountShell, type ButtonInjector, type EmulatorMode } from "./ui/shell";
 
 const APP_DIR = "smoke-test";
 const FIRMWARE_IMAGE_URL = "/firmware/factory.bin";
+/**
+ * The WASM module the Worker boots, at the URL the generated glue
+ * (`src/cpu/wasm-pkg/emulator_wasm.js`) resolves for itself: the `.wasm`
+ * next to it. Vite rewrites this to the hashed asset in a build.
+ */
+const CPU_WASM_URL = new URL("./cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url);
+
+async function fetchBytes(url: string | URL): Promise<ArrayBuffer> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`failed to fetch ${url}: HTTP ${res.status}`);
+  return res.arrayBuffer();
+}
 
 /** Mirrors `console.log` into the on-page log panel, so `badge.sys.log` calls are visible. */
 function installLogPanel(): void {
@@ -96,29 +110,34 @@ function main(): void {
   // it's kept alive (not disposed) across later mode switches so switching
   // back doesn't re-boot from scratch.
   //
-  // The `./cpu/bridge` import itself is dynamic (below), not static at the
-  // top of this file: `bridge.ts` imports the gitignored, Rust-toolchain-
-  // generated `src/cpu/wasm-pkg/`, so a static import here would make
-  // Lua-sandbox mode -- which has no need for any of that -- fail to even
-  // load (`vite dev`/`vite build`/`bunx tsc --noEmit` all error) on a clean
-  // checkout that hasn't run `bun run build:wasm`. Keeping the import inside
-  // this lazy-boot function means the Lua-only path never touches `src/cpu/`
-  // at all.
+  // Since Milestone 7 Task 8 the emulator runs in a dedicated Worker
+  // (`runtime/firmware-worker.ts`); this thread only fetches the bytes,
+  // paints the frames the Worker posts and forwards input
+  // (`runtime/firmware-worker-client.ts`). The Worker imports `./cpu/bridge`
+  // lazily, as this file did before: `bridge.ts` imports the gitignored,
+  // Rust-toolchain-generated `src/cpu/wasm-pkg/`, and the Lua-only path
+  // never creates the Worker, so it never loads `src/cpu/`.
   let firmwareRuntime: FirmwareRuntime | null = null;
   let firmwareRuntimePromise: Promise<FirmwareRuntime> | null = null;
 
   async function ensureFirmwareRuntime(): Promise<FirmwareRuntime> {
     if (firmwareRuntime) return firmwareRuntime;
     firmwareRuntimePromise ??= (async () => {
-      const { createFirmwareEmulator, initCpuWasm } = await import("./cpu/bridge");
-      await initCpuWasm();
-      const res = await fetch(FIRMWARE_IMAGE_URL);
-      if (!res.ok) {
-        throw new Error(`failed to fetch ${FIRMWARE_IMAGE_URL}: HTTP ${res.status}`);
+      const [wasm, image] = await Promise.all([fetchBytes(CPU_WASM_URL), fetchBytes(FIRMWARE_IMAGE_URL)]);
+      const worker = new Worker(new URL("./runtime/firmware-worker.ts", import.meta.url), { type: "module" });
+      // A real Worker's handlers take DOM event types; the client needs only `data`.
+      const rt = createWorkerFirmwareRuntime(worker as unknown as WorkerLike, shell.ctx, wasm, image);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          rt.ready.then(resolve, reject);
+          worker.addEventListener("error", (e) => reject(new Error(`firmware worker: ${e.message}`)), {
+            once: true,
+          });
+        });
+      } catch (e) {
+        rt.dispose();
+        throw e;
       }
-      const image = new Uint8Array(await res.arrayBuffer());
-      const handle = createFirmwareEmulator(image);
-      const rt = createFirmwareRuntime(handle, shell.ctx);
       firmwareRuntime = rt;
       return rt;
     })().catch((e: unknown) => {

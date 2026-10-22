@@ -69,8 +69,17 @@ impl Clock {
     }
 
     /// One executed step: returns the whole timer ticks it completed.
+    ///
+    /// Most steps complete no tick when the CPU runs faster than the timer,
+    /// so a remainder still below one tick returns 0 before the division
+    /// (Milestone 7 Task 6); the division would give 0 and leave the
+    /// remainder unchanged.
+    #[inline]
     pub fn step(&mut self) -> u64 {
         self.remainder += self.cycles_per_step * self.timer_hz;
+        if self.remainder < self.cpu_hz {
+            return 0;
+        }
         let ticks = self.remainder / self.cpu_hz;
         self.remainder %= self.cpu_hz;
         self.total_ticks += ticks;

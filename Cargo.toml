@@ -3,7 +3,12 @@ resolver = "2"
 members = ["emulator-core", "emulator-wasm"]
 
 [profile.release]
-opt-level = "s"
+# Milestone 7 Task 3: opt-level 3, not "s". Measured in the Milestone 7
+# spec (docs/superpowers/specs/2026-10-21-milestone7-core-throughput-design.md,
+# "Measured baseline"): 1.65x native steps/s and 1.30x WASM steps/s for
+# +10.7 KB of WASM (94,419 to 105,110 bytes). Fat LTO with one codegen
+# unit on top measured under 2 % more and is not adopted.
+opt-level = 3
 
 # Debug builds (`cargo test --workspace`) optimize the emulator core: the
 # boot rungs run hundreds of millions of emulated instructions, which an

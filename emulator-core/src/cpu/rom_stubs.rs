@@ -1723,13 +1723,31 @@ impl RomStub {
     }
 }
 
-/// Address → [`RomStub`] table. An empty table (the default) makes the CPU's
-/// stub check a single `is_empty()` branch, so a `Cpu` that never opts in
-/// pays essentially nothing and behaves identically to one built before this
-/// mechanism existed.
-#[derive(Debug, Clone, Default)]
+/// Address → [`RomStub`] table. The CPU looks every fetch address up
+/// here, so the table keeps the lowest and highest registered address and
+/// answers `None` outside that range with two compares, before any hashing
+/// (Milestone 7 Task 6). An empty table (the default) has an empty range
+/// (`min_addr > max_addr`), so a `Cpu` that never opts in pays the same two
+/// compares and behaves identically to one built before this mechanism
+/// existed. The range is learned from the registered addresses alone; no
+/// chip's address constant lives here.
+#[derive(Debug, Clone)]
 pub struct RomStubTable {
     entries: HashMap<u32, RomStub>,
+    /// Lowest registered address (`u32::MAX` while empty).
+    min_addr: u32,
+    /// Highest registered address (`0` while empty).
+    max_addr: u32,
+}
+
+impl Default for RomStubTable {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            min_addr: u32::MAX,
+            max_addr: 0,
+        }
+    }
 }
 
 impl RomStubTable {
@@ -1742,13 +1760,17 @@ impl RomStubTable {
     /// expression.
     pub fn insert(&mut self, addr: u32, stub: RomStub) -> &mut Self {
         self.entries.insert(addr, stub);
+        self.min_addr = self.min_addr.min(addr);
+        self.max_addr = self.max_addr.max(addr);
         self
     }
 
-    /// The stub registered at `addr`, if any. Short-circuits on an empty
-    /// table — see the type-level doc.
+    /// The stub registered at `addr`, if any. Outside the registered
+    /// address range (always, for an empty table) this is `None` without a
+    /// map lookup — see the type-level doc.
+    #[inline]
     pub fn lookup(&self, addr: u32) -> Option<RomStub> {
-        if self.entries.is_empty() {
+        if addr < self.min_addr || addr > self.max_addr {
             return None;
         }
         self.entries.get(&addr).copied()
@@ -1793,6 +1815,40 @@ mod tests {
         assert_eq!(stub.name, "rtc_get_reset_reason");
         assert_eq!(stub.effect, RomStubEffect::Return(1));
         assert_eq!(table.lookup(0x4000_001c), None, "neighbouring address");
+    }
+
+    #[test]
+    fn lookup_outside_the_registered_range_is_none() {
+        let mut table = RomStubTable::new();
+        table.insert(0x4000_0100, RomStub::returning("low", 1));
+        table.insert(0x4000_0200, RomStub::returning("high", 2));
+        // Below, above, and at the extremes of the address space.
+        assert_eq!(table.lookup(0x4000_00fe), None);
+        assert_eq!(table.lookup(0x4000_0202), None);
+        assert_eq!(table.lookup(0), None);
+        assert_eq!(table.lookup(u32::MAX), None);
+        // Both ends of the range are still found.
+        assert_eq!(table.lookup(0x4000_0100).unwrap().name, "low");
+        assert_eq!(table.lookup(0x4000_0200).unwrap().name, "high");
+        // Inside the range, a gap still goes to the map: no stub there.
+        assert_eq!(table.lookup(0x4000_0180), None);
+        // A later insert below the range widens it.
+        table.insert(0x4000_0010, RomStub::returning("lower", 3));
+        assert_eq!(table.lookup(0x4000_0010).unwrap().name, "lower");
+        assert_eq!(table.lookup(0x4000_0100).unwrap().name, "low");
+        // Re-registering an address keeps the range and replaces the stub.
+        table.insert(0x4000_0200, RomStub::returning("high2", 4));
+        assert_eq!(table.lookup(0x4000_0200).unwrap().name, "high2");
+        assert_eq!(table.len(), 3);
+    }
+
+    #[test]
+    fn a_single_entry_table_matches_only_its_address() {
+        let mut table = RomStubTable::new();
+        table.insert(0, RomStub::returning("zero", 0));
+        assert_eq!(table.lookup(0).unwrap().name, "zero");
+        assert_eq!(table.lookup(1), None);
+        assert_eq!(table.lookup(u32::MAX), None);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! setup supplies its CSR addresses ([`Csrs::set_cycle_counter`]).
 
 mod decode;
+mod decode_cache;
 // The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
 // blobs use is referenced, so the rest would trip `dead_code` now that the
 // module is crate-private.
@@ -34,6 +35,7 @@ pub use registers::{
 pub use rom_stubs::{RomStub, RomStubTable};
 
 use crate::mem::Bus;
+use decode_cache::DecodeCache;
 
 /// Outcome of a single [`Cpu::step`] call, for tests/callers to observe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,10 @@ pub struct Cpu {
     /// a core without this mechanism. See [`rom_stubs`] and
     /// [`Cpu::set_rom_stubs`].
     rom_stubs: RomStubTable,
+    /// Decoded instructions by address, validated by the fetched bits on
+    /// every hit, so it needs no invalidation (see [`decode_cache`]). A
+    /// clone copies it with the rest of the core.
+    decode_cache: DecodeCache,
 }
 
 /// Picks the line to take from a non-zero `pending` mask: the highest
@@ -153,6 +159,7 @@ impl Default for Cpu {
             rom_stub_index_drops: 0,
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
+            decode_cache: DecodeCache::new(),
         }
     }
 }
@@ -355,7 +362,7 @@ impl Cpu {
             };
         }
 
-        let (instr, len) = match fetch_and_decode(bus, pc) {
+        let (instr, len) = match fetch_and_decode(bus, &mut self.decode_cache, pc) {
             Ok(fetched) => fetched,
             Err(fault_addr) => {
                 // `self.regs.pc` is still `pc` here (untouched), so
@@ -1040,16 +1047,32 @@ impl Cpu {
 /// wasn't mapped (either `pc` itself, or `pc + 2` if the first halfword
 /// fetched fine but indicated a full-width instruction whose second half
 /// wasn't mapped).
-fn fetch_and_decode<B: Bus>(bus: &mut B, pc: u32) -> Result<(Instruction, u8), u32> {
+///
+/// Every instruction is still fetched; only its decode comes from `cache`
+/// when the cache holds a decode of exactly the fetched bits at `pc`.
+fn fetch_and_decode<B: Bus>(
+    bus: &mut B,
+    cache: &mut DecodeCache,
+    pc: u32,
+) -> Result<(Instruction, u8), u32> {
     let lo = bus.fetch16(pc).ok_or(pc)?;
-    if lo & 0b11 != 0b11 {
-        Ok((decode::decode_16(lo), 2))
+    let raw = if lo & 0b11 != 0b11 {
+        lo as u32
     } else {
         let hi_addr = pc.wrapping_add(2);
         let hi = bus.fetch16(hi_addr).ok_or(hi_addr)?;
-        let word = (lo as u32) | ((hi as u32) << 16);
-        Ok((decode::decode_32(word), 4))
+        (lo as u32) | ((hi as u32) << 16)
+    };
+    // Validated by the bits just fetched (see `decode_cache`): a hit is
+    // the decode of exactly these bits, so code that changed since it was
+    // cached misses here and is decoded afresh.
+    if let Some(hit) = cache.lookup(pc, raw) {
+        debug_assert_eq!(hit, decode_cache::decode_raw(raw));
+        return Ok(hit);
     }
+    let (instr, len) = decode_cache::decode_raw(raw);
+    cache.insert(pc, raw, instr, len);
+    Ok((instr, len))
 }
 
 #[cfg(test)]
@@ -3097,5 +3120,127 @@ mod tests {
         assert!(!info.trap_taken);
         assert_eq!(info.instr_len, 2);
         assert_eq!(cpu.regs.pc, 2);
+    }
+
+    // ---- Task 7 (Milestone 7): the decoded-instruction cache ----
+
+    #[test]
+    fn decode_cache_sees_a_store_over_a_cached_instruction() {
+        // 0x00: addi x5, x5, 1     <- overwritten after two iterations
+        // 0x04: addi x6, x6, 1
+        // 0x08: blt  x6, x7, -8    (x7 = 2: back to 0x00 once)
+        // 0x0c: sw   x8, 0(x0)     (x8 = addi x5, x5, 7)
+        // 0x10: jal  x0, -16       (back to 0x00)
+        let old = addi(5, 5, 1);
+        let new = addi(5, 5, 7);
+        let mut bus = TestBus::with_program(&[
+            old,
+            addi(6, 6, 1),
+            b_type(0b100, 6, 7, -8),
+            s_type(0b0100011, 0b010, 0, 8, 0),
+            jal(0, -16),
+        ]);
+        let mut cpu = Cpu::new();
+        cpu.regs.write(7, 2);
+        cpu.regs.write(8, new);
+
+        for _ in 0..6 {
+            assert!(!cpu.step(&mut bus).trap_taken);
+        }
+        assert_eq!(cpu.regs.read(5), 2, "two iterations of addi x5, x5, 1");
+        assert_eq!(cpu.regs.pc, 0x0c);
+        assert_eq!(
+            cpu.decode_cache.lookup(0, old),
+            Some((decode::decode_32(old), 4)),
+            "the old instruction is cached before the store"
+        );
+
+        cpu.step(&mut bus); // sw
+        cpu.step(&mut bus); // jal
+        assert_eq!(cpu.regs.pc, 0);
+        let info = cpu.step(&mut bus);
+        assert!(!info.trap_taken);
+        assert_eq!(
+            cpu.regs.read(5),
+            9,
+            "the stored addi x5, x5, 7 ran, not the cached decode"
+        );
+        assert_eq!(
+            cpu.decode_cache.lookup(0, old),
+            None,
+            "the entry now holds the new bits"
+        );
+        assert_eq!(
+            cpu.decode_cache.lookup(0, new),
+            Some((decode::decode_32(new), 4))
+        );
+    }
+
+    #[test]
+    fn decode_cache_keeps_unmapped_fetch_faulting() {
+        // A full-width instruction at 0 and a jal back to it: both cached
+        // after one pass, then the memory under them goes away.
+        let mut bus = TestBus::with_program(&[addi(5, 5, 1), jal(0, -4)]);
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x3000;
+        for _ in 0..4 {
+            assert!(!cpu.step(&mut bus).trap_taken);
+        }
+        assert_eq!(cpu.regs.pc, 0);
+        assert!(cpu.decode_cache.lookup(0, addi(5, 5, 1)).is_some());
+
+        // Only the first halfword stays fetchable: the second half faults.
+        bus.mem.truncate(3);
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(info.instr_len, 0);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(cpu.csr.mtval, 2);
+        assert_eq!(cpu.regs.read(5), 2, "the cached addi did not run");
+
+        // Nothing fetchable: the first halfword faults.
+        cpu.regs.pc = 0;
+        bus.mem.clear();
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(cpu.csr.mtval, 0);
+        assert_eq!(cpu.regs.pc, 0x3000);
+        assert_eq!(cpu.regs.read(5), 2);
+    }
+
+    #[test]
+    fn compressed_and_full_instructions_share_the_cache() {
+        // 0x00: c.addi x5, 1        (16-bit)
+        // 0x02: addi   x6, x6, 2    (32-bit)
+        // 0x06: jal    x0, -6       (32-bit, back to 0x00)
+        let c_addi: u16 = 0b000_0_00101_00001_01;
+        let full = addi(6, 6, 2);
+        let mut bus = TestBus::new(64);
+        bus.mem[0..2].copy_from_slice(&c_addi.to_le_bytes());
+        bus.mem[2..6].copy_from_slice(&full.to_le_bytes());
+        bus.mem[6..10].copy_from_slice(&jal(0, -6).to_le_bytes());
+        let mut cpu = Cpu::new();
+
+        let mut lens = Vec::new();
+        for _ in 0..6 {
+            let info = cpu.step(&mut bus);
+            assert!(!info.trap_taken);
+            lens.push(info.instr_len);
+        }
+        assert_eq!(lens, [2, 4, 4, 2, 4, 4]);
+        assert_eq!(cpu.regs.read(5), 2);
+        assert_eq!(cpu.regs.read(6), 4);
+        assert_eq!(cpu.regs.pc, 0);
+        assert_eq!(
+            cpu.decode_cache.lookup(0, c_addi as u32),
+            Some((decode::decode_16(c_addi), 2))
+        );
+        assert_eq!(
+            cpu.decode_cache.lookup(2, full),
+            Some((decode::decode_32(full), 4))
+        );
+        // The bits decide: the same pc with other bits is a miss.
+        assert_eq!(cpu.decode_cache.lookup(2, c_addi as u32), None);
     }
 }

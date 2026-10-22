@@ -2,7 +2,13 @@
 //! trait with an app image's parsed segments (see `crate::mem::image`).
 //!
 //! An ordered sequence of named address ranges, checked in this order on
-//! every access:
+//! every access. Multi-byte accesses behave exactly as their bytes in
+//! address order; a word fast path (Milestone 7 Task 5,
+//! [`FirmwareBus::read_fast`]/[`FirmwareBus::write_fast`] and
+//! [`Bus::fetch16`]) runs only tiers 1 and 2 below, in that order, for an
+//! access wholly inside one MMU page of an aperture or one resolved RAM
+//! span ([`RamSpan`], which keeps tier 2's first-match rule), and hands
+//! everything else to the byte path:
 //! 1. **XIP** (the flash-cache apertures, [`crate::mem::soc::DBUS_CACHE_RANGE`]
 //!    and [`crate::mem::soc::IBUS_CACHE_RANGE`], 8 MiB each): every access
 //!    translates through the flash MMU ([`FirmwareBus::mmu`]) to a physical
@@ -227,6 +233,23 @@ impl RamRegion {
     }
 }
 
+/// One span of the *resolved* RAM map the word fast path (Milestone 7
+/// Task 5) looks addresses up in: every byte of `[start, end)` lies outside
+/// both cache apertures and resolves, in [`FirmwareBus::read_byte`]'s
+/// first-match region lookup, to `ram_regions[region]`, whose `load_addr`
+/// is `base`. The spans are sorted, disjoint and end at or below 2^32, so an
+/// access that lies wholly inside one span touches exactly the bytes the
+/// byte path would, in the same region, with no catch-all byte among them
+/// (and nothing to log). Rebuilt whenever a region is added
+/// ([`FirmwareBus::rebuild_ram_spans`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RamSpan {
+    start: u64,
+    end: u64,
+    region: usize,
+    base: u32,
+}
+
 /// A small, fixed, read-only, **executable** code blob mapped at a fixed
 /// address: `[base, base + 4 * words.len())` reads (and fetches) `words` as
 /// little-endian 32-bit instruction words. Writes are dropped, like XIP flash
@@ -311,6 +334,13 @@ pub struct FirmwareBus {
     /// access translates through it to [`FirmwareBus::flash_chip`].
     pub mmu: FlashMmu,
     ram_regions: Vec<RamRegion>,
+    /// The resolved RAM map ([`RamSpan`]) over `ram_regions`, for the word
+    /// fast path. Derived data: rebuilt by [`FirmwareBus::rebuild_ram_spans`]
+    /// whenever `ram_regions` changes.
+    ram_spans: Vec<RamSpan>,
+    /// Index into `ram_spans` of the last span a fast-path access hit; a
+    /// hint only, always re-checked against the access's bounds before use.
+    last_ram_span: usize,
     /// Read-only executable ROM code blobs ([`RomCodeBlob`]), installed by
     /// [`FirmwareBus::map_rom_code`]. Empty unless a caller installs some
     /// (`crate::boot::boot_from_factory_image_with_rom_stubs` installs
@@ -470,6 +500,8 @@ impl FirmwareBus {
         let mut bus = Self {
             mmu: FlashMmu::new(),
             ram_regions,
+            ram_spans: Vec::new(),
+            last_ram_span: 0,
             rom_code: Vec::new(),
             rom_data: Vec::new(),
             // Starts at the XTAL clock the ROM leaves; follows
@@ -493,6 +525,7 @@ impl FirmwareBus {
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
         };
+        bus.rebuild_ram_spans();
         bus.seed_mmu_like_bootloader(segments);
         bus
     }
@@ -574,6 +607,7 @@ impl FirmwareBus {
     /// A pure function of live peripheral state -- this is what
     /// `crate::boot::step_with_interrupts` samples into
     /// `Cpu::set_pending_interrupts` at the start of every step.
+    #[inline]
     pub fn asserted_lines(&self) -> u32 {
         self.intc.poll(self.pending_sources())
     }
@@ -583,6 +617,11 @@ impl FirmwareBus {
     /// once the CPU runs faster than SYSTIMER). Call exactly once per
     /// `Cpu::step()` that is not an idle fast-forward -- see
     /// `crate::boot::step_with_interrupts`.
+    ///
+    /// Inlined into the step loop, with the timed peripherals' advance (a
+    /// step that completes a tick, one in five at 80 MHz) out of line
+    /// (Milestone 7 Task 6); the order of the work is unchanged.
+    #[inline]
     pub fn tick_peripherals(&mut self) {
         // The CPU clock the SYSTEM registers select now, sampled after the
         // step so a word write's byte-split halves are never seen alone.
@@ -592,14 +631,21 @@ impl FirmwareBus {
         self.sync_cpu_clock();
         let ticks = self.clock.step();
         if ticks > 0 {
-            self.systimer.advance_by(ticks);
-            self.usb_serial_jtag.advance(ticks);
+            self.advance_timed_peripherals(ticks);
         }
+    }
+
+    /// The timed peripherals' share of [`FirmwareBus::tick_peripherals`].
+    #[inline(never)]
+    fn advance_timed_peripherals(&mut self, ticks: u64) {
+        self.systimer.advance_by(ticks);
+        self.usb_serial_jtag.advance(ticks);
     }
 
     /// Points the clock at the CPU frequency the SYSTEM clock registers
     /// select ([`System::cpu_hz`]); an invalid encoding (`None`) keeps the
     /// previous rate, so the clock never runs at zero.
+    #[inline]
     fn sync_cpu_clock(&mut self) {
         if let Some(hz) = self.system.cpu_hz() {
             self.clock.set_cpu_hz(hz);
@@ -640,6 +686,120 @@ impl FirmwareBus {
             load_addr,
             data: vec![0u8; len],
         });
+        self.rebuild_ram_spans();
+    }
+
+    /// Recomputes [`FirmwareBus::ram_spans`] from `ram_regions`: cuts the
+    /// address space at every region edge and every cache-aperture edge,
+    /// and gives each piece outside the apertures to the *first* region
+    /// containing it, the same first-match rule as
+    /// [`FirmwareBus::read_byte`]/[`FirmwareBus::write_byte`] (so an image
+    /// segment inside a later scratch aperture keeps its own bytes).
+    /// Adjacent pieces of the same region merge. A handful of regions, so
+    /// the quadratic walk is nothing; it runs at construction and whenever
+    /// [`FirmwareBus::add_scratch_ram`] adds a region.
+    fn rebuild_ram_spans(&mut self) {
+        const TOP: u64 = 1 << 32;
+        let mut cuts: Vec<u64> = vec![0, TOP];
+        for r in &self.ram_regions {
+            let start = r.load_addr as u64;
+            cuts.push(start);
+            cuts.push((start + r.data.len() as u64).min(TOP));
+        }
+        for range in [&DBUS_CACHE_RANGE, &IBUS_CACHE_RANGE] {
+            cuts.push(range.start as u64);
+            cuts.push(range.end as u64);
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut spans: Vec<RamSpan> = Vec::new();
+        for pair in cuts.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            // `start < TOP` because `TOP` is the last cut.
+            let first = start as u32;
+            if Self::in_cache_aperture(first) {
+                continue;
+            }
+            let Some(region) = self.ram_regions.iter().position(|r| r.contains(first)) else {
+                continue;
+            };
+            match spans.last_mut() {
+                Some(last) if last.end == start && last.region == region => last.end = end,
+                _ => spans.push(RamSpan {
+                    start,
+                    end,
+                    region,
+                    base: self.ram_regions[region].load_addr,
+                }),
+            }
+        }
+        self.ram_spans = spans;
+        self.last_ram_span = 0;
+    }
+
+    /// The `(region index, offset)` of an `len`-byte access at `addr` when
+    /// the whole access lies inside one resolved RAM span, else `None`.
+    /// Tries the last span hit first (re-checked), then a binary search.
+    #[inline(always)]
+    fn ram_span_for(&mut self, addr: u32, len: u32) -> Option<(usize, usize)> {
+        let start = addr as u64;
+        let end = start + len as u64;
+        if let Some(s) = self.ram_spans.get(self.last_ram_span) {
+            if s.start <= start && end <= s.end {
+                return Some((s.region, (addr - s.base) as usize));
+            }
+        }
+        let i = self.ram_spans.partition_point(|s| s.end <= start);
+        let s = self.ram_spans.get(i)?;
+        if s.start <= start && end <= s.end {
+            self.last_ram_span = i;
+            Some((s.region, (addr - s.base) as usize))
+        } else {
+            None
+        }
+    }
+
+    /// The `N`-byte little-endian read fast path (Milestone 7 Task 5): the
+    /// XIP-aperture check, then the RAM-region check, in that order, as
+    /// [`FirmwareBus::read_byte`] runs them. `None` means "use the byte
+    /// path": an access that is not wholly inside one MMU page of an
+    /// aperture, whose page is invalid (the byte path logs it), or that is
+    /// not wholly inside one resolved RAM span. Every byte a `Some` covers
+    /// would have been read from the same place by the byte path, and
+    /// none of them would have been logged.
+    #[inline(always)]
+    fn read_fast<const N: usize>(&mut self, addr: u32) -> Option<[u8; N]> {
+        if Self::in_cache_aperture(addr) {
+            // The apertures are whole pages, so an access inside one page
+            // that starts in an aperture stays in it.
+            if (addr % MMU_PAGE_SIZE) as usize > MMU_PAGE_SIZE as usize - N {
+                return None;
+            }
+            // `FLASH_SIZE` is a whole number of pages, so `p + i` stays
+            // inside the same physical page: exactly `read_byte`'s
+            // `translate(addr + i) % FLASH_SIZE`.
+            let p = self.mmu.translate(addr)? % FLASH_SIZE as u32;
+            return Some(std::array::from_fn(|i| self.flash_chip.read(p + i as u32)));
+        }
+        let (r, off) = self.ram_span_for(addr, N as u32)?;
+        self.ram_regions[r].data[off..off + N].try_into().ok()
+    }
+
+    /// The `N`-byte write fast path: RAM only (an aperture write keeps the
+    /// byte path, which drops it). `false` means "use the byte path".
+    #[inline(always)]
+    fn write_fast<const N: usize>(&mut self, addr: u32, bytes: [u8; N]) -> bool {
+        if Self::in_cache_aperture(addr) {
+            return false;
+        }
+        match self.ram_span_for(addr, N as u32) {
+            Some((r, off)) => {
+                self.ram_regions[r].data[off..off + N].copy_from_slice(&bytes);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Maps a read-only, executable [`RomCodeBlob`] onto the bus (see that
@@ -1147,12 +1307,18 @@ impl Bus for FirmwareBus {
     }
 
     fn read16(&mut self, addr: u32) -> u16 {
+        if let Some(b) = self.read_fast::<2>(addr) {
+            return u16::from_le_bytes(b);
+        }
         let b0 = self.read_byte(addr);
         let b1 = self.read_byte(addr.wrapping_add(1));
         u16::from_le_bytes([b0, b1])
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        if let Some(b) = self.read_fast::<4>(addr) {
+            return u32::from_le_bytes(b);
+        }
         let mut buf = [0u8; 4];
         for (i, b) in buf.iter_mut().enumerate() {
             *b = self.read_byte(addr.wrapping_add(i as u32));
@@ -1165,18 +1331,42 @@ impl Bus for FirmwareBus {
     }
 
     fn write16(&mut self, addr: u32, val: u16) {
+        if self.write_fast(addr, val.to_le_bytes()) {
+            return;
+        }
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             self.write_byte(addr.wrapping_add(i as u32), *b);
         }
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        if self.write_fast(addr, val.to_le_bytes()) {
+            return;
+        }
         for (i, b) in val.to_le_bytes().iter().enumerate() {
             self.write_byte(addr.wrapping_add(i as u32), *b);
         }
     }
 
     fn fetch16(&mut self, addr: u32) -> Option<u16> {
+        // Fast path (Milestone 7 Task 5): the IBUS half of the aperture
+        // within one page (DBUS is never fetchable), then RAM. Both mean
+        // `is_mapped` holds for both bytes and `read16` reads them from
+        // the same place. An invalid page, a page-straddling fetch, DBUS,
+        // ROM code blobs and everything else take the original path.
+        if IBUS_CACHE_RANGE.contains(&addr) {
+            if addr % MMU_PAGE_SIZE != MMU_PAGE_SIZE - 1 {
+                if let Some(p) = self.mmu.translate(addr) {
+                    let p = p % FLASH_SIZE as u32;
+                    let lo = self.flash_chip.read(p);
+                    let hi = self.flash_chip.read(p + 1);
+                    return Some(u16::from_le_bytes([lo, hi]));
+                }
+            }
+        } else if let Some((r, off)) = self.ram_span_for(addr, 2) {
+            let d = &self.ram_regions[r].data;
+            return Some(u16::from_le_bytes([d[off], d[off + 1]]));
+        }
         let hi_addr = addr.wrapping_add(1);
         if self.is_mapped(addr) && self.is_mapped(hi_addr) {
             Some(self.read16(addr))
@@ -2040,5 +2230,217 @@ mod tests {
             160_000_000,
             "invalid CPUPERIOD_SEL keeps the rate"
         );
+    }
+
+    // ---- Milestone 7 Task 5: the word fast path must equal the byte path ----
+
+    /// `n` little-endian bytes at `addr`, read one `read8` at a time.
+    fn bytes_le(bus: &mut FirmwareBus, addr: u32, n: u32) -> u32 {
+        (0..n).fold(0u32, |acc, i| {
+            acc | (bus.read8(addr.wrapping_add(i)) as u32) << (8 * i)
+        })
+    }
+
+    /// Writes `n` little-endian bytes of `val` at `addr`, one `write8` at a
+    /// time.
+    fn write_bytes_le(bus: &mut FirmwareBus, addr: u32, val: u32, n: u32) {
+        for i in 0..n {
+            bus.write8(addr.wrapping_add(i), (val >> (8 * i)) as u8);
+        }
+    }
+
+    /// Drives `word` through `read16/read32/write16/write32` and `byte`
+    /// through `read8/write8` at `addr`, asserting the same values and the
+    /// same unmapped log after every access.
+    fn assert_word_matches_bytes(word: &mut FirmwareBus, byte: &mut FirmwareBus, addr: u32) {
+        let log = |b: &FirmwareBus| b.unmapped_log().iter().copied().collect::<Vec<_>>();
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "read32 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "log after read32 {addr:#x}");
+        assert_eq!(
+            word.read16(addr) as u32,
+            bytes_le(byte, addr, 2),
+            "read16 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "log after read16 {addr:#x}");
+        word.write32(addr, 0xA1B2_C3D4);
+        write_bytes_le(byte, addr, 0xA1B2_C3D4, 4);
+        assert_eq!(log(word), log(byte), "log after write32 {addr:#x}");
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "after write32 {addr:#x}"
+        );
+        word.write16(addr, 0x5E6F);
+        write_bytes_le(byte, addr, 0x5E6F, 2);
+        assert_eq!(log(word), log(byte), "log after write16 {addr:#x}");
+        assert_eq!(
+            word.read32(addr),
+            bytes_le(byte, addr, 4),
+            "after write16 {addr:#x}"
+        );
+        assert_eq!(log(word), log(byte), "final log {addr:#x}");
+    }
+
+    #[test]
+    fn word_access_across_a_region_edge_matches_the_byte_path() {
+        // A word starting 2 bytes before the end of a RAM region: two bytes
+        // are RAM, two fall through to the catch-all (read 0, logged, writes
+        // dropped).
+        let make = || bus_with(vec![(0x3fc9_0000, (1..=8).collect())]);
+        let (mut word, mut byte) = (make(), make());
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0006);
+        assert!(!word.unmapped_log().is_empty(), "the edge was reached");
+        // And one starting 1 and 3 bytes before the end.
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0007);
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_0005);
+
+        // First-match edges between overlapping regions: an image segment
+        // inside a scratch aperture added after it (as `crate::boot` does).
+        // A word across either edge of the segment mixes the two regions
+        // byte by byte, and the segment's bytes must win.
+        let make = || {
+            let mut bus = bus_with(vec![(0x3fc9_0010, (1..=8).collect())]);
+            bus.add_scratch_ram(0x3fc9_0000, 0x40);
+            bus
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in [0x3fc9_000e, 0x3fc9_000f, 0x3fc9_0016, 0x3fc9_0017] {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        // The scratch region's own end, against the catch-all.
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3fc9_003e);
+        // The very top of the address space must not wrap into address 0.
+        assert_word_matches_bytes(&mut word, &mut byte, u32::MAX - 1);
+    }
+
+    #[test]
+    fn word_fetch_across_an_mmu_page_edge_matches_the_byte_path() {
+        // Exactly one IBUS page mapped; the next one is invalid.
+        let make = || {
+            let code: Vec<u8> = (0..MMU_PAGE_SIZE).map(|i| (i * 7 + 3) as u8).collect();
+            bus_with(vec![(0x4200_0000, code)])
+        };
+        let (mut word, mut byte) = (make(), make());
+        assert_eq!(
+            word.fetch16(0x4200_ffff),
+            None,
+            "half the fetch is unmapped"
+        );
+        assert_eq!(
+            word.fetch16(0x4200_fffe).map(u32::from),
+            Some(bytes_le(&mut byte, 0x4200_fffe, 2))
+        );
+        assert_eq!(
+            word.fetch16(0x4200_fffd).map(u32::from),
+            Some(bytes_le(&mut byte, 0x4200_fffd, 2))
+        );
+        assert_eq!(word.fetch16(0x4201_0000), None);
+        // Data reads across the same edge: the invalid page's bytes read 0
+        // and are logged, byte by byte. (XIP writes are dropped either way.)
+        for addr in [0x4200_fffd, 0x4200_fffe, 0x4200_ffff] {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        assert!(word
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == 0x4201_0000 && !a.is_write));
+        // And across the DBUS end of the aperture into unmapped space.
+        let make = || bus_with(vec![(0x3c7f_0000, vec![0x5a; MMU_PAGE_SIZE as usize])]);
+        let (mut word, mut byte) = (make(), make());
+        assert_word_matches_bytes(&mut word, &mut byte, 0x3c7f_fffe);
+    }
+
+    #[test]
+    fn unaligned_word_read_in_ram_matches_the_byte_path() {
+        let make = || {
+            bus_with(vec![(
+                0x3fc9_0000,
+                (0..64u32).map(|i| (i * 3) as u8).collect(),
+            )])
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in 0x3fc9_0001..0x3fc9_0008 {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+        assert!(word.unmapped_log().is_empty());
+        // Unaligned in XIP too, inside one page.
+        let make = || {
+            bus_with(vec![(
+                0x3c00_0000,
+                (0..64u32).map(|i| (i * 5) as u8).collect(),
+            )])
+        };
+        let (mut word, mut byte) = (make(), make());
+        for addr in 0x3c00_0001..0x3c00_0008 {
+            assert_word_matches_bytes(&mut word, &mut byte, addr);
+        }
+    }
+
+    #[test]
+    fn dbus_is_still_not_fetchable() {
+        let mut bus = bus_with(vec![
+            (0x3c00_0000, vec![0x13, 0x00, 0x00, 0x00, 0x13, 0x00]),
+            (0x4200_0000, vec![0x13, 0x00, 0x00, 0x00]),
+        ]);
+        for addr in 0x3c00_0000..0x3c00_0006 {
+            assert_eq!(bus.fetch16(addr), None, "DBUS {addr:#x}");
+        }
+        assert_eq!(bus.read16(0x3c00_0000), 0x0013, "DBUS stays readable");
+        assert_eq!(bus.fetch16(0x4200_0000), Some(0x0013), "IBUS fetches");
+    }
+
+    // ---- Task 7 (Milestone 7): the decode cache under an MMU remap ----
+
+    #[test]
+    fn decode_cache_sees_a_remapped_xip_page() {
+        use crate::cpu::encode::{addi, jal};
+        use crate::cpu::{exception_code, Cpu};
+        let page = |imm: i32| {
+            let mut code = vec![0u8; MMU_PAGE_SIZE as usize];
+            code[0..4].copy_from_slice(&addi(5, 5, imm).to_le_bytes());
+            code[4..8].copy_from_slice(&jal(0, -4).to_le_bytes());
+            code
+        };
+        // Two IBUS pages backed by two different flash pages: the first
+        // adds 1 in a loop, the second adds 7.
+        let mut bus = bus_with(vec![(0x4200_0000, page(1)), (0x4201_0000, page(7))]);
+        let entry = |id: u32| MMU_TABLE_RANGE.start + 4 * id;
+        let (first, second) = (bus.read32(entry(0)), bus.read32(entry(1)));
+        assert_ne!(first, second);
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x4038_0000;
+        cpu.regs.pc = 0x4200_0000;
+        for _ in 0..4 {
+            assert!(!cpu.step(&mut bus).trap_taken);
+        }
+        assert_eq!(
+            cpu.regs.read(5),
+            2,
+            "the first page's addi ran twice, the second from the cache"
+        );
+        assert_eq!(cpu.regs.pc, 0x4200_0000);
+
+        // Point the first page's entry at the second page's flash.
+        bus.write32(entry(0), second);
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert_eq!(
+            cpu.regs.read(5),
+            9,
+            "the remapped page's addi x5, x5, 7 ran"
+        );
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert_eq!(cpu.regs.pc, 0x4200_0000);
+
+        // And an entry set invalid under the cached pc faults.
+        bus.write32(entry(0), MMU_INVALID);
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(cpu.csr.mtval, 0x4200_0000);
+        assert_eq!(cpu.regs.read(5), 9);
     }
 }

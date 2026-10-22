@@ -10,7 +10,9 @@
     "preview": "vite preview",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build:wasm": "wasm-pack build ../emulator-wasm --target web --out-dir ../frontend/src/cpu/wasm-pkg"
+    "build:wasm": "wasm-pack build ../emulator-wasm --target web --out-dir ../frontend/src/cpu/wasm-pkg",
+    "bench:wasm": "bun bench/bun-bench.ts",
+    "bench:safari": "bun bench/safari-bench.ts"
   },
   "dependencies": {
     "fengari": "^0.1.5",

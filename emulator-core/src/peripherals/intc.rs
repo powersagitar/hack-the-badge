@@ -158,6 +158,24 @@ pub struct InterruptController {
     cpu_int_clear: u32,
     cpu_int_pri: [u32; LINE_COUNT as usize],
     cpu_int_thresh: u32,
+    /// Lines that are enabled, have a non-zero priority and a priority
+    /// `>=` the threshold: the register-derived half of [`Self::poll`],
+    /// recomputed by [`Self::recompute_line_gate`] whenever
+    /// [`Self::write_byte`] (the only writer of the registers it derives
+    /// from; ROM-stub writes reach it through the bus) changes one of them.
+    /// Milestone 7 Tasks 4 and 6.
+    line_gate: u32,
+    /// Sources whose MAP route is a line in [`Self::line_gate`] (line 0,
+    /// "not routed", never is): the only sources that can contribute a line
+    /// to [`Self::poll`]. Register-derived like `line_gate` and recomputed
+    /// with it when an input of either changes; never peripheral state. Milestone 7
+    /// Task 6.
+    gated_sources: u64,
+    /// For each line, the sources whose MAP register routes to it (index 0:
+    /// the unrouted ones), kept in step with `map` by [`Self::write_byte`],
+    /// so a gate change rebuilds [`Self::gated_sources`] from the gated
+    /// lines alone. Milestone 7 Task 6.
+    line_sources: [u64; LINE_COUNT as usize],
 }
 
 impl Default for InterruptController {
@@ -169,6 +187,14 @@ impl Default for InterruptController {
             cpu_int_clear: 0,
             cpu_int_pri: [0; LINE_COUNT as usize],
             cpu_int_thresh: 0,
+            line_gate: 0,     // nothing enabled at reset
+            gated_sources: 0, // so no source can reach a line
+            line_sources: {
+                // Every MAP register resets to 0: every source on line 0.
+                let mut l = [0; LINE_COUNT as usize];
+                l[0] = u64::MAX;
+                l
+            },
         }
     }
 }
@@ -202,17 +228,69 @@ impl InterruptController {
     /// Mask of CPU lines with at least one asserted, routed source
     /// (`pending_sources` bit `s` set and `MAP[s] & 0x1F != 0`), before any
     /// enable/priority gating.
+    ///
+    /// Visits only the set bits of `pending_sources` (Milestone 7 Task 4);
+    /// a line-0 route sets bit 0, which no `line_gate` or caller treats as
+    /// a line, so it is cleared at the end.
     fn routed_lines(&self, pending_sources: u64) -> u32 {
         let mut lines = 0u32;
-        for (src, map) in self.map.iter().enumerate() {
-            if pending_sources & (1u64 << src) != 0 {
-                let line = map & LINE_MASK;
-                if line != 0 {
-                    lines |= 1 << line;
-                }
+        let mut pending = pending_sources;
+        while pending != 0 {
+            let src = pending.trailing_zeros() as usize;
+            pending &= pending - 1;
+            lines |= 1 << (self.map[src] & LINE_MASK);
+        }
+        lines & !1 // line 0 means "not routed"
+    }
+
+    /// The register-derived line gate, computed from scratch: enabled,
+    /// priority != 0 (priority 0 is "disabled") and priority >= threshold.
+    fn computed_line_gate(&self) -> u32 {
+        let thresh = self.cpu_int_thresh & PRIO_MASK;
+        let mut gate = 0u32;
+        for (line, pri) in self.cpu_int_pri.iter().enumerate() {
+            let pri = pri & PRIO_MASK;
+            if pri != 0 && pri >= thresh {
+                gate |= 1 << line;
             }
         }
-        lines
+        gate & self.cpu_int_enable
+    }
+
+    /// The sources routed to a line in `gate`, computed from scratch: a
+    /// source routed to line 0 is not routed, and line 0 is never in a
+    /// gate that matters (`routed_lines` clears it), so it is excluded.
+    fn computed_gated_sources(&self, gate: u32) -> u64 {
+        let mut sources = 0u64;
+        for (src, map) in self.map.iter().enumerate() {
+            let line = map & LINE_MASK;
+            if line != 0 && gate & (1 << line) != 0 {
+                sources |= 1 << src;
+            }
+        }
+        sources
+    }
+
+    /// Refreshes [`Self::line_gate`] and [`Self::gated_sources`] after a
+    /// write that changed a register they derive from. `gated_sources` is
+    /// the union of [`Self::line_sources`] over the gate's lines (line 0
+    /// excluded), the same set [`Self::computed_gated_sources`] scans the
+    /// MAP registers for.
+    fn recompute_line_gate(&mut self) {
+        self.line_gate = self.computed_line_gate();
+        let mut gate = self.line_gate & !1;
+        let mut sources = 0u64;
+        while gate != 0 {
+            let line = gate.trailing_zeros() as usize;
+            gate &= gate - 1;
+            sources |= self.line_sources[line];
+        }
+        self.gated_sources = sources;
+        debug_assert_eq!(
+            self.gated_sources,
+            self.computed_gated_sources(self.line_gate),
+            "line_sources out of step with the MAP registers"
+        );
     }
 
     /// The set of CPU lines currently asserted *to the CPU*: routed pending,
@@ -220,21 +298,34 @@ impl InterruptController {
     /// is "disabled"), and with priority greater than or equal to
     /// `CPU_INT_THRESH_REG` (only priorities strictly below the threshold are
     /// masked). See the module doc.
+    ///
+    /// The enable/priority/threshold half is the precomputed
+    /// [`Self::line_gate`]; debug builds check it against a fresh
+    /// computation on every call. Pending sources are never cached.
+    ///
+    /// Only sources in [`Self::gated_sources`] are routed (Milestone 7
+    /// Task 6): any other pending source maps to line 0 or to a line the
+    /// gate masks, so it could not change the result. Debug builds check
+    /// the result against the unfiltered routing on every call (and the
+    /// mask against a scan of the MAP registers whenever it is rebuilt).
     pub fn poll(&self, pending_sources: u64) -> u32 {
-        if pending_sources == 0 {
-            return 0; // the common case, every step: skip the scans
-        }
-        let candidates = self.routed_lines(pending_sources) & self.cpu_int_enable;
-        let thresh = self.cpu_int_thresh & PRIO_MASK;
-        let mut out = 0u32;
-        for line in 0..LINE_COUNT {
-            let pri = self.cpu_int_pri[line as usize] & PRIO_MASK;
-            // Priority 0 = line disabled (module doc), whatever `thresh` is.
-            if candidates & (1 << line) != 0 && pri != 0 && pri >= thresh {
-                out |= 1 << line;
-            }
-        }
-        out
+        debug_assert_eq!(
+            self.line_gate,
+            self.computed_line_gate(),
+            "stale interrupt line gate"
+        );
+        let deliverable = pending_sources & self.gated_sources;
+        let lines = if deliverable == 0 {
+            0 // the common case, every step: skip the scan
+        } else {
+            self.routed_lines(deliverable) & self.line_gate
+        };
+        debug_assert_eq!(
+            lines,
+            self.routed_lines(pending_sources) & self.line_gate,
+            "source filter changed the asserted lines"
+        );
+        lines
     }
 
     /// Each CPU line's 4-bit `CPU_INT_PRI_n` priority, for the core's
@@ -268,25 +359,55 @@ impl InterruptController {
         word.to_le_bytes()[idx]
     }
 
+    /// Stores one byte. The line gate and the gated sources are rebuilt
+    /// only when an enable, priority or threshold register, or a MAP
+    /// register's route, actually changes (Milestone 7 Task 6): they are
+    /// pure functions of those registers, so an unchanged value leaves them
+    /// correct, and the next `poll` sees every change.
     pub fn write_byte(&mut self, offset: u32, val: u8) {
+        /// `set_byte`, reporting whether the word changed.
+        fn store(word: &mut u32, idx: u32, val: u8) -> bool {
+            let before = *word;
+            set_byte(word, idx, val);
+            *word != before
+        }
         let word_offset = offset & !0b11;
         let idx = offset & 0b11;
-        match word_offset {
-            CPU_INT_ENABLE_REG => set_byte(&mut self.cpu_int_enable, idx, val),
-            CPU_INT_TYPE_REG => set_byte(&mut self.cpu_int_type, idx, val),
-            CPU_INT_CLEAR_REG => set_byte(&mut self.cpu_int_clear, idx, val),
-            CPU_INT_THRESH_REG => set_byte(&mut self.cpu_int_thresh, idx, val),
+        let gate_inputs_changed = match word_offset {
+            CPU_INT_ENABLE_REG => store(&mut self.cpu_int_enable, idx, val),
+            CPU_INT_TYPE_REG => {
+                set_byte(&mut self.cpu_int_type, idx, val);
+                false
+            }
+            CPU_INT_CLEAR_REG => {
+                set_byte(&mut self.cpu_int_clear, idx, val);
+                false
+            }
+            CPU_INT_THRESH_REG => store(&mut self.cpu_int_thresh, idx, val),
             o if (CPU_INT_PRI_BASE_REG..CPU_INT_THRESH_REG).contains(&o) => {
                 let n = ((o - CPU_INT_PRI_BASE_REG) / 4) as usize;
-                set_byte(&mut self.cpu_int_pri[n], idx, val);
+                store(&mut self.cpu_int_pri[n], idx, val)
             }
-            o if o < MAP_REGION_END => set_byte(&mut self.map[(o / 4) as usize], idx, val),
+            o if o < MAP_REGION_END => {
+                let src = (o / 4) as usize;
+                let old_line = (self.map[src] & LINE_MASK) as usize;
+                set_byte(&mut self.map[src], idx, val);
+                let new_line = (self.map[src] & LINE_MASK) as usize;
+                if old_line != new_line {
+                    self.line_sources[old_line] &= !(1u64 << src);
+                    self.line_sources[new_line] |= 1u64 << src;
+                }
+                old_line != new_line
+            }
             // CPU_INT_EIP_STATUS_REG is read-only; FirmwareBus already
             // intercepts reads of it before calling into this peripheral,
             // but a write reaching here (if it ever did) is correctly a
             // no-op. Anything past CPU_INT_THRESH_REG (e.g. the DATE
             // register) is likewise accepted and dropped.
-            _ => {}
+            _ => false,
+        };
+        if gate_inputs_changed {
+            self.recompute_line_gate();
         }
     }
 }
@@ -495,5 +616,101 @@ mod tests {
         arm(&mut ic, 50, 4, 1);
         assert_eq!(ic.poll(1u64 << 50), 1 << 4);
         assert_eq!(ic.poll(0), 0, "no latching: level follows the source");
+    }
+
+    /// Routing visits only the set bits of `pending_sources` (Milestone 7
+    /// Task 4): a routed source that is not pending contributes nothing,
+    /// and the top source (63) routes like any other.
+    #[test]
+    fn routed_lines_visits_only_pending_sources() {
+        let mut ic = InterruptController::new();
+        write_word(&mut ic, 19 * 4, 3);
+        write_word(&mut ic, 44 * 4, 9);
+        assert_eq!(ic.routed_lines(1u64 << 44), 1 << 9);
+        assert_eq!(
+            ic.routed_lines((1u64 << 19) | (1u64 << 44)),
+            (1 << 3) | (1 << 9)
+        );
+        assert_eq!(ic.routed_lines(0), 0);
+        write_word(&mut ic, 63 * 4, 21);
+        assert_eq!(ic.routed_lines(1u64 << 63), 1 << 21);
+        assert_eq!(ic.routed_lines(u64::MAX), (1 << 3) | (1 << 9) | (1 << 21));
+    }
+
+    /// Review Focus 3 (Milestone 7): the precomputed line gate follows every
+    /// enable, priority and threshold write, so the very next `poll` sees it,
+    /// exactly as the per-register scan it replaced did.
+    #[test]
+    fn line_gate_follows_enable_priority_and_threshold_writes() {
+        let src = 1u64 << 19;
+        let fresh = || {
+            let mut ic = InterruptController::new();
+            write_word(&mut ic, 19 * 4, 5);
+            write_word(&mut ic, CPU_INT_ENABLE_REG, 1 << 5);
+            write_word(&mut ic, CPU_INT_PRI_BASE_REG + 5 * 4, 3);
+            write_word(&mut ic, CPU_INT_THRESH_REG, 1);
+            assert_eq!(ic.poll(src), 1 << 5);
+            assert_eq!(ic.line_gate, ic.computed_line_gate());
+            ic
+        };
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_THRESH_REG, 4);
+        assert_eq!(ic.poll(src), 0, "threshold 4 above priority 3");
+        write_word(&mut ic, CPU_INT_THRESH_REG, 3);
+        assert_eq!(ic.poll(src), 1 << 5, "threshold 3 == priority 3 (>=)");
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 5 * 4, 0);
+        assert_eq!(ic.poll(src), 0, "priority 0 disables the line");
+
+        let mut ic = fresh();
+        write_word(&mut ic, CPU_INT_ENABLE_REG, 0);
+        assert_eq!(ic.poll(src), 0, "enable bit cleared");
+
+        // A single byte write (as a `sb`, or one lane of a byte-split word)
+        // takes effect on its own.
+        let mut ic = fresh();
+        ic.write_byte(CPU_INT_THRESH_REG, 4);
+        assert_eq!(ic.poll(src), 0);
+        assert_eq!(ic.line_gate, ic.computed_line_gate());
+    }
+
+    /// Task 6's source filter follows MAP writes as well as the gate: a
+    /// source rerouted to a masked line, to line 0, or back, and a line's
+    /// gate opening under an already-routed source, all take effect on the
+    /// next poll; masked or unrouted pending sources never hide a
+    /// deliverable one.
+    #[test]
+    fn gated_sources_follow_map_and_gate_writes() {
+        let a = 1u64 << 19;
+        let b = 1u64 << 40;
+        let mut ic = InterruptController::new();
+        arm(&mut ic, 19, 5, 3);
+        write_word(&mut ic, 40 * 4, 6); // routed, line 6 not enabled
+        assert_eq!(ic.gated_sources, a);
+        assert_eq!(ic.poll(a | b), 1 << 5);
+        assert_eq!(ic.poll(b), 0);
+
+        write_word(&mut ic, 19 * 4, 6); // reroute to the masked line
+        assert_eq!(ic.poll(a | b), 0);
+        write_word(&mut ic, 19 * 4, 0); // unrouted
+        assert_eq!(ic.poll(a), 0);
+        assert_eq!(ic.gated_sources, 0);
+        write_word(&mut ic, 19 * 4, 5); // back
+        assert_eq!(ic.poll(a), 1 << 5);
+
+        // Line 6's gate opens: source 40, routed earlier, now delivers.
+        let en = read_word(&mut ic, CPU_INT_ENABLE_REG);
+        write_word(&mut ic, CPU_INT_ENABLE_REG, en | 1 << 6);
+        write_word(&mut ic, CPU_INT_PRI_BASE_REG + 6 * 4, 2);
+        assert_eq!(ic.gated_sources, a | b);
+        assert_eq!(ic.poll(a | b), 1 << 5 | 1 << 6);
+        assert_eq!(ic.poll(b), 1 << 6);
+
+        // Two sources on one line, one rerouted away: the line stays up.
+        write_word(&mut ic, 40 * 4, 5);
+        assert_eq!(ic.poll(b), 1 << 5);
+        assert_eq!(ic.gated_sources, ic.computed_gated_sources(ic.line_gate));
     }
 }
