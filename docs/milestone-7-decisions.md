@@ -511,6 +511,41 @@ under Profiles).
   a capped slice yields through the timer`. If wrong: none; the
   alternative is firmware that runs unseen.
 
+### Task 9a: Dev server
+
+- **R-T9a-1, the dependency pre-bundle gets the production build's
+  `process.env` define.** `bun run dev` died at load with `Uncaught
+  ReferenceError: process is not defined` (pre-existing; reproduced at
+  `6cd0a6e`). Root cause: fengari's `src/luaconf.js` line 3 reads
+  `process.env.FENGARICONF` at module top level with no `typeof process`
+  guard. Every other `process` use in fengari (`lauxlib`, `lbaselib`,
+  `lualib`, `linit`, `liolib`, `loslib`, `ldblib`, `loadlib`) sits in the
+  Node branch of a `typeof process` guard, and its Node-only deps `tmp`
+  and `readline-sync` are required only inside those branches. Vite 8.3.0's production build
+  replaces `process.env` with `{}` (`vite:define`, non-lib builds), so
+  `conf` is `{}` there; the dev optimizer (`prepareRolldownOptimizerRun`)
+  defines only `process.env.NODE_ENV` plus
+  `optimizeDeps.rolldownOptions.transform.define`, and dev serves
+  `node_modules` deps only through that pre-bundle. The fix is
+  `optimizeDeps.rolldownOptions.transform.define = { "process.env": "{}" }`
+  in `frontend/vite.config.ts`: the same rule the production build applies,
+  so fengari's config resolves to `{}` in both and the Lua sandbox is
+  unchanged. Rejected: a top-level `define` (it does not reach the
+  optimizer, and in dev Vite's `env.mjs` assigns each define onto
+  `globalThis` at runtime, so `globalThis.process = { env: {} }` would
+  make `typeof process` true and switch on fengari's Node paths, `io` and
+  `process.stdout` among them); a narrower `process.env.FENGARICONF`
+  define (same value today, but diverges from production for any other
+  dep's `process.env`); a `process` shim (also flips the `typeof` guards);
+  excluding fengari from the optimizer (it is CommonJS and must be
+  pre-bundled in dev); patching `node_modules`. Pinned by `pre-bundled
+  fengari evaluates without a process global` (`test/vite-prebundle.test.ts`),
+  which runs the real optimizer with this config into a temporary cache
+  directory and evaluates the output in a `node:vm` context with no
+  `process`; it fails without the define. If wrong: a dep that needs a
+  real `process.env` in dev would see `{}`, as it already does in the
+  production build.
+
 ## Measurements
 
 The native benchmark is
