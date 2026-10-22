@@ -174,6 +174,8 @@ reads a little below the redraws' steps/s.
 | `6cd0a6e` core (Task 2's bench, measured at `b9a7336` plus Task 2) | 2 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.00 | 0.151 | 0.199 | 0.264 | n/a |
 | `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Safari 27.0.1 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 11.07 | 0.152 | 0.201 | 0.264 | — |
 | `6cd0a6e` core (Task 2's bench, measured at `0468972`) | 2 | WASM, Chrome 155 (bench page, Worker), Apple M5 Pro | release `opt-level = "s"` (wasm-pack) | 12.36 | 0.172 | 0.228 | 0.301 | — |
+| Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 20.78 | 0.302 | 0.385 | 0.510 | 27.0 |
+| Task 3 (measured at `0fff5d4` plus Task 3's `Cargo.toml`) | 3 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 13.75 | 0.191 | 0.257 | 0.340 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -252,6 +254,47 @@ host the steps per redraw were identical (home 19,286,041, down
   literal factor 0.234, 0.227, 0.976. An earlier run that overlapped
   Safari read 12.15 Msteps/s and pin factors 0.167, 0.219, 0.302, within
   4 %.
+
+### Task 3: release `opt-level = 3`
+
+`Cargo.toml`'s `[profile.release]` goes from `opt-level = "s"` to
+`opt-level = 3` (the debug profile already built `emulator-core` at 3,
+so the debug suite does not change). Every pin held. Native `BENCH`
+lines:
+
+```
+BENCH walk steps=372597011 wall_s=17.93 msteps_per_s=20.78
+BENCH home emulated_ms=254.0 steps=19106041 busy_pct=94.0 wall_ms_median=839.8 wall_ms_min=837.2 factor=0.302 msteps_per_s=22.75
+BENCH down emulated_ms=115.0 steps=6858235 busy_pct=74.6 wall_ms_median=298.6 wall_ms_min=297.1 factor=0.385 msteps_per_s=22.97
+BENCH onboarding emulated_ms=67.0 steps=3018254 busy_pct=56.4 wall_ms_median=131.3 wall_ms_min=131.2 factor=0.510 msteps_per_s=23.00
+```
+
+Bun (`bun run bench:wasm`, median of 3; the runs agreed within 3 % on
+the walk and 1.5 % on every redraw):
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=0fff5d4+dirty profile=release opt-level=3
+BENCH median runs=3 walk msteps_per_s=13.75
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=1342.7 factor=0.261 msteps_per_s=14.36 pin_factor=0.191
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=450.3 factor=0.257 msteps_per_s=15.34 pin_factor=0.257
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=218.0 factor=1.101 msteps_per_s=15.30 pin_factor=0.340
+```
+
+(`+dirty`: Task 3's uncommitted `Cargo.toml`.) Against the baselines:
+native redraws 1.65x the steps/s (HOME 13.80 to 22.75 M), the walk
+1.55x; Bun redraws 1.27x to 1.29x (pin factors 0.151, 0.199, 0.264 to
+0.191, 0.257, 0.340), the walk 1.25x. This matches the spec's
+brainstorming measurement (1.65x native, 1.30x WASM).
+
+WASM size (`frontend/src/cpu/wasm-pkg/emulator_wasm_bg.wasm`): 94,419
+bytes at `"s"`, 105,110 bytes at 3 (+10,691 bytes, +11.3 %), the spec's
+figures exactly.
+
+Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
+534 lib + 95 integration pass (64 boot rungs, 1 ignored), 29.1 s wall,
+`boot_progress` 28.4 s; release `boot_progress` 64 pass, 1 ignored, 27.0 s
+(41.5 s at `"s"`); clippy the same 3 warnings; `bun run build:wasm` and
+`bun run typecheck` ok; `bun test` 149 pass, 0 fail, 29.4 s.
 
 ## Profiles
 
