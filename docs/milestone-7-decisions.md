@@ -1279,6 +1279,21 @@ it, either or both:
 - The status line can show a pre-reset state for up to one
   `STATUS_INTERVAL_MS` (250 ms) after a reset or provision (R-T8-9).
 
+### From the final review
+
+- `stepFirmwareFrame` (firmware-runtime.ts:221, called from
+  firmware-worker.ts) copies the 153,600-byte framebuffer out of WASM on
+  every slice (line 231), even when a frame is already in flight; fetch
+  it only when a frame will be posted.
+- A Worker error after ready only logs to the console
+  (firmware-worker-client.ts:157-159): the client keeps `running`, the
+  canvas freezes and the status line gives no hint; surface it there.
+- In firmware-runtime.ts, `injectButton`'s local `now` (emulated us,
+  line 420) shadows the `now` option (wall clock, line 308); rename it.
+- A button held (not a deferred release) across a mode switch or a hidden
+  tab stays held, unchanged from Milestone 6; a UI release-on-blur would
+  fix it.
+
 ### Speed and timing
 
 - **Snake's game-over draw after an eat** comes 50 to 134 ms after the

@@ -114,7 +114,7 @@ For the Rust/WASM CPU emulator (`emulator-core/`, `emulator-wasm/`):
   core/peripherals (no WASM round-trip; this is the primary iteration loop).
 - Build profiles (root `Cargo.toml`): release is `opt-level = 3` since
   Milestone 7 (it was `"s"`; 1.65x native and 1.3x WASM steps/s for an
-  11 % larger `.wasm`, about 110.8 KB), and the dev profile builds
+  11 % larger `.wasm` at Task 3, 105.1 KB; 110.8 KB at the end of Milestone 7), and the dev profile builds
   `emulator-core` at `opt-level = 3` with debug assertions on, so the
   debug suite runs the debug-only cross-checks (the interrupt line gate,
   the CPU clock decode, each decode-cache hit) on every step.

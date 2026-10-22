@@ -696,7 +696,8 @@ impl FirmwareBus {
     /// [`FirmwareBus::read_byte`]/[`FirmwareBus::write_byte`] (so an image
     /// segment inside a later scratch aperture keeps its own bytes).
     /// Adjacent pieces of the same region merge. A handful of regions, so
-    /// the quadratic walk is nothing; it runs only at construction.
+    /// the quadratic walk is nothing; it runs at construction and whenever
+    /// [`FirmwareBus::add_scratch_ram`] adds a region.
     fn rebuild_ram_spans(&mut self) {
         const TOP: u64 = 1 << 32;
         let mut cuts: Vec<u64> = vec![0, TOP];
