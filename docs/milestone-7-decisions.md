@@ -347,6 +347,48 @@ under Profiles).
   that state would remove (spec Part 2's audit); not done here. If wrong:
   speed left on the table, a Milestone 8 item if HOME needs it.
 
+### Task 7
+
+- **R-T7-3, the decode cache is tagged by the raw bits alone; this
+  departs from the brief's entry shape.** The brief's entry is
+  `{ pc, raw, instr, len }` and a hit matched both `pc` and `raw`. The
+  decoders take nothing but the bits (`decode_16(u16)`,
+  `decode_32(u32)`: no `pc`, no machine state), so an entry another
+  address left in the slot is the true decode whenever its bits match
+  the bits fetched now. The table is still indexed by `pc`
+  (`(pc >> 1) & mask`), `lookup(pc, raw)` and `insert(pc, raw, instr,
+  len)` keep the brief's signatures, and the entry is `{ raw, instr, len }`
+  (16 bytes instead of 20). Measured in one session, back to back:
+  HOME 1.047x and 1.050x with the `pc` tag, 1.110x and 1.125x without it
+  (more hits on shared slots, one compare and four bytes less per entry).
+  Review Focus 1 holds unchanged: a hit still requires the bits fetched
+  this step. If wrong: only if a future decoder reads anything but the
+  bits; the module doc says the `pc` tag must come back then, and the
+  debug check of R-T7-5 fails on the first such hit.
+- **R-T7-4, the table stays at `1 << 14` entries, 262,144 bytes per
+  `Cpu` and so per `FirmwareRuntime` clone.** Measured with the `pc` tag
+  (HOME factor): `1 << 10` 1.001x, `1 << 12` 1.033x, `1 << 14` 1.047x,
+  `1 << 16` 1.063x. The clone-heavy release suite got faster, not slower
+  (9.7 s to 8.0 s wall; the table is one 256 KiB `memcpy` per clone, and
+  the emulator state a clone already copies is larger), so clone cost is
+  not material. If wrong: `1 << 16` would give about 1.5 % more for
+  1 MiB per clone and in WASM linear memory; a Milestone 8 option, not
+  needed for the bar.
+- **R-T7-5, debug builds check every cache hit against a fresh
+  decode** (`debug_assert_eq!` in `fetch_and_decode`), so every step of
+  the debug suite proves the hit equals what the decoder says. Release
+  builds skip it. Cost: the debug workspace run went from 14.0 s to
+  14.9 s wall. If wrong: none in release.
+- **R-T7-6, no invalidation-based variant goes on the Milestone 8
+  backlog.** R-T7-1 sets the bar at fetch 10 % or more after this task;
+  `FirmwareBus::fetch16` is 9.0 % of the Task 7 profile (8.8 % before).
+  The ROM-stub check still runs before the fetch, and the cache is
+  consulted only after a successful fetch, so a stubbed `pc` never
+  reaches the cache and an unmapped fetch traps before any lookup. If
+  wrong: fetch stays a per-step cost of about 9 %; a block cache that
+  skips fetch (Task 10's backlog lead if HOME needs it) would remove it
+  together with the dispatch cost below.
+
 ## Measurements
 
 The native benchmark is
@@ -376,6 +418,8 @@ reads a little below the redraws' steps/s.
 | Task 5 (measured at `c54e8c8` plus Task 5's code) | 5 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 32.39 | 0.476 | 0.709 | 0.886 | n/a |
 | Task 6 (measured at `f23288a` plus Task 6's code) | 6 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 66.74 | 1.020 | 1.313 | 1.649 | 9.7 |
 | Task 6 (measured at `f23288a` plus Task 6's code) | 6 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 38.01 | 0.557 | 0.858 | 1.089 | n/a |
+| Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | native, Apple M5 Pro (18 cores), rustc 1.98.1 | release `opt-level = 3` | 69.43 | 1.077 | 1.400 | 1.756 | 8.0 |
+| Task 7 (measured at `fb968ad` plus Task 7's code) | 7 | WASM, Bun 1.3.14 (JavaScriptCore), Apple M5 Pro | release `opt-level = 3` (wasm-pack) | 40.77 | 0.609 | 0.972 | 1.211 | n/a |
 
 The baseline's `BENCH` lines:
 
@@ -644,6 +688,70 @@ step; release `boot_progress` 64 pass, 1 ignored, 9.7 s wall (8.4 s in
 the harness); clippy the same 3 warnings; `bun run build:wasm` and
 `bun run typecheck` ok; `bun test` 149 pass, 0 fail, 11.4 s.
 
+### Task 7: decoded-instruction cache
+
+`Cpu` holds a `DecodeCache` (`cpu/decode_cache.rs`): a direct-mapped
+table of `1 << 14` entries indexed by `(pc >> 1) & mask`, validated by
+the raw instruction bits on every hit (R-T7-1) and tagged by them alone
+(R-T7-3). `Cpu::step` is unchanged up to the fetch: interrupt entry,
+then the ROM-stub check, then both `fetch16`s exactly as before;
+`fetch_and_decode` then looks the bits up and decodes only on a miss.
+`raw` is the halfword zero-extended for a 16-bit instruction and the
+whole word for a 32-bit one. Every pin held. Native `BENCH` lines:
+
+```
+BENCH walk steps=372597011 wall_s=5.37 msteps_per_s=69.43
+BENCH home emulated_ms=254.0 steps=19106041 busy_pct=94.0 wall_ms_median=235.9 wall_ms_min=235.2 factor=1.077 msteps_per_s=80.98
+BENCH down emulated_ms=115.0 steps=6858235 busy_pct=74.6 wall_ms_median=82.2 wall_ms_min=81.7 factor=1.400 msteps_per_s=83.48
+BENCH onboarding emulated_ms=67.0 steps=3018254 busy_pct=56.4 wall_ms_median=38.1 wall_ms_min=38.0 factor=1.756 msteps_per_s=79.12
+```
+
+Native runs of the same code varied more than in earlier tasks (HOME
+1.069x to 1.104x over five runs, the profiled build included), so the
+cache was also measured against itself switched off (the lookup and
+insert compiled out, everything else equal), alternating, in one
+session: off 0.999x and 0.981x HOME, on 1.103x and 1.102x; DOWN 1.288x
+and 1.261x against 1.440x and 1.439x; onboarding 1.613x and 1.591x
+against 1.801x and 1.792x; the walk 65.6 and 65.1 against 70.8 and 70.7
+Msteps/s. Like for like, the cache is worth 1.10x to 1.14x natively. The
+table keeps the first plain run.
+
+Bun (`bun run bench:wasm`, median of 3; a second invocation agreed
+within 2 % on the walk and every pin factor: 40.74, 0.603, 0.953, 1.186):
+
+```
+BENCH host="Bun 1.3.14 (JavaScriptCore), Apple M5 Pro, darwin arm64" commit=fb968ad+dirty profile=release opt-level=3
+BENCH median runs=3 walk msteps_per_s=40.77
+BENCH median runs=3 home emulated_ms=349.8 steps=19286041 wall_ms=421.1 factor=0.831 msteps_per_s=45.80 pin_factor=0.609
+BENCH median runs=3 down emulated_ms=115.6 steps=6908235 wall_ms=119.2 factor=0.970 msteps_per_s=57.94 pin_factor=0.972
+BENCH median runs=3 onboarding emulated_ms=240.0 steps=3335609 wall_ms=61.1 factor=3.927 msteps_per_s=54.57 pin_factor=1.211
+```
+
+(`+dirty`: Task 7's uncommitted code.) Against Task 6: Bun pin factors
+1.09x to 1.13x (0.557, 0.858, 1.089 to 0.609, 0.972, 1.211), the walk
+1.07x. **HOME under Bun is still short of the badge's speed, at a pin
+factor of 0.609** (DOWN 0.972, onboarding 1.211); for Task 10, the
+remaining native profile is the Task 7 table under Profiles: instruction
+execution and its dispatch (`execute` 24.7 %, `Cpu::step` 15.3 %), the
+per-step interrupt sample and clock in `step_with_interrupts` (20.5 %),
+and `fetch16` (9.0 %). Only a cache that skips the per-step fetch and
+dispatch (a block cache) or the per-step peripheral sample (spec Part 2's
+audit) attacks the first two.
+
+Cache size: 262,144 bytes per `Cpu` (16,384 entries of 16 bytes), so per
+`FirmwareRuntime` clone and per runtime in WASM linear memory. The
+clone-heavy release suite went from 9.7 s to 8.0 s wall (R-T7-4).
+
+WASM size: 110,286 bytes at Task 6, 110,768 bytes now (+482 bytes).
+
+Check list, all green: `cargo fmt --all` clean; `cargo test --workspace`
+549 lib (Task 7's six new tests: three in `cpu`, two in
+`cpu::decode_cache`, one in `mem::bus`) + 95 integration pass (64 boot
+rungs, 1 ignored), 14.9 s wall, `boot_progress` 11.6 s; release
+`boot_progress` 64 pass, 1 ignored, 8.0 s wall (7.9 s in the harness);
+clippy the same 3 warnings; `bun run build:wasm` and `bun run typecheck`
+ok; `bun test` 149 pass, 0 fail, 10.8 s.
+
 ## Profiles
 
 Procedure (every optimization task follows it):
@@ -805,6 +913,35 @@ two compares; the interrupt sample, the clock tick and the step glue went
 from 2,741 samples (24.8 %) to 2,202 (23.6 % of a shorter profile).
 Fetch and decode (`decode_16`, `decode_32`, `fetch16`: 28.4 %) lead
 what is left, which is Task 7's decode cache.
+
+### Task 7 (decoded-instruction cache, release `opt-level = 3`)
+
+Before: the Task 6 "After" table above (9,329 samples). After: 9,087
+samples (this run: walk 69.38 Msteps/s, HOME 1.069x).
+
+| Share | Symbol |
+| --- | --- |
+| 24.7 % | `cpu::execute::execute` |
+| 20.5 % | `step_with_interrupts` (with `tick_peripherals` and `asserted_lines` inlined) |
+| 15.3 % | `Cpu::step` (with `fetch_and_decode` and the cache lookup inlined) |
+| 11.7 % | the `bench_redraws` closure (the benchmark's own framebuffer hashing) |
+| 9.0 % | `FirmwareBus::fetch16` |
+| 2.7 % | `FirmwareBus::read32` |
+| 2.7 % | `SysTimer::advance_by` |
+| 1.8 % | `FirmwareBus::write_byte` |
+| 1.7 % | `FirmwareBus::write32` |
+| 1.7 % | `FirmwareBus::read_byte` |
+
+Below the top 10: `run_until_stable_frame` 1.5 %, `idle_until` 1.5 %,
+`UsbSerialJtag::advance` 1.2 %, `FirmwareRuntime::run_until` 1.2 %,
+`decode_16` 0.6 % and `decode_32` 0.4 % (misses only). In samples,
+decode went from 1,834 (`decode_16` 1,216, `decode_32` 618) to 87, and
+`Cpu::step` rose from 1,191 to 1,386 (the lookup), but `execute` rose
+from 852 to 2,247: much of what the profile charged to decode was the
+host's mispredicted branches on the instruction's kind, which now land
+on `execute`'s `match` over the cached `Instruction` instead. The net
+gain is the 1.10x to 1.14x measured above, not the 20 % decode share.
+Fetch (`fetch16`, 9.0 %) is under R-T7-1's 10 % bar (R-T7-6).
 
 ## Milestone 8 backlog
 

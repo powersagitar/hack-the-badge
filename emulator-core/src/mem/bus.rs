@@ -2391,4 +2391,55 @@ mod tests {
         assert_eq!(bus.read16(0x3c00_0000), 0x0013, "DBUS stays readable");
         assert_eq!(bus.fetch16(0x4200_0000), Some(0x0013), "IBUS fetches");
     }
+
+    // ---- Task 7 (Milestone 7): the decode cache under an MMU remap ----
+
+    #[test]
+    fn decode_cache_sees_a_remapped_xip_page() {
+        use crate::cpu::encode::{addi, jal};
+        use crate::cpu::{exception_code, Cpu};
+        let page = |imm: i32| {
+            let mut code = vec![0u8; MMU_PAGE_SIZE as usize];
+            code[0..4].copy_from_slice(&addi(5, 5, imm).to_le_bytes());
+            code[4..8].copy_from_slice(&jal(0, -4).to_le_bytes());
+            code
+        };
+        // Two IBUS pages backed by two different flash pages: the first
+        // adds 1 in a loop, the second adds 7.
+        let mut bus = bus_with(vec![(0x4200_0000, page(1)), (0x4201_0000, page(7))]);
+        let entry = |id: u32| MMU_TABLE_RANGE.start + 4 * id;
+        let (first, second) = (bus.read32(entry(0)), bus.read32(entry(1)));
+        assert_ne!(first, second);
+        let mut cpu = Cpu::new();
+        cpu.csr.mtvec = 0x4038_0000;
+        cpu.regs.pc = 0x4200_0000;
+        for _ in 0..4 {
+            assert!(!cpu.step(&mut bus).trap_taken);
+        }
+        assert_eq!(
+            cpu.regs.read(5),
+            2,
+            "the first page's addi ran twice, the second from the cache"
+        );
+        assert_eq!(cpu.regs.pc, 0x4200_0000);
+
+        // Point the first page's entry at the second page's flash.
+        bus.write32(entry(0), second);
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert_eq!(
+            cpu.regs.read(5),
+            9,
+            "the remapped page's addi x5, x5, 7 ran"
+        );
+        assert!(!cpu.step(&mut bus).trap_taken);
+        assert_eq!(cpu.regs.pc, 0x4200_0000);
+
+        // And an entry set invalid under the cached pc faults.
+        bus.write32(entry(0), MMU_INVALID);
+        let info = cpu.step(&mut bus);
+        assert!(info.trap_taken);
+        assert_eq!(cpu.csr.mcause, exception_code::INSTRUCTION_ACCESS_FAULT);
+        assert_eq!(cpu.csr.mtval, 0x4200_0000);
+        assert_eq!(cpu.regs.read(5), 9);
+    }
 }
