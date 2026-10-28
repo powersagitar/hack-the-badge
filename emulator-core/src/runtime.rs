@@ -41,6 +41,40 @@
 //!   accelerometer on I2C0 reports (`crate::peripherals::sc7a20h`); the
 //!   onboarding app's "Shake it!" page needs a shake.
 //!
+//! ## Software reset (Milestone 9)
+//!
+//! v392 opens some apps by rebooting into them: `esp_restart()` ends in the
+//! mask-ROM `software_reset_cpu` (`crate::rom`, entry 26), whose stub
+//! requests a reset (`crate::cpu::rom_stubs::RomStubEffect::RequestReset`).
+//! The run loop collects the request after the step that made it
+//! ([`crate::cpu::Cpu::take_reset_request`]) and re-boots the same image
+//! there, so a run's step budget stays exact. The new boot is a fresh
+//! [`boot_from_firmware_image_with_rom_stubs`] with
+//! `crate::rom::esp32c3_rom_stubs_with_reset_reason`, so
+//! `rtc_get_reset_reason` reports the reset's reason, plus what a reset
+//! keeps on the badge:
+//!
+//! - **the emulated flash, whole** (the identity, `reboot.cfg`);
+//! - **RTC_CNTL `STORE0..7`** (`crate::peripherals::rtc_cntl`; ESP-IDF's
+//!   reset-reason hint is `STORE6`, `RTC_RESET_CAUSE_REG`, per
+//!   `components/esp_system/port/soc/esp32c3/reset_reason.c`);
+//! - **RTC fast memory** (`crate::mem::soc::RTC_RANGE`), with the image's
+//!   own RTC segments reloaded over it, as the bootloader would;
+//! - **the panel** (`crate::peripherals::spi::St7789`): an external chip
+//!   the MCU reset does not touch, so its pixels stay until the firmware
+//!   redraws (any command byte clears its transient parameter state);
+//! - **the console's output text**; queued host serial input is dropped
+//!   with the old USB-Serial-JTAG, as [`FirmwareRuntime::reset`] does;
+//! - **held buttons and the host-set acceleration**, re-applied;
+//! - **[`FirmwareRuntime::total_steps`] and host time:**
+//!   [`FirmwareRuntime::emulated_time_us`] is the time accumulated before
+//!   the reset plus the new clock's, so it never goes backwards and a
+//!   [`FirmwareRuntime::run_until`] across a reset still stops at its
+//!   target.
+//!
+//! [`FirmwareRuntime::soft_reset_count`] counts them. The host's own
+//! [`FirmwareRuntime::reset`] stays a cold power-on.
+//!
 //! ## Checkpoints
 //!
 //! A `FirmwareRuntime` is `Clone`, and a clone is a complete, independent
@@ -102,6 +136,13 @@ pub struct FirmwareRuntime {
     /// a reset doesn't strand a physically-held button in the "down" state.
     buttons: [bool; NUM_RAW_BUTTON_SLOTS],
     total_steps: u64,
+    /// Software resets since construction or the last cold reset (module
+    /// doc, "Software reset").
+    soft_reset_count: u32,
+    /// Emulated time, in microseconds, accumulated by the clocks that
+    /// software resets replaced; [`FirmwareRuntime::emulated_time_us`] adds
+    /// the current clock's.
+    time_base_us: u64,
 }
 
 impl FirmwareRuntime {
@@ -117,6 +158,8 @@ impl FirmwareRuntime {
             bus,
             buttons: [false; NUM_RAW_BUTTON_SLOTS],
             total_steps: 0,
+            soft_reset_count: 0,
+            time_base_us: 0,
         })
     }
 
@@ -124,7 +167,9 @@ impl FirmwareRuntime {
     /// peripheral state, the emulated flash and the reconstructed
     /// framebuffer all start over), with the currently-held buttons and the
     /// host-set acceleration ([`FirmwareRuntime::set_acceleration`])
-    /// re-applied. Queued serial input is dropped with the old bus.
+    /// re-applied. Queued serial input is dropped with the old bus. A cold
+    /// power-on: the soft-reset count and emulated time go back to 0, and
+    /// `rtc_get_reset_reason` reports `POWERON_RESET` again.
     ///
     /// Can only fail if the image stopped parsing, which can't happen for an
     /// image that already parsed once — but the error is propagated rather
@@ -135,13 +180,69 @@ impl FirmwareRuntime {
         self.cpu = cpu;
         self.bus = bus;
         self.total_steps = 0;
+        self.soft_reset_count = 0;
+        self.time_base_us = 0;
+        self.reapply_host_input(accel);
+        Ok(())
+    }
+
+    /// Re-applies the held buttons and `accel` to a freshly-built bus.
+    fn reapply_host_input(&mut self, accel: [i32; 3]) {
         let held = self.buttons;
         for (slot, pressed) in held.iter().enumerate() {
             self.apply_button(slot, *pressed);
         }
         let [x, y, z] = accel;
         self.bus.i2c0.accel.set_acceleration(x, y, z);
-        Ok(())
+    }
+
+    /// The software reset a `RequestReset` ROM stub asked for, with
+    /// `reason` for the next boot's `rtc_get_reset_reason`. See the module
+    /// doc, "Software reset", for what it keeps. If the image somehow
+    /// stopped parsing, nothing changes: the core stays on the stub, which
+    /// asks again next step.
+    fn soft_reset(&mut self, reason: u32) {
+        use crate::mem::soc::RTC_RANGE;
+        use crate::mem::Bus;
+        let Ok((mut cpu, bus)) = boot_from_firmware_image_with_rom_stubs(&self.image) else {
+            return;
+        };
+        let Ok(parsed) = crate::mem::image::parse_image(&self.image) else {
+            return;
+        };
+        cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs_with_reset_reason(reason));
+        let rtc_ram: Vec<u8> = RTC_RANGE.map(|a| self.bus.read8(a)).collect();
+        let accel = self.acceleration();
+        self.time_base_us += self.bus.clock.elapsed_us();
+        let old = std::mem::replace(&mut self.bus, bus);
+        self.cpu = cpu;
+
+        self.bus.flash_chip = old.flash_chip;
+        self.bus.rtc_cntl.set_store_regs(old.rtc_cntl.store_regs());
+        for (a, b) in RTC_RANGE.zip(rtc_ram) {
+            self.bus.write8(a, b);
+        }
+        // The image's RTC segments are reloaded over the kept memory.
+        for seg in &parsed.segments {
+            let Some(data) = self.image.get(seg.file_offset..seg.file_offset + seg.len) else {
+                continue;
+            };
+            for (a, b) in (seg.load_addr..).zip(data) {
+                if RTC_RANGE.contains(&a) {
+                    self.bus.write8(a, *b);
+                }
+            }
+        }
+        self.bus.spi.st7789 = old.spi.st7789;
+        self.bus.console = old.console;
+        self.reapply_host_input(accel);
+        self.soft_reset_count += 1;
+    }
+
+    /// Software resets since construction or the last
+    /// [`FirmwareRuntime::reset`] (module doc, "Software reset").
+    pub fn soft_reset_count(&self) -> u32 {
+        self.soft_reset_count
     }
 
     /// Runs up to `budget` instruction steps, delivering peripheral
@@ -166,15 +267,25 @@ impl FirmwareRuntime {
     /// An idle `WFI` wait whose next event lies past the target is advanced
     /// only to the target ([`crate::boot::idle_until`]), so a run that ends
     /// idle ends exactly at the target instead of at the next alarm; a run
-    /// that ends busy overshoots by at most one step's time.
+    /// that ends busy overshoots by at most one step's time. A software
+    /// reset on the way does not move the target (module doc).
     pub fn run_until(&mut self, target_time_us: u64, max_steps: u32) -> RunSummary {
-        let target_ticks = self.bus.clock.ticks_at_us(target_time_us);
-        self.run_impl(max_steps, Some(target_ticks), None)
+        self.run_impl(max_steps, Some(target_time_us), None)
     }
 
-    /// Emulated time since construction or the last reset, in microseconds.
+    /// Emulated time since construction or the last cold
+    /// [`FirmwareRuntime::reset`], in microseconds. Software resets do not
+    /// restart it (module doc, "Software reset").
     pub fn emulated_time_us(&self) -> u64 {
-        self.bus.clock.elapsed_us()
+        self.time_base_us + self.bus.clock.elapsed_us()
+    }
+
+    /// The current clock's tick count at host time `target_us` (0 if the
+    /// target is before this clock started).
+    fn ticks_at_host_us(&self, target_us: u64) -> u64 {
+        self.bus
+            .clock
+            .ticks_at_us(target_us.saturating_sub(self.time_base_us))
     }
 
     /// Same as [`FirmwareRuntime::run`], but also tallies each step's
@@ -190,14 +301,17 @@ impl FirmwareRuntime {
 
     /// Shared body for [`FirmwareRuntime::run`],
     /// [`FirmwareRuntime::run_until`] and [`FirmwareRuntime::run_traced`]:
-    /// up to `budget` steps, stopping early (before a step) once the clock
-    /// has reached `stop_at_ticks`.
+    /// up to `budget` steps, stopping early (before a step) once emulated
+    /// time has reached `stop_at_us`. A software reset requested by a step
+    /// is performed right after it, and the stop point is re-derived for
+    /// the new clock.
     fn run_impl(
         &mut self,
         budget: u32,
-        stop_at_ticks: Option<u64>,
+        stop_at_us: Option<u64>,
         mut pc_hist: Option<&mut HashMap<u32, u64>>,
     ) -> RunSummary {
+        let mut stop_at_ticks = stop_at_us.map(|us| self.ticks_at_host_us(us));
         let mut summary = RunSummary::default();
         let mut ran: u32 = 0;
         while ran < budget {
@@ -220,6 +334,10 @@ impl FirmwareRuntime {
             }
             if info.rom_stub.is_some() {
                 summary.rom_stub_calls += 1;
+            }
+            if let Some(reason) = self.cpu.take_reset_request() {
+                self.soft_reset(reason);
+                stop_at_ticks = stop_at_us.map(|us| self.ticks_at_host_us(us));
             }
             ran += 1;
         }
@@ -274,7 +392,8 @@ impl FirmwareRuntime {
         self.cpu.regs.pc
     }
 
-    /// Total steps run since construction or the last [`FirmwareRuntime::reset`].
+    /// Total steps run since construction or the last cold
+    /// [`FirmwareRuntime::reset`]; software resets do not restart it.
     pub fn total_steps(&self) -> u64 {
         self.total_steps
     }
@@ -631,5 +750,144 @@ mod tests {
         let s = rt.run_until(0, 1_000);
         assert_eq!(s.steps, 0);
         assert_eq!(rt.total_steps(), 10_000);
+    }
+
+    /// Runs one step at `stub` (a mask-ROM stub address) with `ra` pointing
+    /// back at the synthetic image's self-loop, as an ordinary call would.
+    fn call_stub(rt: &mut FirmwareRuntime, stub: u32) -> RunSummary {
+        rt.cpu
+            .regs
+            .write(crate::cpu::rom_stubs::REG_RA, 0x4200_0020);
+        rt.cpu.regs.pc = stub;
+        rt.run(1)
+    }
+
+    /// What `rtc_get_reset_reason` returns right now.
+    fn reset_reason(rt: &mut FirmwareRuntime) -> u32 {
+        call_stub(rt, crate::rom::RTC_GET_RESET_REASON);
+        rt.cpu.regs.read(crate::cpu::rom_stubs::REG_A0)
+    }
+
+    /// A blank (`0xFF`) flash offset in the storage partition, for the
+    /// retention tests.
+    const FLASH_PROBE: u32 = 0x3F_0000;
+    /// An RTC fast memory word no image segment covers.
+    const RTC_PROBE: u32 = crate::mem::soc::RTC_RANGE.start + 0x100;
+    /// `RTC_CNTL_STORE6_REG`, ESP-IDF's `RTC_RESET_CAUSE_REG`.
+    const STORE6_ADDR: u32 =
+        crate::mem::soc::RTC_CNTL_RANGE.start + crate::peripherals::rtc_cntl::STORE6_REG;
+
+    #[test]
+    fn soft_reset_keeps_flash_store_regs_and_counts_steps() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert_eq!(rt.soft_reset_count(), 0);
+        rt.run(100);
+        rt.bus.flash_chip.program(FLASH_PROBE, &[0x5A]);
+        rt.bus.write32(STORE6_ADDR, 0x8003_0003);
+        rt.bus.write32(RTC_PROBE, 0xC0FF_EE00);
+        let steps = rt.total_steps();
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.pc(), 0x4200_0020, "restarted at the image's entry");
+        assert_eq!(rt.total_steps(), steps + 1, "the reset step counts once");
+        assert_eq!(rt.bus.flash_chip.read(FLASH_PROBE), 0x5A);
+        assert_eq!(rt.bus.read32(STORE6_ADDR), 0x8003_0003);
+        assert_eq!(rt.bus.read32(RTC_PROBE), 0xC0FF_EE00);
+        assert_eq!(reset_reason(&mut rt), crate::rom::RESET_REASON_CPU0_SW);
+    }
+
+    #[test]
+    fn software_reset_reports_a_core_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(reset_reason(&mut rt), crate::rom::RESET_REASON_CORE_SW);
+    }
+
+    #[test]
+    fn emulated_time_is_monotonic_across_a_soft_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(80_000);
+        let t_before = rt.emulated_time_us();
+        assert!(t_before > 0);
+        rt.cpu
+            .regs
+            .write(crate::cpu::rom_stubs::REG_RA, 0x4200_0020);
+        rt.cpu.regs.pc = crate::rom::SOFTWARE_RESET_CPU;
+        let s = rt.run_until(t_before + 50_000, 100_000_000);
+        assert_eq!(rt.soft_reset_count(), 1, "the run crossed the reset");
+        assert!(s.steps > 1);
+        assert!(
+            rt.emulated_time_us() >= t_before + 50_000,
+            "{} < {}",
+            rt.emulated_time_us(),
+            t_before + 50_000
+        );
+        assert!(
+            rt.emulated_time_us() < t_before + 50_100,
+            "stopped at the target, not past it"
+        );
+
+        // Sampled step by step around a second reset: never decreasing.
+        let mut last = rt.emulated_time_us();
+        rt.cpu.regs.pc = crate::rom::SOFTWARE_RESET_CPU;
+        for _ in 0..1_000 {
+            rt.run(1);
+            let now = rt.emulated_time_us();
+            assert!(now >= last, "{now} < {last}");
+            last = now;
+        }
+        assert_eq!(rt.soft_reset_count(), 2);
+    }
+
+    #[test]
+    fn held_button_survives_a_soft_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.set_raw_button(1, true);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert!(rt.raw_button(1));
+        pulse_load(&mut rt);
+        assert!(
+            !rt.bus()
+                .gpio
+                .pin_level(crate::peripherals::gpio::PIN_HC165_DATA),
+            "the fresh bus shows slot 1 pressed"
+        );
+    }
+
+    #[test]
+    fn console_output_survives_a_soft_reset() {
+        use crate::mem::soc::USB_SERIAL_JTAG_RANGE;
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        for b in b"reboot into scanner\n" {
+            rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(*b));
+        }
+        let before = rt.console_output();
+        rt.serial_input(b"queued");
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(b'!'));
+        assert!(rt.console_output().starts_with(&before));
+        assert_eq!(rt.console_output(), format!("{before}!"));
+        assert_eq!(rt.serial_pending(), 0, "queued host input is dropped");
+    }
+
+    #[test]
+    fn cold_reset_after_a_soft_reset_is_a_power_on() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.flash_chip.program(FLASH_PROBE, &[0x5A]);
+        rt.run(10_000);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        rt.run(10_000);
+        assert_eq!(rt.soft_reset_count(), 1);
+        rt.reset().expect("reset");
+        assert_eq!(rt.bus.flash_chip.read(FLASH_PROBE), 0xFF);
+        assert_eq!(rt.soft_reset_count(), 0);
+        assert_eq!(rt.emulated_time_us(), 0);
+        assert_eq!(reset_reason(&mut rt), crate::rom::POWERON_RESET);
     }
 }

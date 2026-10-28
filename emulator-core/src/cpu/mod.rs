@@ -121,6 +121,10 @@ pub struct Cpu {
     /// a core without this mechanism. See [`rom_stubs`] and
     /// [`Cpu::set_rom_stubs`].
     rom_stubs: RomStubTable,
+    /// The reason code of a [`rom_stubs::RomStubEffect::RequestReset`] stub
+    /// this core ran and its driver has not collected yet (see
+    /// [`Cpu::take_reset_request`]).
+    reset_request: Option<u32>,
     /// Decoded instructions by address, validated by the fetched bits on
     /// every hit, so it needs no invalidation (see [`decode_cache`]). A
     /// clone copies it with the rest of the core.
@@ -159,6 +163,7 @@ impl Default for Cpu {
             rom_stub_index_drops: 0,
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
+            reset_request: None,
             decode_cache: DecodeCache::new(),
         }
     }
@@ -221,6 +226,15 @@ impl Cpu {
     /// `(stub address, offending index)` of the most recent dropped call.
     pub fn last_rom_stub_index_drop(&self) -> Option<(u32, u32)> {
         self.last_rom_stub_index_drop
+    }
+
+    /// Collects (and clears) the reason code of the last
+    /// [`rom_stubs::RomStubEffect::RequestReset`] stub this core ran, if any.
+    /// The core itself never resets: the driver checks this after each step
+    /// and rebuilds the machine (`crate::runtime::FirmwareRuntime`). Until
+    /// then `pc` stays on the stub, so stepping on re-runs it.
+    pub fn take_reset_request(&mut self) -> Option<u32> {
+        self.reset_request.take()
     }
 
     /// The currently-installed ROM-stub table (empty unless
@@ -482,6 +496,12 @@ impl Cpu {
         match stub.effect {
             RomStubEffect::Return(value) => self.regs.write(rom_stubs::REG_A0, value),
             RomStubEffect::Void => {}
+            RomStubEffect::RequestReset(reason) => {
+                // Does not return: `pc` stays on the stub (see the effect's
+                // doc).
+                self.reset_request = Some(reason);
+                return;
+            }
             RomStubEffect::Memset => {
                 let dst = self.regs.read(rom_stubs::REG_A0);
                 let byte = self.regs.read(rom_stubs::REG_A1) as u8;
@@ -2176,6 +2196,27 @@ mod tests {
             "a void stub must not clobber a0"
         );
         assert_eq!(cpu.regs.pc, 8);
+    }
+
+    #[test]
+    fn request_reset_stub_records_its_reason_once_and_does_not_return() {
+        let mut cpu = Cpu::new();
+        let mut table = RomStubTable::new();
+        table.insert(ROM_STUB_ADDR, RomStub::request_reset("fake_reset", 7));
+        cpu.set_rom_stubs(table);
+        cpu.regs.write(10, 0xdead_beef);
+
+        let mut bus = rom_stub_test_bus();
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.take_reset_request(), None, "nothing requested yet");
+        let stubbed = cpu.step(&mut bus);
+
+        assert_eq!(stubbed.rom_stub, Some(ROM_STUB_ADDR));
+        assert_eq!(cpu.regs.pc, ROM_STUB_ADDR, "never returns to ra");
+        assert_eq!(cpu.regs.read(10), 0xdead_beef, "a0 untouched");
+        assert_eq!(cpu.take_reset_request(), Some(7));
+        assert_eq!(cpu.take_reset_request(), None, "taken once");
     }
 
     #[test]

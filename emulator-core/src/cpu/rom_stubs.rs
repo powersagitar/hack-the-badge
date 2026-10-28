@@ -453,6 +453,16 @@ pub enum RomStubEffect {
     /// there for the next. All three are `void`: `a0` is left untouched.
     /// Chip-agnostic: nothing here knows which chip's ROM this is.
     Md5(Md5Op),
+    /// A ROM function that resets the chip and never returns
+    /// (`software_reset`, `software_reset_cpu`). The stub records the
+    /// reset's reason code (the value the next boot's `rtc_get_reset_reason`
+    /// reports) for the driver to collect with
+    /// [`crate::cpu::Cpu::take_reset_request`], and leaves `pc` on the stub
+    /// address instead of returning to `ra`: the driver is expected to
+    /// rebuild the machine before the next step. Chip-agnostic: the reason
+    /// codes and what a reset keeps are `crate::rom`'s and
+    /// `crate::runtime`'s.
+    RequestReset(u32),
 }
 
 /// The three MD5 calls of [`RomStubEffect::Md5`], with Plumb's argument
@@ -1461,6 +1471,14 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Void,
+        }
+    }
+
+    /// A ROM reset that never returns — see [`RomStubEffect::RequestReset`].
+    pub const fn request_reset(name: &'static str, reason: u32) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::RequestReset(reason),
         }
     }
 

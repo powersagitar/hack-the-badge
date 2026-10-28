@@ -905,6 +905,33 @@
 //!     with C11 semantics matching the ROM's newlib code (`0x40058bf2`,
 //!     `0x40058d2e`).
 //!
+//! 26. **Software reset: `software_reset` and `software_reset_cpu`**
+//!     ([`SOFTWARE_RESET`] `0x4000_0090`, [`SOFTWARE_RESET_CPU`]
+//!     `0x4000_0094`, `esp32c3.rom.ld`) — Milestone 9 Task 3. v392 opens
+//!     Scanner, Sync, Share, Sponsors and Workshop Quest by rebooting into
+//!     them (`app_reboot: reboot into <app>`, a persisted
+//!     `/littlefs/config/reboot.cfg`); `esp_restart()` ends in
+//!     `esp_restart_noos()` (`components/esp_system/port/soc/esp32c3/system_internal.c`),
+//!     whose last call is `esp_rom_software_reset_cpu(0)`, i.e. ROM
+//!     `software_reset_cpu`. Both never return, so each is a
+//!     [`RomStubEffect::RequestReset`](crate::cpu::rom_stubs::RomStubEffect::RequestReset)
+//!     carrying the reset reason the ROM's `rtc_get_reset_reason` reports
+//!     on the next boot (`components/soc/esp32c3/include/soc/reset_reasons.h`):
+//!     `software_reset_cpu` is [`RESET_REASON_CPU0_SW`] (`0x0C`, "Software
+//!     resets CPU 0 by RTC_CNTL_SW_PROCPU_RST") and `software_reset` is
+//!     [`RESET_REASON_CORE_SW`] (`0x03`, "Software resets the digital core
+//!     by RTC_CNTL_SW_SYS_RST"). `crate::runtime::FirmwareRuntime` performs
+//!     the reset: it re-boots the same image with
+//!     [`esp32c3_rom_stubs_with_reset_reason`] (so `rtc_get_reset_reason`
+//!     returns that reason instead of [`POWERON_RESET`]) and carries over
+//!     what survives a reset on the badge — the flash, the RTC_CNTL
+//!     `STORE0..7` registers (ESP-IDF's reset-reason hint lives in
+//!     `STORE6`, `RTC_RESET_CAUSE_REG`, per
+//!     `components/esp_system/port/soc/esp32c3/reset_reason.c`), RTC fast
+//!     memory, the panel's pixels — see its module doc, "Software reset".
+//!     Both kinds are modeled as the same full re-boot through the shortcut
+//!     boot; only the reported reason differs.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -1190,6 +1217,27 @@ pub const POWERON_RESET: u32 = 1;
 
 /// `rtc_get_reset_reason`'s fixed ROM address.
 pub const RTC_GET_RESET_REASON: u32 = 0x4000_0018;
+
+/// `RESET_REASON_CORE_SW` (`0x03`): "Software resets the digital core by
+/// RTC_CNTL_SW_SYS_RST" (`components/soc/esp32c3/include/soc/reset_reasons.h`,
+/// ESP-IDF v5.5.3). What `rtc_get_reset_reason` reports after
+/// [`SOFTWARE_RESET`] (module doc, entry 26).
+pub const RESET_REASON_CORE_SW: u32 = 0x03;
+
+/// `RESET_REASON_CPU0_SW` (`0x0C`): "Software resets CPU 0 by
+/// RTC_CNTL_SW_PROCPU_RST" (same header). What `rtc_get_reset_reason`
+/// reports after [`SOFTWARE_RESET_CPU`], the reset `esp_restart()` uses
+/// (module doc, entry 26).
+pub const RESET_REASON_CPU0_SW: u32 = 0x0C;
+
+/// `software_reset`'s fixed ROM address (`esp32c3.rom.ld`): resets the
+/// digital core and never returns (module doc, entry 26).
+pub const SOFTWARE_RESET: u32 = 0x4000_0090;
+
+/// `software_reset_cpu`'s fixed ROM address (`esp32c3.rom.ld`): resets the
+/// CPU and never returns; `esp_restart_noos()` ends in it (module doc,
+/// entry 26).
+pub const SOFTWARE_RESET_CPU: u32 = 0x4000_0094;
 
 /// `ets_delay_us`'s fixed ROM address (`esp32c3.rom.ld`).
 pub const ETS_DELAY_US: u32 = 0x4000_0050;
@@ -2175,6 +2223,14 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
         RomStub::printf("ets_printf", USB_SERIAL_JTAG_RANGE.start),
     ),
     (ETS_DELAY_US, RomStub::void("ets_delay_us")),
+    (
+        SOFTWARE_RESET,
+        RomStub::request_reset("software_reset", RESET_REASON_CORE_SW),
+    ),
+    (
+        SOFTWARE_RESET_CPU,
+        RomStub::request_reset("software_reset_cpu", RESET_REASON_CPU0_SW),
+    ),
     (MEMSET, RomStub::memset("memset")),
     (MEMCPY, RomStub::memcpy("memcpy")),
     (
@@ -2475,7 +2531,16 @@ const CACHE_FAMILY: &[(u32, &str)] = &[
 /// `crate::boot::boot_from_firmware_image_with_rom_stubs` is the normal way to
 /// get a `Cpu` with this installed; constructing it directly is for tests and
 /// for callers that want to extend it.
+///
+/// `rtc_get_reset_reason` reports [`POWERON_RESET`]: exactly
+/// [`esp32c3_rom_stubs_with_reset_reason`]`(POWERON_RESET)`.
 pub fn esp32c3_rom_stubs() -> RomStubTable {
+    esp32c3_rom_stubs_with_reset_reason(POWERON_RESET)
+}
+
+/// [`esp32c3_rom_stubs`], with `rtc_get_reset_reason` reporting `reason`:
+/// the table a software reset re-boots with (module doc, entry 26).
+pub fn esp32c3_rom_stubs_with_reset_reason(reason: u32) -> RomStubTable {
     let mut table = RomStubTable::new();
     for (addr, stub) in NAMED_STUBS {
         table.insert(*addr, *stub);
@@ -2503,6 +2568,10 @@ pub fn esp32c3_rom_stubs() -> RomStubTable {
         };
         table.insert(*addr, stub);
     }
+    table.insert(
+        RTC_GET_RESET_REASON,
+        RomStub::returning("rtc_get_reset_reason", reason),
+    );
     table
 }
 
@@ -2517,6 +2586,47 @@ mod tests {
         let stub = table.lookup(RTC_GET_RESET_REASON).expect("registered");
         assert_eq!(stub.name, "rtc_get_reset_reason");
         assert_eq!(stub.effect, RomStubEffect::Return(POWERON_RESET));
+    }
+
+    #[test]
+    fn the_reset_reason_table_differs_only_in_rtc_get_reset_reason() {
+        let cold = esp32c3_rom_stubs();
+        let warm = esp32c3_rom_stubs_with_reset_reason(RESET_REASON_CPU0_SW);
+        assert_eq!(cold.len(), warm.len());
+        assert_eq!(
+            warm.lookup(RTC_GET_RESET_REASON)
+                .expect("registered")
+                .effect,
+            RomStubEffect::Return(RESET_REASON_CPU0_SW)
+        );
+        let poweron = esp32c3_rom_stubs_with_reset_reason(POWERON_RESET);
+        for (addr, stub) in NAMED_STUBS {
+            assert_eq!(cold.lookup(*addr), Some(*stub));
+            assert_eq!(poweron.lookup(*addr), Some(*stub));
+            if *addr != RTC_GET_RESET_REASON {
+                assert_eq!(warm.lookup(*addr), Some(*stub));
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_software_resets_request_a_reset_with_their_reason() {
+        // ESP-IDF v5.5.3 `soc/reset_reasons.h`: CORE_SW 0x03, CPU0_SW 0x0C.
+        assert_eq!(RESET_REASON_CORE_SW, 0x03);
+        assert_eq!(RESET_REASON_CPU0_SW, 0x0C);
+        let table = esp32c3_rom_stubs();
+        let reset = table.lookup(SOFTWARE_RESET).expect("registered");
+        assert_eq!(reset.name, "software_reset");
+        assert_eq!(
+            reset.effect,
+            RomStubEffect::RequestReset(RESET_REASON_CORE_SW)
+        );
+        let cpu = table.lookup(SOFTWARE_RESET_CPU).expect("registered");
+        assert_eq!(cpu.name, "software_reset_cpu");
+        assert_eq!(
+            cpu.effect,
+            RomStubEffect::RequestReset(RESET_REASON_CPU0_SW)
+        );
     }
 
     #[test]

@@ -195,6 +195,31 @@ comparable with Milestone 7's v335 rows).
   alone, and Global Constraints also list a `Claude-Session` line — cost
   if wrong: one missing trailer line, which can be amended before the
   push.
+- Ruling R-T3-1: the software reset carries the whole ST7789 model
+  (`bus.spi.st7789`), not just its pixels. The panel is a separate chip
+  that the MCU's reset does not touch, every command byte clears its
+  transient parameter state, and the field is already public, so
+  `spi.rs` needs no setter — cost if wrong: a stale CASET/RASET window
+  could survive until the firmware's first window command; the new boot
+  sends its own before drawing, and the Scanner frame is pinned.
+- Ruling R-T3-2: `RtcCntl::handles` stays `STORE4` alone. `STORE0..7`
+  are plain storage already; the reset reads and restores them through
+  `store_regs`/`set_store_regs`. Listing them in `handles` would only
+  drop their accesses from the unmapped-access log, which boot-probe and
+  the rungs read — cost if wrong: STORE accesses keep appearing in the
+  diagnostic log.
+- Ruling R-T3-3: `STORE4` is carried over like the other seven, after
+  the fresh boot seeded it, so the app's last value wins over the seed.
+  On the badge the bootloader would rewrite it with the XTAL frequency
+  (`0x0028_0028`, the value the shortcut boot seeds) — cost if wrong: a
+  firmware that wrote something else to `STORE4` would keep that value
+  across a reboot instead of the bootloader's.
+- Ruling R-T3-4: Scanner's HOME is a direct return, measured: after HOME
+  the console shows `heap after exit Scanner` and `launched Launcher`
+  with no `reboot into`, and the soft-reset count stays 1. The rung keeps
+  the plan's name, `scanner_home_reboots_to_the_launcher`, and asserts
+  the direct return; its doc records the path — cost if wrong: a name
+  that reads as a second reboot; the assertions say what happens.
 
 ## Milestone 10 backlog
 

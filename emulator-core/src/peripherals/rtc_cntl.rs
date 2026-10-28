@@ -149,6 +149,22 @@
 //! generic word storage below holds it. It is listed in [`RtcCntl::handles`]
 //! because it is now a deliberately modeled register, so its accesses are
 //! not logged as unmapped.
+//!
+//! ## STORE0..7 across a software reset (Milestone 9)
+//!
+//! `RTC_CNTL_STORE0_REG`..`STORE3_REG` (`+0x50`..`+0x5c`) and
+//! `STORE4_REG`..`STORE7_REG` (`+0xb8`..`+0xc4`, `soc/rtc_cntl_reg.h`
+//! v5.5.3) are plain R/W retention registers in the RTC domain, which a
+//! digital-core or CPU reset does not clear. ESP-IDF keeps the reset-reason
+//! hint in `RTC_RESET_CAUSE_REG`, which is `STORE6`
+//! (`components/esp_system/port/soc/esp32c3/reset_reason.c`:
+//! `esp_reset_reason_set_hint()` writes it before a restart, and
+//! `esp_reset_reason_init()` reads it back on the next boot). Their storage
+//! is the generic word array, as before; [`RtcCntl::store_regs`] and
+//! [`RtcCntl::set_store_regs`] let `crate::runtime`'s software reset carry
+//! the eight words into the rebuilt peripheral. Only `STORE4` is in
+//! [`RtcCntl::handles`] (unchanged), so the unmapped-access log stays as it
+//! was.
 
 use super::set_byte;
 use super::timg::RC_SLOW_HZ;
@@ -171,6 +187,25 @@ pub const TIME_HIGH0_REG: u32 = 0x14;
 /// shortcut boot seeds instead (`crate::rom::RTC_XTAL_FREQ_REG`). See the
 /// module doc's "STORE4" section.
 pub const STORE4_REG: u32 = 0xb8;
+/// `RTC_CNTL_STORE0_REG` (`+0x50`, `soc/rtc_cntl_reg.h`).
+pub const STORE0_REG: u32 = 0x50;
+/// `RTC_CNTL_STORE1_REG` (`+0x54`).
+pub const STORE1_REG: u32 = 0x54;
+/// `RTC_CNTL_STORE2_REG` (`+0x58`).
+pub const STORE2_REG: u32 = 0x58;
+/// `RTC_CNTL_STORE3_REG` (`+0x5c`).
+pub const STORE3_REG: u32 = 0x5c;
+/// `RTC_CNTL_STORE5_REG` (`+0xbc`).
+pub const STORE5_REG: u32 = 0xbc;
+/// `RTC_CNTL_STORE6_REG` (`+0xc0`): ESP-IDF's `RTC_RESET_CAUSE_REG`, which
+/// holds the reset-reason hint (module doc, "STORE0..7").
+pub const STORE6_REG: u32 = 0xc0;
+/// `RTC_CNTL_STORE7_REG` (`+0xc4`).
+pub const STORE7_REG: u32 = 0xc4;
+/// The eight retention registers, `STORE0` to `STORE7` in order.
+pub const STORE_REGS: [u32; 8] = [
+    STORE0_REG, STORE1_REG, STORE2_REG, STORE3_REG, STORE4_REG, STORE5_REG, STORE6_REG, STORE7_REG,
+];
 
 /// `RTC_CNTL_TIME_UPDATE`, bit 31 of `TIME_UPDATE_REG` -- byte index 3, bit
 /// 7 of that byte (`31 - 24 == 7`).
@@ -229,6 +264,19 @@ impl RtcCntl {
             offset & !0b11,
             TIME_UPDATE_REG | TIME_LOW0_REG | TIME_HIGH0_REG | STORE4_REG
         )
+    }
+
+    /// `STORE0`..`STORE7`'s current values, in [`STORE_REGS`] order.
+    pub fn store_regs(&self) -> [u32; 8] {
+        STORE_REGS.map(|off| self.regs[(off >> 2) as usize])
+    }
+
+    /// Sets `STORE0`..`STORE7` (a software reset carrying them over; see
+    /// the module doc).
+    pub fn set_store_regs(&mut self, values: [u32; 8]) {
+        for (off, v) in STORE_REGS.iter().zip(values) {
+            self.regs[(off >> 2) as usize] = v;
+        }
     }
 
     pub fn read_byte(&mut self, offset: u32) -> u8 {
@@ -434,6 +482,27 @@ mod tests {
         assert!(!RtcCntl::handles(0x00)); // OPTIONS0_REG
         assert!(!RtcCntl::handles(0x18)); // STATE0_REG
         assert!(!RtcCntl::handles(0xbc)); // STORE5_REG (RTC_APB_FREQ_REG): not seeded
+    }
+
+    #[test]
+    fn store_regs_round_trip_in_order_and_are_bus_visible() {
+        let mut t = RtcCntl::new();
+        assert_eq!(t.store_regs(), [0; 8]);
+        w(&mut t, STORE6_REG, 0x8003_0003, 0);
+        w(&mut t, STORE0_REG, 0x1111_1111, 0);
+        let mut expect = [0u32; 8];
+        expect[0] = 0x1111_1111;
+        expect[6] = 0x8003_0003;
+        assert_eq!(t.store_regs(), expect);
+
+        let mut fresh = RtcCntl::new();
+        let values = [1, 2, 3, 4, 5, 6, 7, 8];
+        fresh.set_store_regs(values);
+        assert_eq!(fresh.store_regs(), values);
+        for (off, v) in STORE_REGS.iter().zip(values) {
+            assert_eq!(r(&mut fresh, *off), v, "STORE at {off:#x}");
+        }
+        assert_eq!(r(&mut fresh, 0x60), 0, "a neighbour is untouched");
     }
 
     #[test]

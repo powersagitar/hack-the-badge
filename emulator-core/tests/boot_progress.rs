@@ -1612,6 +1612,111 @@ fn launcher_opens_dice() {
     assert_no_panic_text(&rt);
 }
 
+/// Milestone 9 Task 3: from the launcher, the navigation to Scanner (top
+/// row, third column) with each selection's stable frame (role hacker,
+/// v392, measured): two RIGHTs.
+const TO_SCANNER: &[(usize, u64)] = &[
+    (6, 0x7abe_9faf_bf7f_982e), // RIGHT
+    (6, 0xb9a6_064d_93a2_1cf4), // RIGHT: "Scanner"
+];
+/// Scanner's first stable frame after its reboot: title "Scanner", the
+/// round "Use your badge's Scanner app!" sticker art, "Align your badge's
+/// flower pattern with a matching sticker!", footer "HOME apps". Measured
+/// on v392 (first sampled 14,500,000 steps after A's release) and checked
+/// by eye; never compared with the physical badge, which runs v335.
+const SCANNER_OPEN_HASH: u64 = 0x4958_3da5_06ff_ab49;
+/// A's response: release to the first stable Scanner frame 14.5M, then
+/// [`AFTER_PRESS_STABLE_FOR`] more to confirm, 22.5M; + 25%, rounded up to
+/// 1,000,000.
+const SCANNER_RESPONSE_STEPS: u64 = 29_000_000;
+/// HOME's response from Scanner: release to the first stable launcher
+/// 11.75M, then [`AFTER_PRESS_STABLE_FOR`] more, 19.75M; + 25%, rounded up
+/// to 1,000,000.
+const SCANNER_HOME_RESPONSE_STEPS: u64 = 25_000_000;
+
+static SCANNER: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// From the hacker launcher: [`TO_SCANNER`], then A held
+/// [`PRESS_HOLD_US`], then the first stable frame after it, asserted to be
+/// [`SCANNER_OPEN_HASH`].
+fn scanner_open() -> FirmwareRuntime {
+    SCANNER
+        .get_or_init(|| {
+            let mut rt = launcher_for(OWN_ROLE);
+            let mut previous = LAUNCHER_HASH;
+            for &(slot, expected) in TO_SCANNER {
+                let (hash, step) = press_and_settle(&mut rt, slot, previous);
+                assert_eq!(hash, expected, "after slot {slot}, stable at step {step}");
+                previous = hash;
+            }
+            press(&mut rt, 1);
+            let cap = rt.total_steps() + SCANNER_RESPONSE_STEPS;
+            let (hash, step) =
+                run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
+            assert_eq!(
+                hash, SCANNER_OPEN_HASH,
+                "Scanner opened, stable at step {step}"
+            );
+            rt
+        })
+        .clone()
+}
+
+/// Milestone 9: v392 enters Scanner by rebooting into it. A on Scanner
+/// logs `app_reboot: reboot into scanner`, `esp_restart()` reaches the
+/// mask-ROM `software_reset_cpu` (`emulator_core::rom::SOFTWARE_RESET_CPU`),
+/// and the runtime re-boots with the flash (identity, `reboot.cfg`) kept.
+/// The new boot reads `reboot.cfg` and launches Scanner directly, exactly
+/// once: one soft reset, no reboot loop. The frame is
+/// [`SCANNER_OPEN_HASH`] (v392, measured, checked by eye).
+#[test]
+fn scanner_opens_after_one_reboot() {
+    let rt = scanner_open();
+    let console = rt.console_output();
+    let reboot = console
+        .find("app_reboot: reboot into scanner")
+        .unwrap_or_else(|| panic!("no reboot line; console:\n{console}"));
+    assert!(
+        console[reboot..].contains("app_reg: launched Scanner"),
+        "Scanner launched after the reboot; console:\n{console}"
+    );
+    assert_eq!(rt.soft_reset_count(), 1);
+    assert_no_panic_text(&rt);
+}
+
+/// Leaving Scanner: HOME from the open Scanner. Measured on v392, the
+/// exit path is a **direct return**, not a second reboot: the firmware
+/// logs `heap after exit Scanner` and `launched Launcher` with no
+/// `reboot into`, the soft-reset count stays 1, and the launcher frame
+/// (first icon selected, [`LAUNCHER_HASH`]) is stable 11.75M steps after
+/// the release.
+#[test]
+fn scanner_home_reboots_to_the_launcher() {
+    let mut rt = scanner_open();
+    let before = rt.console_output().len();
+    press(&mut rt, TO_LAUNCHER_SLOT);
+    let cap = rt.total_steps() + SCANNER_HOME_RESPONSE_STEPS;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[SCANNER_OPEN_HASH]);
+    assert_eq!(hash, LAUNCHER_HASH, "launcher, stable at step {step}");
+    let console = rt.console_output();
+    let after = &console[before..];
+    assert!(
+        after.contains("app_reg: launched Launcher"),
+        "console after HOME:\n{after}"
+    );
+    assert!(
+        !after.contains("reboot into"),
+        "console after HOME:\n{after}"
+    );
+    assert_eq!(
+        rt.soft_reset_count(),
+        1,
+        "a direct return, no second reboot"
+    );
+    assert_no_panic_text(&rt);
+}
+
 /// A half-open pixel rectangle `[x0, x1) x [y0, y1)`.
 #[derive(Clone, Copy, Debug)]
 struct Rect {
