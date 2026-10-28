@@ -116,6 +116,10 @@ ESP_ERR_INVALID_STATE` (NFC is not modeled) and still draw. No app
 prints panic text, and none faults except Connect and Sync. The frames
 are in `local/m9-apps/<cell>-<slug>.png` (not committed).
 
+Release `boot_progress` with every Task 4 rung: 79 passed, 1 ignored,
+11.7 s wall (`/usr/bin/time`, real 11.74 s; Task 3's 66 rungs took about
+8 s), under the 90 s limit.
+
 ### Benchmarks on v392 (Task 4)
 
 Re-measured with every Task 4 rung in place (`3a87c3b` + tests; no
@@ -293,7 +297,8 @@ comparable with Milestone 7's v335 rows).
   `LAUNCHER_AFTER_NAV_HASH`, `TO_SCANNER` and `TO_DICE` for the nine
   cells they already pin. Each rung walks from the hacker launcher
   checkpoint and asserts every selection on its way, rather than sharing
-  per-row checkpoints; the release suite stays at about 8 s. My Badge's
+  per-row checkpoints; the release suite goes from about 8 s to 11.7 s,
+  under the 90 s limit. My Badge's
   open frame is `ROLE_ROWS`' hacker registered screen, the same frame —
   cost if wrong: the walks repeat some navigation work.
 
