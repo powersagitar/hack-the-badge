@@ -1717,6 +1717,349 @@ fn scanner_home_reboots_to_the_launcher() {
     assert_no_panic_text(&rt);
 }
 
+/// Milestone 9 Task 4: every launcher app, from role hacker's launcher on
+/// v392 (measured; every new frame checked by eye, none compared with the
+/// physical badge, which runs v335). Cell = row × 4 + column. "Soft
+/// resets" is [`FirmwareRuntime::soft_reset_count`] once the app is open:
+/// v392 enters five apps by rebooting into them.
+///
+/// | Cell | App (`app_reg: launched …`) | Soft resets | Rung |
+/// |---|---|---|---|
+/// | 0 | My Badge | 0 | [`launcher_opens_my_badge`] |
+/// | 1 | Connect | 0, stops at the Bluetooth ROM | [`connect_stops_at_the_bluetooth_controller`] |
+/// | 2 | Scanner | 1 | [`scanner_opens_after_one_reboot`] |
+/// | 3 | Sync | 1, stops at the Bluetooth ROM | [`sync_reboots_then_stops_at_the_bluetooth_controller`] |
+/// | 4 | Share | 1 | [`launcher_opens_share_after_one_reboot`] |
+/// | 5 | Solana Scavenger Hunt | 0 | [`launcher_opens_solana_scavenger_hunt`] |
+/// | 6 | Sponsors | 1 | [`launcher_opens_sponsors_after_one_reboot`] |
+/// | 7 | Workshop Quest | 1 | [`launcher_opens_workshop_quest_after_one_reboot`] |
+/// | 8 | Mood LEDs | 0 | [`launcher_opens_mood_leds`] |
+/// | 9 | Socials | 0 | [`launcher_opens_socials`] |
+/// | 10 | Schedule | 0 | [`launcher_opens_schedule`] |
+/// | 11 | Info & Rules | 0 | [`launcher_opens_info_and_rules`] |
+/// | 12 | Museum | 0 | [`launcher_opens_museum`] |
+/// | 13 | Progress | 0 | [`launcher_opens_progress`] |
+/// | 14 | Snake | 0 | [`launcher_opens_snake`] |
+/// | 15 | Dice | 0 | [`launcher_opens_dice`] |
+///
+/// Each entry here is the launcher's stable frame with that cell
+/// selected. Cells 0, 1, 2, 4, 8 and 12 to 15 reuse [`LAUNCHER_HASH`],
+/// [`TO_SCANNER`]'s and [`TO_DICE`]'s pins; the others are new (v392,
+/// measured).
+const LAUNCHER_SELECTED: [u64; 16] = [
+    LAUNCHER_HASH,           // 0: My Badge
+    TO_SCANNER[0].1,         // 1: Connect
+    TO_SCANNER[1].1,         // 2: Scanner
+    0x57d9_5cfd_9af2_b2cd,   // 3: Sync
+    LAUNCHER_AFTER_NAV_HASH, // 4: Share
+    0x2554_fbce_7c2c_3424,   // 5: Solana Scavenger Hunt
+    0xf265_0006_b483_df82,   // 6: Sponsors
+    0xc7c2_2146_83c2_df08,   // 7: Workshop Quest
+    TO_DICE[1].1,            // 8: Mood LEDs
+    0x93ae_2f49_c557_56ec,   // 9: Socials
+    0xc8ea_e827_7574_714f,   // 10: Schedule
+    0x13f5_f222_1252_28ec,   // 11: Info & Rules
+    TO_DICE[2].1,            // 12: Museum
+    TO_DICE[3].1,            // 13: Progress
+    TO_DICE[4].1,            // 14: Snake
+    TO_DICE[5].1,            // 15: Dice
+];
+/// RIGHT: moves the launcher's selection one column.
+const RIGHT_SLOT: usize = 6;
+/// A: opens the selected app.
+const A_SLOT: usize = 1;
+
+/// From hacker's launcher (first cell selected): DOWN × row, then RIGHT ×
+/// column to `cell`, asserting each selection's frame from
+/// [`LAUNCHER_SELECTED`], then A held [`PRESS_HOLD_US`]. Returns the
+/// runtime just after A's release and the console's length before A.
+fn press_a_on_cell(cell: usize) -> (FirmwareRuntime, usize) {
+    let mut rt = launcher_for(OWN_ROLE);
+    let mut at = 0;
+    while at != cell {
+        let (slot, next) = if at / 4 < cell / 4 {
+            (NAV_SLOT, at + 4)
+        } else {
+            (RIGHT_SLOT, at + 1)
+        };
+        let (hash, step) = press_and_settle(&mut rt, slot, LAUNCHER_SELECTED[at]);
+        assert_eq!(
+            hash, LAUNCHER_SELECTED[next],
+            "cell {next} selected, stable at step {step}"
+        );
+        at = next;
+    }
+    let before = rt.console_output().len();
+    press(&mut rt, A_SLOT);
+    (rt, before)
+}
+
+/// A on launcher `cell` opens `app`: within `response_steps` of A's
+/// release the first stable frame other than the selection is
+/// `open_hash`, the console since A says `app_reg: launched <app>`, the
+/// runtime has soft-reset `soft_resets` times, and nothing panicked.
+fn assert_launcher_opens(
+    cell: usize,
+    app: &str,
+    soft_resets: u32,
+    response_steps: u64,
+    open_hash: u64,
+) {
+    let (mut rt, before) = press_a_on_cell(cell);
+    let cap = rt.total_steps() + response_steps;
+    let (hash, step) = run_until_stable_frame(
+        &mut rt,
+        cap,
+        AFTER_PRESS_STABLE_FOR,
+        &[LAUNCHER_SELECTED[cell]],
+    );
+    assert_eq!(hash, open_hash, "{app} opened, stable at step {step}");
+    let console = rt.console_output();
+    assert!(
+        console[before..].contains(&format!("app_reg: launched {app}")),
+        "console since A:\n{}",
+        &console[before..]
+    );
+    assert_eq!(rt.soft_reset_count(), soft_resets, "{app}: soft resets");
+    assert_no_panic_text(&rt);
+}
+
+/// One parallel rung per app: `name, cell, "app", soft_resets,
+/// response_steps, open_hash`. Each response is the measured release to
+/// first stable frame, then [`AFTER_PRESS_STABLE_FOR`] more to confirm;
+/// + 25 %, rounded up to 1,000,000.
+macro_rules! launcher_opens {
+    ($(#[$doc:meta])* $name:ident, $cell:expr, $app:literal, $soft_resets:expr, $response:expr, $hash:expr) => {
+        $(#[$doc])*
+        #[test]
+        fn $name() {
+            assert_launcher_opens($cell, $app, $soft_resets, $response, $hash);
+        }
+    };
+}
+
+launcher_opens!(
+    /// My Badge opens on hacker's registered screen (role title, the QR
+    /// code, "Test Hacker", the badge ID; `ROLE_ROWS`' hacker entry),
+    /// first stable 9.0M steps after A's release: 22M.
+    launcher_opens_my_badge,
+    0,
+    "My Badge",
+    0,
+    22_000_000,
+    role_row(OWN_ROLE).1
+);
+launcher_opens!(
+    /// Share reboots into itself (`app_reboot: reboot into share`):
+    /// "Share Custom Apps", "Send an app" selected, "Receive an app",
+    /// footer "Up/Down: choose  A: select". First stable 9.0M after the
+    /// release: 22M.
+    launcher_opens_share_after_one_reboot,
+    4,
+    "Share",
+    1,
+    22_000_000,
+    0xfc51_aedc_c0ab_617d
+);
+launcher_opens!(
+    /// Solana Scavenger Hunt: its title, the "Find boxes with the Solana
+    /// logo …" instructions, footer "A: start hunting  Start: help
+    /// anytime". First stable 5.25M after the release: 17M.
+    launcher_opens_solana_scavenger_hunt,
+    5,
+    "Solana Scavenger Hunt",
+    0,
+    17_000_000,
+    0x7ad3_a516_f050_78cf
+);
+launcher_opens!(
+    /// Sponsors reboots into itself (`app_reboot: reboot into sponsors`)
+    /// and logs `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE` (NFC is not
+    /// modeled), as Scanner does. Its first stable frame is the floor map
+    /// ("Floor 1", "Floor 2", "Extended Sponsor Bay", counter "--/64",
+    /// footer "A SPONSOR  B INFO  START LIST  HOME APPS") before any booth
+    /// is drawn; first stable 16.0M after the release: 30M. The booth
+    /// icons then appear in 42 redraws, the last about 60.5M steps after
+    /// the release, with the counter at "0/64 0%"; they are not pinned.
+    launcher_opens_sponsors_after_one_reboot,
+    6,
+    "Sponsors",
+    1,
+    30_000_000,
+    0xb082_0063_bef2_19eb
+);
+launcher_opens!(
+    /// Workshop Quest reboots into itself (`app_reboot: reboot into
+    /// workshops`) and logs the same NFC error as Sponsors: "Workshop
+    /// Quest", "0/5", "Internship Maxxing Workshop", a grid of 15 hexagon
+    /// tags ("INT" selected), footer "SCAN TAG  D-PAD BROWSE  B PAGE
+    /// 1/3". First stable 21.75M after the release: 38M.
+    launcher_opens_workshop_quest_after_one_reboot,
+    7,
+    "Workshop Quest",
+    1,
+    38_000_000,
+    0x894d_5dae_e0d9_8e2a
+);
+launcher_opens!(
+    /// Mood LEDs: "Choose a mood, then leave this app open …", "Green
+    /// means: looking for a team!", "Press A to choose your mood", footer
+    /// "HOME: apps". First stable 8.0M after the release: 20M.
+    launcher_opens_mood_leds,
+    8,
+    "Mood LEDs",
+    0,
+    20_000_000,
+    0x0c6c_07b5_b963_4775
+);
+launcher_opens!(
+    /// Socials: "My Socials", "No social profiles are loaded yet." (the
+    /// fake identity has none), footer "HOME apps". First stable 4.0M
+    /// after the release: 15M.
+    launcher_opens_socials,
+    9,
+    "Socials",
+    0,
+    15_000_000,
+    0xeedf_ef97_7fd2_ea52
+);
+launcher_opens!(
+    /// Schedule: a QR code for `https://my.hackthenorth.com/schedule`,
+    /// footer "HOME to return". First stable 8.25M after the release: 21M.
+    launcher_opens_schedule,
+    10,
+    "Schedule",
+    0,
+    21_000_000,
+    0x59e7_950e_07fb_f1e9
+);
+launcher_opens!(
+    /// Info & Rules: a QR code, "Scan with your phone for badge rules.",
+    /// footer "HOME apps". First stable 8.0M after the release: 20M.
+    launcher_opens_info_and_rules,
+    11,
+    "Info & Rules",
+    0,
+    20_000_000,
+    0x3472_9924_2cdb_54aa
+);
+launcher_opens!(
+    /// Museum: a QR code for `https://museum.hackthenorth.com`, footer
+    /// "Scan to explore | HOME to return". First stable 8.25M after the
+    /// release: 21M.
+    launcher_opens_museum,
+    12,
+    "Museum",
+    0,
+    21_000_000,
+    0xd7f7_b7e2_9354_c399
+);
+launcher_opens!(
+    /// Progress: a "0/107" ring, "Apps 0/34", "Sponsors 0/64", "Solana
+    /// Scavenger Hunt 0/9", footer "A Clues  Home Apps". First stable
+    /// 5.75M after the release: 18M.
+    launcher_opens_progress,
+    13,
+    "Progress",
+    0,
+    18_000_000,
+    0x2651_4b50_3ed5_3c44
+);
+
+/// The mask-ROM address Connect and Sync fetch after `hal_radio:
+/// init_once`: `btdm_controller_rom_data_init`
+/// (`esp32c3.rom.bt_funcs.ld`, ESP-IDF v5.5.3). It has no stub, so the
+/// fetch traps (an unmapped instruction fetch always does) and the
+/// firmware's panic handler prints the register dump. Milestone 10 lifts
+/// it.
+const BLUETOOTH_ROM_FAULT_PC: u32 = 0x4000_08ec;
+/// The panic handler's register-dump line for [`BLUETOOTH_ROM_FAULT_PC`].
+const BLUETOOTH_ROM_FAULT_MEPC: &str = "MEPC    : 0x400008ec";
+
+/// Runs `rt` in [`FRAME_CHUNK`]-step chunks until the console since
+/// `before` shows [`BLUETOOTH_ROM_FAULT_MEPC`], asserting that the only
+/// instruction fault on the way is at [`BLUETOOTH_ROM_FAULT_PC`] and that
+/// one happened. Returns the console since `before`. Panics if the line
+/// is not there by `max_steps` (total steps).
+fn run_to_the_bluetooth_fault(rt: &mut FirmwareRuntime, before: usize, max_steps: u64) -> String {
+    let mut faulted = false;
+    while rt.total_steps() < max_steps {
+        let summary = rt.run(FRAME_CHUNK);
+        if let Some(pc) = summary.last_instruction_fault {
+            assert_eq!(pc, BLUETOOTH_ROM_FAULT_PC, "{summary:?}");
+            faulted = true;
+        }
+        let since = rt.console_output()[before..].to_string();
+        if since.contains(BLUETOOTH_ROM_FAULT_MEPC) {
+            assert!(faulted, "MEPC printed without a fault:\n{since}");
+            return since;
+        }
+    }
+    panic!(
+        "no {BLUETOOTH_ROM_FAULT_MEPC:?} within {max_steps} steps; pc=0x{:08x}\n{}",
+        rt.pc(),
+        &rt.console_output()[before..]
+    );
+}
+
+/// Connect (cell 1) does not open on v392 yet: after A, `hal_radio:
+/// init_once` and then the fetch of [`BLUETOOTH_ROM_FAULT_PC`]; the
+/// register dump is printed 0.75M steps after A's release (cap: + 25 %,
+/// rounded up to 1,000,000). No soft reset comes first. Measured after
+/// the dump (not pinned): the panic handler prints `Rebooting...`, the
+/// runtime soft-resets, and the badge boots with `reset reason=4` into
+/// My Badge, with no reboot loop. Milestone 10 (Bluetooth) lifts the
+/// stop.
+#[test]
+fn connect_stops_at_the_bluetooth_controller() {
+    let (mut rt, before) = press_a_on_cell(1);
+    let cap = rt.total_steps() + 1_000_000;
+    let console = run_to_the_bluetooth_fault(&mut rt, before, cap);
+    let radio = console
+        .find("hal_radio: init_once")
+        .unwrap_or_else(|| panic!("console since A:\n{console}"));
+    assert!(
+        console[radio..].contains(BLUETOOTH_ROM_FAULT_MEPC),
+        "console since A:\n{console}"
+    );
+    assert!(
+        !console.contains("app_reg: launched Connect"),
+        "console since A:\n{console}"
+    );
+    assert_eq!(rt.soft_reset_count(), 0);
+}
+
+/// Sync (cell 3) reboots into itself (`app_reboot: reboot into sync`,
+/// one soft reset), then stops like Connect: after the reboot,
+/// `hal_radio: init_once` and the fetch of [`BLUETOOTH_ROM_FAULT_PC`],
+/// with no `launched Sync`. The register dump is printed 6.75M steps
+/// after A's release (cap: + 25 %, rounded up to 1,000,000). Measured
+/// after the dump (not pinned): `Rebooting...`, a second soft reset, and
+/// a boot with `reset reason=4` into My Badge, with no reboot loop.
+/// Milestone 10 (Bluetooth) lifts the stop.
+#[test]
+fn sync_reboots_then_stops_at_the_bluetooth_controller() {
+    let (mut rt, before) = press_a_on_cell(3);
+    let cap = rt.total_steps() + 9_000_000;
+    let console = run_to_the_bluetooth_fault(&mut rt, before, cap);
+    let reboot = console
+        .find("app_reboot: reboot into sync")
+        .unwrap_or_else(|| panic!("no reboot line; console since A:\n{console}"));
+    let radio = reboot
+        + console[reboot..]
+            .find("hal_radio: init_once")
+            .unwrap_or_else(|| panic!("console since A:\n{console}"));
+    assert!(
+        console[radio..].contains(BLUETOOTH_ROM_FAULT_MEPC),
+        "console since A:\n{console}"
+    );
+    assert!(
+        !console.contains("app_reg: launched Sync"),
+        "console since A:\n{console}"
+    );
+    assert_eq!(rt.soft_reset_count(), 1);
+}
+
 /// A half-open pixel rectangle `[x0, x1) x [y0, y1)`.
 #[derive(Clone, Copy, Debug)]
 struct Rect {

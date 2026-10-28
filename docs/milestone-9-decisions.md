@@ -83,6 +83,59 @@ official firmware is public (the human partner, 2026-10-22).
   back" and "Confirm the bump"; reset-reason logging; the LCD repaints in
   30-row stripes.
 
+### Every launcher app on v392 (Task 4)
+
+Measured natively in release from role hacker's launcher (DOWN × row,
+RIGHT × column, each settled; A held 100 ms), then pinned in
+`boot_progress.rs` (`LAUNCHER_SELECTED` and the `launcher_opens!`
+rungs). Every soft-reset count agrees with the probe above: Scanner,
+Sync, Share, Sponsors and Workshop Quest reboot once; the others open
+directly. Steps are from A's release to the first stable frame.
+
+| Cell | App | Soft resets | First stable | Frame |
+|---|---|---|---|---|
+| 0 | My Badge | 0 | 9.0M | hacker's registered screen (unchanged) |
+| 1 | Connect | 0 | — | stops at `0x4000_08ec` (dump at 0.75M) |
+| 2 | Scanner | 1 | 14.5M | `0x4958_3da5_06ff_ab49` (Task 3) |
+| 3 | Sync | 1 | — | stops at `0x4000_08ec` (dump at 6.75M) |
+| 4 | Share | 1 | 9.0M | `0xfc51_aedc_c0ab_617d` |
+| 5 | Solana Scavenger Hunt | 0 | 5.25M | `0x7ad3_a516_f050_78cf` |
+| 6 | Sponsors | 1 | 16.0M | `0xb082_0063_bef2_19eb` |
+| 7 | Workshop Quest | 1 | 21.75M | `0x894d_5dae_e0d9_8e2a` |
+| 8 | Mood LEDs | 0 | 8.0M | `0x0c6c_07b5_b963_4775` |
+| 9 | Socials | 0 | 4.0M | `0xeedf_ef97_7fd2_ea52` |
+| 10 | Schedule | 0 | 8.25M | `0x59e7_950e_07fb_f1e9` |
+| 11 | Info & Rules | 0 | 8.0M | `0x3472_9924_2cdb_54aa` |
+| 12 | Museum | 0 | 8.25M | `0xd7f7_b7e2_9354_c399` |
+| 13 | Progress | 0 | 5.75M | `0x2651_4b50_3ed5_3c44` |
+| 14 | Snake | 0 | — | existing rungs, unchanged |
+| 15 | Dice | 0 | 2.75M | `DICE_OPEN_HASH`, unchanged |
+
+Scanner, Sponsors and Workshop Quest log `hal_nfc: rc522_start:
+ESP_ERR_INVALID_STATE` (NFC is not modeled) and still draw. No app
+prints panic text, and none faults except Connect and Sync. The frames
+are in `local/m9-apps/<cell>-<slug>.png` (not committed).
+
+### Benchmarks on v392 (Task 4)
+
+Re-measured with every Task 4 rung in place (`3a87c3b` + tests; no
+change under `emulator-core/src` since Task 3). Bun is `bun run
+bench:wasm`, the median of 3 runs, its `pin_factor` column; native is
+one `bench_redraws` run. Milestone 8's v335 numbers are beside them for
+reference; they measure different firmware, so the columns are not a
+speed comparison. There is no speed target.
+
+| Redraw | Bun (WASM), v392 | Bun (WASM), M8 v335 | Native, v392 |
+|---|---|---|---|
+| HOME (enter the launcher) | 0.623x | 0.614x | 0.947x |
+| DOWN (move inside it) | 0.857x | 0.977x | 1.006x |
+| Onboarding | 1.110x | 1.224x | 1.430x |
+
+Walk throughput: 39.96M steps/s in Bun's WASM (Milestone 8: 41.2M),
+62.99M natively. Task 2's single native run on this machine gave home
+1.13, down 1.20, onboarding 1.70; native runs vary that much between
+sessions.
+
 ## Re-pins (v335 → v392)
 
 Every pin that Task 2 changes gets a row. Frames are described as
@@ -220,6 +273,29 @@ comparable with Milestone 7's v335 rows).
   the plan's name, `scanner_home_reboots_to_the_launcher`, and asserts
   the direct return; its doc records the path — cost if wrong: a name
   that reads as a second reboot; the assertions say what happens.
+- Ruling R-T4-1: Sponsors' pinned open frame is its first stable
+  frame, the floor map before any booth is drawn ("--/64"). The booth
+  icons then appear in 42 redraws, the last about 60.5M steps after A's
+  release, with the counter at "0/64 0%"; they are not pinned. The brief
+  pins each app's first stable frame, and the loaded map would add about
+  45M steps to the rung — cost if wrong: a change that breaks only the
+  booth drawing would not fail the rung.
+- Ruling R-T4-2: Connect's and Sync's rungs stop at the register dump
+  (`MEPC    : 0x400008ec`), as the brief asks. What follows was measured
+  and is not pinned: the panic handler prints `Rebooting...`, the
+  runtime soft-resets (Task 3), and the badge boots with `boot: reset
+  reason=4` into My Badge, once, with no loop. On v335 without the
+  software reset this was "Panic handler entered multiple times"
+  forever — cost if wrong: a regression in the post-panic reboot would
+  go unnoticed until Milestone 10 replaces the fault.
+- Ruling R-T4-3: the launcher's 16 selection frames are one table,
+  `LAUNCHER_SELECTED`, which reuses `LAUNCHER_HASH`,
+  `LAUNCHER_AFTER_NAV_HASH`, `TO_SCANNER` and `TO_DICE` for the nine
+  cells they already pin. Each rung walks from the hacker launcher
+  checkpoint and asserts every selection on its way, rather than sharing
+  per-row checkpoints; the release suite stays at about 8 s. My Badge's
+  open frame is `ROLE_ROWS`' hacker registered screen, the same frame —
+  cost if wrong: the walks repeat some navigation work.
 
 ## Milestone 10 backlog
 
