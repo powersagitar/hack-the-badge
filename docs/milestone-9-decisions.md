@@ -142,6 +142,27 @@ Walk throughput: 39.96M steps/s in Bun's WASM (Milestone 8: 41.2M),
 1.13, down 1.20, onboarding 1.70; native runs vary that much between
 sessions.
 
+### The browser gate (Task 5, 2026-10-28)
+
+**Smoke test** (Chrome, `bun run build:wasm && bun run dev`; screenshots
+under `local/m9-browser/`, not committed): provisioning hacker, the
+11-page onboarding app, the launcher, and Scanner opened and left again
+through HOME all work. The speed readout holds at 1.0x, except about
+0.8x for about 0.5 s while Scanner reboots; the reboot shows as an
+ordinary screen change, with no stall. The console is clean apart from
+a 404 for the favicon.
+
+**The human partner's verdicts:**
+
+1. The v392 frames are right: "side by side comes clean". This is the
+   human's eye on v392 next to the badge; the rung docs still describe
+   only v335 frames as compared with hardware.
+2. "pin the loaded frame instead now": Sponsors' rung pins its loaded
+   frame, superseding R-T4-1 (see that ruling).
+3. The lower speed on v392 (for example WASM DOWN 0.977x → 0.857x, in
+   the table above) is accepted: "speed is indeed slower and noticeable
+   yet acceptable". There is still no speed target.
+
 ## Re-pins (v335 → v392)
 
 Every pin that Task 2 changes gets a row. Frames are described as
