@@ -184,8 +184,8 @@ from code the seam replaces.
   `execution_digest_is_unchanged` and `hacker_walk_totals_are_unchanged`
   stay byte-identical. A move is a bug in the change.
 - Any server other than the Vercel signaling function; any relay; radio
-  traffic through any server. (STUN/TURN and the signaling store are
-  open below.)
+  traffic through any server; STUN/TURN, including public STUN; any
+  third-party service beyond the signaling store (Upstash Redis).
 - Browser or network input that can panic the emulator, or a malformed
   peer packet that can crash a tab.
 - Guessed register layouts, ROM addresses or app-image addresses.
@@ -328,10 +328,17 @@ firmware's threshold and records it).
 - Peer data is validated (size, shape) before it reaches the Worker.
 - `bun run dev` serves the function locally too, so development and
   tests do not need a deployment.
-- Open (the human partner's choice): the signaling store; whether the
-  copy-paste codes stay as a fallback; whether ICE stays host/mDNS only
-  (`iceServers: []`, same network only) or adds STUN for links across
-  the internet.
+- **Decided (2026-10-29):**
+  - The store is Upstash Redis through Vercel's Marketplace, with keys
+    that expire (`SET … EX`). The human partner sets it up in the Vercel
+    account; the function reads its credentials from the environment.
+  - The copy-paste codes stay as a fallback behind a "manual" toggle,
+    with the same offer/answer payload, for offline use, self-hosted
+    builds and a down function.
+  - Same network only: `iceServers: []`, host and mDNS candidates. No
+    STUN or TURN.
+  - It is built as Part 4, after the radio model works, at the "before
+    Part 4" gate.
 
 ### Part 5 — Conditional: hearing real badges (Chrome)
 
@@ -375,8 +382,9 @@ Milestone 11 backlog, and CLAUDE.md's architecture map.
   or checks data the committed fake identities cannot pass (a signature
   against an organizer key), stop with the evidence; the human partner
   decides whether that work is in scope or the success criteria change.
-- Before Part 4 and before Part 5's spike (the human partner's badge and
-  a second device may be needed).
+- Before Part 4 (the human partner connects Upstash Redis to the Vercel
+  project; a second device is needed) and before Part 5's spike (the
+  human partner's badge).
 - Part 5's go/no-go after its firmware reading.
 - Release `boot_progress` over 90 s; any override of a recorded decision.
 - The browser checks in success criterion 5.
@@ -386,8 +394,9 @@ Milestone 11 backlog, and CLAUDE.md's architecture map.
 - Connect and Sync to their home screens; emulated badges hear each
   other; hear real badges if possible.
 - No servers whatsoever; WebRTC with copy-paste accepted. **Overridden
-  2026-10-29:** a signaling server on Vercel replaces the copy-paste; no
-  relay.
+  2026-10-29:** a signaling server on Vercel, storing in Upstash Redis,
+  replaces the copy-paste, which stays as a fallback; no relay; same
+  network only (no STUN/TURN); built as Part 4.
 - One active emulator per device, like a real badge; the peer comes from
   another device. The same-browser link is dropped. R-T8-10 stands.
 - Being heard by a real badge and a pretend sync desk are out.
