@@ -90,7 +90,9 @@ RIGHT × column, each settled; A held 100 ms), then pinned in
 `boot_progress.rs` (`LAUNCHER_SELECTED` and the `launcher_opens!`
 rungs). Every soft-reset count agrees with the probe above: Scanner,
 Sync, Share, Sponsors and Workshop Quest reboot once; the others open
-directly. Steps are from A's release to the first stable frame.
+directly. Steps are from A's release to the first stable frame, except
+Sponsors, whose pin is its loaded frame (the human partner's ruling at
+the Task 5 gate, below R-T4-1).
 
 | Cell | App | Soft resets | First stable | Frame |
 |---|---|---|---|---|
@@ -100,7 +102,7 @@ directly. Steps are from A's release to the first stable frame.
 | 3 | Sync | 1 | — | stops at `0x4000_08ec` (dump at 6.75M) |
 | 4 | Share | 1 | 9.0M | `0xfc51_aedc_c0ab_617d` |
 | 5 | Solana Scavenger Hunt | 0 | 5.25M | `0x7ad3_a516_f050_78cf` |
-| 6 | Sponsors | 1 | 16.0M | `0xb082_0063_bef2_19eb` |
+| 6 | Sponsors | 1 | 60.5M (loaded) | `0xcdc7_9972_60aa_f1c8` |
 | 7 | Workshop Quest | 1 | 21.75M | `0x894d_5dae_e0d9_8e2a` |
 | 8 | Mood LEDs | 0 | 8.0M | `0x0c6c_07b5_b963_4775` |
 | 9 | Socials | 0 | 4.0M | `0xeedf_ef97_7fd2_ea52` |
@@ -277,13 +279,28 @@ comparable with Milestone 7's v335 rows).
   the plan's name, `scanner_home_reboots_to_the_launcher`, and asserts
   the direct return; its doc records the path — cost if wrong: a name
   that reads as a second reboot; the assertions say what happens.
-- Ruling R-T4-1: Sponsors' pinned open frame is its first stable
-  frame, the floor map before any booth is drawn ("--/64"). The booth
-  icons then appear in 42 redraws, the last about 60.5M steps after A's
-  release, with the counter at "0/64 0%"; they are not pinned. The brief
-  pins each app's first stable frame, and the loaded map would add about
-  45M steps to the rung — cost if wrong: a change that breaks only the
-  booth drawing would not fail the rung.
+- Ruling R-T4-1 (superseded at the Task 5 gate, see below): Sponsors'
+  pinned open frame is its first stable frame, the floor map before any
+  booth is drawn ("--/64"). The booth icons then appear in 42 redraws,
+  the last about 60.5M steps after A's release, with the counter at
+  "0/64 0%"; they are not pinned. The brief pins each app's first stable
+  frame, and the loaded map would add about 45M steps to the rung — cost
+  if wrong: a change that breaks only the booth drawing would not fail
+  the rung.
+  - Superseded by the human partner at the Task 5 browser gate
+    (2026-10-28): "pin the loaded frame instead now". The rung now pins
+    `SPONSORS_LOADED_HASH` = `0xcdc7_9972_60aa_f1c8` ("0/64 0%", the map
+    covered in "?" booth icons, the first one outlined) in place of
+    `0xb082_0063_bef2_19eb`. Measured: the map is stable 16.0M steps
+    after A's release; the icons come in four batches after pauses of
+    8.25M, 8.5M, 8.75M and 9.5M steps (42 redraws); the last redraw is
+    at 60.5M and the frame is unchanged through 150M. The rung waits for
+    a frame that holds `SPONSORS_LOADED_STABLE_FOR` = 20M steps (over
+    twice the longest pause; the other rungs' 8M would stop on the bare
+    map) within 101M (60.5M + 20M = 80.5M, + 25 %, rounded up). It is a
+    test pin chosen by the human, not a re-pin: no emulated behaviour
+    changed and no other pin moved. The rung takes about 7 s alone; the
+    release suite stays at 11.7 s, since the rungs run in parallel.
 - Ruling R-T4-2: Connect's and Sync's rungs stop at the register dump
   (`MEPC    : 0x400008ec`), as the brief asks. What follows was measured
   and is not pinned: the panic handler prints `Rebooting...`, the

@@ -1795,24 +1795,21 @@ fn press_a_on_cell(cell: usize) -> (FirmwareRuntime, usize) {
 }
 
 /// A on launcher `cell` opens `app`: within `response_steps` of A's
-/// release the first stable frame other than the selection is
-/// `open_hash`, the console since A says `app_reg: launched <app>`, the
-/// runtime has soft-reset `soft_resets` times, and nothing panicked.
+/// release the first frame other than the selection that holds for
+/// `stable_for` steps is `open_hash`, the console since A says
+/// `app_reg: launched <app>`, the runtime has soft-reset `soft_resets`
+/// times, and nothing panicked.
 fn assert_launcher_opens(
     cell: usize,
     app: &str,
     soft_resets: u32,
     response_steps: u64,
+    stable_for: u64,
     open_hash: u64,
 ) {
     let (mut rt, before) = press_a_on_cell(cell);
     let cap = rt.total_steps() + response_steps;
-    let (hash, step) = run_until_stable_frame(
-        &mut rt,
-        cap,
-        AFTER_PRESS_STABLE_FOR,
-        &[LAUNCHER_SELECTED[cell]],
-    );
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, stable_for, &[LAUNCHER_SELECTED[cell]]);
     assert_eq!(hash, open_hash, "{app} opened, stable at step {step}");
     let console = rt.console_output();
     assert!(
@@ -1833,7 +1830,14 @@ macro_rules! launcher_opens {
         $(#[$doc])*
         #[test]
         fn $name() {
-            assert_launcher_opens($cell, $app, $soft_resets, $response, $hash);
+            assert_launcher_opens(
+                $cell,
+                $app,
+                $soft_resets,
+                $response,
+                AFTER_PRESS_STABLE_FOR,
+                $hash,
+            );
         }
     };
 }
@@ -1872,22 +1876,39 @@ launcher_opens!(
     17_000_000,
     0x7ad3_a516_f050_78cf
 );
-launcher_opens!(
-    /// Sponsors reboots into itself (`app_reboot: reboot into sponsors`)
-    /// and logs `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE` (NFC is not
-    /// modeled), as Scanner does. Its first stable frame is the floor map
-    /// ("Floor 1", "Floor 2", "Extended Sponsor Bay", counter "--/64",
-    /// footer "A SPONSOR  B INFO  START LIST  HOME APPS") before any booth
-    /// is drawn; first stable 16.0M after the release: 30M. The booth
-    /// icons then appear in 42 redraws, the last about 60.5M steps after
-    /// the release, with the counter at "0/64 0%"; they are not pinned.
-    launcher_opens_sponsors_after_one_reboot,
-    6,
-    "Sponsors",
-    1,
-    30_000_000,
-    0xb082_0063_bef2_19eb
-);
+/// How long Sponsors' frame must hold to count as loaded. Sponsors draws
+/// its floor map (stable from 16.0M steps after A's release), then the
+/// booth icons in four batches, 42 redraws in all; the pauses before the
+/// batches are 8.25M, 8.5M, 8.75M and 9.5M steps (measured, v392), so
+/// [`AFTER_PRESS_STABLE_FOR`] would stop on the bare map. This window is
+/// over twice the longest pause; the last redraw is 60.5M after the
+/// release, and the frame was unchanged through 150M.
+const SPONSORS_LOADED_STABLE_FOR: u64 = 20_000_000;
+/// Sponsors' loaded frame: "Sponsors", "0/64 0%", the floor map ("Floor
+/// 1", "Floor 2", "Extended Sponsor Bay") covered in "?" booth icons, the
+/// first one outlined, footer "A SPONSOR  B INFO  START LIST  HOME APPS".
+/// Measured on v392 and checked by eye; never compared with the physical
+/// badge, which runs v335.
+const SPONSORS_LOADED_HASH: u64 = 0xcdc7_9972_60aa_f1c8;
+
+/// Sponsors reboots into itself (`app_reboot: reboot into sponsors`) and
+/// logs `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE` (NFC is not
+/// modeled), as Scanner does. Pinned on its loaded frame (the human
+/// partner's ruling at the Task 5 browser check, superseding R-T4-1),
+/// [`SPONSORS_LOADED_HASH`]: last redrawn 60.5M steps after A's release,
+/// then [`SPONSORS_LOADED_STABLE_FOR`] more to confirm, 80.5M; + 25 %,
+/// rounded up to 1,000,000: 101M.
+#[test]
+fn launcher_opens_sponsors_after_one_reboot() {
+    assert_launcher_opens(
+        6,
+        "Sponsors",
+        1,
+        101_000_000,
+        SPONSORS_LOADED_STABLE_FOR,
+        SPONSORS_LOADED_HASH,
+    );
+}
 launcher_opens!(
     /// Workshop Quest reboots into itself (`app_reboot: reboot into
     /// workshops`) and logs the same NFC error as Sponsors: "Workshop
