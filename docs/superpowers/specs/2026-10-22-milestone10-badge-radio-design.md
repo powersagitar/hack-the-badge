@@ -141,16 +141,21 @@ from code the seam replaces.
   (`requestLEScan`, Chrome behind the experimental-web-platform flag;
   Safari has no Web Bluetooth). So a real badge or desk can never hear
   the emulator.
-- **No servers whatsoever** (decided): no relay, no signaling server.
-  Links between devices use WebRTC with a manual copy-paste of
-  connection codes (accepted by the human partner).
+- **A signaling server on Vercel, and no relay** (decided 2026-10-29,
+  overriding 2026-10-22's "no servers whatsoever"): the site's own
+  Vercel deployment hosts a small signaling function that passes WebRTC
+  offers and answers between two tabs, replacing the copy-paste. Radio
+  traffic never touches it: it flows browser to browser over WebRTC.
+  Vercel Functions cannot hold WebSockets or share memory between
+  invocations, so the function is plain HTTP, and pending offers and
+  answers live in a store with a short expiry.
 
 ## Goals
 
 1. **Connect and Sync open to their home screens** and never freeze
    (Part 1).
 2. **Emulated badges on different devices hear each other**, through a
-   WebRTC link set up by copy-paste. **One active emulator per device,
+   WebRTC link set up through the Vercel signaling function. **One active emulator per device,
    like a real badge** (decided): a second firmware-mode tab in the same
    browser does not run a second badge (Part 3).
 3. **A bump between two emulated badges pairs them in Connect**, ending in
@@ -178,8 +183,9 @@ from code the seam replaces.
   radio app opens, so every other rung,
   `execution_digest_is_unchanged` and `hacker_walk_totals_are_unchanged`
   stay byte-identical. A move is a bug in the change.
-- Any server, relay, STUN/TURN or third-party service, including public
-  STUN.
+- Any server other than the Vercel signaling function; any relay; radio
+  traffic through any server. (STUN/TURN and the signaling store are
+  open below.)
 - Browser or network input that can panic the emulator, or a malformed
   peer packet that can crash a tab.
 - Guessed register layouts, ROM addresses or app-image addresses.
@@ -202,7 +208,8 @@ from code the seam replaces.
 4. Every existing suite and pin unchanged; release `boot_progress` under
    90 s.
 5. **Human gates:** Connect's and Sync's home screens; a bump between
-   emulated badges on two devices, linked by copy-paste WebRTC, ending in
+   emulated badges on two devices, linked through the deployed signaling
+   function, ending in
    "SYNCED" on both.
 
 ## Design
@@ -305,18 +312,26 @@ firmware's threshold and records it).
   the receiving badge's current emulated time on arrival. No cross-tab
   clock sync.
 
-### Part 4 — WebRTC copy-paste link
+### Part 4 — WebRTC link, signaled through Vercel
 
-- Tab A makes an offer code; the user pastes it into tab B, which makes
-  an answer code; the user pastes that back into A. Two pastes per pair.
-  A tab can hold several links. Links do not forward to each other
+- **The signaling function** lives in the frontend's Vercel project
+  (`frontend/api/`, next to `frontend/vercel.json`). Tab A creates a
+  room and shows a short code; tab B enters it. A posts its offer, B
+  fetches it and posts its answer, and A polls for the answer. Offers
+  wait for ICE gathering to finish, so one exchange each way suffices
+  (no trickle ICE). The function only stores and returns bounded,
+  validated SDP blobs under unguessable room codes, which expire after
+  minutes. It never sees radio traffic and keeps no logs of SDP.
+- A tab can hold several links. Links do not forward to each other
   (radio does not hop): a badge hears only badges it is directly linked
   to.
-- **No ICE servers** (`iceServers: []`): host and mDNS candidates only,
-  so links work between devices on the same local network, not across
-  the internet. Codes wait for ICE
-  gathering to finish, so one paste each way suffices.
 - Peer data is validated (size, shape) before it reaches the Worker.
+- `bun run dev` serves the function locally too, so development and
+  tests do not need a deployment.
+- Open (the human partner's choice): the signaling store; whether the
+  copy-paste codes stay as a fallback; whether ICE stays host/mDNS only
+  (`iceServers: []`, same network only) or adds STUN for links across
+  the internet.
 
 ### Part 5 — Conditional: hearing real badges (Chrome)
 
@@ -370,7 +385,9 @@ Milestone 11 backlog, and CLAUDE.md's architecture map.
 
 - Connect and Sync to their home screens; emulated badges hear each
   other; hear real badges if possible.
-- No servers whatsoever; WebRTC with copy-paste accepted.
+- No servers whatsoever; WebRTC with copy-paste accepted. **Overridden
+  2026-10-29:** a signaling server on Vercel replaces the copy-paste; no
+  relay.
 - One active emulator per device, like a real badge; the peer comes from
   another device. The same-browser link is dropped. R-T8-10 stands.
 - Being heard by a real badge and a pretend sync desk are out.
@@ -384,7 +401,7 @@ Milestone 11 backlog, and CLAUDE.md's architecture map.
 
 - The HCI-level model, rather than any attempt at the ROM controller.
 - A second tab can take the badge over; it is not simply refused.
-- Links do not forward; WebRTC without ICE servers (LAN only).
+- Links do not forward.
 - A linked peer's RSSI is a fixed strong value.
 - Bump hits every linked emulated badge at once.
 - An opt-in per-runtime factory MAC (eFuse) as the radio identity,
