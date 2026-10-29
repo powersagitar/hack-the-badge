@@ -1110,7 +1110,8 @@ const RING_TEST_DEADLINE: u64 = 21_000_000;
 // re-runs the walk and fails with the walk's own message: nothing is
 // skipped or loosened. Rungs start from: blank-flash boot ([`FIRST_RUN`]),
 // role hacker's onboarding page 6 ([`OWN_SHAKE_PAGE`]), each role's
-// registered screen ([`REGISTERED`]) and launcher ([`LAUNCHER`]).
+// registered screen ([`REGISTERED`]) and launcher ([`LAUNCHER`]), and
+// each launcher app once open ([`OPENED`]).
 // ---------------------------------------------------------------------
 
 /// The stable first-run screen on blank flash ([`first_run_screen`]).
@@ -1699,12 +1700,28 @@ fn scanner_opens_after_one_reboot() {
 /// the release.
 #[test]
 fn scanner_home_returns_to_the_launcher() {
-    let mut rt = scanner_open();
+    assert_home_returns_to_the_launcher(
+        scanner_open(),
+        SCANNER_OPEN_HASH,
+        SCANNER_HOME_RESPONSE_STEPS,
+    );
+}
+
+/// HOME from an open app that rebooted into itself once: within
+/// `response_steps` of HOME's release the first frame other than
+/// `open_hash` that holds for [`AFTER_PRESS_STABLE_FOR`] is
+/// [`LAUNCHER_HASH`], the console since HOME says `app_reg: launched
+/// Launcher` with no `reboot into`, the soft-reset count stays 1 (a
+/// direct return, no second reboot), and nothing panicked.
+fn assert_home_returns_to_the_launcher(
+    mut rt: FirmwareRuntime,
+    open_hash: u64,
+    response_steps: u64,
+) {
     let before = rt.console_output().len();
     press(&mut rt, TO_LAUNCHER_SLOT);
-    let cap = rt.total_steps() + SCANNER_HOME_RESPONSE_STEPS;
-    let (hash, step) =
-        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[SCANNER_OPEN_HASH]);
+    let cap = rt.total_steps() + response_steps;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[open_hash]);
     assert_eq!(hash, LAUNCHER_HASH, "launcher, stable at step {step}");
     let console = rt.console_output();
     let after = &console[before..];
@@ -1749,6 +1766,14 @@ fn scanner_home_returns_to_the_launcher() {
 /// | 13 | Progress | 0 | [`launcher_opens_progress`] |
 /// | 14 | Snake | 0 | [`launcher_opens_snake`] |
 /// | 15 | Dice | 0 | [`launcher_opens_dice`] |
+///
+/// Leaving each app that rebooted into itself is pinned too: HOME returns
+/// directly to [`LAUNCHER_HASH`] with no second reboot
+/// ([`scanner_home_returns_to_the_launcher`],
+/// [`share_home_returns_to_the_launcher`],
+/// [`sponsors_home_returns_to_the_launcher`],
+/// [`workshop_quest_home_returns_to_the_launcher`]). Connect and Sync
+/// cannot be left: they stop at the Bluetooth ROM (Milestone 10).
 ///
 /// Each entry here is the launcher's stable frame with that cell
 /// selected. Cells 0, 1, 2, 4, 8 and 12 to 15 reuse [`LAUNCHER_HASH`]
@@ -1807,7 +1832,8 @@ fn press_a_on_cell(cell: usize) -> (FirmwareRuntime, usize) {
 /// release the first frame other than the selection that holds for
 /// `stable_for` steps is `open_hash`, the console since A says
 /// `app_reg: launched <app>`, the runtime has soft-reset `soft_resets`
-/// times, and nothing panicked.
+/// times, and nothing panicked. Returns the open app, a checkpoint in
+/// [`OPENED`] that a HOME rung continues from.
 fn assert_launcher_opens(
     cell: usize,
     app: &str,
@@ -1815,20 +1841,30 @@ fn assert_launcher_opens(
     response_steps: u64,
     stable_for: u64,
     open_hash: u64,
-) {
-    let (mut rt, before) = press_a_on_cell(cell);
-    let cap = rt.total_steps() + response_steps;
-    let (hash, step) = run_until_stable_frame(&mut rt, cap, stable_for, &[LAUNCHER_SELECTED[cell]]);
-    assert_eq!(hash, open_hash, "{app} opened, stable at step {step}");
-    let console = rt.console_output();
-    assert!(
-        console[before..].contains(&format!("app_reg: launched {app}")),
-        "console since A:\n{}",
-        &console[before..]
-    );
-    assert_eq!(rt.soft_reset_count(), soft_resets, "{app}: soft resets");
-    assert_no_panic_text(&rt);
+) -> FirmwareRuntime {
+    OPENED[cell]
+        .get_or_init(|| {
+            let (mut rt, before) = press_a_on_cell(cell);
+            let cap = rt.total_steps() + response_steps;
+            let (hash, step) =
+                run_until_stable_frame(&mut rt, cap, stable_for, &[LAUNCHER_SELECTED[cell]]);
+            assert_eq!(hash, open_hash, "{app} opened, stable at step {step}");
+            let console = rt.console_output();
+            assert!(
+                console[before..].contains(&format!("app_reg: launched {app}")),
+                "console since A:\n{}",
+                &console[before..]
+            );
+            assert_eq!(rt.soft_reset_count(), soft_resets, "{app}: soft resets");
+            assert_no_panic_text(&rt);
+            rt
+        })
+        .clone()
 }
+
+/// Each launcher cell's open app, reached once by [`assert_launcher_opens`]
+/// and shared by its open rung and its HOME rung.
+static OPENED: [OnceLock<FirmwareRuntime>; 16] = [const { OnceLock::new() }; 16];
 
 /// One parallel rung per app: `name, cell, "app", soft_resets,
 /// response_steps, open_hash`. Each response is the measured release to
@@ -1838,7 +1874,29 @@ fn assert_launcher_opens(
 /// Sponsors' rung, [`launcher_opens_sponsors_after_one_reboot`], sits
 /// outside the macro: it pins the loaded frame, which needs its own
 /// stable window ([`SPONSORS_LOADED_STABLE_FOR`]).
+///
+/// An app that reboots into itself adds `home: home_name, home_response`:
+/// a second rung that continues from the open app ([`OPENED`]) and
+/// presses HOME ([`assert_home_returns_to_the_launcher`]). Its budget is
+/// measured the same way, from HOME's release to the stable launcher.
 macro_rules! launcher_opens {
+    ($(#[$doc:meta])* $name:ident, $cell:expr, $app:literal, $soft_resets:expr, $response:expr, $hash:expr,
+     home: $(#[$home_doc:meta])* $home:ident, $home_response:expr) => {
+        launcher_opens!($(#[$doc])* $name, $cell, $app, $soft_resets, $response, $hash);
+        $(#[$home_doc])*
+        #[test]
+        fn $home() {
+            let rt = assert_launcher_opens(
+                $cell,
+                $app,
+                $soft_resets,
+                $response,
+                AFTER_PRESS_STABLE_FOR,
+                $hash,
+            );
+            assert_home_returns_to_the_launcher(rt, $hash, $home_response);
+        }
+    };
     ($(#[$doc:meta])* $name:ident, $cell:expr, $app:literal, $soft_resets:expr, $response:expr, $hash:expr) => {
         $(#[$doc])*
         #[test]
@@ -1876,7 +1934,13 @@ launcher_opens!(
     "Share",
     1,
     22_000_000,
-    0xfc51_aedc_c0ab_617d
+    0xfc51_aedc_c0ab_617d,
+    home:
+    /// Leaving Share: HOME returns directly to the launcher, as Scanner's
+    /// does: `app_reg: launched Launcher`, no `reboot into`, one soft
+    /// reset. First stable 12.25M after HOME's release: 26M.
+    share_home_returns_to_the_launcher,
+    26_000_000
 );
 launcher_opens!(
     /// Solana Scavenger Hunt: its title, the "Find boxes with the Solana
@@ -1913,6 +1977,12 @@ const SPONSORS_LOADED_HASH: u64 = 0xcdc7_9972_60aa_f1c8;
 /// rounded up to 1,000,000: 101M.
 #[test]
 fn launcher_opens_sponsors_after_one_reboot() {
+    sponsors_loaded();
+}
+
+/// [`launcher_opens_sponsors_after_one_reboot`]'s assertions, returning
+/// the loaded Sponsors app.
+fn sponsors_loaded() -> FirmwareRuntime {
     assert_launcher_opens(
         6,
         "Sponsors",
@@ -1920,6 +1990,23 @@ fn launcher_opens_sponsors_after_one_reboot() {
         101_000_000,
         SPONSORS_LOADED_STABLE_FOR,
         SPONSORS_LOADED_HASH,
+    )
+}
+
+/// HOME's response from Sponsors' loaded map: release to the first
+/// stable launcher 12.0M, then [`AFTER_PRESS_STABLE_FOR`] more, 20.0M;
+/// + 25 %, rounded up to 1,000,000.
+const SPONSORS_HOME_RESPONSE_STEPS: u64 = 25_000_000;
+
+/// Leaving Sponsors: HOME from the loaded map ([`SPONSORS_LOADED_HASH`])
+/// returns directly to the launcher, as Scanner's does:
+/// `app_reg: launched Launcher`, no `reboot into`, one soft reset.
+#[test]
+fn sponsors_home_returns_to_the_launcher() {
+    assert_home_returns_to_the_launcher(
+        sponsors_loaded(),
+        SPONSORS_LOADED_HASH,
+        SPONSORS_HOME_RESPONSE_STEPS,
     );
 }
 launcher_opens!(
@@ -1933,7 +2020,13 @@ launcher_opens!(
     "Workshop Quest",
     1,
     38_000_000,
-    0x894d_5dae_e0d9_8e2a
+    0x894d_5dae_e0d9_8e2a,
+    home:
+    /// Leaving Workshop Quest: HOME returns directly to the launcher, as
+    /// Scanner's does: `app_reg: launched Launcher`, no `reboot into`,
+    /// one soft reset. First stable 12.25M after HOME's release: 26M.
+    workshop_quest_home_returns_to_the_launcher,
+    26_000_000
 );
 launcher_opens!(
     /// Mood LEDs: "Choose a mood, then leave this app open …", "Green
