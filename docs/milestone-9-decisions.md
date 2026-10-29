@@ -2,8 +2,9 @@
 
 Milestone 9 upgrades the emulated firmware from the badge's dumped v335
 to the official v392, renames the committed image from `factory.bin` to
-`firmware.bin`, re-pins the tests, and adds the software reset that five
-v392 apps use to open. Spec:
+`firmware.bin`, re-pins the tests, and adds the software reset that v392
+uses to enter five apps (four of them now open; Sync then stops at the
+Bluetooth ROM). Spec:
 `docs/superpowers/specs/2026-10-22-milestone9-firmware-upgrade-design.md`;
 plan: `docs/superpowers/plans/2026-10-22-milestone9-firmware-upgrade.md`.
 

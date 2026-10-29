@@ -768,8 +768,9 @@ below):
   found again in v392 by its bytes or its function's shape).
 - The software reset (Task 3): `software_reset` and `software_reset_cpu`
   are stubs that request a reset, and `FirmwareRuntime` re-boots while
-  keeping the flash, RTC_CNTL `STORE0..7` and RTC fast memory. Five apps
-  that froze on v392 now open.
+  keeping the flash, RTC_CNTL `STORE0..7` and RTC fast memory. Scanner,
+  Share, Sponsors and Workshop Quest now open; Sync gets past its reboot
+  and stops at the Bluetooth ROM (limitation 1).
 - Every launcher app has a rung (Task 4); Sponsors is pinned on its
   loaded frame (the human partner's ruling at the Task 5 gate).
 
