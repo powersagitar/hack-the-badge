@@ -31,10 +31,11 @@ screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
 the browser the emulator runs in a Web Worker, paced to wall-clock time.
 Snake plays at about 1.0x, and every tap of a quick burst registers (a
-per-button tap queue in the browser). On v392, a launcher move (DOWN)
-plays at about 0.86x and entering the launcher (the HOME redraw) at
-about 0.6x, because the WASM core does about 40M steps/s against the
-badge's 80M. Before assuming anything else works, read
+per-button tap queue in the browser). On v392, in Bun's WASM bench, a
+launcher move (DOWN) plays at about 0.86x and entering the launcher
+(the HOME redraw) at about 0.6x, because the WASM core does about 40M
+steps/s against the badge's 80M; browsers were not re-measured on
+v392. Before assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
 `docs/milestone-3-decisions.md` through `docs/milestone-9-decisions.md`.
@@ -81,7 +82,7 @@ plus `wasm-pack`.
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 79 rungs plus 1 ignored benchmark, about
+  real-firmware boot ratchet, 82 rungs plus 1 ignored benchmark, about
   12 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.

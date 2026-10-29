@@ -114,6 +114,28 @@ the Task 5 gate, below R-T4-1).
 | 14 | Snake | 0 | — | existing rungs, unchanged |
 | 15 | Dice | 0 | 2.75M | `DICE_OPEN_HASH`, unchanged |
 
+Leaving each app that rebooted into itself (added by the whole-branch
+review's fix wave, measured natively in release on v392): HOME from the
+open app (Sponsors: from its loaded map) returns directly to the
+launcher. In every case the frame is `LAUNCHER_HASH`, the console after
+HOME shows `app_reg: launched Launcher` and no `reboot into`, the
+soft-reset count stays 1, and nothing panics. Steps are from HOME's
+release to the first stable launcher; the budget is that + 8M, + 25 %,
+rounded up to 1M.
+
+| Cell | App | First stable | Budget | Rung |
+|---|---|---|---|---|
+| 2 | Scanner | 11.75M | 25M | `scanner_home_returns_to_the_launcher` (Task 3) |
+| 4 | Share | 12.25M | 26M | `share_home_returns_to_the_launcher` |
+| 6 | Sponsors | 12.0M | 25M | `sponsors_home_returns_to_the_launcher` |
+| 7 | Workshop Quest | 12.25M | 26M | `workshop_quest_home_returns_to_the_launcher` |
+
+Connect and Sync cannot be left: they stop at the Bluetooth ROM
+(Milestone 10). The rungs are additions: `assert_launcher_opens` now
+caches each open app in `OPENED` and returns it, and Scanner's HOME
+rung became the shared `assert_home_returns_to_the_launcher`, with the
+same assertions; no pin moved.
+
 Scanner, Sponsors and Workshop Quest log `hal_nfc: rc522_start:
 ESP_ERR_INVALID_STATE` (NFC is not modeled) and still draw. No app
 prints panic text, and none faults except Connect and Sync. The frames
@@ -140,8 +162,37 @@ speed comparison. There is no speed target.
 
 Walk throughput: 39.96M steps/s in Bun's WASM (Milestone 8: 41.2M),
 62.99M natively. Task 2's single native run on this machine gave home
-1.13, down 1.20, onboarding 1.70; native runs vary that much between
-sessions.
+1.13, down 1.20, onboarding 1.70. That drop is not session variance.
+The whole-branch review ran `bench_redraws` alternately at `b25a68c`
+(Task 2) and at `7e02b9d` in one session, with identical step counts
+in every run (HOME 1.127x and 1.130x against 1.014x and 0.943x; DOWN
+1.196x and 1.201x against 1.063x and 1.056x; onboarding 1.69x against
+1.51x), and the fix wave repeated it (three alternating pairs,
+2026-10-28):
+
+| Redraw | Native, `b25a68c` | Native, `7e02b9d` |
+|---|---|---|
+| HOME | 1.128x, 1.117x, 1.113x | 1.011x, 1.021x, 1.007x |
+| DOWN | 1.189x, 1.184x, 1.181x | 1.056x, 1.092x, 1.053x |
+| Onboarding | 1.677x, 1.677x, 1.668x | 1.508x, 1.557x, 1.509x |
+
+Walk throughput was 71.2M to 71.9M steps/s at `b25a68c` and 65.5M to
+67.3M at `7e02b9d`. So the native core is about 10 % slower since Task
+3, and the cause is Task 3's per-step reset check: the reviewer's
+probes found that `b25a68c`'s tests over `7e02b9d`'s `emulator-core/src`
+reproduce the drop, and removing only the `take_reset_request` /
+`soft_reset` block in `run_impl` recovers most of it (HOME 1.096x, DOWN
+1.155x to 1.181x). Marking `soft_reset` `#[cold] #[inline(never)]`
+recovered part of it (HOME 1.05x to 1.06x); gating the check on
+`info.rom_stub.is_some()` did not help. The code is unchanged in
+Milestone 9; recovering the speed is Milestone 10 backlog.
+
+WASM was not A/B'd. An estimate: scaling Milestone 8's v335 Bun factors
+by each redraw's change in emulated time per step from v335 to v392
+predicts HOME about 0.616x, DOWN about 0.80x and onboarding about 1.13x,
+against the measured 0.623x, 0.857x and 1.110x. That leaves no visible
+extra drop in the WASM numbers behind the browser speed the human
+partner accepted, but it is an estimate, not a measurement.
 
 ### The browser gate (Task 5, 2026-10-28)
 
@@ -410,6 +461,13 @@ Measured at the Task 6 commit, native on the development machine:
 pass, and no pin moved after `b25a68c` except Sponsors' (the human
 partner's ruling at the Task 5 gate).
 
+After the whole-branch review's fix wave (three HOME rungs added, no
+change under `emulator-core/src`): release `boot_progress` 82 passed, 1
+ignored, real 11.83 s and 11.80 s warm (`/usr/bin/time -p`); `cargo
+test --workspace` 672 passed, 1 ignored, real 17.2 s warm; clippy still
+the 3 known warnings. No frontend file changed, so the Bun checks were
+not re-run.
+
 ## Milestone 10 backlog
 
 ### Lead: the badge radio
@@ -438,6 +496,22 @@ before a plan.
 - After Connect's and Sync's Bluetooth fault, the panic handler's reboot
   into My Badge (`boot: reset reason=4`, once, no loop) is measured but
   not pinned (R-T4-2). Milestone 10 replaces the fault.
+- Recover the native slowdown from Task 3's per-step reset check (about
+  10 % on every `bench_redraws` row; "Benchmarks on v392"): take reset
+  collection off the hot loop, for example an out-of-line slow path
+  entered only when a stub has asked for a reset. Verify with
+  `bench_redraws` and `bun run bench:wasm`, each A/B'd against
+  `b25a68c` in one session, with the suites byte-identical.
+- A/B WASM throughput (`bun run bench:wasm`) between `b25a68c` and the
+  Milestone 9 head; only the estimate in "Benchmarks on v392" exists.
+- The console now survives soft resets, so each reboot appends a full
+  boot log to the 256 KiB console ring, and the provisioner's
+  first-prompt scan (`frontend/src/runtime/provisioner.ts`: its
+  `prompt` phase searches the whole console for `badge> `, not only the
+  output since the last reset) could match a stale prompt from before a
+  reboot and type before the new console is up. Low risk today: it
+  needs a provision started during a reboot, and the usual flow
+  provisions on the first-run screen, before any app reboots.
 - `soft_reset_count()` is not exposed through `emulator-wasm`, so the
   browser cannot show or test it.
 - The RTC timer restarts at 0 at a software reset; on the badge the RTC

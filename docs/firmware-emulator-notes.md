@@ -720,7 +720,9 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   goes backwards). Scanner opens after exactly one reset
   (`scanner_opens_after_one_reboot`, `0x4958_3da5_06ff_ab49`), and HOME
   from Scanner is a direct return to the launcher, with no second reset
-  (`scanner_home_returns_to_the_launcher`). After Connect's and Sync's
+  (`scanner_home_returns_to_the_launcher`); so is HOME from Share,
+  Sponsors and Workshop Quest (`share_`, `sponsors_` and
+  `workshop_quest_home_returns_to_the_launcher`). After Connect's and Sync's
   Bluetooth fault the panic handler's `Rebooting...` now soft-resets too,
   and the badge boots once into My Badge (`boot: reset reason=4`;
   measured, not pinned) instead of v335's endless "Panic handler entered
@@ -3081,6 +3083,13 @@ persisted `/littlefs/config/reboot.cfg`) and the reboot calls mask-ROM
   loaded frame (`0xcdc7_9972_60aa_f1c8`, 60.5M steps after A, superseding
   R-T4-1), and accepted the lower speed (WASM DOWN 0.977x on v335,
   0.857x on v392).
+- **Whole-branch review fixes:** HOME rungs for Share, Sponsors and
+  Workshop Quest (each a direct return to the launcher, one soft reset;
+  the release suite has 82 rungs, still about 11.8 s). An A/B of
+  `bench_redraws` showed the native core about 10 % slower since Task 3,
+  from the per-step reset check, not session variance (Milestone 9
+  decisions, "Benchmarks on v392"); recovering it is Milestone 10
+  backlog.
 
 ## Emulated flash chip: what it contains
 
