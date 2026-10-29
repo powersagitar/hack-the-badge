@@ -5,8 +5,9 @@ and split out of Milestone 9, which upgrades the emulator to the official
 v392 firmware first
 (`docs/superpowers/specs/2026-10-22-milestone9-firmware-upgrade-design.md`).
 Milestone 9 finished (main @ `0d56ba5`); the measurements below were
-re-taken on v392 at kickoff (2026-10-29, "Measured on v392"). The human
-partner approves this spec, then a plan follows.
+re-taken on v392 at kickoff (2026-10-29, "Measured on v392").
+**Approved by the human partner on 2026-10-29**, with every "My call"
+kept and three backlog items riding along ("Ride-along").
 
 ## Why
 
@@ -165,6 +166,21 @@ from code the seam replaces.
    scan. Kept only if the firmware shows that one-way hearing has a
    visible effect (Part 5); dropped otherwise, with the evidence
    recorded.
+
+## Ride-along (Milestone 9 backlog, chosen 2026-10-29)
+
+1. **The native slowdown:** take Task 3's per-step reset check in
+   `run_impl` off the hot loop (an out-of-line slow path entered only
+   when a stub has asked for a reset). Pure performance work: every
+   step count, needle, time and hash stays byte-identical. Verified with
+   `bench_redraws` and `bun run bench:wasm`, each A/B'd against `b25a68c`
+   in one session; the WASM A/B Milestone 9 lacked comes with it.
+2. **`soft_reset_count()` in `emulator-wasm`**, a one-line passthrough.
+3. **R-T6-1's test gaps:** a press, release, then soft reset test (the
+   "nothing replays" half), and `assert_launcher_opens` asserting
+   `app_reboot: reboot into <slug>` for the apps that reboot. The third
+   gap (`run_to_the_bluetooth_fault`'s per-chunk check) is moot once the
+   fault rungs are replaced.
 
 ## Non-goals
 
