@@ -1691,7 +1691,7 @@ fn scanner_opens_after_one_reboot() {
 /// (first icon selected, [`LAUNCHER_HASH`]) is stable 11.75M steps after
 /// the release.
 #[test]
-fn scanner_home_reboots_to_the_launcher() {
+fn scanner_home_returns_to_the_launcher() {
     let mut rt = scanner_open();
     let before = rt.console_output().len();
     press(&mut rt, TO_LAUNCHER_SLOT);
