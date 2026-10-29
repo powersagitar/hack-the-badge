@@ -45,16 +45,23 @@ unmodified, rather than trying to hand-extract or recreate any built-in app.
 
 ### `firmware.bin` segment table
 
-File offsets are relative to 0x10000 (the partition's flash offset).
+The official v392 image (`v0.1.2-392-gd3089c4`), committed since
+Milestone 9. Offsets are flash addresses, the file offset plus 0x10000
+(the partition's flash offset).
 
-| # | kind | load addr | file offset | size |
+| # | kind | load addr | flash offset | size |
 |---|------|-----------|--------------|------|
-| 0 | DROM (XIP rodata) | 0x3c130020 | 0x10020–0x147ea8 | 1,277,576 B |
-| 1 | DRAM | 0x3fc99c00 | 0x147eb0–0x150018 | 33,128 B |
-| 2 | IROM (XIP code) | 0x42000020 | 0x150020–0x279b6c | 1,219,404 B |
-| 3 | DRAM | 0x3fca1d68 | 0x279b74–0x2805f0 | 27,260 B |
-| 4 | IRAM | 0x40380000 | 0x2805f8–0x29a164 | 105,324 B |
-| 5 | RTC/LP | 0x50000000 | 0x29a16c–0x29a18c | 32 B |
+| 0 | DROM (XIP rodata) | 0x3c130020 | 0x10020–0x148760 | 1,279,808 B |
+| 1 | DRAM | 0x3fc99c00 | 0x148768–0x150018 | 30,896 B |
+| 2 | IROM (XIP code) | 0x42000020 | 0x150020–0x27c720 | 1,230,592 B |
+| 3 | DRAM | 0x3fca14b0 | 0x27c728–0x27dabc | 5,012 B |
+| 4 | IRAM | 0x40380000 | 0x27dac4–0x297670 | 105,388 B |
+| 5 | RTC/LP | 0x50000000 | 0x297678–0x297698 | 32 B |
+
+The dumped v335 image (`factory.bin` until Milestone 9) has the same
+six kinds, load addresses (except segment 3's, `0x3fca1d68`) and entry
+point; its sizes were 1,277,576, 33,128, 1,219,404, 27,260, 105,324 and
+32 bytes.
 
 Entry point is `0x403803fc` (bytes 4-7 of the image header, confirmed by
 directly reading `firmware.bin`'s raw bytes). `emulator-core/src/mem/image.rs`
@@ -231,8 +238,10 @@ backed the same split way:
   the badge's v0.4 (ECO3) chip; the rev0 ELF has different addresses.
   The ELF is not committed.
 - Only fields the firmware actually reads get real values. Disassembly of
-  `factory.bin` shows exactly one reader of `ets_rom_layout_p`, and it
-  reads only `dram0_rtos_reserved_start` (offset 4). The other 39 fields
+  the v335 image (then `factory.bin`, Milestone 3) shows exactly one
+  reader of `ets_rom_layout_p`, and it reads only
+  `dram0_rtos_reserved_start` (offset 4); v392 was not re-traced, and it
+  boots with the same table. The other 39 fields
   are `0`. A later consumer of another field must back it from the same
   ELF, not rely on the `0`.
 - Task D10 added a second consumer: the coexistence library's version
@@ -580,39 +589,67 @@ key event of 16 ms or more (Chrome 155). The human accepted the speed
 (ruling R-T9-1); a block cache leads the Milestone 8 backlog. Per-host
 figures are in "Known limitations" below.
 
+On v392 (Milestone 9) the same benchmark in Bun's WASM gives HOME
+0.623x, DOWN 0.857x and onboarding 1.110x (v335: 0.614x, 0.977x,
+1.224x), at 39.96M steps/s; the firmware differs, so the columns are not
+a speed comparison. The human partner found the lower speed noticeable
+and accepted it (Task 5 gate). An app that opens by rebooting adds no
+pacing case: the reset happens inside one step, the run continues on the
+new boot, and host time keeps counting (see "Software reset" under
+"Current state"). In Chrome the readout dipped to about 0.8x for about
+0.5 s while Scanner rebooted.
+
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 7)
+### Current state (end of Milestone 9)
 
-Milestone 7 was performance work only: what the firmware does, step for
-step, is exactly what Milestone 6 left (every pin unchanged), so the
-state below is Milestone 6's, now reached faster. Current throughput per
-host is limitation 1 below.
+**The firmware is the official v392** (`v0.1.2-392-gd3089c4`, compiled
+Sep 17 2026, 2,651,840 bytes), committed unpadded as
+`frontend/public/firmware/firmware.bin`; until Milestone 9 the emulator
+ran the badge's dumped v335 (`v0.1.2-335-gbf0bee6`) as `factory.bin`.
+The badge itself stays on v335, so every comparison with hardware below
+was made on v335: a v392 frame with the same hash is the same frame, and
+v392's changed frames were checked only by the human partner's eye
+(side by side with the v335 badge at Milestone 9's Task 5 gate, "side
+by side comes clean"). Every pin that moved with the upgrade, and why,
+is in `milestone-9-decisions.md`, "Re-pins (v335 → v392)". Milestone 8
+changed only the browser's tap handling, and Milestone 7 only speed, so
+apart from the upgrade and the software reset the firmware's behaviour,
+step for step, is what Milestone 6 left.
 
 Real-firmware boot runs from the shortcut boot of `firmware.bin` on blank
 synthetic flash through `app_main` to My Badge's first-run screen, and
 from there, provisioned through the firmware's own USB console with a
 committed fake identity, through the onboarding app to the app launcher,
-which responds to navigation and opens Dice and Snake. Snake is playable.
-From a cold boot (release build, role hacker; step counts are emulated
-steps, not time, under the Milestone 6 clock: re-measured after Task
-D-M6-1, the last Milestone 6 change that moved them; see "Timing model"
-above for how steps relate to emulated time):
+which responds to navigation and opens 14 of its 16 apps; Connect and
+Sync stop at the Bluetooth controller in mask ROM (Milestone 10). Snake
+is playable. From a cold boot (release build, role hacker; step counts
+are emulated steps, not time, under the Milestone 6 clock; see "Timing
+model" above for how steps relate to emulated time). Step numbers are
+v392's where marked; the others are v335's, measured after Milestone 6
+Task D-M6-1, and v392 reaches each point somewhat earlier (role
+hacker's launcher checkpoint at the end of the test walk: 342,600,776
+steps and 94.52 s of emulated time on v392, against 372,597,011 and
+98.46 s on v335):
 
-- The boot splash is final from about step 4.43M (`boots_to_first_real_frame`,
-  hash `0x5599c270ab0429fa`). My Badge's first-run screen ("Not
-  registered yet") is stable from the 15,250,000-step sample
-  (`boots_to_first_run_screen`, `0x8c5027cec0f79490`), and START still
-  opens the hardware self-test (`first_run_screen_responds_to_start`,
-  `0x7f325d838835baaa`, with a 100 ms press of emulated time). Both were compared
-  with a factory-reset badge (Milestone 4, 2026-10-07); Milestone 4's end
-  state, in the history below, has the details.
+- The boot splash ("Hack the North × SOLANA", footer "FW
+  v0.1.2-392-gd3089c4") is final from step 4,250,000 on v392
+  (`boots_to_first_real_frame`, hash `0xfb30_5408_a9e5_0e98`; v335's was
+  `0x5599c270ab0429fa`, from about 4.43M). My Badge's first-run screen
+  ("Not registered yet") is stable from the 14,500,000-step sample on
+  v392 (`boots_to_first_run_screen`, `0x8c5027cec0f79490`, unchanged),
+  and START still opens the hardware self-test
+  (`first_run_screen_responds_to_start`, `0x7f325d838835baaa`,
+  unchanged, with a 100 ms press of emulated time). Both were compared
+  with a factory-reset badge on v335 (Milestone 4, 2026-10-07); Milestone
+  4's end state, in the history below, has the details.
 - **The console starts.** `app_main` starts the USB console REPL after
   the first app launches, as on the badge (`hal_console: console
   started`, rung `boot_starts_the_console`); its interrupt-driven
   USB-Serial-JTAG driver needs interrupt source 26 and the RX direction,
-  both modeled since Task 2. The `badge> ` prompt is up at about step
-  16.04M, and `prov show` answers `provisioned=0` on blank flash.
+  both modeled since Task 2. The `badge> ` prompt is up by step 15.12M
+  on v392 (v335: about 16.04M), and `prov show` answers `provisioned=0`
+  on blank flash.
 - **Provisioning through the console.** A host (the Rust test helper
   `tests/common/provision.rs`, or the browser's
   `frontend/src/runtime/provisioner.ts`) types the firmware's own
@@ -620,12 +657,15 @@ above for how steps relate to emulated time):
   in 64-byte chunks 48,000 steps apart (the firmware's driver drops what
   does not fit its 256-byte RX ring), then `prov apply`. The fixtures are
   `frontend/public/firmware/test-identities/<role>.json`, one per role in
-  the firmware's role table. `PROV OK` prints at 28.19M to 28.39M steps,
-  depending on the role. An empty record is rejected (`PROV FAIL invalid
-  or missing /littlefs/identity.json`) and the badge stays unregistered.
+  the firmware's role table. `PROV OK` prints by 28.74M steps for every
+  role on v392 (v335: 28.19M to 28.39M, depending on the role). An empty
+  record is rejected (`PROV FAIL invalid or missing
+  /littlefs/identity.json`) and the badge stays unregistered.
 - **Onboarding.** `prov apply` resets onboarding, and My Badge hands over
   to the onboarding app ("Setup", 11 pages). Page 1 shows the identity's
-  name. Page 3 wants every button pressed; page 6 ("Shake it!") reads the
+  name. Page 3 wants every button pressed: eight on v392 ("Press all 8
+  buttons once"; v335 also wanted Aux1, raw slot 8, which v392 dropped,
+  ruling R-T2-1); page 6 ("Shake it!") reads the
   SC7A20H accelerometer on I2C0 (modeled since Task D-M5-2; host input
   `FirmwareRuntime::set_acceleration`, at rest (0, 0, +1000) mg) and
   passes after a two-axis shake (the walk shakes at about step 226.0M);
@@ -641,14 +681,51 @@ above for how steps relate to emulated time):
   The WASM twin reaches the same launcher through the wasm-bindgen build,
   and the browser offers the same path (role picker, "Provision test
   badge", "Shake"; the user walks onboarding with the button pad).
-- **Human comparison, 2026-10-08:** the human partner compared the
+- **Human comparison, 2026-10-08 (v335):** the human partner compared the
   registered screen, the onboarding pages, the launcher and the launcher
   after DOWN with the physical badge, for role hacker, and confirmed they
   match ("frames are correct"). No other role's frames were compared on
-  hardware.
+  hardware. On v392 the registered screens, onboarding pages 2 and 4 to
+  11, the shaken page and the launcher after DOWN keep those hashes;
+  page 1, page 3's frames and the launcher (`0x94d7_a7a8_5fa9_3ea3`, a
+  few pixels differ) changed and were checked by eye only.
 - No fault, no panic text on the way. Still unmodeled on this path: the
   LEDs (`prov apply`'s green flashes and role colour are sent over RMT
   but not shown) and NFC.
+- **Every launcher app (Milestone 9).** From role hacker's launcher,
+  DOWN × row and RIGHT × column select a cell and A opens it; each cell
+  has a rung (`LAUNCHER_SELECTED` and the `launcher_opens_*` rungs in
+  `boot_progress.rs`; table and steps in `milestone-9-decisions.md`,
+  "Every launcher app on v392"). Twelve apps open directly or after one
+  reboot and draw a pinned first frame: My Badge, Scanner, Share,
+  Solana Scavenger Hunt, Sponsors (pinned on its loaded map, 60.5M steps
+  after A), Workshop Quest, Mood LEDs, Socials, Schedule, Info & Rules,
+  Museum and Progress; Snake and Dice keep their rungs. Scanner, Sponsors
+  and Workshop Quest log `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE`
+  (NFC is not modeled) and still draw. Connect and Sync stop at mask-ROM
+  `0x4000_08ec` (limitation 1 below). None of these frames was compared
+  with hardware.
+- **Software reset (Milestone 9).** v392 opens Scanner, Sync, Share,
+  Sponsors and Workshop Quest by rebooting into them (`app_reboot: reboot
+  into <app>`, a persisted `/littlefs/config/reboot.cfg`); `esp_restart()`
+  ends in mask-ROM `software_reset_cpu`. Its stub (`rom.rs` entry 26)
+  asks the runtime to reset, and `FirmwareRuntime` re-boots the image
+  through the shortcut boot after that step, with `rtc_get_reset_reason`
+  reporting `RESET_REASON_CPU0_SW` (`0x0C`; `software_reset` reports
+  `RESET_REASON_CORE_SW`, `0x03`). It keeps what a reset keeps on the
+  badge: the whole emulated flash, RTC_CNTL `STORE0..7` (ESP-IDF's reset-reason hint is `STORE6`),
+  RTC fast memory (with the image's RTC segment reloaded), the panel and
+  its pixels; it also keeps the console text, held buttons, the
+  acceleration, the step count and host time (`emulated_time_us()` never
+  goes backwards). Scanner opens after exactly one reset
+  (`scanner_opens_after_one_reboot`, `0x4958_3da5_06ff_ab49`), and HOME
+  from Scanner is a direct return to the launcher, with no second reset
+  (`scanner_home_returns_to_the_launcher`). After Connect's and Sync's
+  Bluetooth fault the panic handler's `Rebooting...` now soft-resets too,
+  and the badge boots once into My Badge (`boot: reset reason=4`;
+  measured, not pinned) instead of v335's endless "Panic handler entered
+  multiple times". The host's reset button stays a cold power-on (blank
+  flash, `POWERON_RESET`, count 0).
 - **A built-in app: Dice** (Milestone 5 Task 9 stretch, rung
   `launcher_opens_dice`).
   From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
@@ -680,6 +757,26 @@ above for how steps relate to emulated time):
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 9** (details in
+[`milestone-9-decisions.md`](milestone-9-decisions.md) and the history
+below):
+
+- The official v392 firmware replaces the dumped v335, as
+  `firmware.bin` (Tasks 1 and 2); every moved pin was re-pinned with its
+  reason, and no v335 code-address rung was retired (each address was
+  found again in v392 by its bytes or its function's shape).
+- The software reset (Task 3): `software_reset` and `software_reset_cpu`
+  are stubs that request a reset, and `FirmwareRuntime` re-boots while
+  keeping the flash, RTC_CNTL `STORE0..7` and RTC fast memory. Five apps
+  that froze on v392 now open.
+- Every launcher app has a rung (Task 4); Sponsors is pinned on its
+  loaded frame (the human partner's ruling at the Task 5 gate).
+
+**Resolved in Milestone 8** (details in
+[`milestone-8-decisions.md`](milestone-8-decisions.md) and the history
+below): a quick second tap on a button is no longer dropped; the browser
+queues taps per button.
 
 **Resolved in Milestone 7** (details in
 [`milestone-7-decisions.md`](milestone-7-decisions.md) and the history
@@ -770,14 +867,39 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 8 candidates)** (the Milestone 8 backlog in
-`milestone-7-decisions.md` is the complete list):
+**Open limitations (Milestone 10 candidates)** (the Milestone 10 backlog
+in `milestone-9-decisions.md` is the complete list):
 
-1. **The launcher's HOME redraw runs slower than real time in the
+1. **Bluetooth: Connect, and Sync after its reboot, stop at the
+   Bluetooth controller ROM.** After `hal_radio: init_once` both fetch
+   mask-ROM `0x4000_08ec`, `btdm_controller_rom_data_init`
+   (`esp32c3.rom.bt_funcs.ld`), which has no stub, and take an
+   instruction access fault (rungs
+   `connect_stops_at_the_bluetooth_controller` and
+   `sync_reboots_then_stops_at_the_bluetooth_controller`, which stop at
+   the register dump, `MEPC    : 0x400008ec`). The panic handler then
+   reboots once into My Badge. The controller is a closed blob in mask
+   ROM that this project does not have; Milestone 10
+   (`docs/superpowers/specs/2026-10-22-milestone10-badge-radio-design.md`)
+   replaces it with a fake BLE controller.
+2. **The RTC timer restarts at a software reset.** The reset builds a
+   fresh bus, and the RTC timer counts the new SYSTIMER clock, so it
+   starts again at 0. On the badge the RTC domain keeps counting through
+   a CPU reset. Host time (`emulated_time_us()`) does not restart, but
+   anything the firmware derives from the RTC timer across a reboot
+   would read low. Nothing observed depends on it yet.
+3. **A reboot takes no time.** The shortcut boot replaces the mask ROM
+   and the 2nd-stage bootloader, so the new boot starts in the step
+   after `software_reset_cpu`; on the badge the ROM and the bootloader
+   run first (not measured on the badge, and not modeled). Rebooting
+   apps open that much sooner than on hardware.
+4. **The launcher's HOME redraw runs slower than real time in the
    browser.** The core runs about 40M to 42M steps per second in WASM
-   against the badge's 80M cycles per second (Milestone 7's bench, Apple
-   M5 Pro; the factor is the redraw's emulated time over its wall time,
-   1.0x is the badge):
+   against the badge's 80M cycles per second (Milestone 7's bench on
+   v335, Apple M5 Pro; the factor is the redraw's emulated time over its
+   wall time, 1.0x is the badge; v392's Bun numbers are under "Timing
+   model": HOME 0.623x, DOWN 0.857x, onboarding 1.110x; the browsers
+   were not re-benchmarked on v392):
 
    | Host | Walk M steps/s | HOME | DOWN | Onboarding |
    | --- | --- | --- | --- | --- |
@@ -791,9 +913,11 @@ plan text), plus the full Milestone 4 backlog, are in
    page turns keep real time. Idle-dominated apps such as Snake keep real
    time (see "Timing model"). Input no longer waits behind a redraw: the
    emulator runs in a Web Worker. The human accepted this speed for
-   Milestone 7; a block cache leads the Milestone 8 backlog. Only two
-   built-in apps (Dice and Snake) are checked; the others are untested.
-2. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
+   Milestone 7, and the lower v392 speed at Milestone 9's Task 5 gate;
+   the block cache is shelved (R-M8-1). Every built-in app now has an
+   open rung, but only Dice and Snake were compared with the badge
+   (on v335), and no app's deeper screens are tested.
+5. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
    hardcodes the unrotated 320x240 order. The pinned hashes are of *this*
@@ -801,17 +925,19 @@ plan text), plus the full Milestone 4 backlog, are in
    (splash, first-run, self-test, onboarding, registered screen, launcher)
    matches in orientation, so the conditional Milestone 4 MADCTL task was
    skipped.
-3. **No LED output, no NFC; one I2C device.** The SC7A20H accelerometer
+6. **No LED output, no NFC; one I2C device.** The SC7A20H accelerometer
    answers on I2C0; any other I2C address is NACKed. RMT transmissions
-   are consumed but not shown, and NFC is not modeled.
-4. The dormant items from the history below: flagged ROM-stub guesses
+   are consumed but not shown, and NFC is not modeled (Scanner, Sponsors
+   and Workshop Quest log `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE`
+   and draw anyway).
+7. The dormant items from the history below: flagged ROM-stub guesses
    (item 5) and simplified edge interrupts (item 9). (Items 6 and 7 are
    resolved; so is the old `CPU_FREQ_MHZ` = 160 stub, see "Resolved in
    Milestone 6".)
-5. **The eFuse block is not modeled**, so the emulated boot logs
+8. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
-6. **Resolved (Task D-M5-3): early log timestamps.** They used to read
+9. **Resolved (Task D-M5-3): early log timestamps.** They used to read
    `I (0)` up to `main_task: Calling app_main()`, because the early
    timestamp is the CPU cycle counter (`mpccr`, CSR `0x7E2`) and that CSR
    read 0. With the counter modeled (one count per step) the early lines
@@ -825,11 +951,11 @@ plan text), plus the full Milestone 4 backlog, are in
    Task 3 moved them (to `W (25)`, `I (12)`..`I (14)`, while RTC time ran
    at 0.4 of emulated time) and Task D-M6-1 moved them back to exactly
    these values. They have not been compared with the badge's values.
-7. **Snake's game-over draw after an eat comes late.** With no eat, the
-   game-over box is drawn 22 ms after the tick that hits the wall; after
-   an eat (`snake_eats`), 50 to 134 ms after it. Not explained (a
-   high-score save is a guess, not verified), and not compared with the
-   badge.
+10. **Snake's game-over draw after an eat comes late.** With no eat, the
+    game-over box is drawn 22 ms after the tick that hits the wall; after
+    an eat (`snake_eats`), 50 to 134 ms after it. Not explained (a
+    high-score save is a guess, not verified), and not compared with the
+    badge.
 
 ### Ground truth from the physical badge
 
@@ -837,6 +963,13 @@ Read from the real badge's serial boot log and partition table (neither is
 committed; see the "Data-handling note"). None of these facts is personal
 data:
 
+- The badge runs the firmware it was dumped with, v335
+  (`v0.1.2-335-gbf0bee6`); the emulator runs the official v392 since
+  Milestone 9. Every comparison with the badge in these notes, and in
+  the rung docs, was made on v335; v392 frames are checked by the human
+  partner's eye only. The official flashes' bootloader and partition
+  table are byte-identical to the badge's, and so is the v335 app to
+  the dump's `factory` partition.
 - ESP32-C3, chip revision v0.4; 40 MHz crystal; CPU at 80 MHz (the
   emulated boot logs `cpu freq: 80000000 Hz` too since Milestone 6 Task 2;
   before, a constant `ets_get_cpu_frequency` stub made it 160).
@@ -1625,6 +1758,11 @@ predicted these blockers would surface once TIMG unblocks further boot
    unchanged, the boot splash with 2,340 distinct RGB565 values. Pinned in
    `emulator-core/tests/rom_stub_boot.rs`'s
    `boot_stubs_reach_load_partitions_md5init_after_drawing_the_splash` (renamed and truncated in Milestone 4 Task 2; was `boot_stubs_rom_md5init_then_load_partitions_reads_zeros_through_the_unmapped_flash_mmu_window`).
+   (Milestone 9: on v392 `load_partitions()` runs before the splash is
+   drawn, so the rung is now
+   `boot_stubs_reach_load_partitions_md5init_after_the_first_flush`, with
+   `MD5Init` on step 1,855,884 and a uniform first flush on screen;
+   ruling R-T2-2 in `milestone-9-decisions.md`.)
 
    One loose end: `load_partitions()`'s `ESP_LOGE` does run
    (`esp_log_write` from `0x420f_a826`, for about 2,700 steps), but no byte
@@ -2889,6 +3027,60 @@ at about the badge's speed; only entering it (HOME, 0.61x WASM) is slow.
 The block cache was deferred until the human judges the launcher after
 this fix.
 
+### Milestone 9: the official v392 firmware and the software reset
+
+The human partner's gap: "not all built in apps open … it just freezes
+the whole emulator." A throwaway probe from role hacker's launcher found
+that on v335 14 of 16 apps open; Connect and Sync fetch mask-ROM
+`0x4000_08ec` (`btdm_controller_rom_data_init`) after `hal_radio:
+init_once` and loop in the panic handler. The human partner then
+supplied the official flashes (bootloader, partition table and the app,
+`v0.1.2-392-gd3089c4`) and chose to upgrade to v392 first and leave
+Bluetooth to Milestone 10. On v392 six apps froze: Connect on the same
+ROM call, and Scanner, Sync, Share, Sponsors and Workshop Quest because
+v392 opens them by rebooting (`app_reboot: reboot into <app>`, a
+persisted `/littlefs/config/reboot.cfg`) and the reboot calls mask-ROM
+`software_reset_cpu` (`0x4000_0094`), which had no stub.
+
+- **Task 1** renamed the committed image and every name for it from
+  `factory` to `firmware` (`boot_from_firmware_image*`, the tests'
+  `firmware()`, `/firmware/firmware.bin`); the flash partition keeps its
+  firmware-defined name, `factory` (ruling R-T1-1).
+- **Task 2** committed v392 unpadded (the emulated flash starts erased,
+  so padding to the partition's `0x2a0000` changed nothing) and
+  re-pinned. Changed frames: the splash, onboarding page 1, page 3 and
+  its button frames ("Press all 8 buttons once": v392 dropped Aux1, so
+  the walk no longer presses raw slot 8, R-T2-1) and the launcher (same
+  grid, a few pixels). Every v335 code-address rung was re-derived from
+  v392's bytes or the function's shape; none was retired (R-T2-3). On
+  v392 `load_partitions()` calls `MD5Init` at step 1,855,884, before the
+  splash is drawn, so `rom_stub_boot`'s phase 9 now checks LVGL's first
+  flush, a uniform `0xf7be` fill (R-T2-2). The equivalence pins
+  (`EXECUTION_DIGEST`, the hacker walk's totals) were re-pinned last,
+  and guard everything after.
+- **Task 3** added the software reset ("Current state" above, and
+  `runtime.rs`'s module doc): `software_reset` (`0x4000_0090`) and
+  `software_reset_cpu` (`0x4000_0094`, `esp32c3.rom.ld`) are
+  `RequestReset` stubs; the run loop collects the request after the step
+  and re-boots with the reset reason (`reset_reasons.h`: `0x03`,
+  `0x0C`), keeping the flash, RTC_CNTL `STORE0..7`
+  (`rtc_cntl_reg.h`: `0x50..0x5c` and `0xb8..0xc4`), RTC fast memory and
+  the panel (R-T3-1 to R-T3-3). Scanner opens after one reset; HOME from
+  it is a direct return, measured (R-T3-4). No pin moved.
+- **Task 4** gave every launcher cell a rung: the 16 selection frames,
+  then each app's open frame and soft-reset count. Connect and Sync stop
+  at the Bluetooth ROM fault (after it the panic handler's reboot lands
+  once in My Badge, unpinned, R-T4-2). The release suite went from 7.9 s
+  to 11.7 s.
+- **Task 5**, the browser gate: in Chrome, provisioning, onboarding, the
+  launcher and Scanner (opened and left) work, and the reboot shows as an
+  ordinary screen change (the readout dips to about 0.8x for about 0.5
+  s). The human partner compared v392 in the emulator side by side with
+  the v335 badge ("side by side comes clean"), had Sponsors pinned on its
+  loaded frame (`0xcdc7_9972_60aa_f1c8`, 60.5M steps after A, superseding
+  R-T4-1), and accepted the lower speed (WASM DOWN 0.977x on v335,
+  0.857x on v392).
+
 ## Emulated flash chip: what it contains
 
 Milestone 3 Task 8 gives the emulator a model of the badge's whole 4 MiB
@@ -2958,7 +3150,8 @@ physical badge" above.
 `frontend/public/firmware/test-identities/<role>.json` holds eleven
 obviously fake identity records, one per role in the firmware's role
 table. They were written by hand from the identity schema traced in
-`factory.bin` (`docs/milestone-5-decisions.md`, "Trace facts"), never
+the v335 image, then `factory.bin` (`docs/milestone-5-decisions.md`,
+"Trace facts"; all eleven still provision on v392), never
 derived from the flash dump or the boot log: "Test <Role>" names,
 `example.com` addresses, `test-` badge IDs, empty contact fields. The
 human partner relayed the Hack the North organizers' permission to commit

@@ -264,6 +264,11 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 /// an alarm whose line is disabled or masked) just costs one step per call,
 /// so `crate::runtime::FirmwareRuntime::run(budget)` always returns after
 /// `budget` steps.
+///
+/// A reset stub's request ([`Cpu::take_reset_request`], Milestone 9) is
+/// collected only by `crate::runtime::FirmwareRuntime`'s run loop, not
+/// here: a caller that drives this function directly and never takes the
+/// request keeps re-running the stub, since `pc` stays on it.
 pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu::StepInfo {
     let mut lines = bus.asserted_lines();
     let fast_forward = cpu.is_waiting() && lines == 0;

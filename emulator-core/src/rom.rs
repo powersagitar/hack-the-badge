@@ -928,7 +928,8 @@
 //!     `STORE0..7` registers (ESP-IDF's reset-reason hint lives in
 //!     `STORE6`, `RTC_RESET_CAUSE_REG`, per
 //!     `components/esp_system/port/soc/esp32c3/reset_reason.c`), RTC fast
-//!     memory, the panel's pixels — see its module doc, "Software reset".
+//!     memory, the panel's pixels — see `crate::runtime`'s module doc,
+//!     "Software reset".
 //!     Both kinds are modeled as the same full re-boot through the shortcut
 //!     boot; only the reported reason differs.
 //!
@@ -951,7 +952,12 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 5 Task D-M5-2**: 125 stubs. With the SC7A20H
+//! **As of Milestone 9 Task 3**: 125 stubs (`esp32c3_rom_stubs().len()`):
+//! Milestone 6 Task 2 turned the two CPU-frequency stubs into guest code
+//! (entry 6), leaving 123, and Milestone 9 Task 3 added `software_reset`
+//! and `software_reset_cpu` (entry 26).
+//!
+//! **As of Milestone 5 Task D-M5-2** (history): 125 stubs. With the SC7A20H
 //! accelerometer answering on I2C0, `hal_accel`'s sample read converts
 //! each axis with `__floatsisf` (`0x4000_0800`), the onboarding's shake
 //! detector (`0x4205_7292`) compares against its moving baseline with

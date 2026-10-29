@@ -67,8 +67,9 @@ export interface Redraw {
 
 /*
  * boot_progress.rs's HOME_REDRAW, DOWN_REDRAW and ONBOARDING_REDRAW (Task 1,
- * pinned at 6cd0a6e; re-pinned for v392 in Milestone 9), copied. The bench uses `endHash`; the native
- * emulated time and steps are printed beside the in-walk numbers.
+ * pinned at 6cd0a6e; re-pinned for v392 in Milestone 9), copied. The bench
+ * uses `endHash`; the native emulated time and steps are printed beside the
+ * in-walk numbers.
  */
 export const HOME_REDRAW: Redraw = {
   emulatedUs: 244_000,

@@ -45,7 +45,9 @@
 //! Every comparison with the physical badge named below was made on v335
 //! (the human partner's badge stays on v335); a v392 frame with the same
 //! hash is the same frame, and v392's changed frames were checked by eye
-//! in Milestone 9, never on hardware.
+//! in Milestone 9, never on hardware: by the controller as each was
+//! pinned, and bindingly by the human partner at the Task 5 browser gate,
+//! v392 in the emulator beside the v335 badge.
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -614,7 +616,9 @@ fn boot_idles_in_wfi_and_fast_forwards_to_the_freertos_tick_without_faulting() {
 /// GDMA's TX out-link feeds SPI2, so LVGL's flushes reach the ST7789 model:
 /// the framebuffer is still blank at step 1,100,000 (first pixels land at
 /// ~1,137,900) and by step 5,550,000 holds a drawn frame of at least 2,000
-/// distinct colors (the splash has 2,340), sent through GDMA channel 0,
+/// distinct colors (the splash has 2,340 at that step on v335 and v392
+/// alike; v392's counted with `boot-probe` in Milestone 9), sent through
+/// GDMA channel 0,
 /// with no exception and no panic text. (The name is Milestone 3's; the
 /// `MD5Init` stall it mentions is gone.)
 #[test]
@@ -688,7 +692,7 @@ fn load_partitions_accepts_the_synthesized_table_through_the_flash_mmu() {
     const ESP_OK: u32 = 0;
 
     let mut rt = FirmwareRuntime::from_image(&firmware()).expect("firmware.bin boots");
-    // MD5Init is first called on step 1,855,883 in v392 (Milestone 9;
+    // MD5Init is first called on step 1,855,884 in v392 (Milestone 9;
     // 4,450,328 in v335 since Milestone 6 Task D-M6-1, 5,560,533 before).
     let summary = rt.run(1_500_000);
     assert_eq!(summary.last_instruction_fault, None, "{summary:?}");
@@ -1085,7 +1089,10 @@ fn boot_starts_the_console() {
 /// provisioning rungs: total-step deadline. Measured on v392 (Milestone
 /// 9): the prompt is out by 15.12M (10,000-step sampling), before the
 /// first-run checkpoint at 15.50M; [`console_rejects_an_empty_identity`]'s
-/// `prov apply` answers at 19.30M and its stable-frame check ends at
+/// `prov apply` prints `PROV FAIL` at 16.30M (v335: 17.00M), the next
+/// prompt follows at 19.30M (v335: 17.20M; 3.0M busy steps, about 40 ms
+/// of emulated time, after the result line, against 0.2M on v335; what
+/// v392 does there was not traced), and its stable-frame check ends at
 /// 20.30M (50,000-step sampling); that + 25%, rounded up to 1,000,000.
 const CONSOLE_DEADLINE: u64 = 26_000_000;
 
@@ -1718,8 +1725,9 @@ fn scanner_home_returns_to_the_launcher() {
 }
 
 /// Milestone 9 Task 4: every launcher app, from role hacker's launcher on
-/// v392 (measured; every new frame checked by eye, none compared with the
-/// physical badge, which runs v335). Cell = row × 4 + column. "Soft
+/// v392 (measured; every new frame checked by eye, the binding check
+/// being the human partner's at the Task 5 browser gate; none compared
+/// with the physical badge, which runs v335). Cell = row × 4 + column. "Soft
 /// resets" is [`FirmwareRuntime::soft_reset_count`] once the app is open:
 /// v392 enters five apps by rebooting into them.
 ///
@@ -1743,8 +1751,9 @@ fn scanner_home_returns_to_the_launcher() {
 /// | 15 | Dice | 0 | [`launcher_opens_dice`] |
 ///
 /// Each entry here is the launcher's stable frame with that cell
-/// selected. Cells 0, 1, 2, 4, 8 and 12 to 15 reuse [`LAUNCHER_HASH`],
-/// [`TO_SCANNER`]'s and [`TO_DICE`]'s pins; the others are new (v392,
+/// selected. Cells 0, 1, 2, 4, 8 and 12 to 15 reuse [`LAUNCHER_HASH`]
+/// (cell 0), [`TO_SCANNER`]'s pins (1, 2), [`LAUNCHER_AFTER_NAV_HASH`]
+/// (4) and [`TO_DICE`]'s pins (8, 12 to 15); the others are new (v392,
 /// measured).
 const LAUNCHER_SELECTED: [u64; 16] = [
     LAUNCHER_HASH,           // 0: My Badge
@@ -1825,6 +1834,10 @@ fn assert_launcher_opens(
 /// response_steps, open_hash`. Each response is the measured release to
 /// first stable frame, then [`AFTER_PRESS_STABLE_FOR`] more to confirm;
 /// + 25 %, rounded up to 1,000,000.
+///
+/// Sponsors' rung, [`launcher_opens_sponsors_after_one_reboot`], sits
+/// outside the macro: it pins the loaded frame, which needs its own
+/// stable window ([`SPONSORS_LOADED_STABLE_FOR`]).
 macro_rules! launcher_opens {
     ($(#[$doc:meta])* $name:ident, $cell:expr, $app:literal, $soft_resets:expr, $response:expr, $hash:expr) => {
         $(#[$doc])*

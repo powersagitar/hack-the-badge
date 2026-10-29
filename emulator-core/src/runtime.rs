@@ -72,6 +72,12 @@
 //!   [`FirmwareRuntime::run_until`] across a reset still stops at its
 //!   target.
 //!
+//! Everything else starts fresh with the new boot, including two
+//! diagnostics: the bus's unmapped-access log
+//! ([`crate::mem::bus::FirmwareBus::unmapped_log`]) and the core's
+//! [`crate::cpu::Cpu::rom_stub_index_drops`] count (with its last drop)
+//! begin empty, so after a reset they describe only the new boot.
+//!
 //! [`FirmwareRuntime::soft_reset_count`] counts them. The host's own
 //! [`FirmwareRuntime::reset`] stays a cold power-on.
 //!

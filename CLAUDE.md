@@ -12,26 +12,36 @@ wired in `frontend/src/main.ts`):
 1. **Lua sandbox mode:** runs hacker-sideloaded apps (`main.lua` +
    `manifest.cfg`) against a JS implementation of the badge's `badge.*`
    API, in a Fengari (pure-JS Lua 5.3) sandbox.
-2. **Real-firmware mode:** runs the badge's actual dumped firmware
-   (`frontend/public/firmware/firmware.bin`) on a from-scratch ESP32-C3
+2. **Real-firmware mode:** runs the badge's official firmware, v392
+   (`v0.1.2-392-gd3089c4`, `frontend/public/firmware/firmware.bin`; the
+   physical badge still runs the dumped v335) on a from-scratch ESP32-C3
    emulator (RV32IMC core + a minimal peripheral set) written in Rust and
    compiled to WebAssembly. The built-in apps (Snake, Dice, …) are native
    RISC-V code in one ESP-IDF image and cannot be extracted as Lua.
 
 **Current state:** the firmware boots to My Badge's first-run screen,
 provisions a fake test identity through its own USB console, walks the
-11-page onboarding app, and reaches the launcher. Dice and Snake work, and
-their key frames were compared with the physical badge. In the browser the
-emulator runs in a Web Worker, paced to wall-clock time. Snake and
-launcher navigation play at about 1.0x, and every tap of a quick burst
-registers (a per-button tap queue in the browser). Entering the launcher
-(the HOME redraw) plays at about 0.6x, because the WASM core does about
-40M steps/s against the badge's 80M. Before assuming anything else works,
-read `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
+11-page onboarding app, and reaches the launcher. 14 of the launcher's 16
+apps open, each pinned by a rung. v392 enters five apps (Scanner, Sync,
+Share, Sponsors, Workshop Quest) by rebooting, through the emulated
+software reset. Connect, and Sync after its reboot, stop at the
+Bluetooth controller in mask ROM, which is Milestone 10. Every frame
+compared with the physical badge (boot, onboarding, the registered
+screen, the launcher, Dice, Snake) was compared on v335; v392's changed
+frames and its other apps were checked by the human partner's eye. In
+the browser the emulator runs in a Web Worker, paced to wall-clock time.
+Snake plays at about 1.0x, and every tap of a quick burst registers (a
+per-button tap queue in the browser). On v392, a launcher move (DOWN)
+plays at about 0.86x and entering the launcher (the HOME redraw) at
+about 0.6x, because the WASM core does about 40M steps/s against the
+badge's 80M. Before assuming anything else works, read
+`docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-8-decisions.md`.
-Milestone 7's has the benchmark results and profiles; Milestone 8's has
-the Milestone 9 backlog, with no lead chosen and the block cache shelved.
+`docs/milestone-3-decisions.md` through `docs/milestone-9-decisions.md`.
+Milestone 7's has the benchmark results and profiles. Milestone 9's has
+the v335 → v392 re-pins and the Milestone 10 backlog, led by the
+Bluetooth spec
+(`docs/superpowers/specs/2026-10-22-milestone10-badge-radio-design.md`).
 
 ## Repository layout
 
@@ -55,9 +65,10 @@ commands from the repo root.
   dev-only bench page `/bench.html`.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, about 11 s. Most of that is the WASM twin that
-  provisions and walks to the launcher, `test/cpu-wasm.test.ts`. Run one
-  file with `bun test path/to/file.test.ts`.
+- `bun test`: unit tests, 182 of them, about 10 s. Most of that is the
+  WASM twin that provisions and walks to the launcher,
+  `test/cpu-wasm.test.ts`. Run one file with
+  `bun test path/to/file.test.ts`.
 - `bun run typecheck`: `tsc --noEmit`.
 
 Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` target,
@@ -70,13 +81,14 @@ plus `wasm-pack`.
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, about 8 s.
+  real-firmware boot ratchet, 79 rungs plus 1 ignored benchmark, about
+  12 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
-  - `cargo test --workspace` runs the same rungs in debug, about 12 s.
+  - `cargo test --workspace` runs the same rungs in debug, about 17 s.
 - `cargo clippy --workspace --all-targets` has 3 known warnings (two in
   `boot.rs`, one in a `console.rs` test).
 - Benchmarks are never part of a test run; results go in
@@ -188,9 +200,9 @@ frontend/src/
 frontend/public/
   apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
                         because require() must return synchronously.
-  firmware/             firmware.bin (official v0.1.2-335 at this commit; public;
-                        publication approved by the organizers) and
-                        test-identities/.
+  firmware/             firmware.bin (official v0.1.2-392-gd3089c4,
+                        unpadded; public; publication approved by the
+                        organizers) and test-identities/.
 
 emulator-core/src/
   cpu/                  Generic RV32IMC core: CSRs, traps, WFI, the cycle
@@ -215,20 +227,30 @@ emulator-core/src/
                         (clock registers, software interrupts), APB_CTRL's
                         RNG (fixed seed), GPIO plus the 74HC165 button shift
                         register, SPI2 plus the ST7789 framebuffer, GDMA,
-                        TIMG, RTC_CNTL, USB-Serial-JTAG (the console, in both
-                        directions), I2C0 plus the SC7A20H accelerometer, RMT,
+                        TIMG, RTC_CNTL (the RTC timer; STORE0..7, kept
+                        across a software reset), USB-Serial-JTAG (the
+                        console, in both directions), I2C0 plus the SC7A20H
+                        accelerometer, RMT,
                         the flash MMU, and flash.rs (a synthetic 4 MiB flash
                         and the SPI1 controller).
-  rom.rs                The ESP32-C3 mask-ROM HLE stub table, the
-                        guest-executed ROM code blobs (qsort, strdup, the
-                        CPU-frequency pair), the ROM data tables and the
-                        boot-time RAM initializers.
+  rom.rs                The ESP32-C3 mask-ROM HLE stub table (including
+                        the software_reset/software_reset_cpu stubs that
+                        request a reset, and the reset reason
+                        rtc_get_reset_reason reports), the guest-executed
+                        ROM code blobs (qsort, strdup, the CPU-frequency
+                        pair), the ROM data tables and the boot-time RAM
+                        initializers.
   boot.rs               "Shortcut boot": loads firmware.bin straight from its
                         header, skipping ROM and bootloader emulation.
                         step_with_interrupts runs one step, with WFI
                         fast-forward.
   runtime.rs            FirmwareRuntime: the whole emulator as one Clone-able
                         object. Buttons by raw slot; serial input; the
-                        acceleration; run_until and emulated_time_us.
+                        acceleration; run_until and emulated_time_us. The
+                        software reset: after a reset stub's step it
+                        re-boots the image, keeping the flash, RTC_CNTL's
+                        STORE registers, RTC memory, the panel, the console
+                        text, held input and host time (soft_reset_count).
+                        reset() stays a cold power-on.
 emulator-wasm/          The logic-free wasm-bindgen shim.
 ```
