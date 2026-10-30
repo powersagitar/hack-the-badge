@@ -222,6 +222,77 @@ stays, as R-T3-O1 directs. If the browser (WASM) number is the one that
 counts, the human partner may prefer the tagged filter at the Task 6
 gate; R-T3-5 records the choice.
 
+### The eFuse factory MAC (Task 4)
+
+A scratch probe (not committed) single-stepped role hacker's whole walk,
+from power-on through provisioning and onboarding to the launcher, then
+A on Connect to the `0x4000_08ec` fault, exactly as `press_a_on_cell(1)`
+and the Milestone 9 rung do. Before each step it decoded the instruction
+from `firmware.bin`'s code segments and recorded every load or store
+whose address fell in `0x6000_8800..0x6000_8a00` (`DR_REG_EFUSE_BASE`,
+`soc/reg_base.h` v5.5.3), with the value loaded; it also counted every
+ROM-stub call and recorded the registers at `esp_read_mac`
+(`0x42100a64`), the address builder (`0x42010344`, at `0x4201035a`,
+`0x4201035e` and `0x4201037a`), its caller `0x42010fc2` and hal_radio's
+init (`0x42010416`). Single steps are the same run as the walk's
+chunked runs: the step counts below are the rungs' (launcher at
+342,600,776, `HACKER_LAUNCHER_STEPS`).
+
+**1. Which registers carry the factory MAC: two eFuse registers, no ROM
+call.** `esp_read_mac` reads `EFUSE_RD_MAC_SPI_SYS_1_REG` (`+0x48`,
+twice) and `EFUSE_RD_MAC_SPI_SYS_0_REG` (`+0x44`, four times), all from
+the one `lw` at `0x4200094c` (ESP-IDF's eFuse read utility), at steps
+27,121,080 to 27,121,825. The field layout is `esp_efuse_table.csv`'s
+`MAC_FACTORY` (block 1, six bytes at bit offsets 40, 32, 24, 16, 8, 0),
+so `mac[0..2]` is `SYS_1[15:0]`, high byte first, and `mac[2..6]` is
+`SYS_0`, high byte first (`emulator-core/src/peripherals/efuse.rs`). No
+eFuse ROM function is called on the way: the only eFuse ROM stubs the
+whole walk calls are `ets_efuse_get_spiconfig` (28 calls) and
+`ets_efuse_get_wp_pad` (1), both in early boot and both unrelated to the
+MAC. The other eFuse loads in the walk are early-boot reads of `+0x34`,
+`+0x3c`, `+0x40`, `+0x50`, `+0x58` and `+0x6c` (block 0 and
+`SYS_3`/`SYS_5`: chip revision, flash and security fields), all reading
+0, plus one read of `+0x34` at step 359,410,702, inside the panic
+handler. No store touches the page.
+
+**2. Whether anything reads the MAC before `hal_radio: init_once`: yes,
+during provisioning.** The only call of the address builder
+(`0x42010344`) in the whole walk is at step 27,120,644, between the
+first-run screen (stable by 16.5M) and onboarding page 1, long before
+the launcher. It is called through `0x42010fc2` (hal_radio's "own
+address": the address the sync callback stored at `0x3fcb5db4` once the
+host has synced, otherwise the builder) from `0x4200bee4`
+(`0x4200beda`, which returns that address and, if it is all zeros,
+calls `0x420109c6` and retries). `esp_read_mac` caches what it reads in
+`s_mac_table` (`components/esp_hw_support/mac_addr.c`,
+`get_mac_addr_from_mac_table` line 114 and `esp_read_mac` line 354), so
+on v392 the MAC is fixed for the boot at step 27.12M. From the launcher
+to the fault there is no `esp_read_mac` call and no MAC-register read;
+`0x42010416` is reached at step 359,285,221 and nothing after it reads
+the MAC before the fault, which is before the host-sync callback
+(`0x4201039e`) that calls the builder again.
+
+**3. What `esp_read_mac` returns today: `ESP_OK` and
+`00:00:00:00:00:00`.** At `0x4201035a` (the first instruction after the
+call) `a0` is `0`; the buffer at `sp + 8` reads `00 00 00 00 00` and byte
+5 `00` (registers at `0x4201037a` and `0x4201035e`), so the builder's
+address is `00:00:00:00:00:C0`, whose 46-bit random part is all zeros,
+which `ble_hs_id_set_rnd` (`0x420812aa`) rejects. Every runtime reads
+the same.
+
+**With `set_factory_mac(02:00:00:00:10:01)` before the first step**
+(the same probe, Step 5): the same `lw` at `0x4200094c` reads
+`SYS_1 = 0x200` and `SYS_0 = 0x1001`; at `0x4201035a` `a0` is `0`
+(`ESP_OK`); the buffer reads `02 00 00 00 10` (`a0..a4` at
+`0x4201037a`) and byte 5 `01` (`a5` at `0x4201035e`, before the
+`ori 0xC0` makes it `0xC1`). So `esp_read_mac` returns exactly the set
+MAC, and the builder's address is `02:00:00:00:10:C1`. The walk with the
+MAC passed every frame assertion of `launcher_for` (role hacker's
+onboarding pages, registered screen, launcher), but reached the launcher
+95 steps earlier (342,600,681 against 342,600,776) and A's release at
+358,750,075; Connect then stopped at the same fault, by 359,500,075.
+Without a MAC every count matched the rungs.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -284,6 +355,36 @@ gate; R-T3-5 records the choice.
   near `c9d1c42` in WASM (measurements above). No behaviour was changed
   to chase it — cost if wrong: before any hook table is installed,
   Snake and the launcher run that much slower than they could.
+- Ruling R-T4-1 (Task 4, `feat: opt-in eFuse factory MAC`): the
+  firmware reads the MAC before the radio (measurement 2, step
+  27,120,644, during provisioning, and `esp_read_mac` caches it for the
+  boot), so a rung that needs a MAC sets it at power-on, on a fresh
+  `FirmwareRuntime::from_image` before its first step, and the radio
+  rungs walk from their own boot: they cannot share the `REGISTERED` or
+  `LAUNCHER` checkpoints, which were reached without a MAC, and setting
+  a MAC on a clone of one changes nothing the firmware uses until the
+  next reset. The walk with a MAC passes the same frame assertions but
+  takes 95 fewer steps to the launcher, so a MAC rung pins no step
+  count from the shared walk. Measured but not used here: nothing reads
+  the MAC registers before step 27.12M, so a clone of the `FIRST_RUN`
+  checkpoint (stable by 16.5M) with the MAC set runs as a power-on with
+  it; Task 6 may start its walk there. The browser sets the MAC before
+  the Worker's first run — cost if wrong: each radio rung (and each
+  badge of Task 8's pair) pays its own walk to the launcher, about 5 s
+  in release instead of a clone.
+- Ruling R-T4-2 (Task 4): the eFuse controller is a new `FirmwareBus`
+  field, `efuse`, after `rtc_cntl`, and `RTC_CNTL_RANGE` is narrowed to
+  `0x6000_8000..0x6000_8800` so the two ranges are disjoint
+  (`EFUSE_RANGE` is `0x6000_8800..0x6000_9000`, `DR_REG_EFUSE_BASE` to
+  `DR_REG_IO_MUX_BASE`). Before, the eFuse half fell in RTC_CNTL's range
+  past its modeled words: it read 0, dropped writes and logged every
+  access. With no MAC set `Efuse` does exactly that, including the
+  unmapped log; with a MAC set only `+0x44` and `+0x48` are served (and
+  not logged), and they stay read-only. The word fast path is unchanged.
+  `emulator-wasm` gets its `set_factory_mac` passthrough in Task 8, as
+  the plan lists it there — cost if wrong: none for behaviour (every pin
+  and both equivalence rungs are unchanged); a later eFuse field (chip
+  revision) goes into the same module.
 
 ## Replaced rungs
 

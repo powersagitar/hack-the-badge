@@ -184,23 +184,28 @@ impl FirmwareRuntime {
     pub fn reset(&mut self) -> Result<(), ImageParseError> {
         let (cpu, bus) = boot_from_firmware_image_with_rom_stubs(&self.image)?;
         let accel = self.acceleration();
+        let mac = self.factory_mac();
         self.cpu = cpu;
         self.bus = bus;
         self.total_steps = 0;
         self.soft_reset_count = 0;
         self.time_base_us = 0;
-        self.reapply_host_input(accel);
+        self.reapply_host_input(accel, mac);
         Ok(())
     }
 
-    /// Re-applies the held buttons and `accel` to a freshly-built bus.
-    fn reapply_host_input(&mut self, accel: [i32; 3]) {
+    /// Re-applies the held buttons, `accel` and the factory `mac` to a
+    /// freshly-built bus.
+    fn reapply_host_input(&mut self, accel: [i32; 3], mac: Option<[u8; 6]>) {
         let held = self.buttons;
         for (slot, pressed) in held.iter().enumerate() {
             self.apply_button(slot, *pressed);
         }
         let [x, y, z] = accel;
         self.bus.i2c0.accel.set_acceleration(x, y, z);
+        if let Some(mac) = mac {
+            self.bus.efuse.set_factory_mac(mac);
+        }
     }
 
     /// The software reset a `RequestReset` ROM stub asked for, with
@@ -242,7 +247,7 @@ impl FirmwareRuntime {
         }
         self.bus.spi.st7789 = old.spi.st7789;
         self.bus.console = old.console;
-        self.reapply_host_input(accel);
+        self.reapply_host_input(accel, old.efuse.factory_mac());
         self.soft_reset_count += 1;
     }
 
@@ -485,6 +490,31 @@ impl FirmwareRuntime {
     /// ±16 g clamp).
     pub fn acceleration(&self) -> [i32; 3] {
         self.bus.i2c0.accel.acceleration()
+    }
+
+    /// Gives this badge a factory MAC (host input; Milestone 10 Task 4):
+    /// the eFuse block reports `mac` in its MAC registers
+    /// (`crate::peripherals::efuse`), which `esp_read_mac` reads and the
+    /// BLE random address is built from. Returns `false`, changing nothing,
+    /// unless `mac` is exactly 6 bytes. With none set (the default) the
+    /// eFuse block reads as it always has.
+    ///
+    /// The MAC is the chip's: [`FirmwareRuntime::reset`], a software reset
+    /// and a clone all keep it. ESP-IDF reads it once per boot and caches
+    /// it, and v392 first reads it while provisioning, so set it before the
+    /// first step (or reset after setting it) for the firmware to use it
+    /// (`docs/milestone-10-decisions.md`, ruling R-T4-1).
+    pub fn set_factory_mac(&mut self, mac: &[u8]) -> bool {
+        let Ok(mac) = <[u8; 6]>::try_from(mac) else {
+            return false;
+        };
+        self.bus.efuse.set_factory_mac(mac);
+        true
+    }
+
+    /// The host-set factory MAC, if any ([`FirmwareRuntime::set_factory_mac`]).
+    pub fn factory_mac(&self) -> Option<[u8; 6]> {
+        self.bus.efuse.factory_mac()
     }
 }
 
@@ -942,6 +972,62 @@ mod tests {
         assert!(rt.console_output().starts_with(&before));
         assert_eq!(rt.console_output(), format!("{before}!"));
         assert_eq!(rt.serial_pending(), 0, "queued host input is dropped");
+    }
+
+    /// The fake hacker MAC the radio rungs use (common context).
+    const HACKER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01];
+    /// `EFUSE_RD_MAC_SPI_SYS_0_REG` and `_SYS_1_REG` on the bus.
+    const MAC_SYS_0: u32 =
+        crate::mem::soc::EFUSE_RANGE.start + crate::peripherals::efuse::RD_MAC_SPI_SYS_0_REG;
+    const MAC_SYS_1: u32 =
+        crate::mem::soc::EFUSE_RANGE.start + crate::peripherals::efuse::RD_MAC_SPI_SYS_1_REG;
+
+    #[test]
+    fn set_factory_mac_rejects_a_wrong_length() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert_eq!(rt.factory_mac(), None, "no MAC by default");
+        let seven = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01, 0x00];
+        for bad in [&[][..], &HACKER_MAC[..5], &seven[..]] {
+            assert!(!rt.set_factory_mac(bad), "{} bytes", bad.len());
+            assert_eq!(rt.factory_mac(), None, "{} bytes", bad.len());
+        }
+        assert_eq!(rt.bus.read32(MAC_SYS_0), 0);
+        assert!(rt.set_factory_mac(&HACKER_MAC));
+        assert_eq!(rt.factory_mac(), Some(HACKER_MAC));
+        assert_eq!(rt.bus.read32(MAC_SYS_0), 0x0000_1001);
+        assert_eq!(rt.bus.read32(MAC_SYS_1), 0x0000_0200);
+        assert!(!rt.set_factory_mac(&seven));
+        assert_eq!(
+            rt.factory_mac(),
+            Some(HACKER_MAC),
+            "a rejected MAC changes nothing"
+        );
+    }
+
+    /// The MAC is the chip's: a soft reset keeps it, and so does a cold
+    /// power-on, as a real badge keeps its MAC.
+    #[test]
+    fn mac_survives_cold_and_soft_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert!(rt.set_factory_mac(&HACKER_MAC));
+        rt.run(1_000);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.factory_mac(), Some(HACKER_MAC));
+        assert_eq!(rt.bus.read32(MAC_SYS_0), 0x0000_1001);
+        assert_eq!(rt.bus.read32(MAC_SYS_1), 0x0000_0200);
+
+        rt.reset().expect("reset");
+        assert_eq!(rt.soft_reset_count(), 0, "a cold power-on");
+        assert_eq!(rt.factory_mac(), Some(HACKER_MAC));
+        assert_eq!(rt.bus.read32(MAC_SYS_0), 0x0000_1001);
+        assert_eq!(rt.bus.read32(MAC_SYS_1), 0x0000_0200);
+
+        // A clone carries it too (the rungs' checkpoints).
+        let clone = rt.clone();
+        assert_eq!(clone.factory_mac(), Some(HACKER_MAC));
     }
 
     #[test]

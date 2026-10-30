@@ -219,16 +219,26 @@ pub const TIMG0_RANGE: Range<u32> = 0x6001_F000..0x6002_0000;
 pub const TIMG1_RANGE: Range<u32> = 0x6002_0000..0x6002_1000;
 
 /// RTC_CNTL peripheral registers (`DR_REG_RTCCNTL_BASE`, confirmed via
-/// ESP-IDF v5.5.3's `components/soc/esp32c3/register/soc/reg_base.h`). Same
-/// one-4KiB-page rationale as [`SYSTIMER_RANGE`] (the header's
-/// highest-cited `RTC_CNTL_*_REG` offset is `0x1FC`, comfortably inside one
-/// page). This is the peripheral `rtc_cntl_ll_get_rtc_time()` reads at boot
+/// ESP-IDF v5.5.3's `components/soc/esp32c3/register/soc/reg_base.h`), up
+/// to the eFuse controller at `DR_REG_EFUSE_BASE` (`0x6000_8800`, same
+/// header), which shares the 4 KiB page ([`EFUSE_RANGE`]). The header's
+/// highest-cited `RTC_CNTL_*_REG` offset is `0x1FC`, well inside. (Until
+/// Milestone 10 Task 4 this range was the whole page; the eFuse half read
+/// 0, dropped writes and was logged, as [`EFUSE_RANGE`] still does with no
+/// MAC set.) This is the peripheral `rtc_cntl_ll_get_rtc_time()` reads at boot
 /// (`RTC_CNTL_TIME_UPDATE_REG`/`TIME_LOW0_REG`/`TIME_HIGH0_REG`) — see
 /// `crate::peripherals::rtc_cntl` for what's actually modeled within it.
 /// Not to be confused with [`RTC_RANGE`] above (`0x5000_0000`), which is RTC
 /// *slow memory* — a completely different address-space region from this
 /// peripheral's MMIO registers.
-pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_9000;
+pub const RTC_CNTL_RANGE: Range<u32> = 0x6000_8000..0x6000_8800;
+
+/// eFuse controller registers (`DR_REG_EFUSE_BASE = 0x6000_8800`, ESP-IDF
+/// v5.5.3 `components/soc/esp32c3/register/soc/reg_base.h`, line 34) up to
+/// `DR_REG_IO_MUX_BASE` (`0x6000_9000`, line 27). `efuse_reg.h`'s highest
+/// register, `EFUSE_DATE_REG`, is at `+0x1FC`. Only the factory MAC is
+/// modeled, and only when the host sets one; see `crate::peripherals::efuse`.
+pub const EFUSE_RANGE: Range<u32> = 0x6000_8800..0x6000_9000;
 
 /// SPI1 / `SPIMEM1` flash-controller registers (`DR_REG_SPI1_BASE`,
 /// confirmed via ESP-IDF v5.5.3's
@@ -407,7 +417,10 @@ mod tests {
     fn rtc_cntl_range_is_disjoint_from_every_other_peripheral_range_and_xip_iram_and_rtc_slow_memory(
     ) {
         assert!(RTC_CNTL_RANGE.contains(&0x6000_8000));
-        assert!(!RTC_CNTL_RANGE.contains(&0x6000_9000)); // exclusive end
+        // Exclusive end: the eFuse controller fills the rest of the page.
+        assert!(!RTC_CNTL_RANGE.contains(&0x6000_8800));
+        assert_eq!(RTC_CNTL_RANGE.end, EFUSE_RANGE.start);
+        assert_eq!(EFUSE_RANGE.end, 0x6000_9000); // DR_REG_IO_MUX_BASE
 
         for other in [
             SYSTIMER_RANGE.start,

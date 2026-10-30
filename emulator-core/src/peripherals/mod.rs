@@ -76,6 +76,11 @@
 //!   threshold/loop interrupt until the ISR acknowledges it, and `INT_ST`
 //!   drives `SRC_RMT`. `FirmwareBus` holds it as `rmt`.
 //!
+//! - [`efuse`]: [`efuse::Efuse`], the eFuse controller (Milestone 10 Task
+//!   4), serving only an opt-in, host-set factory MAC in block 1's layout;
+//!   with none set it reads 0 and logs, as before. `FirmwareBus` holds it as
+//!   `efuse`.
+//!
 //! Per this plan's pre-flight design ruling, no peripheral is behind a
 //! trait object: `FirmwareBus` holds concrete, named fields for each, and
 //! does its own address-range dispatch (see `mem::bus`'s module doc) —
@@ -84,6 +89,7 @@
 
 pub mod apb_ctrl;
 pub mod console;
+pub mod efuse;
 pub mod flash;
 pub mod gdma;
 pub mod gpio;

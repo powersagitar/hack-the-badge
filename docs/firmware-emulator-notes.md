@@ -940,6 +940,12 @@ in `milestone-9-decisions.md` is the complete list):
 8. **The eFuse block is not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
+   The one exception (Milestone 10 Task 4) is an opt-in factory MAC
+   (`FirmwareRuntime::set_factory_mac`, `peripherals/efuse.rs`); with
+   none set, `esp_read_mac` returns `00:00:00:00:00:00`, the same for
+   every runtime. The firmware reads it once per boot, during
+   provisioning, so set it before the first step
+   (`docs/milestone-10-decisions.md`, R-T4-1).
 9. **Resolved (Task D-M5-3): early log timestamps.** They used to read
    `I (0)` up to `main_task: Calling app_main()`, because the early
    timestamp is the CPU cycle counter (`mpccr`, CSR `0x7E2`) and that CSR

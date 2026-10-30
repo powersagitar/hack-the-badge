@@ -127,6 +127,13 @@
 //!    [`crate::peripherals::rtc_cntl::RtcCntl::handles`], even though the
 //!    peripheral itself gives them real (if inert) storage — see that
 //!    module's doc.
+//! 11b. **eFuse** ([`crate::mem::soc::EFUSE_RANGE`], the upper half of
+//!    RTC_CNTL's 4 KiB page, which RTC_CNTL's range covered until Milestone
+//!    10 Task 4): routed to [`FirmwareBus::efuse`], same ruling — see
+//!    `crate::peripherals::efuse`. Only the two factory-MAC words, and only
+//!    when the host has set a MAC ([`crate::peripherals::efuse::Efuse::handles`]),
+//!    are modeled; every other access reads 0, drops writes and is logged
+//!    into [`FirmwareBus::unmapped_log`], exactly as before the split.
 //! 12. **SPIMEM1** ([`crate::mem::soc::SPIMEM1_RANGE`], the SPI1 flash
 //!    controller): routed to [`FirmwareBus::spimem1`], same ruling — see
 //!    `crate::peripherals::flash`. A write that sets one of `SPI_MEM_CMD_REG`'s
@@ -181,6 +188,7 @@ use std::sync::Arc;
 use crate::clock::Clock;
 use crate::peripherals::apb_ctrl::ApbCtrl;
 use crate::peripherals::console::Console;
+use crate::peripherals::efuse::Efuse;
 use crate::peripherals::flash::{EmulatedFlash, Spimem1, APP_OFFSET, FLASH_SIZE};
 use crate::peripherals::gdma::{self, Gdma};
 use crate::peripherals::gpio::Gpio;
@@ -197,11 +205,11 @@ use crate::peripherals::usb_serial_jtag::UsbSerialJtag;
 
 use super::image::SegmentDescriptor;
 use super::soc::{
-    is_xip_addr, APB_CTRL_RANGE, DBUS_CACHE_RANGE, DRAM_RANGE, GDMA_RANGE, GPIO_RANGE, I2C0_RANGE,
-    IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE, MMU_TABLE_RANGE,
-    MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE, SRC_FROM_CPU_INTR0,
-    SYSTEM_RANGE, SYSTIMER_HZ, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE, USB_SERIAL_JTAG_RANGE,
-    XTAL_HZ,
+    is_xip_addr, APB_CTRL_RANGE, DBUS_CACHE_RANGE, DRAM_RANGE, EFUSE_RANGE, GDMA_RANGE, GPIO_RANGE,
+    I2C0_RANGE, IBUS_CACHE_RANGE, INTERRUPT_CORE0_RANGE, MMU_DROM_END_ENTRY_ID, MMU_PAGE_SIZE,
+    MMU_TABLE_RANGE, MMU_VALID_VAL_MASK, RMT_RANGE, RTC_CNTL_RANGE, SPI2_RANGE, SPIMEM1_RANGE,
+    SRC_FROM_CPU_INTR0, SYSTEM_RANGE, SYSTIMER_HZ, SYSTIMER_RANGE, TIMG0_RANGE, TIMG1_RANGE,
+    USB_SERIAL_JTAG_RANGE, XTAL_HZ,
 };
 use super::Bus;
 
@@ -403,6 +411,10 @@ pub struct FirmwareBus {
     /// ruling — the RTC timer latch (`TIME_UPDATE_REG`/`TIME_LOW0_REG`/
     /// `TIME_HIGH0_REG`) `rtc_cntl_ll_get_rtc_time()` polls at boot.
     pub rtc_cntl: RtcCntl,
+    /// The eFuse controller (`crate::peripherals::efuse`), same ruling: the
+    /// opt-in host-set factory MAC, and the unset block's old catch-all
+    /// behaviour.
+    pub efuse: Efuse,
     /// The SPI1 flash controller (`crate::peripherals::flash::Spimem1`),
     /// same ruling — runs flash commands against [`FirmwareBus::flash_chip`].
     pub spimem1: Spimem1,
@@ -520,6 +532,7 @@ impl FirmwareBus {
             timg0: Timg::new(),
             timg1: Timg::new(),
             rtc_cntl: RtcCntl::new(),
+            efuse: Efuse::new(),
             spimem1: Spimem1::new(),
             flash_chip,
             console: Console::new(),
@@ -948,6 +961,13 @@ impl FirmwareBus {
             }
             return self.rtc_cntl.read_byte(offset);
         }
+        if EFUSE_RANGE.contains(&addr) {
+            let offset = addr - EFUSE_RANGE.start;
+            if !self.efuse.handles(offset) {
+                self.record_unmapped(addr, false);
+            }
+            return self.efuse.read_byte(offset);
+        }
         if SPIMEM1_RANGE.contains(&addr) {
             let offset = addr - SPIMEM1_RANGE.start;
             if !Spimem1::handles(offset) {
@@ -1090,6 +1110,14 @@ impl FirmwareBus {
             // `crate::peripherals::rtc_cntl`'s module doc.
             let elapsed_ticks = self.systimer.elapsed_ticks();
             self.rtc_cntl.write_byte(offset, val, elapsed_ticks);
+            return;
+        }
+        if EFUSE_RANGE.contains(&addr) {
+            let offset = addr - EFUSE_RANGE.start;
+            if !self.efuse.handles(offset) {
+                self.record_unmapped(addr, true);
+            }
+            self.efuse.write_byte(offset, val);
             return;
         }
         if SPIMEM1_RANGE.contains(&addr) {
