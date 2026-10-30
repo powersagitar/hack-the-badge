@@ -179,6 +179,49 @@ gap). Forcing `idle_until` inline (ruling R-T3-4) recovered all but the
 Release `boot_progress` after the change: 82 passed, 1 ignored, real
 11.49 s (`/usr/bin/time -p`, warm).
 
+### Benchmarks: a page filter in front of both checks (Task 3, fix round 1, not kept)
+
+Orchestrator ruling R-T3-O1 asked for one coarse filter in place of
+both the ROM-stub range test and the two hook ranges. A filter hit
+would go to a cold path that runs the exact ROM-stub check, then the
+exact hook check. Two designs were built from the tables the `Cpu`
+already receives, with no chip constant:
+
+- **A 1,024-bit bitmap** keyed by a hash of `pc >> 12`. It lost to
+  `ff14e3c` natively (HOME 1.076x). A probe counted 10.3M false
+  cold-path visits per launcher walk: hot flash page `0x420aa` hashed
+  onto a ROM-stub page's bit. The 125 ROM stubs sit on two pages,
+  `0x40000` and `0x40001`.
+- **A 64-slot tagged table.** Each slot holds an exact region key
+  (`pc >> shift`). On a collision between two registered keys, the
+  build coarsens the key. This removes the aliasing; its hot-path test
+  is ten AArch64 instructions (load the shift, shift, multiply, shift,
+  load the tag, compare, branch).
+
+The tagged table against `ff14e3c` and `c9d1c42` (2026-10-30, one
+session, three rounds, each round in the order `c9d1c42`, `ff14e3c`,
+filter, from detached scratchpad worktrees). The step counts were the
+same in every run.
+
+| Redraw | Native, `c9d1c42` | Native, `ff14e3c` | Native, filter | Bun, `c9d1c42` | Bun, `ff14e3c` | Bun, filter |
+|---|---|---|---|---|---|---|
+| HOME | 1.151x, 1.155x, 1.161x | 1.122x, 1.137x, 1.134x | 1.096x, 1.091x, 1.097x | 0.663x, 0.659x, 0.650x | 0.647x, 0.643x, 0.639x | 0.654x, 0.649x, 0.652x |
+| DOWN | 1.224x, 1.226x, 1.233x | 1.191x, 1.197x, 1.202x | 1.157x, 1.152x, 1.157x | 0.914x, 0.900x, 0.887x | 0.889x, 0.876x, 0.867x | 0.894x, 0.889x, 0.895x |
+| Onboarding | 1.728x, 1.727x, 1.743x | 1.672x, 1.693x, 1.696x | 1.643x, 1.634x, 1.648x | 1.192x, 1.173x, 1.170x | 1.158x, 1.145x, 1.139x | 1.179x, 1.163x, 1.167x |
+| Walk, M steps/s | 71.11, 70.98, 70.78 | 69.00, 69.46, 69.55 | 68.45, 68.15, 68.54 | 42.83, 42.63, 42.12 | 41.81, 41.63, 41.49 | 42.59, 42.11, 42.35 |
+
+- **Native:** the filter is 0.8 to 4.0 % behind `ff14e3c` in every round.
+- **Bun's WASM:** the filter is 0.6 to 3.2 % ahead of `ff14e3c` in every
+  round. Against `c9d1c42` it is 0.6 to 2.2 % behind in the first two
+  rounds and ahead on HOME, DOWN and the walk in the third.
+- **A cheaper xor-fold hash** in place of the multiply did worse natively
+  (HOME 1.079x).
+
+It was not faster than `ff14e3c` on both builds, so `ff14e3c`'s design
+stays, as R-T3-O1 directs. If the browser (WASM) number is the one that
+counts, the human partner may prefer the tagged filter at the Task 6
+gate; R-T3-5 records the choice.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -227,14 +270,20 @@ Release `boot_progress` after the change: 82 passed, 1 ignored, real
   out-of-line call before every `run_until` step, 6 to 8 % of native
   redraw speed by itself — cost if wrong: none for behaviour; a later
   change that grows `idle_until` grows `run_impl` with it.
-- Ruling R-T3-5 (Task 3): the remaining slowdown, 2.0 to 3.5 % native
-  and 0.6 to 4.8 % in Bun's WASM against `c9d1c42`, is accepted as the
-  cost of the per-step check (seven instructions on AArch64: two load
-  pairs, two subtracts, a compare, a conditional compare and one
-  branch), and
-  no behaviour was changed to chase it — cost if wrong: Snake and the
-  launcher run that much slower in the browser than they could, before
-  any hook table is installed.
+- Ruling R-T3-5 (Task 3): the per-step hook check (`ff14e3c`'s design,
+  seven AArch64 instructions: two load pairs, two subtracts, a compare,
+  a conditional compare and one branch) costs, against `c9d1c42`:
+  - 2.0 to 3.5 % native and 0.6 to 4.8 % in Bun's WASM (first A/B);
+  - 1.6 to 3.2 % native and 1.5 to 2.9 % in Bun's WASM (fix round 1's
+    session).
+
+  This misses the plan's Step 5 "within noise". It is not accepted
+  here. It is recorded by the orchestrator (R-T3-O1) for the human
+  partner's decision at the Task 6 gate, together with fix round 1's
+  tagged page filter: slower natively, but faster than `ff14e3c` and
+  near `c9d1c42` in WASM (measurements above). No behaviour was changed
+  to chase it — cost if wrong: before any hook table is installed,
+  Snake and the launcher run that much slower than they could.
 
 ## Replaced rungs
 
