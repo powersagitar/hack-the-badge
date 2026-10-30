@@ -164,6 +164,26 @@ describe("emulator-wasm firmware-boot boundary", () => {
       handle.dispose();
     }
   });
+
+  // softResetCount crosses the boundary: no software reset after
+  // construction, and a cold reset() is a power-on that clears the count
+  // (the reboot paths themselves are pinned natively in boot_progress.rs).
+  test("softResetCount is 0 after construction and after reset()", () => {
+    const wasmBytes = readFileSync(
+      new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
+    );
+    initSync({ module: wasmBytes });
+    const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
+    const emu = new FirmwareEmulator(new Uint8Array(image));
+    try {
+      expect(emu.softResetCount).toBe(0);
+      emu.run(10_000).free();
+      emu.reset();
+      expect(emu.softResetCount).toBe(0);
+    } finally {
+      emu.free();
+    }
+  });
 });
 
 describe("emulator-wasm provisioned boot", () => {

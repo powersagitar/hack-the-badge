@@ -1856,10 +1856,29 @@ fn assert_launcher_opens(
                 &console[before..]
             );
             assert_eq!(rt.soft_reset_count(), soft_resets, "{app}: soft resets");
+            if soft_resets == 1 {
+                let line = format!("app_reboot: reboot into {}", reboot_slug(app));
+                assert!(
+                    console[before..].contains(&line),
+                    "{app}: no `{line}`; console since A:\n{}",
+                    &console[before..]
+                );
+            }
             assert_no_panic_text(&rt);
             rt
         })
         .clone()
+}
+
+/// The slug `app_reboot: reboot into <slug>` names for an app that
+/// [`assert_launcher_opens`] enters by rebooting, read from v392's console.
+fn reboot_slug(app: &str) -> &'static str {
+    match app {
+        "Share" => "share",
+        "Sponsors" => "sponsors",
+        "Workshop Quest" => "workshops",
+        _ => panic!("{app} has no reboot slug"),
+    }
 }
 
 /// Each launcher cell's open app, reached once by [`assert_launcher_opens`]

@@ -881,6 +881,31 @@ mod tests {
         );
     }
 
+    /// R-T6-1's gap, the "nothing replays" half of Milestone 9's Review
+    /// Focus 1: a button pressed and released before a soft reset is not
+    /// re-applied to the fresh bus. The shift register reads it released
+    /// from the reset step on, before the new boot runs anything.
+    #[test]
+    fn released_button_does_not_replay_after_a_soft_reset() {
+        use crate::peripherals::gpio::PIN_HC165_DATA;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.set_raw_button(1, true);
+        rt.run(1_000);
+        rt.set_raw_button(1, false);
+        rt.run(1_000);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert!(!rt.raw_button(1));
+        pulse_load(&mut rt);
+        for i in 0..crate::peripherals::gpio::HC165_SLOTS {
+            assert!(
+                rt.bus().gpio.pin_level(PIN_HC165_DATA),
+                "the fresh bus shows every slot released (bit {i})"
+            );
+            clk_rising_edge(&mut rt);
+        }
+    }
+
     #[test]
     fn console_output_survives_a_soft_reset() {
         use crate::mem::soc::USB_SERIAL_JTAG_RANGE;

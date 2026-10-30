@@ -173,6 +173,13 @@ impl FirmwareEmulator {
         self.inner.total_steps() as f64
     }
 
+    /// Software resets since construction or the last
+    /// [`FirmwareEmulator::reset`] (see `FirmwareRuntime::soft_reset_count`).
+    #[wasm_bindgen(getter, js_name = softResetCount)]
+    pub fn soft_reset_count(&self) -> u32 {
+        self.inner.soft_reset_count()
+    }
+
     /// Everything the firmware has printed to its console so far. A method
     /// (not a getter) since it does real work (lossy UTF-8 decode of the
     /// capped console ring) on every call rather than exposing cheap state.
