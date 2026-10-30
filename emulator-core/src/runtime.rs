@@ -47,7 +47,8 @@
 //! mask-ROM `software_reset_cpu` (`crate::rom`, entry 26), whose stub
 //! requests a reset (`crate::cpu::rom_stubs::RomStubEffect::RequestReset`).
 //! The run loop collects the request after the step that made it
-//! ([`crate::cpu::Cpu::take_reset_request`]) and re-boots the same image
+//! ([`crate::cpu::Cpu::needs_attention`], then
+//! [`crate::cpu::Cpu::take_reset_request`] on a cold path) and re-boots the same image
 //! there, so a run's step budget stays exact. The new boot is a fresh
 //! [`boot_from_firmware_image_with_rom_stubs`] with
 //! `crate::rom::esp32c3_rom_stubs_with_reset_reason`, so
@@ -305,12 +306,27 @@ impl FirmwareRuntime {
         self.run_impl(budget, None, Some(pc_hist))
     }
 
+    /// Collects what the last step left for the host
+    /// ([`crate::cpu::Cpu::needs_attention`]): today a software reset
+    /// request, which is performed here. Out of line and cold, so the run
+    /// loop's per-step cost is the flag test alone (Milestone 10 Task 1;
+    /// inlining this check cost about 10 % natively, see
+    /// `docs/milestone-9-decisions.md`).
+    #[cold]
+    #[inline(never)]
+    fn attend(&mut self) {
+        self.cpu.clear_attention();
+        if let Some(reason) = self.cpu.take_reset_request() {
+            self.soft_reset(reason);
+        }
+    }
+
     /// Shared body for [`FirmwareRuntime::run`],
     /// [`FirmwareRuntime::run_until`] and [`FirmwareRuntime::run_traced`]:
     /// up to `budget` steps, stopping early (before a step) once emulated
     /// time has reached `stop_at_us`. A software reset requested by a step
-    /// is performed right after it, and the stop point is re-derived for
-    /// the new clock.
+    /// is performed right after it ([`FirmwareRuntime::attend`]), and the
+    /// stop point is re-derived for the new clock.
     fn run_impl(
         &mut self,
         budget: u32,
@@ -341,8 +357,8 @@ impl FirmwareRuntime {
             if info.rom_stub.is_some() {
                 summary.rom_stub_calls += 1;
             }
-            if let Some(reason) = self.cpu.take_reset_request() {
-                self.soft_reset(reason);
+            if self.cpu.needs_attention() {
+                self.attend();
                 stop_at_ticks = stop_at_us.map(|us| self.ticks_at_host_us(us));
             }
             ran += 1;

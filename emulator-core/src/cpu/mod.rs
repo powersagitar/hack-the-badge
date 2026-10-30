@@ -125,6 +125,11 @@ pub struct Cpu {
     /// this core ran and its driver has not collected yet (see
     /// [`Cpu::take_reset_request`]).
     reset_request: Option<u32>,
+    /// `true` once a step has left something for the driver to collect
+    /// (today only a reset request), until the driver clears it -- see
+    /// [`Cpu::needs_attention`]. One flag, so the driver's per-step check
+    /// is a single load and branch.
+    attention: bool,
     /// Decoded instructions by address, validated by the fetched bits on
     /// every hit, so it needs no invalidation (see [`decode_cache`]). A
     /// clone copies it with the rest of the core.
@@ -164,6 +169,7 @@ impl Default for Cpu {
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
             reset_request: None,
+            attention: false,
             decode_cache: DecodeCache::new(),
         }
     }
@@ -235,6 +241,22 @@ impl Cpu {
     /// then `pc` stays on the stub, so stepping on re-runs it.
     pub fn take_reset_request(&mut self) -> Option<u32> {
         self.reset_request.take()
+    }
+
+    /// `true` if a step has left something for the driver to collect since
+    /// the last [`Cpu::clear_attention`]: today a reset request
+    /// ([`Cpu::take_reset_request`]). The driver tests only this after each
+    /// step and collects the requests on a cold path, so the hot loop
+    /// carries one flag test instead of a check per kind of request.
+    #[inline]
+    pub fn needs_attention(&self) -> bool {
+        self.attention
+    }
+
+    /// Clears [`Cpu::needs_attention`]. The driver calls it when it starts
+    /// collecting, before taking each request; it does not discard them.
+    pub fn clear_attention(&mut self) {
+        self.attention = false;
     }
 
     /// The currently-installed ROM-stub table (empty unless
@@ -500,6 +522,7 @@ impl Cpu {
                 // Does not return: `pc` stays on the stub (see the effect's
                 // doc).
                 self.reset_request = Some(reason);
+                self.attention = true;
                 return;
             }
             RomStubEffect::Memset => {
@@ -2209,8 +2232,12 @@ mod tests {
         let mut bus = rom_stub_test_bus();
         cpu.step(&mut bus);
         cpu.step(&mut bus);
+        assert!(!cpu.needs_attention(), "nothing requested yet");
         assert_eq!(cpu.take_reset_request(), None, "nothing requested yet");
         let stubbed = cpu.step(&mut bus);
+        assert!(cpu.needs_attention(), "the request raises the flag");
+        cpu.clear_attention();
+        assert!(!cpu.needs_attention());
 
         assert_eq!(stubbed.rom_stub, Some(ROM_STUB_ADDR));
         assert_eq!(cpu.regs.pc, ROM_STUB_ADDR, "never returns to ra");
