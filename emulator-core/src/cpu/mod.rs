@@ -12,6 +12,7 @@
 //! The optional cycle counter ([`CycleCounter`]) is generic too: chip
 //! setup supplies its CSR addresses ([`Csrs::set_cycle_counter`]).
 
+pub mod app_hooks;
 mod decode;
 mod decode_cache;
 // The encoder is a full RV32IM vocabulary; only the subset `crate::rom`'s
@@ -23,6 +24,7 @@ mod execute;
 mod registers;
 pub mod rom_stubs;
 
+pub use app_hooks::{AppHookTable, HookHit};
 /// Crate-internal access to the raw decoder, so guest-executed code blobs
 /// assembled with [`encode`] (see `crate::rom`) can prove every word they
 /// emit decodes through this core's own decoder.
@@ -125,8 +127,18 @@ pub struct Cpu {
     /// this core ran and its driver has not collected yet (see
     /// [`Cpu::take_reset_request`]).
     reset_request: Option<u32>,
+    /// App-image hooks, checked after the ROM stubs and before the fetch.
+    /// **Empty by default**, which never hits. See [`app_hooks`] and
+    /// [`Cpu::set_app_hooks`].
+    app_hooks: AppHookTable,
+    /// The hook the last hooked step hit, until the driver takes it
+    /// ([`Cpu::take_hook_hit`]).
+    hook_hit: Option<HookHit>,
+    /// The hooked `pc` whose next arrival fetches and executes instead of
+    /// hitting, once ([`Cpu::hook_pass_through`]).
+    hook_pass_through: Option<u32>,
     /// `true` once a step has left something for the driver to collect
-    /// (today only a reset request), until the driver clears it -- see
+    /// (a reset request or a hook hit), until the driver clears it -- see
     /// [`Cpu::needs_attention`]. One flag, so the driver's per-step check
     /// is a single load and branch.
     attention: bool,
@@ -169,6 +181,9 @@ impl Default for Cpu {
             last_rom_stub_index_drop: None,
             rom_stubs: RomStubTable::new(),
             reset_request: None,
+            app_hooks: AppHookTable::new(),
+            hook_hit: None,
+            hook_pass_through: None,
             attention: false,
             decode_cache: DecodeCache::new(),
         }
@@ -244,8 +259,9 @@ impl Cpu {
     }
 
     /// `true` if a step has left something for the driver to collect since
-    /// the last [`Cpu::clear_attention`]: today a reset request
-    /// ([`Cpu::take_reset_request`]). The driver tests only this after each
+    /// the last [`Cpu::clear_attention`]: a reset request
+    /// ([`Cpu::take_reset_request`]) or a hook hit
+    /// ([`Cpu::take_hook_hit`]). The driver tests only this after each
     /// step and collects the requests on a cold path, so the hot loop
     /// carries one flag test instead of a check per kind of request.
     #[inline]
@@ -257,6 +273,44 @@ impl Cpu {
     /// collecting, before taking each request; it does not discard them.
     pub fn clear_attention(&mut self) {
         self.attention = false;
+    }
+
+    /// Installs `table` as this core's app-image hooks, replacing any
+    /// previous table and dropping any pending pass-through. Never called
+    /// means an empty table: no step ever hits. See [`app_hooks`].
+    pub fn set_app_hooks(&mut self, table: AppHookTable) {
+        self.app_hooks = table;
+        self.hook_pass_through = None;
+    }
+
+    /// The currently-installed app-image hook table.
+    pub fn app_hooks(&self) -> &AppHookTable {
+        &self.app_hooks
+    }
+
+    /// Collects (and clears) the hook the last hooked step hit, if any.
+    /// Until the driver answers it ([`Cpu::hook_return`],
+    /// [`Cpu::hook_pass_through`] or a write to `pc`), `pc` stays on the
+    /// hook and each step there hits again.
+    pub fn take_hook_hit(&mut self) -> Option<HookHit> {
+        self.hook_hit.take()
+    }
+
+    /// Answers a hook hit by returning from the hooked function: writes
+    /// `a0` if given, and sets `pc = ra`, as a ROM stub returns. Like a ROM
+    /// stub, it is only meaningful if the guest arrived by an ABI call.
+    pub fn hook_return(&mut self, a0: Option<u32>) {
+        if let Some(value) = a0 {
+            self.regs.write(rom_stubs::REG_A0, value);
+        }
+        self.regs.pc = self.regs.read(rom_stubs::REG_RA);
+    }
+
+    /// Answers a hook hit by letting the guest's own code run: the next
+    /// arrival at the current `pc` fetches and executes normally, once;
+    /// the arrival after that hits again.
+    pub fn hook_pass_through(&mut self) {
+        self.hook_pass_through = Some(self.regs.pc);
     }
 
     /// The currently-installed ROM-stub table (empty unless
@@ -398,6 +452,17 @@ impl Cpu {
             };
         }
 
+        // App-image hook? Two range tests on the fast path (see
+        // `app_hooks`); only a pc inside a range looks further.
+        if self.app_hooks.in_ranges(pc) && self.hook_step(pc) {
+            return StepInfo {
+                trap_taken: false,
+                instr_len: 0,
+                pc_before,
+                rom_stub: None,
+            };
+        }
+
         let (instr, len) = match fetch_and_decode(bus, &mut self.decode_cache, pc) {
             Ok(fetched) => fetched,
             Err(fault_addr) => {
@@ -431,6 +496,25 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    /// The slow half of the hook check, for a `pc` inside the hook ranges:
+    /// `true` if this step is a hit (recorded, attention raised, `pc`
+    /// kept), `false` if the step goes on to fetch -- `pc` is not hooked,
+    /// or a pass-through for it is spent here.
+    #[cold]
+    #[inline(never)]
+    fn hook_step(&mut self, pc: u32) -> bool {
+        let Some(id) = self.app_hooks.lookup(pc) else {
+            return false;
+        };
+        if self.hook_pass_through == Some(pc) {
+            self.hook_pass_through = None;
+            return false;
+        }
+        self.hook_hit = Some(HookHit { id, pc });
+        self.attention = true;
+        true
     }
 
     /// The word address a [`rom_stubs::BusRegisterWrite`] targets with the
@@ -3310,5 +3394,259 @@ mod tests {
         );
         // The bits decide: the same pc with other bits is a miss.
         assert_eq!(cpu.decode_cache.lookup(2, c_addi as u32), None);
+    }
+
+    /// The CPU side of [`super::app_hooks`] (Milestone 10 Task 3), on a
+    /// synthetic call loop. The table-level tests live in that module.
+    mod app_hooks {
+        use super::*;
+
+        /// The hooked function's entry.
+        const HOOKED: u32 = 0x100;
+        /// Where the call returns to (`ra`).
+        const RETURN_SITE: u32 = 0x08;
+        /// A mask-ROM-style stub address for the coexistence test.
+        const STUB: u32 = 0x200;
+        /// The interrupt vector for the ordering tests (`mret` there).
+        const VECTOR: u32 = 0x300;
+        const HOOK_ID: u16 = 3;
+
+        /// A call loop: `0x00` sets `x5 = HOOKED`; `0x04` calls it
+        /// (`ra = 0x08`); `0x08` counts returns in `x6`; `0x0c` jumps
+        /// back to the call. The hooked body at `HOOKED` counts its own
+        /// runs in `x7`, then returns. `VECTOR` holds an `mret`.
+        fn call_loop_bus() -> TestBus {
+            let mut bus = TestBus::with_program(&[
+                addi(5, 0, HOOKED as i32),         // 0x00
+                i_type(0b1100111, 0b000, 1, 5, 0), // 0x04: jalr ra, 0(x5)
+                addi(6, 6, 1),                     // 0x08: the return site
+                jal(0, -8),                        // 0x0c: back to 0x04
+            ]);
+            let hooked = HOOKED as usize;
+            bus.mem[hooked..hooked + 4].copy_from_slice(&addi(7, 7, 1).to_le_bytes());
+            bus.mem[hooked + 4..hooked + 8]
+                .copy_from_slice(&i_type(0b1100111, 0b000, 0, 1, 0).to_le_bytes()); // ret
+            let vector = VECTOR as usize;
+            bus.mem[vector..vector + 4].copy_from_slice(&0x3020_0073u32.to_le_bytes()); // mret
+            bus
+        }
+
+        fn hooked_cpu() -> Cpu {
+            let mut cpu = Cpu::new();
+            let mut table = AppHookTable::new();
+            table.insert(HOOKED, HOOK_ID);
+            cpu.set_app_hooks(table);
+            cpu
+        }
+
+        /// Steps from reset to the call's arrival at `HOOKED`.
+        fn arrive(cpu: &mut Cpu, bus: &mut TestBus) {
+            cpu.step(bus);
+            cpu.step(bus);
+            assert_eq!(cpu.regs.pc, HOOKED);
+        }
+
+        #[test]
+        fn a_cpu_without_hooks_runs_the_call_loop_untouched() {
+            let mut cpu = Cpu::new();
+            let mut bus = call_loop_bus();
+            for _ in 0..40 {
+                let info = cpu.step(&mut bus);
+                assert!(!info.trap_taken);
+                assert!(!cpu.needs_attention());
+            }
+            assert_eq!(cpu.take_hook_hit(), None);
+            assert_eq!(cpu.regs.read(7), 8, "the body ran on every call");
+        }
+
+        #[test]
+        fn hook_hit_consumes_the_step_and_keeps_pc() {
+            let mut cpu = hooked_cpu();
+            let mut bus = call_loop_bus();
+            arrive(&mut cpu, &mut bus);
+            assert!(!cpu.needs_attention());
+
+            let info = cpu.step(&mut bus);
+            assert_eq!(
+                info,
+                StepInfo {
+                    trap_taken: false,
+                    instr_len: 0,
+                    pc_before: HOOKED,
+                    rom_stub: None,
+                }
+            );
+            assert_eq!(cpu.regs.pc, HOOKED, "pc stays on the hook");
+            assert_eq!(cpu.regs.read(7), 0, "nothing at the hook was fetched");
+            assert!(cpu.needs_attention(), "a hit raises the flag");
+            assert_eq!(
+                cpu.take_hook_hit(),
+                Some(HookHit {
+                    id: HOOK_ID,
+                    pc: HOOKED
+                })
+            );
+            assert_eq!(cpu.take_hook_hit(), None, "taken once");
+
+            // Unhandled, it hits again: the core never moves on its own.
+            cpu.clear_attention();
+            cpu.step(&mut bus);
+            assert!(cpu.needs_attention());
+            assert_eq!(cpu.regs.pc, HOOKED);
+            assert_eq!(cpu.regs.read(7), 0);
+        }
+
+        #[test]
+        fn hook_return_sets_a0_and_returns_to_ra() {
+            let mut cpu = hooked_cpu();
+            let mut bus = call_loop_bus();
+            arrive(&mut cpu, &mut bus);
+            cpu.regs.write(10, 0xdead_beef);
+            cpu.step(&mut bus);
+            assert!(cpu.take_hook_hit().is_some());
+
+            cpu.hook_return(Some(42));
+            assert_eq!(cpu.regs.read(10), 42);
+            assert_eq!(cpu.regs.pc, RETURN_SITE);
+            cpu.step(&mut bus);
+            assert_eq!(cpu.regs.read(6), 1, "the caller resumed");
+            assert_eq!(cpu.regs.read(7), 0, "the body never ran");
+
+            // `None` leaves a0 alone.
+            cpu.step(&mut bus); // jal back to the call
+            cpu.step(&mut bus); // the call
+            cpu.step(&mut bus); // the hit
+            assert!(cpu.take_hook_hit().is_some());
+            cpu.hook_return(None);
+            assert_eq!(cpu.regs.read(10), 42);
+            assert_eq!(cpu.regs.pc, RETURN_SITE);
+        }
+
+        #[test]
+        fn pass_through_executes_the_hooked_instruction_once() {
+            let mut cpu = hooked_cpu();
+            let mut bus = call_loop_bus();
+            arrive(&mut cpu, &mut bus);
+            cpu.step(&mut bus);
+            assert!(cpu.take_hook_hit().is_some());
+            cpu.clear_attention();
+
+            cpu.hook_pass_through();
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.instr_len, 4, "fetched and executed");
+            assert!(!cpu.needs_attention(), "no second hit");
+            assert_eq!(cpu.regs.read(7), 1, "the body's first instruction ran");
+            assert_eq!(cpu.regs.pc, HOOKED + 4);
+
+            // ret, the return site, the loop's jal, the call: back at the
+            // hook, which hits again.
+            for _ in 0..4 {
+                cpu.step(&mut bus);
+            }
+            assert_eq!(cpu.regs.read(6), 1);
+            assert_eq!(cpu.regs.pc, HOOKED);
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.instr_len, 0);
+            assert!(cpu.needs_attention());
+            assert_eq!(cpu.regs.read(7), 1, "once only");
+            assert_eq!(cpu.regs.pc, HOOKED);
+        }
+
+        #[test]
+        fn interrupt_is_taken_before_a_hook() {
+            // As for a ROM stub: the boundary before the hooked call is a
+            // valid one for an interrupt, so the trap wins, `mepc` points at
+            // the hook, and the hook hits when the handler returns.
+            let mut cpu = hooked_cpu();
+            cpu.csr.mtvec = VECTOR;
+            cpu.csr.mstatus |= mstatus_bits::MIE;
+            let mut bus = call_loop_bus();
+            arrive(&mut cpu, &mut bus);
+            cpu.raise_interrupt(7);
+
+            let info = cpu.step(&mut bus);
+            assert!(info.trap_taken);
+            assert!(!cpu.needs_attention(), "the trap ran, not the hook");
+            assert_eq!(cpu.take_hook_hit(), None);
+            assert_eq!(cpu.csr.mepc, HOOKED);
+            assert_eq!(cpu.regs.pc, VECTOR);
+
+            cpu.step(&mut bus); // mret
+            assert_eq!(cpu.regs.pc, HOOKED);
+            cpu.step(&mut bus);
+            assert_eq!(
+                cpu.take_hook_hit(),
+                Some(HookHit {
+                    id: HOOK_ID,
+                    pc: HOOKED
+                })
+            );
+        }
+
+        #[test]
+        fn pass_through_survives_an_interrupt_before_it() {
+            // The pass-through belongs to the next *arrival* at the hooked
+            // pc, so an interrupt taken first does not spend it: after the
+            // handler returns, the body runs without a second hit.
+            let mut cpu = hooked_cpu();
+            cpu.csr.mtvec = VECTOR;
+            let mut bus = call_loop_bus();
+            arrive(&mut cpu, &mut bus);
+            cpu.step(&mut bus);
+            assert!(cpu.take_hook_hit().is_some());
+            cpu.clear_attention();
+            cpu.hook_pass_through();
+
+            cpu.csr.mstatus |= mstatus_bits::MIE;
+            cpu.raise_interrupt(7);
+            assert!(cpu.step(&mut bus).trap_taken);
+            cpu.step(&mut bus); // mret
+            assert_eq!(cpu.regs.pc, HOOKED);
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.instr_len, 4);
+            assert!(!cpu.needs_attention());
+            assert_eq!(cpu.regs.read(7), 1);
+        }
+
+        #[test]
+        fn hooks_and_rom_stubs_coexist() {
+            let mut cpu = hooked_cpu();
+            let mut stubs = RomStubTable::new();
+            stubs.insert(STUB, RomStub::returning("fake_rom_fn", 42));
+            cpu.set_rom_stubs(stubs);
+            let mut bus = call_loop_bus();
+
+            // A stub call runs the stub, with no hook involved.
+            cpu.regs.write(1, RETURN_SITE);
+            cpu.regs.pc = STUB;
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(STUB));
+            assert_eq!(cpu.regs.read(10), 42);
+            assert_eq!(cpu.regs.pc, RETURN_SITE);
+            assert!(!cpu.needs_attention());
+
+            // A hooked call hits the hook, with no stub involved.
+            cpu.regs.pc = HOOKED;
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, None);
+            assert_eq!(
+                cpu.take_hook_hit(),
+                Some(HookHit {
+                    id: HOOK_ID,
+                    pc: HOOKED
+                })
+            );
+            cpu.clear_attention();
+
+            // On one address the stub, checked first, wins.
+            let mut both = AppHookTable::new();
+            both.insert(HOOKED, HOOK_ID).insert(STUB, 4);
+            cpu.set_app_hooks(both);
+            cpu.regs.pc = STUB;
+            let info = cpu.step(&mut bus);
+            assert_eq!(info.rom_stub, Some(STUB));
+            assert!(!cpu.needs_attention());
+            assert_eq!(cpu.take_hook_hit(), None);
+        }
     }
 }

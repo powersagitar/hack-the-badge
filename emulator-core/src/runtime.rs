@@ -94,7 +94,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::boot::{boot_from_firmware_image_with_rom_stubs, idle_until, step_with_interrupts};
-use crate::cpu::{exception_code, Cpu};
+use crate::cpu::{exception_code, Cpu, HookHit};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
 use crate::peripherals::spi::{SCREEN_HEIGHT, SCREEN_WIDTH};
@@ -307,26 +307,48 @@ impl FirmwareRuntime {
     }
 
     /// Collects what the last step left for the host
-    /// ([`crate::cpu::Cpu::needs_attention`]): today a software reset
-    /// request, which is performed here. Out of line and cold, so the run
-    /// loop's per-step cost is the flag test alone (Milestone 10 Task 1;
-    /// inlining this check cost about 10 % natively, see
-    /// `docs/milestone-9-decisions.md`).
+    /// ([`crate::cpu::Cpu::needs_attention`]): an app-image hook hit,
+    /// answered by [`FirmwareRuntime::dispatch_hook`], or a software reset
+    /// request, which is performed here. Returns `true` if it reset, so
+    /// the run loop re-derives its stop point only for a new clock. Out of
+    /// line and cold, so the run loop's per-step cost is the flag test
+    /// alone (Milestone 10 Task 1; inlining this check cost about 10 %
+    /// natively, see `docs/milestone-9-decisions.md`).
+    ///
+    /// The flag is cleared first and every kind of request is then taken
+    /// (ruling R-T1-1), so no request is left behind by another's take. A
+    /// raised flag with nothing pending (a driver that took a request
+    /// without clearing it) is an empty attend: it clears the flag and
+    /// changes nothing else.
     #[cold]
     #[inline(never)]
-    fn attend(&mut self) {
+    fn attend(&mut self) -> bool {
         self.cpu.clear_attention();
+        if let Some(hit) = self.cpu.take_hook_hit() {
+            self.dispatch_hook(hit);
+        }
         if let Some(reason) = self.cpu.take_reset_request() {
             self.soft_reset(reason);
+            return true;
         }
+        false
+    }
+
+    /// Answers an app-image hook hit (`crate::cpu::app_hooks`). No handler
+    /// exists yet, and the firmware path installs no hook table, so no
+    /// firmware run reaches this; an unhandled hit passes through and the
+    /// guest's own code runs.
+    fn dispatch_hook(&mut self, _hit: HookHit) {
+        self.cpu.hook_pass_through();
     }
 
     /// Shared body for [`FirmwareRuntime::run`],
     /// [`FirmwareRuntime::run_until`] and [`FirmwareRuntime::run_traced`]:
     /// up to `budget` steps, stopping early (before a step) once emulated
-    /// time has reached `stop_at_us`. A software reset requested by a step
-    /// is performed right after it ([`FirmwareRuntime::attend`]), and the
-    /// stop point is re-derived for the new clock.
+    /// time has reached `stop_at_us`. What a step leaves for the host (a
+    /// hook hit, a software reset) is collected right after it
+    /// ([`FirmwareRuntime::attend`]); after a reset the stop point is
+    /// re-derived for the new clock.
     fn run_impl(
         &mut self,
         budget: u32,
@@ -357,8 +379,7 @@ impl FirmwareRuntime {
             if info.rom_stub.is_some() {
                 summary.rom_stub_calls += 1;
             }
-            if self.cpu.needs_attention() {
-                self.attend();
+            if self.cpu.needs_attention() && self.attend() {
                 stop_at_ticks = stop_at_us.map(|us| self.ticks_at_host_us(us));
             }
             ran += 1;
@@ -936,5 +957,84 @@ mod tests {
         assert_eq!(rt.soft_reset_count(), 0);
         assert_eq!(rt.emulated_time_us(), 0);
         assert_eq!(reset_reason(&mut rt), crate::rom::POWERON_RESET);
+    }
+
+    /// The image's entry, `0x4200_0020`, is `addi x7, x7, 1`, then `j -4`
+    /// back to it: a loop that counts its passes in `x7`.
+    const COUNT_LOOP: u32 = 0x4200_0020;
+
+    fn count_loop_image() -> Vec<u8> {
+        let mut buf = vec![0u8; 24];
+        buf[0] = 0xE9;
+        buf[1] = 1;
+        buf[4..8].copy_from_slice(&COUNT_LOOP.to_le_bytes());
+        buf.extend_from_slice(&COUNT_LOOP.to_le_bytes());
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x0013_8393u32.to_le_bytes()); // addi x7, x7, 1
+        code.extend_from_slice(&0xffdf_f06fu32.to_le_bytes()); // j -4
+        buf.extend_from_slice(&(code.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&code);
+        buf
+    }
+
+    fn hooked_count_loop() -> FirmwareRuntime {
+        let mut rt = FirmwareRuntime::from_image(&count_loop_image()).unwrap();
+        let mut table = crate::cpu::AppHookTable::new();
+        table.insert(COUNT_LOOP, 1);
+        rt.cpu.set_app_hooks(table);
+        rt
+    }
+
+    /// Until Task 6 supplies a handler, the run loop answers a hit by
+    /// passing through: each pass costs one extra step (the hit), the
+    /// guest's own instruction still runs, and the step budget is exact.
+    #[test]
+    fn an_unhandled_hook_hit_passes_through_in_the_run_loop() {
+        let mut plain = FirmwareRuntime::from_image(&count_loop_image()).unwrap();
+        assert_eq!(plain.run(300).steps, 300);
+        assert_eq!(plain.cpu.regs.read(7), 150, "2 steps a pass");
+
+        let mut rt = hooked_count_loop();
+        let s = rt.run(1);
+        assert_eq!(s.pc, COUNT_LOOP, "the hit keeps pc");
+        assert_eq!(rt.cpu.regs.read(7), 0, "the hit ran nothing");
+        assert!(!rt.cpu.needs_attention(), "attend cleared the flag");
+        assert_eq!(rt.cpu.take_hook_hit(), None, "attend took the hit");
+        rt.run(1);
+        assert_eq!(rt.cpu.regs.read(7), 1, "then the guest's instruction");
+
+        let s = rt.run(298);
+        assert_eq!(s.steps, 298);
+        assert_eq!(s.rom_stub_calls, 0, "a hit is not a ROM stub call");
+        assert_eq!(rt.total_steps(), 300);
+        assert_eq!(rt.cpu.regs.read(7), 100, "3 steps a pass");
+        assert_eq!(rt.soft_reset_count(), 0);
+    }
+
+    /// The attention flag raised with nothing to collect (a driver took a
+    /// hit without clearing the flag, as ruling R-T1-1 allows) costs one
+    /// empty attend and nothing else: the run matches one without the flag,
+    /// step for step and in time, including a `run_until` target.
+    #[test]
+    fn an_empty_attend_changes_nothing() {
+        let mut rt = hooked_count_loop();
+        step_with_interrupts(&mut rt.cpu, &mut rt.bus);
+        assert!(rt.cpu.take_hook_hit().is_some());
+        rt.cpu.hook_pass_through();
+        assert!(rt.cpu.needs_attention(), "left raised, nothing pending");
+
+        let mut clean = rt.clone();
+        clean.cpu.clear_attention();
+
+        let target = rt.emulated_time_us() + 50;
+        let a = rt.run_until(target, 10_000);
+        let b = clean.run_until(target, 10_000);
+        assert!(!rt.cpu.needs_attention());
+        assert_eq!(a, b);
+        assert!(a.steps > 0 && a.steps < 10_000, "stopped by the target");
+        assert_eq!(rt.total_steps(), clean.total_steps());
+        assert_eq!(rt.emulated_time_us(), clean.emulated_time_us());
+        assert_eq!(rt.cpu.regs.read(7), clean.cpu.regs.read(7));
+        assert_eq!(rt.soft_reset_count(), 0);
     }
 }

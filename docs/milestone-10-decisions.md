@@ -141,6 +141,44 @@ of `b25a68c` in every pair.
 Release `boot_progress` after the change: 82 passed, 1 ignored, real
 11.20 s (`/usr/bin/time -p`, warm).
 
+### Benchmarks: app-image hooks (Task 3)
+
+Three alternating pairs in one session (2026-10-30, same machine), Task
+1's commit `c9d1c42` first in each pair, from a detached worktree of it
+outside the repo, against Task 3's commit. The commands and columns are
+Task 1's (native `factor`; Bun's median `pin_factor`). Every run had the
+same step counts on both sides (native HOME 18,292,336, DOWN 7,942,619,
+onboarding 2,547,134, walk 342,600,776; Bun HOME 18,317,242, DOWN
+7,972,669, onboarding 2,892,375, walk 341,368,630). No hook table is
+installed, so this is the cost of the check alone.
+
+| Redraw | Native, `c9d1c42` | Native, Task 3 | Bun, `c9d1c42` | Bun, Task 3 |
+|---|---|---|---|---|
+| HOME | 1.145x, 1.132x, 1.134x | 1.109x, 1.102x, 1.111x | 0.652x, 0.654x, 0.651x | 0.648x, 0.640x, 0.631x |
+| DOWN | 1.220x, 1.203x, 1.205x | 1.177x, 1.172x, 1.178x | 0.889x, 0.892x, 0.890x | 0.879x, 0.861x, 0.847x |
+| Onboarding | 1.723x, 1.708x, 1.709x | 1.676x, 1.662x, 1.667x | 1.169x, 1.171x, 1.156x | 1.159x, 1.146x, 1.132x |
+| Walk, M steps/s | 70.47, 70.32, 70.11 | 68.38, 68.11, 68.53 | 42.20, 42.32, 41.92 | 41.80, 41.50, 41.29 |
+
+Natively Task 3 is 2.0 to 3.5 % behind `c9d1c42` in every pair; in
+Bun's WASM, 0.6 to 4.8 % (the Task 3 runs drifted down across the
+session while `c9d1c42`'s held). Not within noise: ruling R-T3-5.
+
+The first build was about 9 % behind natively (HOME 1.050x, 1.036x
+against 1.144x, 1.155x), and it stayed about 6 % behind with the hook
+check compiled out. The cause was not the check: `run_impl` stopped
+inlining `boot::idle_until`, which `run_until` calls before every step
+(the hot-function sizes showed it, 1,444 bytes for `run_impl` before
+against 860 after, with a call to `idle_until`). Things ruled out on the
+way: the `Cpu` field order (a `repr(C)` layout keeping every hot field
+at `c9d1c42`'s offset measured the same), the heap pointer in the table
+(a fixed-capacity inline table measured the same) and code alignment
+(both sides built with 64-byte function and block alignment kept the
+gap). Forcing `idle_until` inline (ruling R-T3-4) recovered all but the
+2 to 3.5 % above.
+
+Release `boot_progress` after the change: 82 passed, 1 ignored, real
+11.49 s (`/usr/bin/time -p`, warm).
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -157,6 +195,46 @@ Release `boot_progress` after the change: 82 passed, 1 ignored, real
   and no behaviour was changed to chase it — cost if wrong: the walk,
   which only tests and benchmarks run, is about 2 % slower than it
   could be.
+- Ruling R-T3-1 (Task 3, `feat: chip-agnostic app-image hooks`): the
+  hook check's two ranges are learned from the table, by splitting its
+  sorted addresses at their largest gap, and tested as
+  `pc.wrapping_sub(base) < len` each (an empty range has length 0, so an
+  empty table never hits). The table is `Vec`-backed inside `Cpu`.
+  `StepInfo` and `RunSummary` are unchanged: a hit is seen only through
+  `needs_attention` and `take_hook_hit` — cost if wrong: a table whose
+  hooks form three or more far-apart clusters makes the code between two
+  of them pay the binary search on every step; a caller that wants hits
+  in `StepInfo` adds a field later.
+- Ruling R-T3-2 (Task 3): a pass-through belongs to the next *arrival*
+  at its `pc`, not the next step: an interrupt taken in between does not
+  spend it, and the hit is not reported again when the handler returns
+  (pinned by `pass_through_survives_an_interrupt_before_it`).
+  `set_app_hooks` drops a pending pass-through. A soft reset rebuilds the
+  `Cpu`, so it drops the table, any hit and any pass-through; Task 6
+  must install its table on every boot, soft resets included — cost if
+  wrong: if an ISR reaches the same hooked `pc` first, the ISR's call
+  runs the guest code and the interrupted call is hooked again when it
+  resumes.
+- Ruling R-T3-3 (Task 3): `attend` returns whether it reset, and
+  `run_impl` re-derives `stop_at_ticks` only then. Behaviour is
+  unchanged: before Task 3 a reset was the only thing that raised the
+  flag, so the re-derivations happen at the same steps; and a
+  re-derivation without a reset is a pure read of the same clock and
+  `time_base_us` — cost if wrong: none for behaviour (pinned by
+  `an_empty_attend_changes_nothing`).
+- Ruling R-T3-4 (Task 3): `boot::idle_until` is `#[inline(always)]`.
+  Adding the hooks flipped the compiler's choice for it to an
+  out-of-line call before every `run_until` step, 6 to 8 % of native
+  redraw speed by itself — cost if wrong: none for behaviour; a later
+  change that grows `idle_until` grows `run_impl` with it.
+- Ruling R-T3-5 (Task 3): the remaining slowdown, 2.0 to 3.5 % native
+  and 0.6 to 4.8 % in Bun's WASM against `c9d1c42`, is accepted as the
+  cost of the per-step check (seven instructions on AArch64: two load
+  pairs, two subtracts, a compare, a conditional compare and one
+  branch), and
+  no behaviour was changed to chase it — cost if wrong: Snake and the
+  launcher run that much slower in the browser than they could, before
+  any hook table is installed.
 
 ## Replaced rungs
 

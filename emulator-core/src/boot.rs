@@ -308,6 +308,12 @@ pub fn step_with_interrupts(cpu: &mut Cpu, bus: &mut FirmwareBus) -> crate::cpu:
 /// nothing the guest can see: the alarm is reached at the same tick, and
 /// the step that wakes the core is the same step, just taken by the next
 /// run.
+///
+/// Always inlined: `crate::runtime::FirmwareRuntime::run_until` calls it
+/// before every step, and when the compiler's heuristic chose an
+/// out-of-line call instead, native redraws ran 6 to 8 % slower
+/// (Milestone 10 ruling R-T3-4).
+#[inline(always)]
 pub fn idle_until(cpu: &Cpu, bus: &mut FirmwareBus, stop_at_ticks: u64) -> bool {
     if !cpu.is_waiting() || bus.asserted_lines() != 0 {
         return false;
