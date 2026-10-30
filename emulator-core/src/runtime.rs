@@ -98,7 +98,8 @@ use crate::cpu::{exception_code, Cpu, HookHit};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
 use crate::peripherals::spi::{SCREEN_HEIGHT, SCREEN_WIDTH};
-use crate::radio::Radio;
+use crate::radio::hci::Advertisement;
+use crate::radio::{self, Radio};
 
 /// Total number of raw button input slots — 1 direct GPIO (`PIN_START`) plus
 /// the 74HC165's [`crate::peripherals::gpio::HC165_SLOTS`] button bits. See
@@ -541,6 +542,44 @@ impl FirmwareRuntime {
     /// The radio, for tests and diagnostics.
     pub fn radio(&self) -> &Radio {
         &self.radio
+    }
+
+    /// What this badge is advertising now
+    /// ([`crate::radio::hci::HciController::advertisement`]), for the
+    /// host to pass to its linked peers; `None` while no radio app
+    /// advertises.
+    pub fn radio_advertisement(&self) -> Option<Advertisement> {
+        self.radio.controller().advertisement()
+    }
+
+    /// [`FirmwareRuntime::radio_advertisement`] in the peers' wire form
+    /// ([`crate::radio::advertisement_to_bytes`]: `addr(6) ‖ addr_type(1)
+    /// ‖ data`); empty while not advertising.
+    pub fn radio_advertisement_bytes(&self) -> Vec<u8> {
+        self.radio_advertisement()
+            .map(|adv| radio::advertisement_to_bytes(&adv))
+            .unwrap_or_default()
+    }
+
+    /// This badge hears a peer's advertisement at `rssi` dBm (host input;
+    /// a linked peer's is heard at [`radio::LINKED_PEER_RSSI`]). `true` if
+    /// it was queued for the firmware, which then receives it from its
+    /// idle task as the run continues; `false` if no radio app is scanning
+    /// (it is dropped, never held for later), the report is masked or a
+    /// duplicate, or `adv` is malformed ([`Radio::deliver`]).
+    pub fn deliver_advertisement(&mut self, adv: &Advertisement, rssi: i8) -> bool {
+        self.radio.deliver(&mut self.cpu, adv, rssi)
+    }
+
+    /// [`FirmwareRuntime::deliver_advertisement`] from a peer's wire form
+    /// ([`crate::radio::advertisement_from_bytes`]): `false`, changing
+    /// nothing, for malformed bytes (shorter than 7, data over 229 bytes,
+    /// an Address_Type over 3). Never panics, whatever the bytes.
+    pub fn deliver_advertisement_bytes(&mut self, bytes: &[u8], rssi: i8) -> bool {
+        match radio::advertisement_from_bytes(bytes) {
+            Some(adv) => self.deliver_advertisement(&adv, rssi),
+            None => false,
+        }
     }
 }
 
@@ -1167,5 +1206,59 @@ mod tests {
         assert_eq!(rt.emulated_time_us(), clean.emulated_time_us());
         assert_eq!(rt.cpu.regs.read(7), clean.cpu.regs.read(7));
         assert_eq!(rt.soft_reset_count(), 0);
+    }
+
+    /// Review Focus 4: peer bytes from the network. Too short (under the
+    /// 7-byte address header), oversized (data over 229 bytes), a bad
+    /// Address_Type, and a stream of random lengths and bytes are all
+    /// refused with `false`, without a panic, and nothing is queued for
+    /// the firmware. A well-formed advertisement is refused too here: no
+    /// app is scanning, and nothing is held for later.
+    #[test]
+    fn deliver_rejects_malformed_bytes() {
+        use crate::radio::LINKED_PEER_RSSI;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let mut ok = vec![0x02, 0x10, 0, 0, 0, 0xC2, 1];
+        ok.extend_from_slice(&[0x03, 0xFF, 0xFF, 0xFF]);
+        let mut oversized = vec![0u8; 7 + 230];
+        oversized[6] = 1;
+        let mut bad_type = ok.clone();
+        bad_type[6] = 4;
+        for bytes in [
+            &[][..],
+            &[0x02],
+            &ok[..6],
+            &oversized[..],
+            &bad_type[..],
+            &[0xFF; 7][..],
+        ] {
+            assert!(
+                !rt.deliver_advertisement_bytes(bytes, LINKED_PEER_RSSI),
+                "{} bytes",
+                bytes.len()
+            );
+        }
+        // xorshift32: deterministic random lengths (0 to 299) and bytes.
+        let mut x: u32 = 0x1234_5678;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        for _ in 0..2_000 {
+            let len = (next() % 300) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let rssi = next() as i8;
+            assert!(!rt.deliver_advertisement_bytes(&bytes, rssi));
+        }
+        assert!(
+            !rt.deliver_advertisement_bytes(&ok, LINKED_PEER_RSSI),
+            "not scanning: dropped, not queued"
+        );
+        assert!(!rt.radio().controller().has_events());
+        assert_eq!(rt.radio_advertisement(), None);
+        assert!(rt.radio_advertisement_bytes().is_empty());
+        assert_eq!(rt.run(100).steps, 100, "the guest runs on");
     }
 }

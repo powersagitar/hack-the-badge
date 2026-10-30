@@ -207,4 +207,28 @@ impl FirmwareEmulator {
     pub fn set_acceleration(&mut self, x_mg: i32, y_mg: i32, z_mg: i32) {
         self.inner.set_acceleration(x_mg, y_mg, z_mg);
     }
+
+    /// Gives the badge a factory MAC; `false` unless exactly 6 bytes (see
+    /// `FirmwareRuntime::set_factory_mac`: set it before the first run).
+    #[wasm_bindgen(js_name = setFactoryMac)]
+    pub fn set_factory_mac(&mut self, mac: &[u8]) -> bool {
+        self.inner.set_factory_mac(mac)
+    }
+
+    /// What the badge advertises now, as `addr(6) ‖ addr_type(1) ‖ data`;
+    /// empty while not advertising (see
+    /// `FirmwareRuntime::radio_advertisement_bytes`).
+    #[wasm_bindgen(js_name = radioAdvertisement)]
+    pub fn radio_advertisement(&self) -> Vec<u8> {
+        self.inner.radio_advertisement_bytes()
+    }
+
+    /// The badge hears a peer's advertisement (the bytes of the peer's
+    /// `radioAdvertisement`) at `rssi` dBm; `false` if dropped or
+    /// malformed, never a throw (see
+    /// `FirmwareRuntime::deliver_advertisement_bytes`).
+    #[wasm_bindgen(js_name = deliverAdvertisement)]
+    pub fn deliver_advertisement(&mut self, bytes: &[u8], rssi: i8) -> bool {
+        self.inner.deliver_advertisement_bytes(bytes, rssi)
+    }
 }

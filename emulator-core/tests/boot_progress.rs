@@ -48,6 +48,7 @@
 //! in Milestone 9, never on hardware: by the controller as each was
 //! pinned, and bindingly by the human partner at the Task 5 browser gate,
 //! v392 in the emulator beside the v335 badge.
+use emulator_core::radio::{self, LINKED_PEER_RSSI};
 use emulator_core::runtime::FirmwareRuntime;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -2168,22 +2169,30 @@ const RADIO_LAUNCHER_US: u64 = 94_521_615;
 /// Role hacker's launcher, walked with [`HACKER_MAC`] ([`radio_launcher`]).
 static RADIO_LAUNCHER: OnceLock<FirmwareRuntime> = OnceLock::new();
 
-/// Role hacker's launcher with [`HACKER_MAC`] set before provisioning: a
-/// clone of the [`RADIO_LAUNCHER`] checkpoint. The walk passes every frame
-/// assertion of [`launcher_for`]'s, and the radio is untouched on the way.
+/// `role`'s launcher, walked from a [`FIRST_RUN`] clone with `mac` set
+/// before provisioning: the same provisioning and walk as
+/// [`launcher_for`]'s, with every frame assertion on the way, and the
+/// radio untouched (never initialized, no hook hit).
+fn launcher_with_mac(role: &str, mac: &[u8; 6]) -> FirmwareRuntime {
+    let mut rt = first_run_screen();
+    assert!(rt.set_factory_mac(mac));
+    let rt = provisioned_from(rt, role);
+    let (rt, previous) = walk_to_shake_page_from(rt, role);
+    let rt = walk_to_registered_from(rt, previous, role);
+    let rt = walk_to_launcher_from(rt, role);
+    assert_eq!(rt.radio_init_count(), 0, "{role}");
+    assert_eq!(rt.radio().hook_hits(), 0, "{role}");
+    rt
+}
+
+/// Role hacker's launcher with [`HACKER_MAC`] set before provisioning
+/// ([`launcher_with_mac`]): a clone of the [`RADIO_LAUNCHER`] checkpoint.
 fn radio_launcher() -> FirmwareRuntime {
     RADIO_LAUNCHER
         .get_or_init(|| {
-            let mut rt = first_run_screen();
-            assert!(rt.set_factory_mac(&HACKER_MAC));
-            let rt = provisioned_from(rt, OWN_ROLE);
-            let (rt, previous) = walk_to_shake_page_from(rt, OWN_ROLE);
-            let rt = walk_to_registered_from(rt, previous, OWN_ROLE);
-            let rt = walk_to_launcher_from(rt, OWN_ROLE);
+            let rt = launcher_with_mac(OWN_ROLE, &HACKER_MAC);
             assert_eq!(rt.total_steps(), RADIO_LAUNCHER_STEPS);
             assert_eq!(rt.emulated_time_us(), RADIO_LAUNCHER_US);
-            assert_eq!(rt.radio_init_count(), 0);
-            assert_eq!(rt.radio().hook_hits(), 0);
             rt
         })
         .clone()
@@ -2282,46 +2291,50 @@ fn run_until_connect_bands(
 /// Connect opened from [`radio_launcher`] ([`connect_open`]).
 static CONNECT_OPEN: OnceLock<FirmwareRuntime> = OnceLock::new();
 
-/// A on cell 1 of [`radio_launcher`]: Connect opens with the radio up.
-/// Within [`CONNECT_RESPONSE_STEPS`] of A's release its bands
-/// ([`CONNECT_BANDS`]) hold for [`AFTER_PRESS_STABLE_FOR`], and the whole
-/// frame there is [`CONNECT_HOME_HASH`]. The console since A says
-/// `hal_radio: init_once`, then `hal_radio: BLE radio ready`, then
-/// `app_reg: launched Connect`, with nothing from
-/// [`assert_radio_clean`]. No soft reset; the controller was initialized
-/// once. A clone of the [`CONNECT_OPEN`] checkpoint.
+/// A on cell 1 of the launcher `rt` (a launcher walked with a MAC, first
+/// cell selected): Connect opens with the radio up. Within
+/// [`CONNECT_RESPONSE_STEPS`] of A's release its bands ([`CONNECT_BANDS`])
+/// hold for [`AFTER_PRESS_STABLE_FOR`], and the whole frame there is
+/// [`CONNECT_HOME_HASH`]. The console since A says `hal_radio:
+/// init_once`, then `hal_radio: BLE radio ready`, then `app_reg: launched
+/// Connect`, with nothing from [`assert_radio_clean`]. No soft reset; the
+/// controller was initialized once.
+fn open_connect_from(rt: FirmwareRuntime) -> FirmwareRuntime {
+    let (mut rt, before) = press_a_on_cell_from(rt, 1);
+    let skip = connect_bands(rt.framebuffer());
+    let cap = rt.total_steps() + CONNECT_RESPONSE_STEPS;
+    let (bands, step) = run_until_connect_bands(&mut rt, cap, AFTER_PRESS_STABLE_FOR, skip);
+    let hash = framebuffer_fnv1a(rt.framebuffer());
+    assert_eq!(
+        (bands, hash),
+        (CONNECT_BANDS, CONNECT_HOME_HASH),
+        "Connect's home, bands held from step {step}, whole frame at {}",
+        rt.total_steps()
+    );
+    let console = rt.console_output();
+    let since = &console[before..];
+    let init = since
+        .find("hal_radio: init_once")
+        .unwrap_or_else(|| panic!("console since A:\n{since}"));
+    let ready = init
+        + since[init..]
+            .find("hal_radio: BLE radio ready")
+            .unwrap_or_else(|| panic!("console since A:\n{since}"));
+    assert!(
+        since[ready..].contains("app_reg: launched Connect"),
+        "console since A:\n{since}"
+    );
+    assert_radio_clean(&rt, before);
+    assert_eq!(rt.soft_reset_count(), 0);
+    assert_eq!(rt.radio_init_count(), 1);
+    rt
+}
+
+/// [`open_connect_from`] on [`radio_launcher`]: a clone of the
+/// [`CONNECT_OPEN`] checkpoint.
 fn connect_open() -> FirmwareRuntime {
     CONNECT_OPEN
-        .get_or_init(|| {
-            let (mut rt, before) = press_a_on_cell_from(radio_launcher(), 1);
-            let skip = connect_bands(rt.framebuffer());
-            let cap = rt.total_steps() + CONNECT_RESPONSE_STEPS;
-            let (bands, step) = run_until_connect_bands(&mut rt, cap, AFTER_PRESS_STABLE_FOR, skip);
-            let hash = framebuffer_fnv1a(rt.framebuffer());
-            assert_eq!(
-                (bands, hash),
-                (CONNECT_BANDS, CONNECT_HOME_HASH),
-                "Connect's home, bands held from step {step}, whole frame at {}",
-                rt.total_steps()
-            );
-            let console = rt.console_output();
-            let since = &console[before..];
-            let init = since
-                .find("hal_radio: init_once")
-                .unwrap_or_else(|| panic!("console since A:\n{since}"));
-            let ready = init
-                + since[init..]
-                    .find("hal_radio: BLE radio ready")
-                    .unwrap_or_else(|| panic!("console since A:\n{since}"));
-            assert!(
-                since[ready..].contains("app_reg: launched Connect"),
-                "console since A:\n{since}"
-            );
-            assert_radio_clean(&rt, before);
-            assert_eq!(rt.soft_reset_count(), 0);
-            assert_eq!(rt.radio_init_count(), 1);
-            rt
-        })
+        .get_or_init(|| open_connect_from(radio_launcher()))
         .clone()
 }
 
@@ -2582,6 +2595,233 @@ fn no_radio_without_a_radio_app() {
     assert_eq!(rt.radio().hook_hits(), 0);
     assert_eq!(rt.radio_init_count(), 0);
     assert_eq!(rt.total_steps(), HACKER_LAUNCHER_STEPS);
+}
+
+// ---------------------------------------------------------------------
+// Milestone 10, Task 8: two emulated badges pair. Hacker (`…10:01`) and
+// organizer (`…10:02`), each on Connect, run in lockstep in one test:
+// both advance to the same emulated time in 1 ms slices, and after each
+// slice each hears the other's advertisement at `LINKED_PEER_RSSI`, as
+// the browser hub (Task 9) passes them between tabs. The exchange is
+// connectionless (`docs/milestone-10-decisions.md`, "Connect's pairing
+// exchange"): no connection is made, so the advertisements are all that
+// travels.
+// ---------------------------------------------------------------------
+
+/// The fake organizer MAC (common context): obviously fake and locally
+/// administered.
+const ORGANIZER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x10, 0x02];
+/// The organizer badge's role (a committed fake identity,
+/// `provision::identity_fixture`).
+const ORGANIZER_ROLE: &str = "organizer";
+
+/// Total steps at [`organizer_launcher`] (measured on v392). Its own
+/// value: a walk with a different identity and a MAC differs from both
+/// [`HACKER_LAUNCHER_STEPS`] and [`RADIO_LAUNCHER_STEPS`] (ruling R-T4-1).
+const ORGANIZER_LAUNCHER_STEPS: u64 = 342_889_379;
+/// Emulated time at [`organizer_launcher`], in microseconds (measured).
+const ORGANIZER_LAUNCHER_US: u64 = 94_541_620;
+
+/// Role organizer's launcher, walked with [`ORGANIZER_MAC`]
+/// ([`organizer_launcher`]).
+static ORGANIZER_LAUNCHER: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// Role organizer's launcher with [`ORGANIZER_MAC`] set before
+/// provisioning ([`launcher_with_mac`]): a clone of the
+/// [`ORGANIZER_LAUNCHER`] checkpoint.
+fn organizer_launcher() -> FirmwareRuntime {
+    ORGANIZER_LAUNCHER
+        .get_or_init(|| {
+            let rt = launcher_with_mac(ORGANIZER_ROLE, &ORGANIZER_MAC);
+            assert_eq!(rt.total_steps(), ORGANIZER_LAUNCHER_STEPS);
+            assert_eq!(rt.emulated_time_us(), ORGANIZER_LAUNCHER_US);
+            rt
+        })
+        .clone()
+}
+
+/// A bump's acceleration: +1 g along x on top of the face-up rest
+/// (0, 0, +1 g), in mg. Connect's bump detector (v392 `0x4201c994`, fed
+/// by `0x4201d250` from Connect's tick) compares each accelerometer
+/// sample with the one before and reports a bump when the change's
+/// magnitude is over 400 counts (the float `400.0` at `0x3c1551a4`,
+/// compared squared), which at the ±2 g full scale Connect leaves set
+/// is 400 mg; a bump then holds off for 8 samples. A 1,000 mg step is
+/// 2.5 times that threshold and stays inside ±2 g. The ruling is
+/// R-T8-2 in `docs/milestone-10-decisions.md`.
+const BUMP_MG: [i32; 3] = [1000, 0, 1000];
+/// How long a bump holds [`BUMP_MG`]: longer than the longest gap
+/// between two of the detector's samples (Connect samples at its tick,
+/// every 40 to 70 ms, measured), so the pulse is always sampled, and
+/// shorter than its 8-sample hold-off (at least 320 ms), so the return
+/// to rest is not a second bump.
+const BUMP_US: u64 = 100_000;
+
+/// Bumps the badge: [`BUMP_MG`] for [`BUMP_US`], then back to rest,
+/// face up. Distinct from [`shake`] (six alternating ±2 g halves of
+/// 62.5 ms, for the onboarding page): one step on one axis, sampled
+/// once or twice. Task 9 mirrors this shape in TypeScript.
+fn bump(rt: &mut FirmwareRuntime) {
+    rt.set_acceleration(BUMP_MG[0], BUMP_MG[1], BUMP_MG[2]);
+    run_for_us(rt, BUMP_US);
+    rt.set_acceleration(0, 0, 1000);
+}
+
+/// One lockstep slice: both badges run to emulated time `t` (asserting
+/// no fault and that `t` was reached), then each hears the other's
+/// current advertisement, in the peers' wire form, at
+/// [`LINKED_PEER_RSSI`]. Returns whether each delivery was queued (the
+/// first badge's, then the second's).
+fn lockstep_to(a: &mut FirmwareRuntime, b: &mut FirmwareRuntime, t: u64) -> (bool, bool) {
+    for rt in [&mut *a, &mut *b] {
+        let s = rt.run_until(t, HOLD_MAX_STEPS);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        assert!(rt.emulated_time_us() >= t, "{t} us not reached");
+    }
+    let from_a = a.radio_advertisement_bytes();
+    let from_b = b.radio_advertisement_bytes();
+    (
+        a.deliver_advertisement_bytes(&from_b, LINKED_PEER_RSSI),
+        b.deliver_advertisement_bytes(&from_a, LINKED_PEER_RSSI),
+    )
+}
+
+/// Lockstep slices before the bump. On its home Connect neither
+/// advertises nor scans (it stops both, Task 6's trace), so nothing is
+/// heard.
+const LOCKSTEP_WARMUP_MS: u64 = 20;
+
+/// Connect's "SYNCED" screen, the same on both badges: "CONNECT BADGES",
+/// "SYNCED", "Conversation Starters unlocked!", "Contacts: 1", footer as
+/// on its home (measured on v392, checked by eye; saved as
+/// `local/m10-frames/synced-hacker.png` and `synced-organizer.png`).
+const SYNCED_HASH: u64 = 0x7c01_8b7f_3e8e_84e6;
+/// The end of the bump to [`SYNCED_HASH`] on both badges, in lockstep
+/// slices: 93 ms (measured; both contacts are saved by 36 ms); + 25 %,
+/// rounded up to 10 ms.
+const SYNCED_WITHIN_MS: u64 = 120;
+/// How long "SYNCED" may stay before Connect's home returns: shown for
+/// about 3.1 s (measured); a cap, not a pin.
+const SYNCED_SHOWN_MAX_US: u64 = 5_000_000;
+
+/// The console's `uitree` (the LVGL tree's labels), typed into `rt`.
+fn uitree(rt: &mut FirmwareRuntime) -> String {
+    let deadline = rt.total_steps() + 20_000_000;
+    match provision::type_line(rt, "uitree", deadline) {
+        Outcome::Done(text) => text,
+        Outcome::Timeout(text) => panic!("`uitree` timed out:\n{text}"),
+    }
+}
+
+/// Milestone 10's pairing finish line. Hacker and organizer, MACs
+/// `…10:01` and `…10:02`, both on Connect's home ([`open_connect_from`]),
+/// run in lockstep ([`lockstep_to`]) from the same emulated time. On
+/// Connect's home neither advertises nor scans, so nothing is heard.
+/// Then both [`bump`] at the same emulated time, so both scan and
+/// advertise their `BMP2` card from different random addresses; within
+/// [`SYNCED_WITHIN_MS`] of lockstep both show [`SYNCED_HASH`], each has
+/// saved the other's badge ID (`contacts_store: saved contact`), and
+/// `uitree` shows "SYNCED" and "Contacts: 1". "SYNCED" then gives way to
+/// Connect's home ([`CONNECT_BANDS`]) with "Contacts: 1" on each badge.
+/// No panic, no radio failure, and the radio initialized once on each.
+#[test]
+fn two_badges_pair_to_synced() {
+    let mut hacker = connect_open();
+    let mut organizer = open_connect_from(organizer_launcher());
+    let t0 = hacker.emulated_time_us().max(organizer.emulated_time_us());
+    lockstep_to(&mut hacker, &mut organizer, t0);
+    for k in 1..=LOCKSTEP_WARMUP_MS {
+        let heard = lockstep_to(&mut hacker, &mut organizer, t0 + k * 1000);
+        assert_eq!(heard, (false, false), "idle: nothing is heard");
+    }
+    for rt in [&hacker, &organizer] {
+        assert_eq!(rt.radio_advertisement(), None, "idle: not advertising");
+        assert!(rt.radio_advertisement_bytes().is_empty());
+        assert!(!rt.radio().controller().is_scanning(), "idle: not scanning");
+        assert!(!rt.console_output().contains("saved contact"));
+    }
+    let before = [&hacker, &organizer].map(|rt| rt.console_output().len());
+
+    let t_bump = hacker.emulated_time_us();
+    assert_eq!(organizer.emulated_time_us(), t_bump, "same emulated time");
+    bump(&mut hacker);
+    bump(&mut organizer);
+    let addrs = [&hacker, &organizer].map(|rt| {
+        let adv = rt.radio_advertisement().expect("a bump advertises");
+        assert_eq!(
+            radio::advertisement_from_bytes(&rt.radio_advertisement_bytes()),
+            Some(adv.clone()),
+            "the wire form decodes to the advertisement"
+        );
+        assert_eq!(
+            &adv.data[1..8],
+            b"\xff\xff\xffBMP2",
+            "the bump card: {:02x?}",
+            adv.data
+        );
+        assert_eq!(adv.addr_type, 1, "a random address");
+        assert!(rt.radio().controller().is_scanning(), "and scans");
+        adv.addr
+    });
+    assert_ne!(addrs[0], addrs[1], "two badges, two addresses");
+
+    let t1 = hacker.emulated_time_us().max(organizer.emulated_time_us());
+    let mut heard = (0, 0);
+    let mut synced_at = None;
+    for ms in 0..=SYNCED_WITHIN_MS {
+        let (a, b) = lockstep_to(&mut hacker, &mut organizer, t1 + ms * 1000);
+        heard = (heard.0 + u32::from(a), heard.1 + u32::from(b));
+        if [&hacker, &organizer]
+            .iter()
+            .all(|rt| framebuffer_fnv1a(rt.framebuffer()) == SYNCED_HASH)
+        {
+            synced_at = Some(ms);
+            break;
+        }
+    }
+    let at = synced_at.unwrap_or_else(|| {
+        panic!(
+            "not SYNCED within {SYNCED_WITHIN_MS} ms: {:#x} {:#x}\nhacker:\n{}\norganizer:\n{}",
+            framebuffer_fnv1a(hacker.framebuffer()),
+            framebuffer_fnv1a(organizer.framebuffer()),
+            &hacker.console_output()[before[0]..],
+            &organizer.console_output()[before[1]..],
+        )
+    });
+    assert!(
+        heard.0 > 0 && heard.1 > 0,
+        "reports reached both: {heard:?} by {at} ms"
+    );
+
+    for (rt, before, peer) in [
+        (&mut hacker, before[0], "test-fake-badge-0002"),
+        (&mut organizer, before[1], "test-fake-badge-0001"),
+    ] {
+        let console = rt.console_output();
+        assert!(
+            console[before..].contains(&format!("contacts_store: saved contact {peer}")),
+            "console since the bump:\n{}",
+            &console[before..]
+        );
+        let tree = uitree(rt);
+        assert!(tree.contains("text=\"SYNCED\""), "{tree}");
+        assert!(tree.contains("text=\"Contacts: 1\""), "{tree}");
+
+        let cap = rt.emulated_time_us() + SYNCED_SHOWN_MAX_US;
+        while framebuffer_fnv1a(rt.framebuffer()) == SYNCED_HASH {
+            assert!(rt.emulated_time_us() < cap, "SYNCED never left");
+            run_for_us(rt, 10_000);
+        }
+        let cap = rt.total_steps() + CONNECT_RESPONSE_STEPS;
+        let (bands, step) = run_until_connect_bands(rt, cap, AFTER_PRESS_STABLE_FOR, (0, 0));
+        assert_eq!(bands, CONNECT_BANDS, "Connect's home, held from {step}");
+        let tree = uitree(rt);
+        assert!(tree.contains("text=\"Bump badges or"), "{tree}");
+        assert!(tree.contains("text=\"Contacts: 1\""), "{tree}");
+        assert_radio_clean(rt, before);
+        assert_eq!(rt.soft_reset_count(), 0);
+        assert_eq!(rt.radio_init_count(), 1);
+    }
 }
 
 /// A half-open pixel rectangle `[x0, x1) x [y0, y1)`.

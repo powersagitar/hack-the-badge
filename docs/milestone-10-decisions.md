@@ -486,6 +486,94 @@ through `Radio::deliver` (a temporary passthrough, deleted).
 - **Event_Type.** The reports R-T5-4 builds (Event_Type `0x0000`) were
   accepted: the pairing above used them.
 
+### The Task 6 gate: the human partner's answers (2026-10-30)
+
+1. **The Connect and Sync home frames look right**
+   (`local/m10-frames/connect-home.png`, `sync-home.png`,
+   `sync-not-ready.png`).
+2. **Sync's success criterion 3 is amended**: with the committed fake
+   identities, "Badge not ready to sync" is accepted in place of "No
+   sync station in range". Ruling R-T6-5 stands; the empty-room path is
+   in the Milestone 11 backlog.
+3. **Pairing scope is confirmed connectionless.** Task 7 (a connection
+   model) is skipped, and a linked peer is heard at
+   `LINKED_PEER_RSSI = -40` dBm.
+4. **The two-range hook design and its cost are accepted** (ruling
+   R-T3-5). `721f4df` against `c9d1c42`: native 1.7 to 4.4 % slower,
+   Bun's WASM 0.8 to 3.9 % slower
+   (`.superpowers/sdd/2026-10-29-milestone10-badge-radio/bench-721f4df.md`).
+   A cheaper check, or the block cache, is in the Milestone 11 backlog.
+
+### Two badges pair (Task 8)
+
+Measured on v392 in release, with scratch probes (copies of
+`boot_progress.rs`, deleted) and the committed rung
+`two_badges_pair_to_synced`.
+
+- **The organizer badge.** A `FIRST_RUN` clone with MAC `…10:02`,
+  provisioned with the committed fake organizer identity and walked as
+  `launcher_for` walks, reaches the launcher at step 342,889,379 and
+  94,541,620 µs (`ORGANIZER_LAUNCHER_STEPS`, `ORGANIZER_LAUNCHER_US`).
+  Hacker's MAC walk is 342,600,681 steps and 94,521,615 µs. From there
+  A on cell 1 opens Connect. Its bands hold 5,750,000 steps after A's
+  release, the same as hacker's, and the whole frame there is
+  `CONNECT_HOME_HASH`, because Connect's home shows no name.
+- **Connect's home neither advertises nor scans.** Over 3 s on the open
+  Connect, `radio_advertisement()` stayed `None`. Task 6's trace shows
+  the home stopping both (`0x2042` disable, `0x2039` disable, `0x203C`).
+  The radio starts only on A or a bump. In the Task 6 probe, the idle
+  payload `03 ff ff ff` appeared 32 ms into an A hold, and the `BPA1`
+  card 6 ms later.
+- **The bump detector.**
+  - Connect's tick (`0x4201eff8`) calls `0x4201d250`, which
+    reads the accelerometer directly (`0x4200ae2e`, under its mutex,
+    `0x4200a9f2`: OUT_X..OUT_Z as `(i16)(H << 8 | L) >> 4` counts,
+    converted to float, no scaling).
+  - It passes the sample to `0x4201c994`, with the threshold
+    `400.0f32` from `0x3c1551a4` and a hold-off of 8.
+  - `0x4201c994` keeps the previous sample (state at Connect + `0x1e4`;
+    the first sample only primes it). It reports a bump when the squared
+    change between two consecutive samples is greater than the squared
+    threshold and no hold-off is running, and then starts the 8-sample
+    hold-off.
+  - At the ±2 g full scale the firmware sets (`0x4200acb6` writes
+    `0x80` to `CTRL_REG4`, `0x23`, through `0x4200aab4`), a
+    count is 1 mg, so a bump is a change of **more than 400 mg** between
+    samples. A 400 mg step never bumped; a (300, 300, 0) mg step
+    (424 mg) did.
+  - A bump with the radio up sets a 1,000,000 µs card window (Connect +
+    `0x210`, `lui a4, 0xf4; addi a4, a4, 0x240` at `0x4201f1ce`), and
+    the badge advertises the bare `BMP2` card while scanning.
+  - `rssi_min` and `threshold_mg` are Chess's keys, as Task 6 read.
+    Connect reads neither.
+- **The sample rate.** Connect samples at its tick. Over 2 s idle, the
+  gaps between samples were 40, 50, 60 and 70 ms, in runs (21 samples
+  in 1 s).
+  - A step held for H ms bumped only when a sample fell inside it: from
+    20 phase offsets 2 ms apart, 1 ms caught 0, 4 ms caught 2, 20 ms
+    caught 10, 30 ms caught 15, and 40 ms or more caught 20.
+  - The first sample inside the step reports the bump. The return to
+    rest falls in the hold-off, at least 8 × 40 ms = 320 ms.
+  - This most likely explains why Task 6's lockstep shake of four 4 ms
+    halves did not bump. A 16 ms pulse contains a sample only about a
+    third of the time, and that run's phase had none.
+- **The pulse chosen** (ruling R-T8-2): +1,000 mg on x, on top of the
+  face-up rest (0, 0, +1,000), for 100 ms, then rest.
+  - Both badges were bumped from the same emulated time, 20 ms into
+    lockstep. Both advertised their `BMP2` card by the end of the pulse.
+  - With 1 ms lockstep slices after it, each had saved the other's
+    badge ID 36 ms later (`contacts_store: saved contact
+    test-fake-badge-0002` / `-0001`). Both showed "SYNCED" (one frame,
+    `SYNCED_HASH = 0x7c01_8b7f_3e8e_84e6`, the same on both badges) 93 ms
+    after the pulse.
+  - "SYNCED" stayed about 3.1 s. Connect's home then returned with
+    "Contacts: 1" and "Conversation Starters unlocked!" on each badge.
+  - Both holding A (no bump) paired too, as in Task 6. The contacts
+    were saved about 120 to 130 ms into the hold (console timestamps).
+    Both badges showed `SYNCED_HASH` from about 210 ms.
+  - Both bumping with the swaps running during the pulse also paired:
+    the contacts were saved at 85 ms after the pulse began.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -753,6 +841,67 @@ through `Radio::deliver` (a temporary passthrough, deleted).
   `mac_addr.c` lines 17 and 392 to 396), in HCI byte order; the
   firmware advertises from its random address, so nothing shows it —
   cost if wrong: none visible; one function.
+- Ruling R-T8-1 (Task 8, `feat: two emulated badges pair to SYNCED`):
+  the radio host API. `LINKED_PEER_RSSI` is `-40` dBm, approved by the
+  human partner at the Task 6 gate. It lives in `emulator_core::radio`,
+  and its doc cites Connect's −64 dBm gate (`0x4201ed4e`, `li a4,
+  -0x40`). The peers' wire form is `addr(6) ‖ addr_type(1) ‖ data`,
+  with `addr` in HCI byte order as `Advertisement` holds it, encoded
+  and decoded in `emulator_core::radio` (`advertisement_to_bytes`,
+  `advertisement_from_bytes`, `ADVERTISEMENT_HEADER_LEN`). The decoder
+  rejects fewer than 7 bytes, more than 229 data bytes and an
+  Address_Type over 3, and nothing else, so validation stays in one
+  place. `FirmwareRuntime` gains `radio_advertisement`,
+  `radio_advertisement_bytes` (empty while not advertising),
+  `deliver_advertisement` and `deliver_advertisement_bytes`. The wasm
+  passthroughs are one line each and named in the shim's camelCase
+  style: `radioAdvertisement()`, `deliverAdvertisement(bytes, rssi)`
+  and `setFactoryMac(mac)` — cost if wrong: Task 9 calls these three
+  names; a rename touches only the shim and `bridge.ts`.
+- Ruling R-T8-2 (Task 8): the bump pulse, mirrored by Task 9 in
+  TypeScript, is +1,000 mg on x on top of the face-up rest, (1000, 0,
+  1000) mg, held for 100 ms, then back to (0, 0, 1000). It is chosen
+  from Connect's detector, not from `threshold_mg` (Chess's key, 300).
+  The detector reports a change of more than 400 mg between two
+  consecutive samples (measurements above). 1,000 mg is 2.5 times that
+  and inside the ±2 g full scale. 100 ms is longer than the longest gap
+  between samples (70 ms, measured), so every phase is sampled. It is
+  shorter than the 8-sample hold-off (at least 320 ms), so the return
+  to rest is not a second bump. It differs from `shake`, which is six
+  alternating ±2 g halves of 62.5 ms. Measured with 500 and 1,000 mg
+  steps: every hold of 40 ms or more bumped at all 20 phase offsets
+  tried (0 to 38 ms) — cost if wrong: on a firmware
+  whose tick slows below one sample per 100 ms, a bump is sometimes
+  missed. Task 9's user then bumps again, and the pairing rung fails
+  first.
+- Ruling R-T8-3 (Task 8): `two_badges_pair_to_synced` pairs by bump,
+  not by holding A, because the bump is now reliable. `bump(rt)` is a
+  blocking pulse, run on each badge in turn from the same emulated
+  time. The two advertisements are therefore swapped only after the
+  pulse, at its end (one 100 ms slice), and then in 1 ms lockstep
+  slices. Task 9's hub posts each change at once (R-PF-3), so in the
+  browser the cards arrive sooner than in the rung. A probe with swaps
+  every 1 ms during the pulse paired as well. The rung pins
+  the "SYNCED" frame by its whole hash, since it holds still for about
+  3.1 s. It pins the home after it by Connect's bands plus `uitree`
+  ("Contacts: 1"), since the home animates (R-T6-6) — cost if wrong: a
+  pairing that only works with reports arriving during the pulse is
+  not exercised, and the hold-A path is covered only by Task 6's
+  probe.
+- Ruling R-T8-4 (Task 8): the organizer badge has its own checkpoint,
+  `ORGANIZER_LAUNCHER`, walked by the shared `launcher_with_mac(role,
+  mac)` (now also behind `RADIO_LAUNCHER`, unchanged) and pinned at its
+  own measured `ORGANIZER_LAUNCHER_STEPS` and `ORGANIZER_LAUNCHER_US`.
+  Connect opens through the shared `open_connect_from(rt)` (now also
+  behind `CONNECT_OPEN`, unchanged). That function asserts the same
+  `CONNECT_BANDS` and `CONNECT_HOME_HASH`, measured identical for the
+  organizer, within the same `CONNECT_RESPONSE_STEPS` budget (a cap,
+  not a step pin; both open in 5.75M steps). The runtime test hook
+  id 1 in `runtime.rs` (`hooked_count_loop`), which collides with the
+  radio's `HOOK_INIT`, is left as it was. Changing it to an id the
+  radio does not know would trip the radio's `debug_assert` in debug
+  builds — cost if wrong: if Connect's home ever shows the identity,
+  the organizer's open fails on the hash and needs its own pin.
 
 ## Replaced rungs
 
@@ -763,3 +912,15 @@ through `Radio::deliver` (a temporary passthrough, deleted).
 | `run_to_the_bluetooth_fault` (helper, with `BLUETOOTH_ROM_FAULT_PC` and `BLUETOOTH_ROM_FAULT_MEPC`) | Used only by the two rungs above; nothing reaches the fault any more. |
 
 ## Milestone 11 backlog
+
+- **Sync's empty-room path** ("No sync station in range"). Sync checks
+  an NVS upload credential (`badge_upload` / `credential`) before it
+  looks for a station (ruling R-T6-5). Reaching that screen needs a fake
+  credential typed through `badge_token set`, cleared with the
+  organizers like the fake identities. It also needs a ROM `crc32_le`
+  stub (`0x4000_0628`) for the NVS write.
+- **A cheaper hook check, or the block cache.** The two-range check
+  costs 1.7 to 4.4 % natively and 0.8 to 3.9 % in Bun's WASM
+  (`721f4df` against `c9d1c42`), accepted at the Task 6 gate. A block
+  cache (shelved in Milestone 8) would test the hook ranges once per
+  block, not once per step.

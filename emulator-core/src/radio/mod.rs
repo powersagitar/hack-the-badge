@@ -322,6 +322,54 @@ impl Radio {
     }
 }
 
+/// The RSSI, in dBm, at which a linked peer's advertisements are heard:
+/// a fixed strong signal, as from a badge held next to this one (the
+/// human partner approved −40 at the Task 6 gate, 2026-10-30).
+///
+/// It must be at least −64 dBm, Connect's proximity gate in v392. The
+/// receive loop at `0x4201ed4e` drops a report whose RSSI is below −64
+/// (`li a4, -0x40; blt a5, a4`), and a two-badge probe paired at −64 but
+/// not at −65 (`docs/milestone-10-decisions.md`, "Connect's pairing
+/// exchange"). The `rssi_min` key (default −60) is Chess's, not Connect's.
+pub const LINKED_PEER_RSSI: i8 = -40;
+
+/// The length of the address header in [`advertisement_to_bytes`]'s wire
+/// form: the address (6 bytes) and its type (1 byte).
+pub const ADVERTISEMENT_HEADER_LEN: usize = 7;
+
+/// An advertisement as bytes for a peer: `addr(6) ‖ addr_type(1) ‖ data`,
+/// `addr` in HCI (little-endian) byte order, as [`hci::Advertisement`]
+/// holds it. The host passes these bytes between badges unchanged.
+pub fn advertisement_to_bytes(adv: &Advertisement) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(ADVERTISEMENT_HEADER_LEN + adv.data.len());
+    bytes.extend_from_slice(&adv.addr);
+    bytes.push(adv.addr_type);
+    bytes.extend_from_slice(&adv.data);
+    bytes
+}
+
+/// The inverse of [`advertisement_to_bytes`], for bytes from a peer (the
+/// network): `None` for anything malformed, never a panic. Malformed is
+/// shorter than [`ADVERTISEMENT_HEADER_LEN`], data over
+/// [`hci::MAX_ADV_DATA_LEN`], or an Address_Type over 3 (7.7.65.13).
+pub fn advertisement_from_bytes(bytes: &[u8]) -> Option<Advertisement> {
+    if bytes.len() < ADVERTISEMENT_HEADER_LEN {
+        return None;
+    }
+    let (header, data) = bytes.split_at(ADVERTISEMENT_HEADER_LEN);
+    let addr_type = header[6];
+    if data.len() > hci::MAX_ADV_DATA_LEN || addr_type > 3 {
+        return None;
+    }
+    let mut addr = [0; 6];
+    addr.copy_from_slice(&header[..6]);
+    Some(Advertisement {
+        addr,
+        addr_type,
+        data: data.to_vec(),
+    })
+}
+
 /// The bt.c seam (module doc), plus the idle hook if `idle`.
 fn table(idle: bool) -> AppHookTable {
     let mut table = AppHookTable::new();
@@ -630,6 +678,49 @@ mod tests {
             (1, 0x0E),
             "the first reply after the reset"
         );
+    }
+
+    /// The wire form for peers (`addr(6) ‖ addr_type(1) ‖ data`): an
+    /// advertisement survives the round trip, and a decoded one reaches a
+    /// scanning host like the original; anything too short, with data
+    /// over [`hci::MAX_ADV_DATA_LEN`] or an Address_Type over 3 decodes to
+    /// nothing.
+    #[test]
+    fn advertisement_bytes_round_trip_and_reject_malformed() {
+        let adv = peer();
+        let bytes = advertisement_to_bytes(&adv);
+        assert_eq!(
+            bytes,
+            [0x02, 0x10, 0, 0, 0, 0xC2, 1, 0x03, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(advertisement_from_bytes(&bytes), Some(adv.clone()));
+        let empty = hci::Advertisement {
+            addr: [1, 2, 3, 4, 5, 6],
+            addr_type: 0,
+            data: Vec::new(),
+        };
+        assert_eq!(
+            advertisement_from_bytes(&advertisement_to_bytes(&empty)),
+            Some(empty)
+        );
+        let mut max = vec![0u8; 7 + hci::MAX_ADV_DATA_LEN];
+        max[6] = 3;
+        assert!(advertisement_from_bytes(&max).is_some());
+        max.push(0);
+        assert_eq!(advertisement_from_bytes(&max), None, "230 bytes of data");
+        assert_eq!(advertisement_from_bytes(&bytes[..6]), None);
+        assert_eq!(advertisement_from_bytes(&[]), None);
+        let mut bad = bytes.clone();
+        bad[6] = 4;
+        assert_eq!(advertisement_from_bytes(&bad), None);
+
+        let mut g = Guest::new();
+        g.bring_up();
+        g.start_scanning();
+        let decoded = advertisement_from_bytes(&bytes).unwrap();
+        assert!(g.radio.deliver(&mut g.cpu, &decoded, LINKED_PEER_RSSI));
+        g.call(v392::ESP_V_APPLICATION_IDLE_HOOK, 0, 0);
+        assert_eq!(g.reg(T4), 0x3E, "LE Meta");
     }
 
     /// The BD_ADDR is `esp_read_mac(ESP_MAC_BT)`'s, in HCI byte order.
