@@ -23,7 +23,11 @@
 //! friends) sit in ESP-IDF's `nimble` submodule, which does not resolve
 //! through `raw.githubusercontent.com/espressif/esp-idf/v5.5.3/…`, so the
 //! command set is the task brief's list and nothing NimBLE-specific is
-//! assumed beyond it. Task 6's command trace on v392 adds what it finds.
+//! assumed beyond it. Task 6's command trace on v392 (Connect and Sync
+//! opening, `docs/milestone-10-decisions.md`) added LE Rand, LE Set Address
+//! Resolution Enable, LE Clear Resolving List, LE Add Device To Resolving
+//! List, LE Set Privacy Mode and LE Remove Advertising Set: with those, the
+//! firmware gets no Unknown HCI Command reply.
 //!
 //! - **Framing.** Vol 4 Part A (UART transport) 2: H4 packet indicators
 //!   `0x01` command, `0x02` ACL, `0x03` SCO, `0x04` event, `0x05` ISO.
@@ -63,6 +67,10 @@
 //! | `0x2002` | LE Read Buffer Size [v1] | CC: Status, length, count | 7.8.2 |
 //! | `0x2003` | LE Read Local Supported Features | CC: Status, LE features | 7.8.3 |
 //! | `0x2005` | LE Set Random Address | CC: Status | 7.8.4 |
+//! | `0x2018` | LE Rand | CC: Status, Random_Number (8) | 7.8.23 |
+//! | `0x2027` | LE Add Device To Resolving List | CC: Status | 7.8.38 |
+//! | `0x2029` | LE Clear Resolving List | CC: Status | 7.8.40 |
+//! | `0x202D` | LE Set Address Resolution Enable | CC: Status | 7.8.44 |
 //! | `0x2035` | LE Set Advertising Set Random Address | CC: Status | 7.8.52 |
 //! | `0x2036` | LE Set Extended Advertising Parameters [v1] | CC: Status, Selected_TX_Power | 7.8.53 |
 //! | `0x2037` | LE Set Extended Advertising Data | CC: Status | 7.8.54 |
@@ -70,8 +78,10 @@
 //! | `0x2039` | LE Set Extended Advertising Enable | CC: Status | 7.8.56 |
 //! | `0x203A` | LE Read Maximum Advertising Data Length | CC: Status, length | 7.8.57 |
 //! | `0x203B` | LE Read Number of Supported Advertising Sets | CC: Status, count | 7.8.58 |
+//! | `0x203C` | LE Remove Advertising Set | CC: Status | 7.8.59 |
 //! | `0x2041` | LE Set Extended Scan Parameters | CC: Status | 7.8.64 |
 //! | `0x2042` | LE Set Extended Scan Enable | CC: Status | 7.8.65 |
+//! | `0x204E` | LE Set Privacy Mode | CC: Status | 7.8.77 |
 //! | any other | — | CC: Unknown HCI Command (`0x01`) | 4.5 |
 //!
 //! ## What it reports about itself
@@ -93,8 +103,11 @@
 //! Advertising Set Terminated / Scan Timeout events), PHYs other than LE
 //! 1M, filter accept lists (the filter policies are validated, then
 //! ignored), privacy and resolvable addresses (own address types 2 and 3
-//! act as 0 and 1), scan requests and responses (scan response data is
-//! stored, never sent), connections and ACL.
+//! act as 0 and 1; the resolving list keeps identities only, so LE Set
+//! Privacy Mode can answer by membership, and nothing resolves), scan
+//! requests and responses (scan response data is stored, never sent),
+//! connections and ACL. LE Rand is deterministic (splitmix64 over a
+//! per-BD_ADDR seed, restarted by Reset), as every emulator input is.
 
 use std::collections::VecDeque;
 
@@ -116,6 +129,9 @@ pub const ACL_PACKET_COUNT: u8 = 4;
 /// remembers; the oldest is forgotten first, as in a real controller's
 /// finite filter.
 pub const DUPLICATE_FILTER_LEN: usize = 64;
+/// The resolving list's capacity (7.8.38: Memory Capacity Exceeded past
+/// it). NimBLE adds one entry, its own identity.
+pub const RESOLVING_LIST_LEN: usize = 8;
 
 pub const SET_EVENT_MASK: u16 = 0x0C01;
 pub const RESET: u16 = 0x0C03;
@@ -129,6 +145,10 @@ pub const LE_SET_EVENT_MASK: u16 = 0x2001;
 pub const LE_READ_BUFFER_SIZE: u16 = 0x2002;
 pub const LE_READ_LOCAL_SUPPORTED_FEATURES: u16 = 0x2003;
 pub const LE_SET_RANDOM_ADDR: u16 = 0x2005;
+pub const LE_RAND: u16 = 0x2018;
+pub const LE_ADD_DEVICE_TO_RESOLVING_LIST: u16 = 0x2027;
+pub const LE_CLEAR_RESOLVING_LIST: u16 = 0x2029;
+pub const LE_SET_ADDR_RESOLUTION_ENABLE: u16 = 0x202D;
 pub const LE_SET_ADV_SET_RANDOM_ADDR: u16 = 0x2035;
 pub const LE_SET_EXT_ADV_PARAMS: u16 = 0x2036;
 pub const LE_SET_EXT_ADV_DATA: u16 = 0x2037;
@@ -136,8 +156,10 @@ pub const LE_SET_EXT_SCAN_RSP_DATA: u16 = 0x2038;
 pub const LE_SET_EXT_ADV_ENABLE: u16 = 0x2039;
 pub const LE_READ_MAX_ADV_DATA_LEN: u16 = 0x203A;
 pub const LE_READ_NUM_SUPPORTED_ADV_SETS: u16 = 0x203B;
+pub const LE_REMOVE_ADV_SET: u16 = 0x203C;
 pub const LE_SET_EXT_SCAN_PARAMS: u16 = 0x2041;
 pub const LE_SET_EXT_SCAN_ENABLE: u16 = 0x2042;
+pub const LE_SET_PRIVACY_MODE: u16 = 0x204E;
 
 /// H4 packet indicators (Vol 4 Part A 2).
 const H4_COMMAND: u8 = 0x01;
@@ -149,6 +171,7 @@ const SUBEVT_EXT_ADV_REPORT: u8 = 0x0D;
 /// Error codes (Vol 1 Part F 1.3).
 const SUCCESS: u8 = 0x00;
 const UNKNOWN_COMMAND: u8 = 0x01;
+const UNKNOWN_CONNECTION: u8 = 0x02;
 const MEMORY_CAPACITY_EXCEEDED: u8 = 0x07;
 const COMMAND_DISALLOWED: u8 = 0x0C;
 const INVALID_PARAMETERS: u8 = 0x12;
@@ -185,7 +208,7 @@ const EXT_ADV_REPORT_HEADER: usize = 26;
 
 /// The `(octet, bit)` of every command in the table above, in 6.27's
 /// Supported Commands mask.
-const SUPPORTED_COMMANDS: [(usize, u8); 20] = [
+const SUPPORTED_COMMANDS: [(usize, u8); 26] = [
     (5, 6),  // Set Event Mask
     (5, 7),  // Reset
     (14, 3), // Read Local Version Information
@@ -197,6 +220,10 @@ const SUPPORTED_COMMANDS: [(usize, u8); 20] = [
     (25, 1), // LE Read Buffer Size [v1]
     (25, 2), // LE Read Local Supported Features
     (25, 4), // LE Set Random Address
+    (27, 7), // LE Rand
+    (34, 3), // LE Add Device To Resolving List
+    (34, 5), // LE Clear Resolving List
+    (35, 1), // LE Set Address Resolution Enable
     (36, 1), // LE Set Advertising Set Random Address
     (36, 2), // LE Set Extended Advertising Parameters
     (36, 3), // LE Set Extended Advertising Data
@@ -204,8 +231,10 @@ const SUPPORTED_COMMANDS: [(usize, u8); 20] = [
     (36, 5), // LE Set Extended Advertising Enable
     (36, 6), // LE Read Maximum Advertising Data Length
     (36, 7), // LE Read Number of Supported Advertising Sets
+    (37, 0), // LE Remove Advertising Set
     (37, 5), // LE Set Extended Scan Parameters
     (37, 6), // LE Set Extended Scan Enable
+    (39, 2), // LE Set Privacy Mode
 ];
 
 /// An advertisement on the air: what the firmware's controller sends
@@ -269,6 +298,15 @@ pub struct HciController {
     filter_duplicates: bool,
     seen: VecDeque<Advertisement>,
     events: VecDeque<QueuedEvent>,
+    /// LE Rand's generator state (7.8.23), seeded from the BD_ADDR.
+    rand_state: u64,
+    /// LE Set Address Resolution Enable's value. It only gates the
+    /// resolving-list commands (7.8.38, 7.8.40, 7.8.77): nothing resolves,
+    /// since privacy is not modeled.
+    addr_resolution: bool,
+    /// The resolving list's identities, (address type, address); the IRKs
+    /// are not kept.
+    resolving_list: Vec<(u8, [u8; 6])>,
 }
 
 impl HciController {
@@ -288,6 +326,9 @@ impl HciController {
             filter_duplicates: false,
             seen: VecDeque::new(),
             events: VecDeque::new(),
+            rand_state: rand_seed(public_addr),
+            resolving_list: Vec::new(),
+            addr_resolution: false,
         }
     }
 
@@ -318,6 +359,11 @@ impl HciController {
     /// parameter length, parameters.
     pub fn pop_event(&mut self) -> Option<Vec<u8>> {
         self.events.pop_front().map(|e| e.bytes)
+    }
+
+    /// Whether an event is waiting for the host ([`Self::pop_event`]).
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
     }
 
     /// What the controller is advertising: the lowest-handle set that is
@@ -484,6 +530,37 @@ impl HciController {
                 self.random_addr = Some(addr);
                 status(SUCCESS)
             }
+            LE_RAND => {
+                // 7.8.23 asks for a random number from the controller's
+                // generator; the emulator's must be deterministic (D-M5-3's
+                // reasoning), so it is splitmix64 over a per-controller
+                // seed, restarted by Reset.
+                let state = &mut self.rand_state;
+                read(p, || splitmix64(state).to_le_bytes().to_vec())
+            }
+            LE_ADD_DEVICE_TO_RESOLVING_LIST | LE_CLEAR_RESOLVING_LIST | LE_SET_PRIVACY_MODE => {
+                self.resolving_list_command(opcode, p)
+            }
+            LE_REMOVE_ADV_SET => {
+                let [handle] = p else {
+                    return status(INVALID_PARAMETERS);
+                };
+                match self.adv_sets.iter().position(|s| s.handle == *handle) {
+                    None => status(UNKNOWN_ADV_IDENTIFIER),
+                    Some(i) if self.adv_sets[i].enabled => status(COMMAND_DISALLOWED),
+                    Some(i) => {
+                        self.adv_sets.remove(i);
+                        status(SUCCESS)
+                    }
+                }
+            }
+            LE_SET_ADDR_RESOLUTION_ENABLE => match p {
+                [enable @ (0 | 1)] => {
+                    self.addr_resolution = *enable == 1;
+                    status(SUCCESS)
+                }
+                _ => status(INVALID_PARAMETERS),
+            },
             LE_SET_ADV_SET_RANDOM_ADDR => {
                 let [handle, a @ ..] = p else {
                     return status(INVALID_PARAMETERS);
@@ -510,6 +587,47 @@ impl HciController {
             LE_SET_EXT_SCAN_PARAMS => self.set_ext_scan_params(p),
             LE_SET_EXT_SCAN_ENABLE => self.set_ext_scan_enable(p),
             _ => status(UNKNOWN_COMMAND),
+        }
+    }
+
+    /// 7.8.38 LE Add Device To Resolving List (identity address type 0 or
+    /// 1, address, peer IRK, local IRK: 39 octets), 7.8.40 LE Clear
+    /// Resolving List (none) and 7.8.77 LE Set Privacy Mode (identity
+    /// address type, address, mode 0 or 1: 8 octets). All three are
+    /// disallowed while address resolution is on and advertising or
+    /// scanning is. The list holds identities only: nothing resolves,
+    /// since privacy is not modeled (R-T5-8).
+    fn resolving_list_command(&mut self, opcode: u16, p: &[u8]) -> Vec<u8> {
+        let well_formed = match opcode {
+            LE_CLEAR_RESOLVING_LIST => p.is_empty(),
+            LE_ADD_DEVICE_TO_RESOLVING_LIST => p.len() == 39 && p[0] <= 1,
+            _ => p.len() == 8 && p[0] <= 1 && p[7] <= 1,
+        };
+        if !well_formed {
+            return status(INVALID_PARAMETERS);
+        }
+        let busy = self.scanning || self.adv_sets.iter().any(|s| s.enabled);
+        if self.addr_resolution && busy {
+            return status(COMMAND_DISALLOWED);
+        }
+        if opcode == LE_CLEAR_RESOLVING_LIST {
+            self.resolving_list.clear();
+            return status(SUCCESS);
+        }
+        let mut addr = [0u8; 6];
+        addr.copy_from_slice(&p[1..7]);
+        let listed = self.resolving_list.contains(&(p[0], addr));
+        match opcode {
+            LE_ADD_DEVICE_TO_RESOLVING_LIST if listed => status(INVALID_PARAMETERS),
+            LE_ADD_DEVICE_TO_RESOLVING_LIST if self.resolving_list.len() >= RESOLVING_LIST_LEN => {
+                status(MEMORY_CAPACITY_EXCEEDED)
+            }
+            LE_ADD_DEVICE_TO_RESOLVING_LIST => {
+                self.resolving_list.push((p[0], addr));
+                status(SUCCESS)
+            }
+            _ if listed => status(SUCCESS),
+            _ => status(UNKNOWN_CONNECTION),
         }
     }
 
@@ -717,6 +835,24 @@ fn read(p: &[u8], f: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
     let mut r = status(SUCCESS);
     r.extend(f());
     r
+}
+
+/// LE Rand's seed: the BD_ADDR, so two controllers differ and one
+/// repeats.
+fn rand_seed(addr: [u8; 6]) -> u64 {
+    let mut b = [0u8; 8];
+    b[..6].copy_from_slice(&addr);
+    u64::from_le_bytes(b) ^ 0x4C45_5F52_414E_4421
+}
+
+/// splitmix64 (Steele, Lea and Flood, "Fast splittable pseudorandom
+/// number generators", 2014): one step of LE Rand's generator.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[cfg(test)]
@@ -1114,8 +1250,14 @@ mod tests {
         }
     }
 
-    const KNOWN: [u16; 21] = [
+    const KNOWN: [u16; 27] = [
         RESET,
+        LE_SET_PRIVACY_MODE,
+        LE_ADD_DEVICE_TO_RESOLVING_LIST,
+        LE_CLEAR_RESOLVING_LIST,
+        LE_REMOVE_ADV_SET,
+        LE_RAND,
+        LE_SET_ADDR_RESOLUTION_ENABLE,
         SET_EVENT_MASK,
         SET_EVENT_MASK_PAGE_2,
         READ_LOCAL_VERSION,
@@ -1137,6 +1279,184 @@ mod tests {
         LE_SET_EXT_SCAN_PARAMS,
         LE_SET_EXT_SCAN_ENABLE,
     ];
+
+    /// Task 6's trace: NimBLE's startup asks for 8 random octets (LE Rand,
+    /// for its local IRK) right after Read BD_ADDR. The answer is
+    /// deterministic for a given BD_ADDR and number of calls, changes from
+    /// call to call, and starts over after Reset.
+    #[test]
+    fn le_rand_returns_eight_deterministic_octets() {
+        let mut c = HciController::new(PUBLIC);
+        let first = send_ok(&mut c, LE_RAND, &[]);
+        assert_eq!(first.len(), 9, "Status + Random_Number[8]");
+        let second = send_ok(&mut c, LE_RAND, &[]);
+        assert_ne!(first, second, "a new number each call");
+        let mut twin = HciController::new(PUBLIC);
+        assert_eq!(send_ok(&mut twin, LE_RAND, &[]), first, "deterministic");
+        send_ok(&mut c, RESET, &[]);
+        assert_eq!(send_ok(&mut c, LE_RAND, &[]), first, "Reset starts over");
+        let mut other = HciController::new(PEER);
+        assert_ne!(send_ok(&mut other, LE_RAND, &[]), first, "per controller");
+        assert_eq!(send(&mut c, LE_RAND, &[0])[..], [INVALID_PARAMETERS]);
+    }
+
+    /// Task 6's trace: NimBLE's startup turns address resolution off
+    /// (`0x202D`, Address_Resolution_Enable `0x00`). Privacy is not
+    /// modeled (R-T5-8): both values succeed, anything else is invalid.
+    #[test]
+    fn le_set_address_resolution_enable_accepts_on_and_off() {
+        let mut c = HciController::new(PUBLIC);
+        assert_eq!(send(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, &[0]), [SUCCESS]);
+        assert_eq!(send(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, &[1]), [SUCCESS]);
+        for bad in [&[2u8][..], &[], &[0, 0]] {
+            assert_eq!(
+                send(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, bad),
+                [INVALID_PARAMETERS],
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Task 6's trace: NimBLE's startup clears the resolving list
+    /// (`0x2029`) after turning address resolution off. Privacy is not
+    /// modeled, so the list is always empty; 7.8.40 disallows the command
+    /// only while address resolution is on and advertising or scanning is.
+    #[test]
+    fn le_clear_resolving_list_succeeds_unless_resolution_is_busy() {
+        let mut c = HciController::new(PUBLIC);
+        assert_eq!(send(&mut c, LE_CLEAR_RESOLVING_LIST, &[]), [SUCCESS]);
+        assert_eq!(
+            send(&mut c, LE_CLEAR_RESOLVING_LIST, &[0]),
+            [INVALID_PARAMETERS]
+        );
+        send_ok(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, &[1]);
+        start_advertising(&mut c, &[0x02, 0x01, 0x06]);
+        assert_eq!(
+            send(&mut c, LE_CLEAR_RESOLVING_LIST, &[]),
+            [COMMAND_DISALLOWED]
+        );
+        send_ok(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, &[0]);
+        assert_eq!(send(&mut c, LE_CLEAR_RESOLVING_LIST, &[]), [SUCCESS]);
+    }
+
+    /// Task 6's trace: Connect's home screen stops advertising and removes
+    /// its set (`0x203C`, handle 0). 7.8.59: an unknown handle is Unknown
+    /// Advertising Identifier, an enabled set is Command Disallowed, and a
+    /// removed set no longer advertises or accepts data.
+    #[test]
+    fn le_remove_advertising_set_removes_a_disabled_set() {
+        let mut c = HciController::new(PUBLIC);
+        assert_eq!(
+            send(&mut c, LE_REMOVE_ADV_SET, &[0]),
+            [UNKNOWN_ADV_IDENTIFIER]
+        );
+        start_advertising(&mut c, &[0x02, 0x01, 0x06]);
+        assert_eq!(send(&mut c, LE_REMOVE_ADV_SET, &[0]), [COMMAND_DISALLOWED]);
+        assert!(c.advertisement().is_some());
+        send_ok(&mut c, LE_SET_EXT_ADV_ENABLE, &[0, 1, 0, 0, 0, 0]);
+        assert_eq!(send(&mut c, LE_REMOVE_ADV_SET, &[0]), [SUCCESS]);
+        assert_eq!(c.advertisement(), None);
+        assert_eq!(
+            send(
+                &mut c,
+                LE_SET_EXT_ADV_DATA,
+                &adv_data(0, &[0x02, 0x01, 0x06])
+            ),
+            [UNKNOWN_ADV_IDENTIFIER]
+        );
+        assert_eq!(send(&mut c, LE_REMOVE_ADV_SET, &[]), [INVALID_PARAMETERS]);
+        // The handle is free again.
+        send_ok(&mut c, LE_SET_EXT_ADV_PARAMS, &adv_params(0, 1));
+    }
+
+    /// Task 6's trace: with address resolution on, NimBLE adds its own
+    /// identity and IRK to the resolving list (`0x2027`, 39 parameter
+    /// octets). Privacy is not modeled (R-T5-8): a well-formed entry is
+    /// accepted and not kept; 7.8.38 disallows the command while address
+    /// resolution is on and advertising or scanning is.
+    #[test]
+    fn le_add_device_to_resolving_list_accepts_a_well_formed_entry() {
+        let mut c = HciController::new(PUBLIC);
+        let mut entry = vec![0x01];
+        entry.extend_from_slice(&RANDOM);
+        entry.extend_from_slice(&[0x11; 16]); // Peer_IRK
+        entry.extend_from_slice(&[0x22; 16]); // Local_IRK
+        assert_eq!(entry.len(), 39);
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &entry),
+            [SUCCESS]
+        );
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &entry[..38]),
+            [INVALID_PARAMETERS]
+        );
+        let mut bad_type = entry.clone();
+        bad_type[0] = 0x02;
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &bad_type),
+            [INVALID_PARAMETERS]
+        );
+        send_ok(&mut c, LE_SET_ADDR_RESOLUTION_ENABLE, &[1]);
+        let mut peer = entry.clone();
+        peer[1..7].copy_from_slice(&PEER);
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &peer),
+            [SUCCESS]
+        );
+        start_advertising(&mut c, &[0x02, 0x01, 0x06]);
+        let mut third = entry.clone();
+        third[0] = 0x00;
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &third),
+            [COMMAND_DISALLOWED]
+        );
+        assert_eq!(
+            send(&mut c, LE_CLEAR_RESOLVING_LIST, &[]),
+            [COMMAND_DISALLOWED]
+        );
+    }
+
+    /// Task 6's trace: after adding its own identity, NimBLE sets that
+    /// identity's privacy mode (`0x204E`). 7.8.77: a device not on the
+    /// resolving list is Unknown Connection Identifier (`0x02`); modes are
+    /// 0 (network) and 1 (device). Clear Resolving List forgets entries,
+    /// and adding the same identity twice is invalid (7.8.38).
+    #[test]
+    fn le_set_privacy_mode_needs_the_device_on_the_resolving_list() {
+        let mut c = HciController::new(PUBLIC);
+        let mut entry = vec![0x01];
+        entry.extend_from_slice(&RANDOM);
+        entry.extend_from_slice(&[0x11; 32]);
+        let mut mode = vec![0x01];
+        mode.extend_from_slice(&RANDOM);
+        mode.push(0x01);
+        assert_eq!(
+            send(&mut c, LE_SET_PRIVACY_MODE, &mode),
+            [UNKNOWN_CONNECTION]
+        );
+        send_ok(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &entry);
+        assert_eq!(
+            send(&mut c, LE_ADD_DEVICE_TO_RESOLVING_LIST, &entry),
+            [INVALID_PARAMETERS],
+            "already listed"
+        );
+        assert_eq!(send(&mut c, LE_SET_PRIVACY_MODE, &mode), [SUCCESS]);
+        let mut bad = mode.clone();
+        bad[7] = 2;
+        assert_eq!(
+            send(&mut c, LE_SET_PRIVACY_MODE, &bad),
+            [INVALID_PARAMETERS]
+        );
+        assert_eq!(
+            send(&mut c, LE_SET_PRIVACY_MODE, &mode[..7]),
+            [INVALID_PARAMETERS]
+        );
+        send_ok(&mut c, LE_CLEAR_RESOLVING_LIST, &[]);
+        assert_eq!(
+            send(&mut c, LE_SET_PRIVACY_MODE, &mode),
+            [UNKNOWN_CONNECTION]
+        );
+    }
 
     #[test]
     fn random_bytes_never_panic() {

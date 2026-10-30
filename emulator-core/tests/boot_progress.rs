@@ -1340,8 +1340,12 @@ fn shake(rt: &mut FirmwareRuntime) {
 /// runtime on onboarding page 1 ("Welcome to Hack the North"), after
 /// asserting `PROV OK` and that page's hash.
 fn provisioned(role: &str) -> FirmwareRuntime {
+    provisioned_from(first_run_screen(), role)
+}
+
+/// [`provisioned`], from `rt` on the stable first-run screen.
+fn provisioned_from(mut rt: FirmwareRuntime, role: &str) -> FirmwareRuntime {
     let (page1, _) = role_row(role);
-    let mut rt = first_run_screen();
     let text = provision::provision(
         &mut rt,
         &provision::identity_fixture(role),
@@ -1369,8 +1373,12 @@ fn pinned(role: &str) -> bool {
 /// Provisions `role`, then walks Setup from page 1 to page 6 ("Shake it!",
 /// at rest), pinning each frame when [`pinned`].
 fn walk_to_shake_page(role: &str) -> (FirmwareRuntime, u64) {
+    walk_to_shake_page_from(provisioned(role), role)
+}
+
+/// [`walk_to_shake_page`], from `rt` on onboarding page 1.
+fn walk_to_shake_page_from(mut rt: FirmwareRuntime, role: &str) -> (FirmwareRuntime, u64) {
     let (page1, _) = role_row(role);
-    let mut rt = provisioned(role);
     let mut previous = page1;
     for &(slot, expected) in TO_SHAKE_PAGE {
         let (hash, step) = press_and_settle(&mut rt, slot, previous);
@@ -1425,8 +1433,18 @@ fn onboarding_shake_page_advances_after_a_shake() {
 /// My Badge's registered screen. Page 1 and the registered screen are
 /// pinned for every role; the pages between only when [`pinned`].
 fn walk_to_registered(role: &str) -> FirmwareRuntime {
+    let (rt, previous) = shake_page(role);
+    walk_to_registered_from(rt, previous, role)
+}
+
+/// [`walk_to_registered`], from `rt` on onboarding page 6 at rest, whose
+/// frame is `previous`.
+fn walk_to_registered_from(
+    mut rt: FirmwareRuntime,
+    mut previous: u64,
+    role: &str,
+) -> FirmwareRuntime {
     let (_, registered_hash) = role_row(role);
-    let (mut rt, mut previous) = shake_page(role);
     shake(&mut rt);
     let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
     let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[previous]);
@@ -1519,8 +1537,12 @@ provisions_role!(provisions_visitor_through_the_console, "visitor");
 
 /// [`registered`], then HOME to the stable launcher.
 fn walk_to_launcher(role: &str) -> FirmwareRuntime {
+    walk_to_launcher_from(registered(role), role)
+}
+
+/// [`walk_to_launcher`], from `rt` on `role`'s registered screen.
+fn walk_to_launcher_from(mut rt: FirmwareRuntime, role: &str) -> FirmwareRuntime {
     let (_, registered_hash) = role_row(role);
-    let mut rt = registered(role);
     press(&mut rt, TO_LAUNCHER_SLOT);
     let cap = rt.total_steps() + LAUNCHER_RESPONSE_STEPS;
     let (hash, step) =
@@ -1751,9 +1773,9 @@ fn assert_home_returns_to_the_launcher(
 /// | Cell | App (`app_reg: launched …`) | Soft resets | Rung |
 /// |---|---|---|---|
 /// | 0 | My Badge | 0 | [`launcher_opens_my_badge`] |
-/// | 1 | Connect | 0, stops at the Bluetooth ROM | [`connect_stops_at_the_bluetooth_controller`] |
+/// | 1 | Connect | 0 (Milestone 10, with a MAC) | [`connect_opens_with_the_radio_up`] |
 /// | 2 | Scanner | 1 | [`scanner_opens_after_one_reboot`] |
-/// | 3 | Sync | 1, stops at the Bluetooth ROM | [`sync_reboots_then_stops_at_the_bluetooth_controller`] |
+/// | 3 | Sync | 1 (Milestone 10, with a MAC) | [`sync_opens_after_its_reboot`] |
 /// | 4 | Share | 1 | [`launcher_opens_share_after_one_reboot`] |
 /// | 5 | Solana Scavenger Hunt | 0 | [`launcher_opens_solana_scavenger_hunt`] |
 /// | 6 | Sponsors | 1 | [`launcher_opens_sponsors_after_one_reboot`] |
@@ -1772,8 +1794,9 @@ fn assert_home_returns_to_the_launcher(
 /// ([`scanner_home_returns_to_the_launcher`],
 /// [`share_home_returns_to_the_launcher`],
 /// [`sponsors_home_returns_to_the_launcher`],
-/// [`workshop_quest_home_returns_to_the_launcher`]). Connect and Sync
-/// cannot be left: they stop at the Bluetooth ROM (Milestone 10).
+/// [`workshop_quest_home_returns_to_the_launcher`]). Connect and Sync open
+/// since Milestone 10, from a launcher walked with a factory MAC (the
+/// radio rungs, below); leaving Connect is [`connect_reopens_after_home`].
 ///
 /// Each entry here is the launcher's stable frame with that cell
 /// selected. Cells 0, 1, 2, 4, 8 and 12 to 15 reuse [`LAUNCHER_HASH`]
@@ -1808,7 +1831,12 @@ const A_SLOT: usize = 1;
 /// [`LAUNCHER_SELECTED`], then A held [`PRESS_HOLD_US`]. Returns the
 /// runtime just after A's release and the console's length before A.
 fn press_a_on_cell(cell: usize) -> (FirmwareRuntime, usize) {
-    let mut rt = launcher_for(OWN_ROLE);
+    press_a_on_cell_from(launcher_for(OWN_ROLE), cell)
+}
+
+/// [`press_a_on_cell`], from `rt` on hacker's launcher (first cell
+/// selected).
+fn press_a_on_cell_from(mut rt: FirmwareRuntime, cell: usize) -> (FirmwareRuntime, usize) {
     let mut at = 0;
     while at != cell {
         let (slot, next) = if at / 4 < cell / 4 {
@@ -2112,98 +2140,448 @@ launcher_opens!(
     0x2651_4b50_3ed5_3c44
 );
 
-/// The mask-ROM address Connect and Sync fetch after `hal_radio:
-/// init_once`: `btdm_controller_rom_data_init`
-/// (`esp32c3.rom.bt_funcs.ld`, ESP-IDF v5.5.3). It has no stub, so the
-/// fetch traps (an unmapped instruction fetch always does) and the
-/// firmware's panic handler prints the register dump. Milestone 10 lifts
-/// it.
-const BLUETOOTH_ROM_FAULT_PC: u32 = 0x4000_08ec;
-/// The panic handler's register-dump line for [`BLUETOOTH_ROM_FAULT_PC`].
-const BLUETOOTH_ROM_FAULT_MEPC: &str = "MEPC    : 0x400008ec";
+// ---------------------------------------------------------------------
+// Milestone 10: the radio. Connect and Sync open through the fake BLE
+// controller (`emulator_core::radio`), which replaces the mask-ROM
+// controller at bt.c's VHCI seam. They replace Milestone 9's two fault
+// rungs (`docs/milestone-10-decisions.md`, "Replaced rungs").
+//
+// Every radio rung starts from its own walk with a factory MAC
+// (`docs/milestone-10-decisions.md`, ruling R-T4-1): the firmware reads
+// the MAC while provisioning, so the shared `LAUNCHER` checkpoint, reached
+// without one, cannot be reused. The walk clones `FIRST_RUN` (nothing reads
+// the MAC before step 27.1M), sets the MAC, then provisions and walks
+// exactly as `launcher_for` does, with every frame assertion on the way.
+// ---------------------------------------------------------------------
 
-/// Runs `rt` in [`FRAME_CHUNK`]-step chunks until the console since
-/// `before` shows [`BLUETOOTH_ROM_FAULT_MEPC`], asserting that the only
-/// instruction fault on the way is at [`BLUETOOTH_ROM_FAULT_PC`] and that
-/// one happened. Returns the console since `before`. Panics if the line
-/// is not there by `max_steps` (total steps).
-fn run_to_the_bluetooth_fault(rt: &mut FirmwareRuntime, before: usize, max_steps: u64) -> String {
-    let mut faulted = false;
+/// The fake hacker MAC every radio rung sets (common context): obviously
+/// fake and locally administered.
+const HACKER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01];
+
+/// Total steps at [`radio_launcher`]: 95 fewer than
+/// [`HACKER_LAUNCHER_STEPS`] (ruling R-T4-1's measurement).
+const RADIO_LAUNCHER_STEPS: u64 = 342_600_681;
+/// Emulated time at [`radio_launcher`], in microseconds: the same as
+/// [`HACKER_LAUNCHER_US`].
+const RADIO_LAUNCHER_US: u64 = 94_521_615;
+
+/// Role hacker's launcher, walked with [`HACKER_MAC`] ([`radio_launcher`]).
+static RADIO_LAUNCHER: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// Role hacker's launcher with [`HACKER_MAC`] set before provisioning: a
+/// clone of the [`RADIO_LAUNCHER`] checkpoint. The walk passes every frame
+/// assertion of [`launcher_for`]'s, and the radio is untouched on the way.
+fn radio_launcher() -> FirmwareRuntime {
+    RADIO_LAUNCHER
+        .get_or_init(|| {
+            let mut rt = first_run_screen();
+            assert!(rt.set_factory_mac(&HACKER_MAC));
+            let rt = provisioned_from(rt, OWN_ROLE);
+            let (rt, previous) = walk_to_shake_page_from(rt, OWN_ROLE);
+            let rt = walk_to_registered_from(rt, previous, OWN_ROLE);
+            let rt = walk_to_launcher_from(rt, OWN_ROLE);
+            assert_eq!(rt.total_steps(), RADIO_LAUNCHER_STEPS);
+            assert_eq!(rt.emulated_time_us(), RADIO_LAUNCHER_US);
+            assert_eq!(rt.radio_init_count(), 0);
+            assert_eq!(rt.radio().hook_hits(), 0);
+            rt
+        })
+        .clone()
+}
+
+/// The console text a radio app must never print: NimBLE's host-sync
+/// failure, the random-address rejection, the firmware's "no radio"
+/// screen, and the panic texts.
+const RADIO_FAILURE_TEXTS: [&str; 3] = ["host sync timeout", "ble_hs_id_set_rnd", "NO RADIO"];
+
+/// Asserts the console since `before` holds none of
+/// [`RADIO_FAILURE_TEXTS`], nor any Unknown HCI Command reply (the
+/// controller model answers every command the firmware sends), and no
+/// panic text.
+fn assert_radio_clean(rt: &FirmwareRuntime, before: usize) {
+    let console = rt.console_output();
+    let since = &console[before..];
+    for text in RADIO_FAILURE_TEXTS {
+        assert!(!since.contains(text), "`{text}`; console since A:\n{since}");
+    }
+    assert!(
+        !since.contains("BLE_ERR_UNKNOWN_HCI_CMD"),
+        "console since A:\n{since}"
+    );
+    assert_no_panic_text(rt);
+}
+
+/// Connect's home screen bands that its animation never touches: the
+/// title ("CONNECT BADGES") and the footer ("Hold A for up to 2
+/// seconds", "B/Start  Contacts  Home  Apps"). Its pulsing rings redraw
+/// rows 27 to 213 continuously (109 distinct frames in 60M steps,
+/// measured), so the whole frame never holds still.
+const CONNECT_TITLE: Rect = Rect {
+    x0: 0,
+    y0: 0,
+    x1: 320,
+    y1: 27,
+};
+const CONNECT_FOOTER: Rect = Rect {
+    x0: 0,
+    y0: 214,
+    x1: 320,
+    y1: 240,
+};
+
+/// [`region_fnv1a`] of [`CONNECT_TITLE`] and of [`CONNECT_FOOTER`].
+fn connect_bands(fb: &[u16]) -> (u64, u64) {
+    (
+        region_fnv1a(fb, 320, CONNECT_TITLE),
+        region_fnv1a(fb, 320, CONNECT_FOOTER),
+    )
+}
+
+/// Connect's home bands (measured on v392, checked by eye).
+const CONNECT_BANDS: (u64, u64) = (0x8b40_6f5a_cbce_e924, 0xf989_f1fd_4dfa_4e43);
+/// Connect's whole home frame at the step its bands are first seen held
+/// for [`AFTER_PRESS_STABLE_FOR`]: "CONNECT BADGES", "Bump badges or
+/// Press A", "Hold badges within 10 cm", "Contacts: 0", the rings at one
+/// phase of their animation, footer as in [`CONNECT_TITLE`]'s doc. The
+/// emulator is deterministic, so the phase at that step is too. Saved
+/// for the human partner's eye check as `local/m10-frames/connect-home.png`.
+const CONNECT_HOME_HASH: u64 = 0x0fdc_677e_aff3_ed53;
+/// A's release to Connect's bands held: measured, then
+/// [`AFTER_PRESS_STABLE_FOR`] more; + 25 %, rounded up to 1,000,000.
+const CONNECT_RESPONSE_STEPS: u64 = 18_000_000;
+
+/// Runs `rt` in [`FRAME_CHUNK`]-step chunks, asserting no instruction
+/// fault, until Connect's bands ([`connect_bands`]) have held for
+/// `stable_for` steps and differ from `skip`. Returns the bands and the
+/// first sampled step that showed them. Panics past `max_steps`.
+fn run_until_connect_bands(
+    rt: &mut FirmwareRuntime,
+    max_steps: u64,
+    stable_for: u64,
+    skip: (u64, u64),
+) -> ((u64, u64), u64) {
+    let mut bands = connect_bands(rt.framebuffer());
+    let mut since = rt.total_steps();
     while rt.total_steps() < max_steps {
-        let summary = rt.run(FRAME_CHUNK);
-        if let Some(pc) = summary.last_instruction_fault {
-            assert_eq!(pc, BLUETOOTH_ROM_FAULT_PC, "{summary:?}");
-            faulted = true;
-        }
-        let since = rt.console_output()[before..].to_string();
-        if since.contains(BLUETOOTH_ROM_FAULT_MEPC) {
-            assert!(faulted, "MEPC printed without a fault:\n{since}");
-            return since;
+        let s = rt.run(FRAME_CHUNK);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        let b = connect_bands(rt.framebuffer());
+        if b != bands {
+            bands = b;
+            since = rt.total_steps();
+        } else if rt.total_steps() - since >= stable_for && b != skip {
+            return (b, since);
         }
     }
     panic!(
-        "no {BLUETOOTH_ROM_FAULT_MEPC:?} within {max_steps} steps; pc=0x{:08x}\n{}",
-        rt.pc(),
-        &rt.console_output()[before..]
+        "Connect's bands not held within {max_steps} steps; last {bands:x?} since {since}\n{}",
+        rt.console_output()
     );
 }
 
-/// Connect (cell 1) does not open on v392 yet: after A, `hal_radio:
-/// init_once` and then the fetch of [`BLUETOOTH_ROM_FAULT_PC`]; the
-/// register dump is printed 0.75M steps after A's release (cap: + 25 %,
-/// rounded up to 1,000,000). No soft reset comes first. Measured after
-/// the dump (not pinned): the panic handler prints `Rebooting...`, the
-/// runtime soft-resets, and the badge boots with `reset reason=4` into
-/// My Badge, with no reboot loop. Milestone 10 (Bluetooth) lifts the
-/// stop.
+/// Connect opened from [`radio_launcher`] ([`connect_open`]).
+static CONNECT_OPEN: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// A on cell 1 of [`radio_launcher`]: Connect opens with the radio up.
+/// Within [`CONNECT_RESPONSE_STEPS`] of A's release its bands
+/// ([`CONNECT_BANDS`]) hold for [`AFTER_PRESS_STABLE_FOR`], and the whole
+/// frame there is [`CONNECT_HOME_HASH`]. The console since A says
+/// `hal_radio: init_once`, then `hal_radio: BLE radio ready`, then
+/// `app_reg: launched Connect`, with nothing from
+/// [`assert_radio_clean`]. No soft reset; the controller was initialized
+/// once. A clone of the [`CONNECT_OPEN`] checkpoint.
+fn connect_open() -> FirmwareRuntime {
+    CONNECT_OPEN
+        .get_or_init(|| {
+            let (mut rt, before) = press_a_on_cell_from(radio_launcher(), 1);
+            let skip = connect_bands(rt.framebuffer());
+            let cap = rt.total_steps() + CONNECT_RESPONSE_STEPS;
+            let (bands, step) = run_until_connect_bands(&mut rt, cap, AFTER_PRESS_STABLE_FOR, skip);
+            let hash = framebuffer_fnv1a(rt.framebuffer());
+            assert_eq!(
+                (bands, hash),
+                (CONNECT_BANDS, CONNECT_HOME_HASH),
+                "Connect's home, bands held from step {step}, whole frame at {}",
+                rt.total_steps()
+            );
+            let console = rt.console_output();
+            let since = &console[before..];
+            let init = since
+                .find("hal_radio: init_once")
+                .unwrap_or_else(|| panic!("console since A:\n{since}"));
+            let ready = init
+                + since[init..]
+                    .find("hal_radio: BLE radio ready")
+                    .unwrap_or_else(|| panic!("console since A:\n{since}"));
+            assert!(
+                since[ready..].contains("app_reg: launched Connect"),
+                "console since A:\n{since}"
+            );
+            assert_radio_clean(&rt, before);
+            assert_eq!(rt.soft_reset_count(), 0);
+            assert_eq!(rt.radio_init_count(), 1);
+            rt
+        })
+        .clone()
+}
+
+/// Milestone 10's first finish line: Connect opens with the radio up
+/// ([`connect_open`]), replacing Milestone 9's
+/// `connect_stops_at_the_bluetooth_controller`.
 #[test]
-fn connect_stops_at_the_bluetooth_controller() {
-    let (mut rt, before) = press_a_on_cell(1);
-    let cap = rt.total_steps() + 1_000_000;
-    let console = run_to_the_bluetooth_fault(&mut rt, before, cap);
-    let radio = console
-        .find("hal_radio: init_once")
-        .unwrap_or_else(|| panic!("console since A:\n{console}"));
-    assert!(
-        console[radio..].contains(BLUETOOTH_ROM_FAULT_MEPC),
-        "console since A:\n{console}"
+fn connect_opens_with_the_radio_up() {
+    connect_open();
+}
+
+/// The launcher after HOME from Connect (measured on v392, checked by
+/// eye): titled "Connect", with Connect still selected, since HOME
+/// returns without a reboot and keeps the selection (the apps that reboot
+/// into themselves come back to cell 0, [`LAUNCHER_HASH`]). By eye it is
+/// [`LAUNCHER_SELECTED`]'s cell 1; by pixel, 143 pixels inside the icons
+/// differ in their lowest colour bits (for example `0x9cd3` against
+/// `0x9cd4` at (40, 51)), so it has its own hash. RIGHT from it leads to
+/// the fresh launcher's cells 2 and 3
+/// ([`sync_after_connect_initializes_the_radio_again`]).
+const CONNECT_HOME_TO_LAUNCHER: u64 = 0x0f8c_1a72_61c1_3a16;
+/// HOME's release to the stable launcher: measured, then
+/// [`AFTER_PRESS_STABLE_FOR`] more; + 25 %, rounded up to 1,000,000.
+const CONNECT_HOME_RESPONSE_STEPS: u64 = 28_000_000;
+
+/// Review Focus 1: Connect opened, left with HOME, and opened again. HOME
+/// lands on the launcher with Connect selected
+/// ([`CONNECT_HOME_TO_LAUNCHER`]) and `app_reg: launched Launcher`; A opens
+/// Connect again to the same bands ([`CONNECT_BANDS`]) and `launched
+/// Connect`, with `BLE radio ready` but no second `hal_radio: init_once`
+/// (the radio is `init_once` and stays up), no stale or unanswered
+/// command, no soft reset, and the controller still initialized exactly
+/// once.
+#[test]
+fn connect_reopens_after_home() {
+    let mut rt = connect_open();
+    let before = rt.console_output().len();
+    press(&mut rt, TO_LAUNCHER_SLOT);
+    let cap = rt.total_steps() + CONNECT_HOME_RESPONSE_STEPS;
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[]);
+    assert_eq!(
+        hash, CONNECT_HOME_TO_LAUNCHER,
+        "launcher, stable at step {step}"
     );
-    assert!(
-        !console.contains("app_reg: launched Connect"),
-        "console since A:\n{console}"
-    );
+    assert!(rt.console_output()[before..].contains("app_reg: launched Launcher"));
+    assert_eq!(rt.radio_init_count(), 1);
+
+    let before = rt.console_output().len();
+    let skip = connect_bands(rt.framebuffer());
+    press(&mut rt, A_SLOT);
+    let cap = rt.total_steps() + CONNECT_RESPONSE_STEPS;
+    let (bands, step) = run_until_connect_bands(&mut rt, cap, AFTER_PRESS_STABLE_FOR, skip);
+    assert_eq!(bands, CONNECT_BANDS, "Connect again, held from step {step}");
+    let console = rt.console_output();
+    let since = &console[before..];
+    assert!(since.contains("hal_radio: BLE radio ready"), "{since}");
+    assert!(since.contains("app_reg: launched Connect"), "{since}");
+    assert!(!since.contains("hal_radio: init_once"), "{since}");
+    assert_radio_clean(&rt, before);
     assert_eq!(rt.soft_reset_count(), 0);
+    assert_eq!(rt.radio_init_count(), 1);
 }
 
-/// Sync (cell 3) reboots into itself (`app_reboot: reboot into sync`,
-/// one soft reset), then stops like Connect: after the reboot,
-/// `hal_radio: init_once` and the fetch of [`BLUETOOTH_ROM_FAULT_PC`],
-/// with no `launched Sync`. The register dump is printed 6.75M steps
-/// after A's release (cap: + 25 %, rounded up to 1,000,000). Measured
-/// after the dump (not pinned): `Rebooting...`, a second soft reset, and
-/// a boot with `reset reason=4` into My Badge, with no reboot loop.
-/// Milestone 10 (Bluetooth) lifts the stop.
+/// Sync's home screen: "Sync", a box with "Find a sync station" and
+/// "looking for a station...", footer "A: sync now   -   HOME: home"
+/// (measured on v392, checked by eye). Saved as
+/// `local/m10-frames/sync-home.png`.
+const SYNC_HOME_HASH: u64 = 0x93d9_3053_90e7_de23;
+/// A's release to Sync's stable home, across its reboot: measured, then
+/// [`AFTER_PRESS_STABLE_FOR`] more; + 25 %, rounded up to 1,000,000.
+const SYNC_RESPONSE_STEPS: u64 = 23_000_000;
+
+/// Sync opened from [`radio_launcher`] ([`sync_open`]).
+static SYNC_OPEN: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// A on cell 3 of [`radio_launcher`]: Sync reboots into itself (one soft
+/// reset, `app_reboot: reboot into sync`), then initializes the radio in
+/// the new boot (`hal_radio: init_once`, `BLE radio ready`, `launched
+/// Sync`, in that order after the reboot line) and settles on
+/// [`SYNC_HOME_HASH`], with nothing from [`assert_radio_clean`]. A clone
+/// of the [`SYNC_OPEN`] checkpoint.
+fn sync_open() -> FirmwareRuntime {
+    SYNC_OPEN
+        .get_or_init(|| {
+            let (mut rt, before) = press_a_on_cell_from(radio_launcher(), 3);
+            let cap = rt.total_steps() + SYNC_RESPONSE_STEPS;
+            let (hash, step) = run_until_stable_frame(
+                &mut rt,
+                cap,
+                AFTER_PRESS_STABLE_FOR,
+                &[LAUNCHER_SELECTED[3]],
+            );
+            assert_eq!(hash, SYNC_HOME_HASH, "Sync's home, stable at step {step}");
+            let console = rt.console_output();
+            let since = &console[before..];
+            let reboot = since
+                .find("app_reboot: reboot into sync")
+                .unwrap_or_else(|| panic!("console since A:\n{since}"));
+            let mut at = reboot;
+            for line in [
+                "hal_radio: init_once",
+                "hal_radio: BLE radio ready",
+                "app_reg: launched Sync",
+            ] {
+                at += since[at..]
+                    .find(line)
+                    .unwrap_or_else(|| panic!("no `{line}` in order; console since A:\n{since}"));
+            }
+            assert_radio_clean(&rt, before);
+            assert_eq!(rt.soft_reset_count(), 1);
+            assert_eq!(rt.radio_init_count(), 1);
+            rt
+        })
+        .clone()
+}
+
+/// Sync opens after its reboot ([`sync_open`]), replacing Milestone 9's
+/// `sync_reboots_then_stops_at_the_bluetooth_controller`. Review Focus 2's
+/// firmware half: the radio initializes cleanly in a boot that a soft
+/// reset started.
 #[test]
-fn sync_reboots_then_stops_at_the_bluetooth_controller() {
-    let (mut rt, before) = press_a_on_cell(3);
-    let cap = rt.total_steps() + 9_000_000;
-    let console = run_to_the_bluetooth_fault(&mut rt, before, cap);
-    let reboot = console
+fn sync_opens_after_its_reboot() {
+    sync_open();
+}
+
+/// Sync's answer to "A: sync now" for the committed fake identities:
+/// "Badge not ready to sync", "Visit registration to set up sync", footer
+/// "A: try again   -   HOME: home" (measured on v392, checked by eye).
+/// The firmware checks for an upload credential before it looks for a
+/// station (`docs/milestone-10-decisions.md`, ruling R-T6-5), and the
+/// fake identities have none.
+const SYNC_NOT_READY_HASH: u64 = 0x98b7_a768_e62d_a0e1;
+/// A's release to the stable answer: the answer is drawn while A is still
+/// held (2.5M steps after the press, inside the 100 ms hold), so it is
+/// first sampled at the release; then [`AFTER_PRESS_STABLE_FOR`] more,
+/// 8M; + 25 %: 10M.
+const SYNC_NOW_RESPONSE_STEPS: u64 = 10_000_000;
+
+/// How long after an app opens its console may take to start: the REPL
+/// prints `hal_console: console started` 19.1M steps after the A that
+/// opened Sync (measured), so this is a generous cap, not a pin.
+const CONSOLE_START_STEPS: u64 = 20_000_000;
+
+/// Types `line` into the console and returns the text up to the next
+/// prompt. First waits for this boot's REPL (`hal_console: console
+/// started` after the console's last `app_reg: launched`), which discards
+/// input until then.
+fn console_command(rt: &mut FirmwareRuntime, line: &str) -> String {
+    let console = rt.console_output();
+    let marker = console.rfind("app_reg: launched").unwrap_or(0);
+    let deadline = rt.total_steps() + CONSOLE_START_STEPS;
+    provision::wait_for_any(rt, marker, &["hal_console: console started"], deadline)
+        .unwrap_or_else(|| panic!("no console:\n{}", &rt.console_output()[marker..]));
+    let deadline = rt.total_steps() + 20_000_000;
+    match provision::type_line(rt, line, deadline) {
+        Outcome::Done(text) => text,
+        Outcome::Timeout(text) => panic!("`{line}` timed out:\n{text}"),
+    }
+}
+
+/// From the open Sync, A ("A: sync now"): with no upload credential (the
+/// fake identity has none, ruling R-T6-5) the firmware answers "Badge not
+/// ready to sync" without scanning for a station, so "No sync station in
+/// range" is not reachable with committed data. Asserted by `uitree` over
+/// the console (the LVGL tree's labels) and by the pinned frame, with no
+/// panic and the radio still initialized once.
+#[test]
+fn sync_now_without_a_credential_is_not_ready() {
+    let mut rt = sync_open();
+    let home = console_command(&mut rt, "uitree");
+    assert!(home.contains("text=\"looking for a station...\""), "{home}");
+    assert!(
+        home.contains("text=\"A: sync now   -   HOME: home\""),
+        "{home}"
+    );
+    press(&mut rt, A_SLOT);
+    let cap = rt.total_steps() + SYNC_NOW_RESPONSE_STEPS;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[SYNC_HOME_HASH]);
+    assert_eq!(hash, SYNC_NOT_READY_HASH, "stable at step {step}");
+    let tree = console_command(&mut rt, "uitree");
+    assert!(tree.contains("text=\"Badge not ready to sync\""), "{tree}");
+    assert!(
+        tree.contains("text=\"Visit registration to set up sync\""),
+        "{tree}"
+    );
+    assert!(!tree.contains("No sync station in range"), "{tree}");
+    assert_no_panic_text(&rt);
+    assert_eq!(rt.radio_init_count(), 1);
+}
+
+/// Review Focus 2 on the firmware: a soft reset while the radio is up.
+/// Connect opens (radio initialized), HOME leaves it, and Sync then
+/// reboots into itself: the new boot finds `btdm_controller_status` IDLE
+/// again, the controller model starts over with the guest (no event from
+/// before the reset is delivered: every command after the reboot is
+/// answered in order, or NimBLE would log the error), and the radio
+/// initializes a second time, cleanly, to Sync's home.
+#[test]
+fn sync_after_connect_initializes_the_radio_again() {
+    let mut rt = connect_open();
+    press(&mut rt, TO_LAUNCHER_SLOT);
+    let cap = rt.total_steps() + CONNECT_HOME_RESPONSE_STEPS;
+    let (hash, _) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[]);
+    assert_eq!(hash, CONNECT_HOME_TO_LAUNCHER);
+    for cell in [2, 3] {
+        let (hash, step) = press_and_settle(&mut rt, RIGHT_SLOT, LAUNCHER_SELECTED[cell - 1]);
+        assert_eq!(
+            hash, LAUNCHER_SELECTED[cell],
+            "cell {cell}, stable at {step}"
+        );
+    }
+    let before = rt.console_output().len();
+    press(&mut rt, A_SLOT);
+    let cap = rt.total_steps() + SYNC_RESPONSE_STEPS;
+    let (hash, step) = run_until_stable_frame(
+        &mut rt,
+        cap,
+        AFTER_PRESS_STABLE_FOR,
+        &[LAUNCHER_SELECTED[3]],
+    );
+    assert_eq!(hash, SYNC_HOME_HASH, "Sync's home, stable at step {step}");
+    let console = rt.console_output();
+    let since = &console[before..];
+    let reboot = since
         .find("app_reboot: reboot into sync")
-        .unwrap_or_else(|| panic!("no reboot line; console since A:\n{console}"));
-    let radio = reboot
-        + console[reboot..]
-            .find("hal_radio: init_once")
-            .unwrap_or_else(|| panic!("console since A:\n{console}"));
+        .unwrap_or_else(|| panic!("console since A:\n{since}"));
     assert!(
-        console[radio..].contains(BLUETOOTH_ROM_FAULT_MEPC),
-        "console since A:\n{console}"
+        since[reboot..].contains("hal_radio: init_once"),
+        "console since A:\n{since}"
     );
     assert!(
-        !console.contains("app_reg: launched Sync"),
-        "console since A:\n{console}"
+        since[reboot..].contains("app_reg: launched Sync"),
+        "{since}"
     );
+    assert_radio_clean(&rt, before);
     assert_eq!(rt.soft_reset_count(), 1);
+    assert_eq!(
+        rt.radio_init_count(),
+        2,
+        "once per boot that opened a radio app"
+    );
+}
+
+/// The radio is inert without a radio app: on role hacker's whole walk to
+/// the launcher (the equivalence rungs' chain, no MAC) the radio's hook
+/// table is installed but no hook is ever hit and the controller is never
+/// initialized. With [`execution_digest_is_unchanged`] and
+/// [`hacker_walk_totals_are_unchanged`] passing unchanged, this is
+/// Milestone 10's "no Milestone 9 pin moves" guarantee.
+#[test]
+fn no_radio_without_a_radio_app() {
+    let rt = launcher_for(OWN_ROLE);
+    assert!(
+        !rt.cpu().app_hooks().is_empty(),
+        "the radio's hooks are installed"
+    );
+    assert_eq!(rt.radio().hook_hits(), 0);
+    assert_eq!(rt.radio_init_count(), 0);
+    assert_eq!(rt.total_steps(), HACKER_LAUNCHER_STEPS);
 }
 
 /// A half-open pixel rectangle `[x0, x1) x [y0, y1)`.

@@ -736,6 +736,9 @@ pub enum Int32UnaryOp {
     /// Zbb (ESP-IDF's `HAL_SWAP32`,
     /// `components/hal/platform_port/include/hal/misc.h:15`).
     Bswap,
+    /// `int __popcountsi2 (unsigned int a)`: the number of 1-bits in `a`.
+    /// Fully defined for every input.
+    Popcount,
 }
 
 impl Int32UnaryOp {
@@ -748,6 +751,7 @@ impl Int32UnaryOp {
                 _ => a.trailing_zeros() + 1,
             },
             Int32UnaryOp::Bswap => a.swap_bytes(),
+            Int32UnaryOp::Popcount => a.count_ones(),
         }
     }
 }

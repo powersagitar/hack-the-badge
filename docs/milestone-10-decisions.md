@@ -293,6 +293,199 @@ onboarding pages, registered screen, launcher), but reached the launcher
 358,750,075; Connect then stopped at the same fault, by 359,500,075.
 Without a MAC every count matched the rungs.
 
+### Connect and Sync through the fake controller (Task 6)
+
+Scratch probes (copies of `boot_progress.rs` with an ignored probe test,
+deleted before the commit) from role hacker's launcher walked with MAC
+`02:00:00:00:10:01` (`radio_launcher`, 342,600,681 steps, 95 fewer than
+without a MAC, as R-T4-1 measured), A on the cell as
+`press_a_on_cell` does.
+
+**Step 1, the command trace.** Phase 1, the hooks answering and
+logging with no event delivered: init (`ra 0x42085892`), enable
+(`ra 0x4208589c`), register callback (`ra 0x42087d6c`), then one
+`check_send_available` and one `send_packet`, HCI Reset (`01 03 0c 00`),
+and nothing more: the host waits for its reply, so the rest of the
+sequence needs delivery. Phase 2, with delivery, Connect's open sends,
+in order (H4 bytes; every reply Command Complete, Status `0x00` once the
+model covers the command):
+
+| # | Opcode | Command | Parameters (hex) |
+|---|---|---|---|
+| 1 | `0x0C03` | Reset | — |
+| 2 | `0x1001` | Read Local Version Information | — |
+| 3 | `0x1002` | Read Local Supported Commands | — |
+| 4 | `0x1003` | Read Local Supported Features | — |
+| 5 | `0x0C01` | Set Event Mask | `9088000200800020` (`0x2000_8000_0200_8890`: bit 61, LE Meta, set) |
+| 6 | `0x0C63` | Set Event Mask Page 2 | `0000800000000000` |
+| 7 | `0x2001` | LE Set Event Mask | `7ffe0f0000000000` (`0x000F_FE7F`: bit 12, Extended Advertising Report, set) |
+| 8 | `0x2003` | LE Read Local Supported Features | — |
+| 9 | `0x1009` | Read BD_ADDR | — |
+| 10, 11 | `0x2018` | LE Rand (twice: the local IRK) | — |
+| 12 | `0x202D` | LE Set Address Resolution Enable | `00` |
+| 13 | `0x2029` | LE Clear Resolving List | — |
+| 14 | `0x202D` | LE Set Address Resolution Enable | `01` |
+| 15 | `0x2027` | LE Add Device To Resolving List | type 0, address 0, peer IRK 0, local IRK (the two LE Rand answers) |
+| 16 | `0x204E` | LE Set Privacy Mode | type 0, address 0, mode `01` |
+| 17 | `0x2005` | LE Set Random Address | `0200000010c1` (`C1:10:00:00:00:02`, the MAC with `0xC0`) |
+| 18 | `0x2036` | LE Set Extended Advertising Parameters | handle 0, properties `0x0000` (non-connectable, non-scannable, extended), 100 ms, own address random, 1M/1M |
+| 19 | `0x2037` | LE Set Extended Advertising Data | handle 0, complete, `03 ff ff ff` (manufacturer data, company `0xFFFF`, empty) |
+| 20 | `0x2035` | LE Set Advertising Set Random Address | handle 0, the same address |
+| 21 | `0x2039` | LE Set Extended Advertising Enable | enable, one set, no duration |
+| 22 | `0x2041` | LE Set Extended Scan Parameters | own random, filter policy 0, 1M, **passive**, 150 ms / 30 ms |
+| 23 | `0x2042` | LE Set Extended Scan Enable | enable, no duplicate filter, no duration |
+| 24 | `0x2042` | LE Set Extended Scan Enable | disable (Connect's home) |
+| 25 | `0x2039` | LE Set Extended Advertising Enable | disable |
+| 26 | `0x203C` | LE Remove Advertising Set | handle 0 |
+
+Sync's open sends 1 to 23 and stays advertising and scanning. Six of
+these were not in Task 5's model and were answered Unknown HCI Command
+until added (ruling R-T6-1): `0x2018` (NimBLE logged "Failed to generate
+local IRK"), `0x202D`, `0x2029`, `0x2027`, `0x204E` and `0x203C`. No
+vendor command, no `0x203D`. With all 26 answered the console shows no
+`BLE_ERR_UNKNOWN_HCI_CMD`. Both event masks enable what R-T5-3 gates
+reports on. No command asks for a connection, a scan request or GATT.
+
+Two mask-ROM libgcc calls followed, each observed faulting and now a real
+stub (ruling R-T6-4): `__popcountsi2` (`0x4000_0888`, from
+`ble_hs_id_set_rnd` at `RA 0x420812d4`, counting the random address's
+one-bits), then, once Connect drew, `__lesf2` (`0x4000_082c`,
+`RA 0x4201ca50`).
+
+**Step 2, the idle hook point.** `esp_vApplicationIdleHook`
+(`freertos_hooks.c` line 41) is `0x4212_ac42`: it loops over eight
+`idle_cb` slots (`li a5, 0x7; blt a5, s0`, table `0x3fcb5704`), then
+calls `esp_pm_impl_idle_hook` (`0x420fcf68`) and `esp_pm_impl_waiti`
+(`0x420fcfb0`), which calls `0x4038b8a4`, holding the image's only `wfi`
+(`0x4038b8b8`). Its one caller is `prvIdleTask` (`0x40390a76`:
+`prvCheckTasksWaitingTermination` at `0x4039092c`, then it, forever;
+`tasks.c` line 4284), whose address goes with the name `"IDLE"`
+(`0x3c133f3c`) to the task creation at `0x403926d0`. The idle task's
+stack is `0x600` bytes (`vApplicationGetIdleTaskMemory`, `0x4038fbe2`:
+`li a5, 0x600; sw a5, 0(s1)`).
+
+**The asynchronous path, measured.** With Sync open (scanning), 20
+advertisements were delivered one at a time (alternately 4 and 229 bytes
+of data, the largest a report can carry), each followed by 200,000 single
+steps: every one was queued, the queue drained through the idle hook
+within 250,000 steps, nothing panicked, and the host printed no
+"exceeds maximum configured HCI event buffer size", so v392's
+`BT_NIMBLE_TRANSPORT_EVT_SIZE` is at least 257 (a 255-byte event plus its
+2-byte header). The lowest `sp` seen in the idle task was 624 bytes below
+its `sp` at the hook's entry, with the 288-byte frame of the largest
+report included, against the task's 1,536.
+
+**Sync's readiness check** (ruling R-T6-5). "A: sync now" calls
+`0x4200f12e` (from `0x42043bf2`), which reads NVS namespace
+`badge_upload` (`0x3c136740`), key `credential` (`0x3c136750`), a
+`0x99`-byte blob, and requires its 64-byte token to be lowercase hex,
+followed by a byte 0, the badge ID (`0x3fca3313`, the identity's
+`badge_id`) and the claim ID (`0x3fca33c8`, `claim_id`). The fake
+identities have no credential, so Sync answers "Badge not ready to sync"
+/ "Visit registration to set up sync" (`0x3c13cfe8`, `0x3c13cfc4`,
+branch at `0x42043bf6`) without scanning for a station; "No sync station
+in range" (`0x3c13d164`, `0x42044030`) is past that check. The credential
+is set over USB by `badge_token set` (`0x3c13618c`; it prints
+`BADGE_TOKEN READY`, then reads 64 raw bytes from stdin, `0x4200c5c0` on).
+A probe that set a throwaway token got `BADGE_TOKEN READY`, then the NVS
+write faulted in ROM `crc32_le` (`0x4000_0628`, `esp32c3.rom.ld` line 415),
+which has no stub.
+
+**Frames.** Connect's home animates its rings without pause: across 240
+samples 60M steps apart from 9.5M after A, 109 distinct frames, with every
+change inside rows 27 to 213 and columns 67 to 253. Its title (rows 0 to
+26) and footer (rows 214 to 239) never change, so the rung waits for
+those bands to hold (ruling R-T6-6). After HOME the launcher comes back
+with Connect selected (no reboot keeps the selection): by eye the fresh
+launcher's cell 1, by pixel 143 pixels inside the icons differ in their
+lowest colour bits (for example `0x9cd3` against `0x9cd4` at (40, 51)).
+
+**Rung budgets** (each: measured, then `AFTER_PRESS_STABLE_FOR`, then
++ 25 %, rounded up to 1,000,000):
+
+| Rung value | Measured | Budget |
+|---|---|---|
+| Connect: A's release (358,750,075) to bands held | 5.75M | `CONNECT_RESPONSE_STEPS` 18M |
+| Connect: HOME's release (379,556,137) to the stable launcher | 13.75M | `CONNECT_HOME_RESPONSE_STEPS` 28M |
+| Sync: A's release (386,878,568) to the stable home, across the reboot | 10.25M | `SYNC_RESPONSE_STEPS` 23M |
+| Sync: A to "Badge not ready to sync" | drawn within the 100 ms hold | `SYNC_NOW_RESPONSE_STEPS` 10M |
+
+Pinned (measured on v392; Connect's home, Sync's home and Sync's answer
+checked by eye, saved under `local/m10-frames/`):
+`CONNECT_BANDS = (0x8b40_6f5a_cbce_e924, 0xf989_f1fd_4dfa_4e43)`,
+`CONNECT_HOME_HASH = 0x0fdc_677e_aff3_ed53` (the whole frame at step
+372,500,075), `CONNECT_HOME_TO_LAUNCHER = 0x0f8c_1a72_61c1_3a16`,
+`SYNC_HOME_HASH = 0x93d9_3053_90e7_de23`,
+`SYNC_NOT_READY_HASH = 0x98b7_a768_e62d_a0e1`, `RADIO_LAUNCHER_STEPS =
+342_600_681`, `RADIO_LAUNCHER_US = 94_521_615`.
+
+Release `boot_progress` after the change: 86 passed, 1 ignored, real
+11.68 s (`/usr/bin/time -p`, warm).
+
+### Connect's pairing exchange (Task 6, Step 7: the gate reading)
+
+Read from the firmware and confirmed in a scratch probe: two runtimes in
+lockstep (1 ms slices of emulated time), hacker with MAC `…10:01` and
+organizer with MAC `…10:02`, each walked to Connect, each one's
+`HciController::advertisement` delivered to the other at a fixed RSSI
+through `Radio::deliver` (a temporary passthrough, deleted).
+
+- **Connectionless only.** Every command either app sends is in the
+  trace above or its repeats: extended advertising (non-connectable,
+  non-scannable) and **passive** extended scanning. No LE Create
+  Connection, no scan request (passive scan), no ACL, no GATT. Both
+  badges reached "SYNCED" over advertising reports alone.
+- **The advertising payload** is one manufacturer-specific AD structure,
+  company `0xFFFF` (`ff ff`), set with LE Set Extended Advertising Data:
+  - idle: `03 ff ff ff` (no payload);
+  - after a bump: `2c ff ff ff` + a `BMP2` card;
+  - while A is held: `38 ff ff ff` + `BPA1` (`42 50 41 31`) + 8 bytes
+    (seen: `31 27 13 22 b1 00 00 00`; the reading did not decode them)
+    + the same `BMP2` card.
+
+  The card (`0x42049d9e` builds it): `BMP2` (`0x3c1383d8`), version
+  `02`, a flags byte, then type-length-value strings: type 1 the
+  `badge_id` (`01 14 "test-fake-badge-0001"`), type 3 the display name
+  (`03 0b "Test Hacker"`), and, when set, types 2 and 4 to 9 and `0x0A`
+  from the identity's other fields (the fake identities have them empty,
+  so the whole AD structure is 45 bytes after a bump and 57 while A is
+  held, well under the 229-byte single-report limit).
+- **Both hold A** advertises the `BPA1` card for about 2 s (the
+  firmware stops at about +34M steps) while scanning. The receive loop
+  (`0x4201ed4e`) takes a report only if its RSSI is not `0x7F` and is at
+  least −64 dBm (`li a4, -0x40; blt a5, a4`), its data starts with
+  `BPA1` (`0x3c155834`), it falls in a 500,000 µs window against the
+  local press (`lui a5, 0x7a; addi a5, a5, 0x120`), its card decodes
+  (`0x4201cc2a`, then `0x42049ec6`), its badge ID is not this badge's
+  (the compare with `s0 + 0x24`), and `0x4201ec46` accepts it; then the
+  contact is saved (`0x4201d98a`, `contacts_store: saved contact
+  test-fake-badge-0002`). Probe: both held A from the same emulated
+  time; at 50 ms "PAIRING..." / "Both press or hold A\nStay within 10
+  cm", at 100 ms "SYNCED" / "Conversation Starters unlocked!" /
+  "Contacts: 1" on both badges (`uitree`). At a fixed RSSI it paired at
+  −40, −55, −60, −61, −62, −63 and −64, and stayed on "PAIRING..." at
+  −65, −66 and −70.
+- **A bump** advertises the bare `BMP2` card (no `BPA1`) for about 1 s.
+  A probe's ±3 g shake of four 300,000-step halves started it on one
+  badge; a shake of four 4 ms halves in lockstep did not, so the bump's
+  pulse is left to Task 8 to measure; its receive branch is
+  `0x4201ee96`.
+- **No signature or organizer key.** The receive path compares bytes
+  and strings only. The image's one signing routine is the Solana
+  wallet's keypair generation (`crypto_sign_seed_keypair`, tag
+  `solana`, `0x42058508`), not on this path, and the fake identities
+  paired.
+- **`rssi_min` and `threshold_mg`.** These keys (`0x3c138280`,
+  `0x3c138270`, with `require_bump`) are read only by Chess's setup
+  (`0x4201c1a2` on, section `chess`, `0x3c135e88`, through the config
+  getter `0x4200baf6` with defaults `threshold_mg` 300
+  (`li a2, 0x12c`), `rssi_min` −60 (`li a2, -0x3c`), `require_bump` 1),
+  which feeds the shared bump-pairing module at `0x420514d6`. Connect
+  does not read them: its proximity gate is the constant −64 dBm above,
+  and its bump detector's threshold was not read here.
+- **Event_Type.** The reports R-T5-4 builds (Event_Type `0x0000`) were
+  accepted: the pairing above used them.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -456,10 +649,117 @@ Without a MAC every count matched the rungs.
   — cost if wrong: if the firmware starts advertising or scanning with
   a Duration, the timeout event it waits for never comes; Task 6's trace
   shows the parameters.
+- Ruling R-T6-1 (Task 6, `feat: Connect and Sync open through a fake
+  BLE controller`): the command set is the trace's. Six commands join
+  Task 5's model, each with a test: LE Rand (`0x2018`, 7.8.23;
+  deterministic, splitmix64 over a per-BD_ADDR seed, restarted by
+  Reset), LE Set Address Resolution Enable (`0x202D`, 7.8.44), LE Clear
+  Resolving List (`0x2029`, 7.8.40), LE Add Device To Resolving List
+  (`0x2027`, 7.8.38), LE Set Privacy Mode (`0x204E`, 7.8.77) and LE
+  Remove Advertising Set (`0x203C`, 7.8.59), with their Supported
+  Commands bits (Core 5.3 table 6.27 as known: 27.7, 35.1, 34.5, 34.3,
+  39.2, 37.0). R-T5-8 is revised: the resolving list now keeps
+  identities (address type and address, at most 8), because LE Set
+  Privacy Mode must answer Unknown Connection Identifier (`0x02`) for a
+  device not on it; IRKs are not kept and nothing resolves — cost if
+  wrong: a later firmware path that relies on address resolution (none
+  seen) would see unresolved addresses; a wrong Supported Commands bit
+  only matters to a host that checks it, and v392's sends each command
+  regardless.
+- Ruling R-T6-2 (Task 6): events reach the host through a guest-executed
+  trampoline, `crate::rom::RADIO_CALL_TRAMPOLINE` (11 instructions built
+  with `cpu/encode.rs`), mapped at `RADIO_CALL_TRAMPOLINE_ADDR`, the next
+  free words of `ROM_CODE_FREE_RANGE` (`0x4003_f000..0x4004_0000`, whose
+  doc shows no `esp32c3.rom*.ld` symbol points into it). At a hooked
+  function's entry the host lowers `sp` by a 16-byte-aligned frame
+  holding the call's `ra`, the old `sp`, up to two function pointers and
+  the packet, and sets `pc` to the trampoline, which calls them and
+  returns to `ra`. Context: a hooked entry is an ABI call boundary, so
+  only caller-saved registers change and the callees preserve the rest;
+  the packet sits in the calling task's own frame, so deliveries in two
+  tasks never share memory, and an interrupt taken in the trampoline
+  saves its context below the frame. Command replies are delivered
+  inside the `esp_vhci_host_send_packet` hook, in the NimBLE host task,
+  after `notify_host_send_available` (which gives back
+  `esp_nimble_hci.c`'s `vhci_send_sem`). Asynchronous events (reports)
+  are delivered from the idle task at `esp_vApplicationIdleHook`'s entry
+  (`0x4212_ac42`), one per idle pass, skipping that pass's body (it
+  waits for an interrupt and runs the idle callbacks; the next pass
+  runs it). The idle hook is in the table only while an event waits for
+  registered callbacks (`Radio` swaps the table; it never makes a
+  pass-through, which is the only thing a swap drops), so without radio
+  traffic it never hits. Stack: the idle task's is `0x600` bytes; the
+  measured worst case, a 229-byte report, went 624 bytes below the
+  hook's `sp` — cost if wrong: `host_rcv_pkt` ends in a FreeRTOS queue
+  send that may block if NimBLE's event queue is full, which the idle
+  task must never do. The idle task only runs when every other task is
+  blocked, and each put wakes the higher-priority host task, which
+  empties the queue, so the queue would have to fill while the host task
+  is blocked on something else. If that is ever seen, delivery moves to
+  a hook in the host task.
+- Ruling R-T6-3 (Task 6): the hook table is installed on every boot
+  (`from_image`, `reset` and the soft reset), and it is present on every
+  run, radio app or not. It covers bt.c's `0x42080c64..0x42080fc8` and
+  nothing else (the idle hook joins only with traffic), so outside
+  Connect and Sync no hook is ever hit: `no_radio_without_a_radio_app`
+  shows zero hits and zero inits on hacker's whole walk, and both
+  equivalence rungs pass unchanged. The per-step check is the same two
+  range tests as with Task 3's empty table; it was not benchmarked again
+  — cost if wrong: a speed change from the non-empty ranges, which
+  `bench_redraws` would show.
+- Ruling R-T6-4 (Task 6): two mask-ROM libgcc stubs, each observed
+  faulting once the radio was up: `__popcountsi2` (`0x4000_0888`, a new
+  `Int32UnaryOp::Popcount`; `ble_hs_id_set_rnd`) and `__lesf2`
+  (`0x4000_082c`, mapped to the existing `SoftFloatOp::Lt`, since
+  libgcc builds `__lesf2` and `__ltsf2` from the same source;
+  Connect's drawing). Both are real implementations, as the module's
+  rule requires — cost if wrong: none for any earlier path, which never
+  called them.
+- Ruling R-T6-5 (Task 6): the planned `sync_finds_no_station` is not
+  reachable with committed data, so it is `sync_now_without_a_credential_is_not_ready`
+  instead: Sync checks an upload credential (NVS `badge_upload` /
+  `credential`, tied to the identity's `badge_id` and `claim_id`) before
+  it looks for a station, and the fake identities have none. Setting one
+  needs a token typed into `badge_token set` and a ROM `crc32_le` stub
+  for the NVS write; neither is done, because a committed token is
+  credential data beyond the eleven fake identities (Data-handling) —
+  cost if wrong: "No sync station in range" and the upload path stay
+  untested; the human partner decides at the gate whether a fake token
+  and the stub are wanted.
+- Ruling R-T6-6 (Task 6): Connect's home animates without pause, so it
+  is pinned by its title and footer bands held for
+  `AFTER_PRESS_STABLE_FOR`, plus the whole frame at the first step they
+  are seen held, which is deterministic. The reopened Connect is checked
+  by the bands only (its ring phase differs). The launcher after HOME
+  from Connect gets its own hash (`CONNECT_HOME_TO_LAUNCHER`): it keeps
+  the selection, and differs from the fresh cell-1 frame in 143
+  low-colour-bit icon pixels — cost if wrong: a change confined to the
+  rings' rows does not move the bands, only `CONNECT_HOME_HASH`.
+- Ruling R-T6-7 (Task 6): the radio rungs share one checkpoint,
+  `RADIO_LAUNCHER`: a `FIRST_RUN` clone with `HACKER_MAC` set, then the
+  same provisioning and walk as `launcher_for`, with every frame
+  assertion, pinned at its own `RADIO_LAUNCHER_STEPS` (342,600,681) and
+  `RADIO_LAUNCHER_US` (94,521,615). Beyond the planned rungs,
+  `sync_after_connect_initializes_the_radio_again` pins Review Focus 2
+  on the firmware itself: Connect's init, HOME, then Sync's reboot and a
+  second clean init (`radio_init_count() == 2`) — cost if wrong: about
+  one more walk's time in the suite (it stays at 11.68 s).
+- Ruling R-T6-8 (Task 6): additions to the planned interface:
+  `FirmwareRuntime::radio()` (read-only), `Radio::hook_hits`,
+  `Radio::controller`, `Radio::deliver(cpu, adv, rssi)` (Task 8's
+  runtime API calls it), `Radio::install`, `Radio::set_mac`/`mac` and
+  `HciController::has_events`. The controller's BD_ADDR is the factory
+  MAC with 2 added to its last byte (`esp_read_mac(ESP_MAC_BT)`,
+  `mac_addr.c` lines 17 and 392 to 396), in HCI byte order; the
+  firmware advertises from its random address, so nothing shows it —
+  cost if wrong: none visible; one function.
 
 ## Replaced rungs
 
 | Rung | Why |
 |---|---|
+| `connect_stops_at_the_bluetooth_controller` | Pinned Milestone 9's stop: Connect fetching mask-ROM `0x4000_08ec` (`btdm_controller_rom_data_init`). The fake controller replaces that path at bt.c's VHCI seam, so the fetch no longer happens; replaced by `connect_opens_with_the_radio_up` (and `connect_reopens_after_home`). |
+| `sync_reboots_then_stops_at_the_bluetooth_controller` | Pinned the same stop after Sync's reboot. Replaced by `sync_opens_after_its_reboot` (and `sync_after_connect_initializes_the_radio_again`); the reboot line and the one soft reset are still asserted. |
+| `run_to_the_bluetooth_fault` (helper, with `BLUETOOTH_ROM_FAULT_PC` and `BLUETOOTH_ROM_FAULT_MEPC`) | Used only by the two rungs above; nothing reaches the fault any more. |
 
 ## Milestone 11 backlog

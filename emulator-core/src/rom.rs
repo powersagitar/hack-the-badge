@@ -933,6 +933,21 @@
 //!     Both kinds are modeled as the same full re-boot through the shortcut
 //!     boot; only the reported reason differs.
 //!
+//! 27. **libgcc `__popcountsi2` and `__lesf2`** (`0x4000_0888` and
+//!     `0x4000_082c`, `esp32c3.rom.libgcc.ld` lines 89 and 66;
+//!     [`LIBGCC_INT32_FAMILY`], [`LIBGCC_SOFT_FLOAT_FAMILY`]) — Milestone
+//!     10 Task 6. With the
+//!     fake BLE controller answering (`crate::radio`), NimBLE's host-sync
+//!     callback reaches `ble_hs_id_set_rnd` (`0x420812aa`), which counts
+//!     the one-bits of the random address's bytes, one call per byte
+//!     (`jalr` from `0x420812cc` on), to reject an all-zero or all-one
+//!     random part. Observed faulting there (`RA 0x420812d4`). A real
+//!     [`Int32UnaryOp::Popcount`]: `a0` in, its one-bit count out. Once
+//!     the radio is up Connect draws its home screen and compares two
+//!     `float`s with `__lesf2` (`RA 0x4201ca50`), observed faulting next:
+//!     libgcc builds `__lesf2` from the same soft-fp source as `__ltsf2`
+//!     (`FP_CMP_S(r, A, B, 2, 2)`), so it is [`SoftFloatOp::Lt`].
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -952,7 +967,10 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 9 Task 3**: 125 stubs (`esp32c3_rom_stubs().len()`):
+//! **As of Milestone 10 Task 6**: 127 stubs (`esp32c3_rom_stubs().len()`),
+//! with `__popcountsi2` and `__lesf2` (entry 27).
+//!
+//! **As of Milestone 9 Task 3** (history): 125 stubs:
 //! Milestone 6 Task 2 turned the two CPU-frequency stubs into guest code
 //! (entry 6), leaving 123, and Milestone 9 Task 3 added `software_reset`
 //! and `software_reset_cpu` (entry 26).
@@ -1920,8 +1938,69 @@ pub const GET_CPU_FREQ_SLOT: [u32; 1] = [jal(
 const _: () =
     assert!(GET_CPU_FREQ_BODY_ADDR + 4 * GET_CPU_FREQ_BODY.len() as u32 <= ROM_CODE_FREE_RANGE.end);
 
+/// Where [`RADIO_CALL_TRAMPOLINE`] is mapped (Milestone 10 Task 6): the
+/// next free words of [`ROM_CODE_FREE_RANGE`], after
+/// [`GET_CPU_FREQ_BODY`]. No `esp32c3.rom*.ld` symbol points into that
+/// range (its doc), and nothing jumps here but `crate::radio`'s redirect,
+/// so the firmware never runs it on its own.
+pub const RADIO_CALL_TRAMPOLINE_ADDR: u32 =
+    GET_CPU_FREQ_BODY_ADDR + 4 * GET_CPU_FREQ_BODY.len() as u32;
+
+/// Byte offsets in the frame [`RADIO_CALL_TRAMPOLINE`] runs on: the host
+/// lowers `sp` by a 16-byte-aligned frame and fills it before redirecting
+/// `pc` here (`crate::radio`). The packet follows the header.
+pub const RADIO_FRAME_RA: i32 = 0;
+pub const RADIO_FRAME_OLD_SP: i32 = 4;
+pub const RADIO_FRAME_FIRST_CALL: i32 = 8;
+pub const RADIO_FRAME_SECOND_CALL: i32 = 12;
+pub const RADIO_FRAME_LEN: i32 = 16;
+pub const RADIO_FRAME_PACKET: i32 = 20;
+
+/// The radio's guest-executed call trampoline (Milestone 10 Task 6;
+/// `crate::radio`, ruling R-T6-2): how the fake BLE controller calls the
+/// host's VHCI callbacks (`esp_vhci_host_callback_t`,
+/// `components/bt/include/esp32c3/include/esp_bt.h`, ESP-IDF v5.5.3) in
+/// the calling task's own context. Entered with `sp` on a frame the host
+/// built (offsets `RADIO_FRAME_*`):
+///
+/// ```text
+///   lw   t0, FIRST_CALL(sp)     ; notify_host_send_available, or 0
+///   beq  t0, zero, 1f
+///   jalr ra, t0, 0              ; void (*)(void)
+/// 1:lw   t0, SECOND_CALL(sp)    ; notify_host_recv, or 0
+///   beq  t0, zero, 2f
+///   addi a0, sp, PACKET         ; uint8_t *data (the frame's packet)
+///   lw   a1, LEN(sp)            ; uint16_t len
+///   jalr ra, t0, 0              ; int (*)(uint8_t *, uint16_t)
+/// 2:lw   ra, RA(sp)             ; where the hooked call returns to
+///   lw   sp, OLD_SP(sp)         ; the frame is gone
+///   jalr zero, ra, 0
+/// ```
+///
+/// The callees are ordinary C functions, so they preserve `sp` and
+/// `s0..s11` (RISC-V psABI); everything the trampoline needs after a call
+/// is reloaded from the frame. Only `t0`, `a0`, `a1` and `ra` are written,
+/// all caller-saved at the hooked call boundary it replaces.
+pub const RADIO_CALL_TRAMPOLINE: [u32; 11] = [
+    lw(T0, SP, RADIO_FRAME_FIRST_CALL),
+    beq(T0, ZERO, 8),
+    jalr(RA, T0, 0),
+    lw(T0, SP, RADIO_FRAME_SECOND_CALL),
+    beq(T0, ZERO, 16),
+    addi(A0, SP, RADIO_FRAME_PACKET),
+    lw(A1, SP, RADIO_FRAME_LEN),
+    jalr(RA, T0, 0),
+    lw(RA, SP, RADIO_FRAME_RA),
+    lw(SP, SP, RADIO_FRAME_OLD_SP),
+    jalr(ZERO, RA, 0),
+];
+const _: () = assert!(
+    RADIO_CALL_TRAMPOLINE_ADDR + 4 * RADIO_CALL_TRAMPOLINE.len() as u32 <= ROM_CODE_FREE_RANGE.end
+);
+
 /// Every guest-executed ROM code blob this module maps (see the module
-/// doc's entries 6, 14 and 25), installed by [`install_esp32c3_rom_code`].
+/// doc's entries 6, 14 and 25, and [`RADIO_CALL_TRAMPOLINE`]), installed
+/// by [`install_esp32c3_rom_code`].
 pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
     RomCodeBlob {
         base: QSORT,
@@ -1954,6 +2033,10 @@ pub const ESP32C3_ROM_CODE: &[RomCodeBlob] = &[
     RomCodeBlob {
         base: GET_CPU_FREQ_BODY_ADDR,
         words: &GET_CPU_FREQ_BODY,
+    },
+    RomCodeBlob {
+        base: RADIO_CALL_TRAMPOLINE_ADDR,
+        words: &RADIO_CALL_TRAMPOLINE,
     },
 ];
 
@@ -2424,12 +2507,15 @@ const LIBGCC_INT64_FAMILY: &[(u32, &str, Int64Op)] = &[
 /// implementations -- see [`Int32UnaryOp`]. `__clzsi2` is TLSF's `fls()` in
 /// the heap allocator (Task D8's stall); `__ffssi2` is the next observed call (a0 = 0x200);
 /// `__bswapsi2` is `spi_ll_set_command()`'s `HAL_SWAP32` (Task D12, module
-/// doc entry 23). Others such as `__ctzsi2` are left to fault loudly until
+/// doc entry 23); `__popcountsi2` is NimBLE's `ble_hs_id_set_rnd`
+/// counting the random address's one-bits (Milestone 10 Task 6, module doc
+/// entry 27). Others such as `__ctzsi2` are left to fault loudly until
 /// something calls them.
 const LIBGCC_INT32_FAMILY: &[(u32, &str, Int32UnaryOp)] = &[
     (0x4000_0788, "__bswapsi2", Int32UnaryOp::Bswap),
     (0x4000_079c, "__clzsi2", Int32UnaryOp::Clz),
     (0x4000_07d4, "__ffssi2", Int32UnaryOp::Ffs),
+    (0x4000_0888, "__popcountsi2", Int32UnaryOp::Popcount),
 ];
 
 /// libgcc's soft-float `double` helpers (`esp32c3.rom.libgcc.ld`), real
@@ -2453,8 +2539,9 @@ const LIBGCC_SOFT_DOUBLE_FAMILY: &[(u32, &str, SoftDoubleOp)] = &[
 /// implementations -- see [`SoftFloatOp`]. Milestone 5 Task 4: the
 /// onboarding app's sixth page ("Shake it!") calls these; Task D-M5-2
 /// added `__floatsisf` (`hal_accel`'s sample conversion) and `__subsf3` /
-/// `__gtsf2` (the shake detector). The others are left to fault loudly
-/// until something calls them.
+/// `__gtsf2` (the shake detector); Milestone 10 Task 6 added `__lesf2`
+/// (Connect's home screen, module doc entry 27). The others are left to
+/// fault loudly until something calls them.
 const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
     (0x4000_0854, "__mulsf3", SoftFloatOp::Mul),
     (0x4000_0838, "__ltsf2", SoftFloatOp::Lt),
@@ -2463,6 +2550,7 @@ const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
     (0x4000_0800, "__floatsisf", SoftFloatOp::FloatSi),
     (0x4000_0898, "__subsf3", SoftFloatOp::Sub),
     (0x4000_0824, "__gtsf2", SoftFloatOp::Gt),
+    (0x4000_082c, "__lesf2", SoftFloatOp::Lt),
 ];
 
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM

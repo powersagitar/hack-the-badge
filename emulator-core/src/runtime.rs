@@ -98,6 +98,7 @@ use crate::cpu::{exception_code, Cpu, HookHit};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
 use crate::peripherals::spi::{SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::radio::Radio;
 
 /// Total number of raw button input slots — 1 direct GPIO (`PIN_START`) plus
 /// the 74HC165's [`crate::peripherals::gpio::HC165_SLOTS`] button bits. See
@@ -150,6 +151,9 @@ pub struct FirmwareRuntime {
     /// software resets replaced; [`FirmwareRuntime::emulated_time_us`] adds
     /// the current clock's.
     time_base_us: u64,
+    /// The fake BLE controller and its hooks (`crate::radio`), installed
+    /// on every boot.
+    radio: Radio,
 }
 
 impl FirmwareRuntime {
@@ -158,7 +162,9 @@ impl FirmwareRuntime {
     /// [`boot_from_firmware_image_with_rom_stubs`].
     pub fn from_image(image: &[u8]) -> Result<Self, ImageParseError> {
         let image: Arc<[u8]> = Arc::from(image.to_vec().into_boxed_slice());
-        let (cpu, bus) = boot_from_firmware_image_with_rom_stubs(&image)?;
+        let (mut cpu, bus) = boot_from_firmware_image_with_rom_stubs(&image)?;
+        let mut radio = Radio::new();
+        radio.install(&mut cpu);
         Ok(Self {
             image,
             cpu,
@@ -167,6 +173,7 @@ impl FirmwareRuntime {
             total_steps: 0,
             soft_reset_count: 0,
             time_base_us: 0,
+            radio,
         })
     }
 
@@ -191,6 +198,9 @@ impl FirmwareRuntime {
         self.soft_reset_count = 0;
         self.time_base_us = 0;
         self.reapply_host_input(accel, mac);
+        self.radio = Radio::new();
+        self.radio.set_mac(mac);
+        self.radio.install(&mut self.cpu);
         Ok(())
     }
 
@@ -248,6 +258,8 @@ impl FirmwareRuntime {
         self.bus.spi.st7789 = old.spi.st7789;
         self.bus.console = old.console;
         self.reapply_host_input(accel, old.efuse.factory_mac());
+        self.radio.soft_reset();
+        self.radio.install(&mut self.cpu);
         self.soft_reset_count += 1;
     }
 
@@ -339,12 +351,11 @@ impl FirmwareRuntime {
         false
     }
 
-    /// Answers an app-image hook hit (`crate::cpu::app_hooks`). No handler
-    /// exists yet, and the firmware path installs no hook table, so no
-    /// firmware run reaches this; an unhandled hit passes through and the
-    /// guest's own code runs.
-    fn dispatch_hook(&mut self, _hit: HookHit) {
-        self.cpu.hook_pass_through();
+    /// Answers an app-image hook hit (`crate::cpu::app_hooks`): every hook
+    /// is the radio's ([`Radio::install`]), which returns or redirects,
+    /// never passes through (`crate::radio`'s module doc).
+    fn dispatch_hook(&mut self, hit: HookHit) {
+        self.radio.on_hook(hit, &mut self.cpu, &mut self.bus);
     }
 
     /// Shared body for [`FirmwareRuntime::run`],
@@ -509,12 +520,27 @@ impl FirmwareRuntime {
             return false;
         };
         self.bus.efuse.set_factory_mac(mac);
+        self.radio.set_mac(Some(mac));
         true
     }
 
     /// The host-set factory MAC, if any ([`FirmwareRuntime::set_factory_mac`]).
     pub fn factory_mac(&self) -> Option<[u8; 6]> {
         self.bus.efuse.factory_mac()
+    }
+
+    /// Successful `esp_bt_controller_init` calls since power-on
+    /// ([`Radio::init_count`]): 1 once a radio app has opened, and still 1
+    /// after it reopens, since the firmware initializes the radio once per
+    /// boot. A soft reset keeps the count; [`FirmwareRuntime::reset`]
+    /// clears it.
+    pub fn radio_init_count(&self) -> u32 {
+        self.radio.init_count()
+    }
+
+    /// The radio, for tests and diagnostics.
+    pub fn radio(&self) -> &Radio {
+        &self.radio
     }
 }
 
@@ -1071,30 +1097,49 @@ mod tests {
         rt
     }
 
-    /// Until Task 6 supplies a handler, the run loop answers a hit by
-    /// passing through: each pass costs one extra step (the hit), the
-    /// guest's own instruction still runs, and the step budget is exact.
+    /// Every boot installs the radio's hook table (`crate::radio`), and the
+    /// run loop hands each hit to the radio, which answers it in the same
+    /// step: `esp_vhci_host_check_send_available` returns `false` (the
+    /// controller status in guest RAM reads IDLE here) to the caller's `ra`
+    /// without running the guest function, and the budget stays exact.
     #[test]
-    fn an_unhandled_hook_hit_passes_through_in_the_run_loop() {
-        let mut plain = FirmwareRuntime::from_image(&count_loop_image()).unwrap();
-        assert_eq!(plain.run(300).steps, 300);
-        assert_eq!(plain.cpu.regs.read(7), 150, "2 steps a pass");
-
-        let mut rt = hooked_count_loop();
+    fn the_run_loop_hands_hook_hits_to_the_radio() {
+        use crate::radio::v392;
+        let mut rt = FirmwareRuntime::from_image(&count_loop_image()).unwrap();
+        assert_eq!(
+            rt.cpu.app_hooks().lookup(v392::ESP_VHCI_HOST_SEND_PACKET),
+            Some(5),
+            "installed at boot"
+        );
+        rt.cpu.regs.write(crate::cpu::rom_stubs::REG_RA, COUNT_LOOP);
+        rt.cpu.regs.write(crate::cpu::rom_stubs::REG_A0, 0xDEAD);
+        rt.cpu.regs.pc = v392::ESP_VHCI_HOST_CHECK_SEND_AVAILABLE;
         let s = rt.run(1);
-        assert_eq!(s.pc, COUNT_LOOP, "the hit keeps pc");
-        assert_eq!(rt.cpu.regs.read(7), 0, "the hit ran nothing");
-        assert!(!rt.cpu.needs_attention(), "attend cleared the flag");
-        assert_eq!(rt.cpu.take_hook_hit(), None, "attend took the hit");
-        rt.run(1);
-        assert_eq!(rt.cpu.regs.read(7), 1, "then the guest's instruction");
-
-        let s = rt.run(298);
-        assert_eq!(s.steps, 298);
+        assert_eq!(s.pc, COUNT_LOOP, "returned to ra");
+        assert_eq!(rt.cpu.regs.read(crate::cpu::rom_stubs::REG_A0), 0);
         assert_eq!(s.rom_stub_calls, 0, "a hit is not a ROM stub call");
-        assert_eq!(rt.total_steps(), 300);
-        assert_eq!(rt.cpu.regs.read(7), 100, "3 steps a pass");
-        assert_eq!(rt.soft_reset_count(), 0);
+        assert!(!rt.cpu.needs_attention(), "attend cleared the flag");
+        assert_eq!(rt.radio().hook_hits(), 1);
+        assert_eq!(rt.run(100).steps, 100);
+        assert_eq!(rt.total_steps(), 101);
+        assert_eq!(rt.cpu.regs.read(7), 50, "the guest runs on");
+
+        // A soft reset rebuilds the core, and the boot installs the table
+        // again (ruling R-T3-2).
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert!(rt
+            .cpu
+            .app_hooks()
+            .lookup(v392::ESP_BT_CONTROLLER_INIT)
+            .is_some());
+        rt.reset().expect("reset");
+        assert!(rt
+            .cpu
+            .app_hooks()
+            .lookup(v392::ESP_BT_CONTROLLER_INIT)
+            .is_some());
+        assert_eq!(rt.radio().hook_hits(), 0, "a cold reset is a new radio");
     }
 
     /// The attention flag raised with nothing to collect (a driver took a
