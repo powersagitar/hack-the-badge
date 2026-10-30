@@ -385,6 +385,77 @@ Without a MAC every count matched the rungs.
   the plan lists it there — cost if wrong: none for behaviour (every pin
   and both equivalence rungs are unchanged); a later eFuse field (chip
   revision) goes into the same module.
+- Ruling R-T5-1 (Task 5, `feat: HCI controller model`): the model's
+  sources are the Bluetooth Core Specification v5.3, Vol 4 Part E, cited
+  per command in `emulator-core/src/radio/hci.rs`'s module doc from the
+  specification as known, not fetched. NimBLE's `ble_hs_startup.c` lives
+  in ESP-IDF's `nimble` submodule, which `raw.githubusercontent.com/
+  espressif/esp-idf/v5.5.3/…` does not serve (curl failed), so the
+  command set is the brief's list plus one: LE Set Advertising Set
+  Random Address (`0x2035`, 7.8.52), the extended-advertising form of
+  "LE Set Random Address", without which a set with a random own address
+  has no address to send. LE Remove / Clear Advertising Sets and every
+  other command answer Unknown HCI Command (`0x01`) until Task 6's trace
+  shows them — cost if wrong: a command NimBLE's startup needs fails
+  with `0x01` and the host resets; Task 6's trace names it and adds it.
+- Ruling R-T5-2 (Task 5): the controller reports itself as an LE-only
+  Core 5.0 controller (HCI/LMP version `0x09`, company `0xFFFF`, the
+  Assigned Numbers testing value, so it claims no vendor), LE features
+  bit 12 (Extended Advertising) only, buffers 251 bytes by 4 packets for
+  both Read Buffer Size commands, 4 advertising sets, and a maximum
+  advertising data length of 229 (the firmware's single-report limit):
+  more is Memory Capacity Exceeded (`0x07`, 7.8.54). Supported Commands
+  sets exactly the implemented commands' bits, from Core 5.3's table
+  6.27 as known — cost if wrong: a host check on a version, feature or
+  command bit takes another path; Task 6's trace shows it, and each
+  value is one constant.
+- Ruling R-T5-3 (Task 5): reports obey the event masks, as 7.7.65
+  requires: Event Mask bit 61 (LE Meta) and LE Event Mask bit 12
+  (subevent `0x0D`). With the masks at their Reset defaults no report is
+  sent, so the host must enable them, as NimBLE does for the events it
+  uses — cost if wrong: if the firmware's masks leave bit 12 clear,
+  `deliver` returns false and Task 6's rung shows no report; the gate is
+  one `if`.
+- Ruling R-T5-4 (Task 5): a delivered advertisement becomes a report
+  with Event_Type `0x0000` (7.7.65.13: not connectable, not scannable,
+  not directed, not a scan response, not legacy, data complete), since
+  the badges advertise without connections or scan responses; primary
+  and secondary PHY LE 1M, SID 0, TX power `0x7F`, the RSSI clamped to
+  -127..=20, no periodic interval, no direct address. The receiver sees
+  the same type whatever the sender's Advertising_Event_Properties —
+  cost if wrong: a firmware filter on the event type (legacy or
+  connectable) drops the report; `Advertisement` then carries the type.
+- Ruling R-T5-5 (Task 5): the event queue holds 32 events. A new event
+  into a full queue drops the oldest advertising report; with none to
+  drop, a report is refused (`deliver` returns false) and a command is
+  refused unexecuted (`host_to_controller` returns false), since only a
+  host ignoring its one-command credit (4.4) fills the queue with
+  replies, and a command not executed owes no reply — cost if wrong:
+  none for NimBLE, which waits for each reply before the next command.
+- Ruling R-T5-6 (Task 5): framing errors (a length byte that disagrees
+  with the packet, a packet shorter than a header) and every H4 type but
+  a command (ACL, SCO, ISO, events, unknown) are refused with `false`
+  and no reply; there are no connections for ACL. A known command whose
+  parameters are the wrong length or out of range answers Invalid HCI
+  Command Parameters (`0x12`), and every error reply carries the Status
+  alone — cost if wrong: none for a correct host.
+- Ruling R-T5-7 (Task 5): the duplicate filter keys on (address,
+  address type, data), is reset by every Scan Enable with Enable 1,
+  treats Filter_Duplicates 2 as 1 (no periods), and remembers the last
+  64 keys (oldest forgotten first). A report later dropped from a full
+  queue stays remembered, as a controller's filter does once it has
+  sent the report — cost if wrong: a peer's unchanged advertisement
+  lost to queue overflow is not heard again until scanning restarts.
+- Ruling R-T5-8 (Task 5): not modeled: air timing (intervals, windows,
+  Duration and Period, hence no Advertising Set Terminated or Scan
+  Timeout event), PHYs other than LE 1M (a scan without 1M hears
+  nothing), filter accept lists (policies validated, then ignored),
+  privacy (own address types 2 and 3 act as 0 and 1), scan requests and
+  responses (scan response data is stored, never sent). A random own
+  address uses the set's random address, else LE Set Random Address's
+  — cost if wrong: if the firmware starts advertising or scanning with
+  a Duration, the timeout event it waits for never comes; Task 6's trace
+  shows the parameters.
 
 ## Replaced rungs
 

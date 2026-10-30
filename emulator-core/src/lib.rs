@@ -4,6 +4,7 @@ pub mod cpu;
 pub mod md5;
 pub mod mem;
 pub mod peripherals;
+pub mod radio;
 pub mod rom;
 pub mod runtime;
 
