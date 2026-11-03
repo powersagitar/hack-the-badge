@@ -23,6 +23,14 @@
  * method other than GET and POST gives 405; a store failure gives a bare
  * 500. Nothing is logged, ever: SDPs carry the peers' addresses.
  *
+ * Rate limit (ruling R-T12-RL; R-T10-8..10): before any other store
+ * work, each request counts against its client's fixed 60 s window (at
+ * most {@link RATE_PER_CLIENT_PER_MIN}) and then a global fixed 1 h
+ * window (at most {@link RATE_GLOBAL_PER_HOUR}), through
+ * {@link SignalStore.incr} under the `rl:` namespace. Over either cap:
+ * 429 with a `Retry-After`, and no further store call. A window starts at
+ * its first request and ends when its counter key expires.
+ *
  * This module imports nothing, so the Vercel function, which runs it as
  * Node ESM, needs no bundling to resolve it.
  */
@@ -36,6 +44,20 @@ export const MAX_SDP_CHARS = 16 * 1024;
 /** The longest request body: one SDP, JSON-escaped (CRLFs double), plus the envelope. */
 export const MAX_BODY_BYTES = 2 * MAX_SDP_CHARS + 1024;
 
+/**
+ * Requests per client per 60 s window: a hackathon NAT puts many badges
+ * behind one IP, and each live pairing polls about once a second.
+ */
+export const RATE_PER_CLIENT_PER_MIN = 240;
+export const RATE_CLIENT_WINDOW_SECONDS = 60;
+/** Requests per 1 h window over all clients: the Upstash allowance's guard. */
+export const RATE_GLOBAL_PER_HOUR = 6000;
+export const RATE_GLOBAL_WINDOW_SECONDS = 3600;
+/** The global counter's key; client keys are `rl:client:<ip>`. */
+const GLOBAL_RATE_KEY = "rl:global";
+/** An IPv4 or IPv6 address's characters (IPv4-mapped IPv6 is at most 45). */
+const CLIENT_IP = /^[0-9A-Fa-f:.]{1,45}$/;
+
 const ROOM_CODE = new RegExp(`^[${CROCKFORD_ALPHABET}]{${ROOM_CODE_LENGTH}}$`);
 /** Tries at a free room code; 32^8 codes make a second try already rare. */
 const CREATE_ATTEMPTS = 8;
@@ -45,6 +67,12 @@ export interface SignalStore {
   /** `SET key value EX ttl [NX]`: `false` when `onlyIfAbsent` and the key exists. */
   set(key: string, value: string, ttlSeconds: number, onlyIfAbsent: boolean): Promise<boolean>;
   get(key: string): Promise<string | null>;
+  /**
+   * Increments the integer at `key` atomically (from 0 if absent) and
+   * returns the new value; a new key expires after `ttlSeconds`, an
+   * existing one keeps its expiry.
+   */
+  incr(key: string, ttlSeconds: number): Promise<number>;
 }
 
 /** An in-memory store, for tests and the dev server. `now` is injectable (ms). */
@@ -65,23 +93,59 @@ export class MemoryStore implements SignalStore {
     return this.entries.get(key)?.value ?? null;
   }
 
+  async incr(key: string, ttlSeconds: number): Promise<number> {
+    this.prune();
+    const entry = this.entries.get(key);
+    if (!entry) {
+      this.entries.set(key, { value: "1", expiresAt: this.now() + ttlSeconds * 1000 });
+      return 1;
+    }
+    const next = Number(entry.value) + 1;
+    entry.value = String(next);
+    return next;
+  }
+
   private prune(): void {
     const now = this.now();
     for (const [key, { expiresAt }] of this.entries) if (expiresAt <= now) this.entries.delete(key);
   }
 }
 
+type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
+
 /**
- * Upstash Redis through its REST API (`POST <url>` with a JSON command
- * array and a bearer token; https://upstash.com/docs/redis/features/restapi),
- * over `fetch`, so no client library is needed.
+ * Upstash Redis through its REST API, over `fetch`, so no client library
+ * is needed (https://upstash.com/docs/redis/features/restapi, checked
+ * 2026-11-02): `POST <url>` with a JSON command array and a bearer token
+ * answers `{result}` or `{error}`; `POST <url>/pipeline` with a
+ * two-dimensional array of commands answers an array of those, in order.
  */
 export class UpstashStore implements SignalStore {
   constructor(
     private readonly url: string,
     private readonly token: string,
-    private readonly fetchFn: typeof fetch = fetch,
+    // Wrapped: a bare `fetch` called as this object's method throws "Illegal invocation" in some runtimes.
+    private readonly fetchFn: FetchFn = (input, init) => fetch(input, init),
   ) {}
+
+  /**
+   * `INCR` then `EXPIRE key ttl NX` in one pipeline request. `INCR` is
+   * atomic on its own; `NX` sets the expiry only on the key's first
+   * count, so the window stays fixed.
+   */
+  async incr(key: string, ttlSeconds: number): Promise<number> {
+    const res = await this.post(`${this.url}/pipeline`, [
+      ["INCR", key],
+      ["EXPIRE", key, String(ttlSeconds), "NX"],
+    ]);
+    if (!Array.isArray(res) || res.length !== 2) throw new Error("store error");
+    for (const r of res) {
+      if (r === null || typeof r !== "object" || "error" in r) throw new Error("store error");
+    }
+    const count = (res[0] as { result?: unknown }).result;
+    if (typeof count !== "number" || !Number.isSafeInteger(count)) throw new Error("store error");
+    return count;
+  }
 
   async set(key: string, value: string, ttlSeconds: number, onlyIfAbsent: boolean): Promise<boolean> {
     const command = ["SET", key, value, "EX", String(ttlSeconds)];
@@ -96,15 +160,19 @@ export class UpstashStore implements SignalStore {
   }
 
   private async command(command: string[]): Promise<unknown> {
-    const res = await this.fetchFn(this.url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(command),
-    });
-    if (!res.ok) throw new Error("store unavailable");
-    const body = (await res.json()) as { result?: unknown; error?: unknown };
+    const body = (await this.post(this.url, command)) as { result?: unknown; error?: unknown } | null;
     if (body === null || typeof body !== "object" || "error" in body) throw new Error("store error");
     return body.result ?? null;
+  }
+
+  private async post(url: string, payload: unknown): Promise<unknown> {
+    const res = await this.fetchFn(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${this.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error("store unavailable");
+    return res.json();
   }
 }
 
@@ -207,9 +275,49 @@ async function handlePost(req: Request, store: SignalStore): Promise<Response> {
   return empty(400);
 }
 
+/**
+ * The client's rate key: the first `x-forwarded-for` entry, else
+ * `x-real-ip`, else `unknown`. A value that is not an IP address's
+ * characters (at most 45) counts as absent, so header garbage never
+ * reaches a key.
+ */
+export function clientRateKey(req: Request): string {
+  for (const header of ["x-forwarded-for", "x-real-ip"]) {
+    const value = req.headers.get(header);
+    if (value === null) continue;
+    const first = value.slice(0, 64).split(",")[0]!.trim();
+    if (CLIENT_IP.test(first)) return `rl:client:${first}`;
+  }
+  return "rl:client:unknown";
+}
+
+function tooMany(retryAfterSeconds: number): Response {
+  return new Response(null, {
+    status: 429,
+    headers: { ...NO_STORE, "Retry-After": String(retryAfterSeconds) },
+  });
+}
+
+/**
+ * Counts the request against both caps: a 429 if either is over, else
+ * `null`. Over the client cap, the global counter is not touched. The
+ * `Retry-After` is the window's length, an upper bound on its rest.
+ */
+async function rateLimit(req: Request, store: SignalStore): Promise<Response | null> {
+  if ((await store.incr(clientRateKey(req), RATE_CLIENT_WINDOW_SECONDS)) > RATE_PER_CLIENT_PER_MIN) {
+    return tooMany(RATE_CLIENT_WINDOW_SECONDS);
+  }
+  if ((await store.incr(GLOBAL_RATE_KEY, RATE_GLOBAL_WINDOW_SECONDS)) > RATE_GLOBAL_PER_HOUR) {
+    return tooMany(RATE_GLOBAL_WINDOW_SECONDS);
+  }
+  return null;
+}
+
 /** Handles one signaling request. Never throws, and never logs. */
 export async function handleSignal(req: Request, store: SignalStore): Promise<Response> {
   try {
+    const limited = await rateLimit(req, store);
+    if (limited) return limited;
     if (req.method === "GET") return await handleGet(new URL(req.url), store);
     if (req.method === "POST") return await handlePost(req, store);
     return new Response(null, { status: 405, headers: { ...NO_STORE, Allow: "GET, POST" } });

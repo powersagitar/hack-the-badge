@@ -1275,6 +1275,49 @@ later restart from the Step 4 spike with the Step 1 evidence above.
 - Ruling R-T11-2 (Task 11 Step 2, `docs: drop Part 5 on the human's
   no-go`): Part 5 is dropped. The text and its reason are under "Task
   11 Step 1: does one-way hearing change anything visible?".
+- Ruling R-T10-8 (Task 10 follow-up, `fix: rate-limit the signaling
+  endpoint`, under the human's R-T12-RL): `handleSignal` rate-limits
+  every request before any other store work. It counts the client in a
+  fixed 60 s window (at most 240 requests, since a hackathon NAT shares
+  one IP and each live pairing polls about once a second), then all
+  clients in a fixed 1 h window (at most 6000, to guard the Upstash
+  allowance). Over either cap it answers 429 with no body,
+  `Cache-Control: no-store` and `Retry-After`. A request refused by the
+  client cap does not count globally. A window starts at its first
+  request and ends when its counter key expires, so the handler needs
+  no clock. `Retry-After` is the full window (60 or 3600), an upper
+  bound on what is left. A failing counter is a bare 500, like any
+  store failure. Nothing is logged — cost if wrong: one NAT with more
+  than four simultaneous live pairings (each polling about 60 times a
+  minute) is throttled for up to a minute; a burst of 6000 requests in
+  an hour, from anyone, stops new links for everyone until the hour
+  ends.
+- Ruling R-T10-9 (Task 10 follow-up): the client key is
+  `rl:client:<ip>`. The IP is the first `x-forwarded-for` entry, else
+  `x-real-ip`. A value of more than 45 characters, or with characters
+  outside `0-9A-Fa-f:.`, counts as absent, and only the first 64
+  characters of a header are read. With neither header usable, the key
+  is `rl:client:unknown`. Keys are therefore at most 55 characters. The
+  global key is `rl:global`. Rate keys are in `rl:`, room keys in
+  `htn-signal:`. The dev server builds its `Request` without the
+  browser's headers, so every dev client shares `unknown` — cost if
+  wrong: a client that sends garbage in both headers shares the
+  `unknown` bucket with every other such client. On Vercel the first
+  `x-forwarded-for` entry is the platform's view of the client.
+- Ruling R-T10-10 (Task 10 follow-up): `SignalStore` gains
+  `incr(key, ttl)`. `UpstashStore` sends one `POST <url>/pipeline` of
+  `[["INCR", key], ["EXPIRE", key, ttl, "NX"]]`
+  (https://upstash.com/docs/redis/features/restapi, checked 2026-11-02).
+  It rejects unless it gets two non-error results and an integer
+  count. `INCR` is atomic, and `EXPIRE … NX` sets the expiry only once,
+  so the window stays fixed. `MemoryStore.incr` is the twin on its
+  injected clock. `UpstashStore`'s default fetch is now
+  `(i, o) => fetch(i, o)`, never a `fetch` called as a method of the
+  store — cost if wrong: a pipeline is not a transaction. If the
+  `EXPIRE` is lost after the `INCR`, the key never expires and that
+  client (or, for `rl:global`, everyone) stays limited until the key is
+  deleted by hand. That needs Upstash to fail between two commands of
+  one request.
 
 ## Replaced rungs
 
