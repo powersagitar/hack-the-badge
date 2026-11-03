@@ -23,13 +23,15 @@
  * method other than GET and POST gives 405; a store failure gives a bare
  * 500. Nothing is logged, ever: SDPs carry the peers' addresses.
  *
- * Rate limit (ruling R-T12-RL; R-T10-8..10): before any other store
- * work, each request counts against its client's fixed 60 s window (at
- * most {@link RATE_PER_CLIENT_PER_MIN}) and then a global fixed 1 h
- * window (at most {@link RATE_GLOBAL_PER_HOUR}), through
- * {@link SignalStore.incr} under the `rl:` namespace. Over either cap:
- * 429 with a `Retry-After`, and no further store call. A window starts at
- * its first request and ends when its counter key expires.
+ * Rate limit (rulings R-T12-RL4; R-T10-8..10): a request is validated
+ * first, with no store call, so a 400 makes no counter key. A valid one
+ * then counts, before any other store work, against four fixed windows
+ * under the `rl:` namespace, in the order {@link rateLimit} gives: all
+ * requests per client (600 / 10 min); polls per room (200 / 300 s) or
+ * writes per client (30 / 60 s); all requests (5000 / 10 min). Over any
+ * cap: 429, empty, with `Retry-After` set to that counter's window, and
+ * no further store call. A window starts at its first request and ends
+ * when its counter key expires.
  *
  * This module imports nothing, so the Vercel function, which runs it as
  * Node ESM, needs no bundling to resolve it.
@@ -45,15 +47,28 @@ export const MAX_SDP_CHARS = 16 * 1024;
 export const MAX_BODY_BYTES = 2 * MAX_SDP_CHARS + 1024;
 
 /**
- * Requests per client per 60 s window: a hackathon NAT puts many badges
- * behind one IP, and each live pairing polls about once a second.
+ * Rate caps (ruling R-T12-RL4, R-T10-8), each a fixed window counted
+ * through {@link SignalStore.incr}. A venue NAT puts many browsers behind
+ * one IP, each waiting one polling about once a second, so polls are
+ * capped per room, not per IP.
+ *
+ * Writes (`create`, `answer`) per client per 60 s.
  */
-export const RATE_PER_CLIENT_PER_MIN = 240;
-export const RATE_CLIENT_WINDOW_SECONDS = 60;
-/** Requests per 1 h window over all clients: the Upstash allowance's guard. */
-export const RATE_GLOBAL_PER_HOUR = 6000;
-export const RATE_GLOBAL_WINDOW_SECONDS = 3600;
-/** The global counter's key; client keys are `rl:client:<ip>`. */
+export const RATE_CLIENT_WRITES = 30;
+export const RATE_CLIENT_WRITES_WINDOW_SECONDS = 60;
+/** Polls (`GET want=offer|answer`) per room, over the room's own 300 s life. */
+export const RATE_ROOM_POLLS = 200;
+export const RATE_ROOM_POLLS_WINDOW_SECONDS = 300;
+/** All requests per client per 10 min: 12% of the global window. */
+export const RATE_CLIENT_REQUESTS = 600;
+export const RATE_CLIENT_REQUESTS_WINDOW_SECONDS = 600;
+/** All requests per 10 min over all clients: the Upstash allowance's guard. */
+export const RATE_GLOBAL_REQUESTS = 5000;
+export const RATE_GLOBAL_WINDOW_SECONDS = 600;
+/**
+ * The global counter's key. The others are `rl:client:<ip>`,
+ * `rl:writes:<ip>` and `rl:room:<code>`.
+ */
 const GLOBAL_RATE_KEY = "rl:global";
 /** An IPv4 or IPv6 address's characters (IPv4-mapped IPv6 is at most 45). */
 const CLIENT_IP = /^[0-9A-Fa-f:.]{1,45}$/;
@@ -130,8 +145,9 @@ export class UpstashStore implements SignalStore {
 
   /**
    * `INCR` then `EXPIRE key ttl NX` in one pipeline request. `INCR` is
-   * atomic on its own; `NX` sets the expiry only on the key's first
-   * count, so the window stays fixed.
+   * atomic on its own; `NX` sets the expiry only when the key has none,
+   * so the window stays fixed, and a key whose TTL was lost (an `EXPIRE`
+   * that failed after its `INCR`) gets one again on its next count.
    */
   async incr(key: string, ttlSeconds: number): Promise<number> {
     const res = await this.post(`${this.url}/pipeline`, [
@@ -235,21 +251,22 @@ async function readBody(req: Request): Promise<string> {
   }
 }
 
-async function handleGet(url: URL, store: SignalStore): Promise<Response> {
-  const room = url.searchParams.get("room");
-  const want = url.searchParams.get("want");
-  if (!isRoomCode(room) || (want !== "offer" && want !== "answer")) return empty(400);
-  if (want === "offer") {
-    const offer = await store.get(offerKey(room));
-    return offer === null ? empty(404) : json(200, { offer });
-  }
-  const answer = await store.get(answerKey(room));
-  if (answer !== null) return json(200, { answer });
-  // Pending only while the room exists; an expired room is gone for good.
-  return (await store.get(offerKey(room))) === null ? empty(404) : empty(204);
-}
+/** A request that passed validation: what the rate limit counts and the handler serves. */
+type Parsed =
+  | { op: "poll"; room: string; want: "offer" | "answer" }
+  | { op: "create"; offer: string }
+  | { op: "answer"; room: string; answer: string };
 
-async function handlePost(req: Request, store: SignalStore): Promise<Response> {
+/** Validates a request without touching the store: the parsed request, or a 400/405. */
+async function parse(req: Request): Promise<Parsed | Response> {
+  if (req.method === "GET") {
+    const url = new URL(req.url);
+    const room = url.searchParams.get("room");
+    const want = url.searchParams.get("want");
+    if (!isRoomCode(room) || (want !== "offer" && want !== "answer")) return empty(400);
+    return { op: "poll", room, want };
+  }
+  if (req.method !== "POST") return new Response(null, { status: 405, headers: { ...NO_STORE, Allow: "GET, POST" } });
   let body: unknown;
   try {
     body = JSON.parse(await readBody(req));
@@ -258,37 +275,48 @@ async function handlePost(req: Request, store: SignalStore): Promise<Response> {
   }
   if (typeof body !== "object" || body === null || Array.isArray(body)) return empty(400);
   const { op, offer, room, answer } = body as Record<string, unknown>;
-  if (op === "create") {
-    if (!isSdp(offer)) return empty(400);
-    for (let i = 0; i < CREATE_ATTEMPTS; i++) {
-      const code = newRoomCode();
-      if (await store.set(offerKey(code), offer, ROOM_TTL_SECONDS, true)) return json(200, { room: code });
-    }
-    return empty(503);
-  }
-  if (op === "answer") {
-    if (!isRoomCode(room) || !isSdp(answer)) return empty(400);
-    if ((await store.get(offerKey(room))) === null) return empty(404);
-    const stored = await store.set(answerKey(room), answer, ROOM_TTL_SECONDS, true);
-    return stored ? empty(204) : empty(409);
-  }
+  if (op === "create" && isSdp(offer)) return { op, offer };
+  if (op === "answer" && isRoomCode(room) && isSdp(answer)) return { op, room, answer };
   return empty(400);
 }
 
+async function serve(p: Parsed, store: SignalStore): Promise<Response> {
+  if (p.op === "poll") {
+    if (p.want === "offer") {
+      const offer = await store.get(offerKey(p.room));
+      return offer === null ? empty(404) : json(200, { offer });
+    }
+    const answer = await store.get(answerKey(p.room));
+    if (answer !== null) return json(200, { answer });
+    // Pending only while the room exists; an expired room is gone for good.
+    return (await store.get(offerKey(p.room))) === null ? empty(404) : empty(204);
+  }
+  if (p.op === "create") {
+    for (let i = 0; i < CREATE_ATTEMPTS; i++) {
+      const code = newRoomCode();
+      if (await store.set(offerKey(code), p.offer, ROOM_TTL_SECONDS, true)) return json(200, { room: code });
+    }
+    return empty(503);
+  }
+  if ((await store.get(offerKey(p.room))) === null) return empty(404);
+  const stored = await store.set(answerKey(p.room), p.answer, ROOM_TTL_SECONDS, true);
+  return stored ? empty(204) : empty(409);
+}
+
 /**
- * The client's rate key: the first `x-forwarded-for` entry, else
+ * The client, for its rate keys: the first `x-forwarded-for` entry, else
  * `x-real-ip`, else `unknown`. A value that is not an IP address's
  * characters (at most 45) counts as absent, so header garbage never
  * reaches a key.
  */
-export function clientRateKey(req: Request): string {
+export function clientId(req: Request): string {
   for (const header of ["x-forwarded-for", "x-real-ip"]) {
     const value = req.headers.get(header);
     if (value === null) continue;
     const first = value.slice(0, 64).split(",")[0]!.trim();
-    if (CLIENT_IP.test(first)) return `rl:client:${first}`;
+    if (CLIENT_IP.test(first)) return first;
   }
-  return "rl:client:unknown";
+  return "unknown";
 }
 
 function tooMany(retryAfterSeconds: number): Response {
@@ -298,29 +326,54 @@ function tooMany(retryAfterSeconds: number): Response {
   });
 }
 
+/** Counts one hit on `key`: `true` if that took it over `cap`. */
+async function over(store: SignalStore, key: string, windowSeconds: number, cap: number): Promise<boolean> {
+  return (await store.incr(key, windowSeconds)) > cap;
+}
+
 /**
- * Counts the request against both caps: a 429 if either is over, else
- * `null`. Over the client cap, the global counter is not touched. The
- * `Retry-After` is the window's length, an upper bound on its rest.
+ * Counts a valid request against its caps, in this order, stopping at
+ * the first one over (a 429 whose `Retry-After` is that counter's window,
+ * an upper bound on its rest):
+ *
+ * 1. all requests per client: a client over its own cap costs one
+ *    counter call and touches no other counter, the global one included;
+ * 2. polls per room (a poll) or writes per client (a create or answer):
+ *    a request refused here costs two calls, and still never moves the
+ *    global counter;
+ * 3. all requests, global: counted only for a request every narrower cap
+ *    let through, so one client or one room cannot spend more of it than
+ *    its own cap allows.
  */
-async function rateLimit(req: Request, store: SignalStore): Promise<Response | null> {
-  if ((await store.incr(clientRateKey(req), RATE_CLIENT_WINDOW_SECONDS)) > RATE_PER_CLIENT_PER_MIN) {
-    return tooMany(RATE_CLIENT_WINDOW_SECONDS);
+async function rateLimit(req: Request, p: Parsed, store: SignalStore): Promise<Response | null> {
+  const client = clientId(req);
+  if (await over(store, `rl:client:${client}`, RATE_CLIENT_REQUESTS_WINDOW_SECONDS, RATE_CLIENT_REQUESTS)) {
+    return tooMany(RATE_CLIENT_REQUESTS_WINDOW_SECONDS);
   }
-  if ((await store.incr(GLOBAL_RATE_KEY, RATE_GLOBAL_WINDOW_SECONDS)) > RATE_GLOBAL_PER_HOUR) {
+  if (p.op === "poll") {
+    if (await over(store, `rl:room:${p.room}`, RATE_ROOM_POLLS_WINDOW_SECONDS, RATE_ROOM_POLLS)) {
+      return tooMany(RATE_ROOM_POLLS_WINDOW_SECONDS);
+    }
+  } else if (await over(store, `rl:writes:${client}`, RATE_CLIENT_WRITES_WINDOW_SECONDS, RATE_CLIENT_WRITES)) {
+    return tooMany(RATE_CLIENT_WRITES_WINDOW_SECONDS);
+  }
+  if (await over(store, GLOBAL_RATE_KEY, RATE_GLOBAL_WINDOW_SECONDS, RATE_GLOBAL_REQUESTS)) {
     return tooMany(RATE_GLOBAL_WINDOW_SECONDS);
   }
   return null;
 }
 
-/** Handles one signaling request. Never throws, and never logs. */
+/**
+ * Handles one signaling request: validate (no store call; a 400 or 405
+ * makes no counter key), rate-limit, serve. Never throws, and never logs.
+ */
 export async function handleSignal(req: Request, store: SignalStore): Promise<Response> {
   try {
-    const limited = await rateLimit(req, store);
+    const parsed = await parse(req);
+    if (parsed instanceof Response) return parsed;
+    const limited = await rateLimit(req, parsed, store);
     if (limited) return limited;
-    if (req.method === "GET") return await handleGet(new URL(req.url), store);
-    if (req.method === "POST") return await handlePost(req, store);
-    return new Response(null, { status: 405, headers: { ...NO_STORE, Allow: "GET, POST" } });
+    return await serve(parsed, store);
   } catch (e) {
     if (e instanceof BadRequest) return empty(400);
     return empty(500);

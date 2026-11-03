@@ -1275,49 +1275,83 @@ later restart from the Step 4 spike with the Step 1 evidence above.
 - Ruling R-T11-2 (Task 11 Step 2, `docs: drop Part 5 on the human's
   no-go`): Part 5 is dropped. The text and its reason are under "Task
   11 Step 1: does one-way hearing change anything visible?".
-- Ruling R-T10-8 (Task 10 follow-up, `fix: rate-limit the signaling
-  endpoint`, under the human's R-T12-RL): `handleSignal` rate-limits
-  every request before any other store work. It counts the client in a
-  fixed 60 s window (at most 240 requests, since a hackathon NAT shares
-  one IP and each live pairing polls about once a second), then all
-  clients in a fixed 1 h window (at most 6000, to guard the Upstash
-  allowance). Over either cap it answers 429 with no body,
-  `Cache-Control: no-store` and `Retry-After`. A request refused by the
-  client cap does not count globally. A window starts at its first
-  request and ends when its counter key expires, so the handler needs
-  no clock. `Retry-After` is the full window (60 or 3600), an upper
+- Ruling R-T10-8 (Task 10 follow-ups, `fix: rate-limit the signaling
+  endpoint`, replaced by `fix: fairer rate limits for the signaling
+  endpoint` under the human's R-T12-RL4): `handleSignal` first
+  validates a request with no store call, so a 400 or 405 makes no
+  counter key. A valid request is then counted, before any other store
+  work, against four fixed windows, in this order:
+  1. all requests per client, 600 per 10 min;
+  2. for a poll (`GET want=offer|answer`), polls per room, 200 per
+     300 s (the room's own life); for a write (`create`, `answer`),
+     writes per client, 30 per 60 s;
+  3. all requests, global, 5000 per 10 min.
+
+  The order is the cheapest refusal for whoever is abusive, without
+  letting a refused request spend shared budget. A client over its own
+  cap is refused after one counter call and touches no other counter,
+  the global one included. A poll of a saturated room, or a write over
+  its cap, is refused after two calls and still never moves the
+  global counter. Only a request every narrower cap let through counts
+  globally, so one IP can spend at most 600 / 5000 = 12 % of a global
+  window, and a global lockout lasts at most 10 min. Over any cap the
+  reply is 429 with no body, `Cache-Control: no-store` and
+  `Retry-After` set to that counter's window (60, 300 or 600), an upper
   bound on what is left. A failing counter is a bare 500, like any
-  store failure. Nothing is logged — cost if wrong: one NAT with more
-  than four simultaneous live pairings (each polling about 60 times a
-  minute) is throttled for up to a minute; a burst of 6000 requests in
-  an hour, from anyone, stops new links for everyone until the hour
-  ends.
-- Ruling R-T10-9 (Task 10 follow-up): the client key is
-  `rl:client:<ip>`. The IP is the first `x-forwarded-for` entry, else
-  `x-real-ip`. A value of more than 45 characters, or with characters
-  outside `0-9A-Fa-f:.`, counts as absent, and only the first 64
-  characters of a header are read. With neither header usable, the key
-  is `rl:client:unknown`. Keys are therefore at most 55 characters. The
-  global key is `rl:global`. Rate keys are in `rl:`, room keys in
-  `htn-signal:`. The dev server builds its `Request` without the
-  browser's headers, so every dev client shares `unknown` — cost if
-  wrong: a client that sends garbage in both headers shares the
-  `unknown` bucket with every other such client. On Vercel the first
+  store failure. Nothing is logged.
+
+  The dev two-device flow (both devices on the shared `unknown` key, one
+  room each way, the host polling 1/s for the full 120 s) makes 248
+  requests:
+  - 4 writes, against a cap of 30 per minute;
+  - at most 122 polls per room, against 200;
+  - 248 per client and 248 globally, against 600 and 5000.
+
+  `test/signal-handler.test.ts` pins these numbers.
+
+  Cost if wrong:
+  - A venue NAT shares 600 requests per 10 min. A waiting host polls
+    about 60 times a minute, so the NAT gets about 4 to 5 full two-minute
+    waits per 10 min before its pairings are refused for the rest of
+    the window.
+  - Five thousand requests in 10 min, from 9 or more IPs, stop new links
+    for everyone until that window ends.
+- Ruling R-T10-9 (Task 10 follow-ups): the client is the first
+  `x-forwarded-for` entry, else `x-real-ip`. Only a header's first 64
+  characters are read. A value longer than 45 characters, or with
+  characters outside `0-9A-Fa-f:.`, counts as absent. With neither header
+  usable, the client is `unknown`.
+
+  The keys are `rl:client:<ip>`, `rl:writes:<ip>`, `rl:room:<code>` (the
+  code already validated as 8 Crockford characters) and `rl:global`, so
+  every key is at most 55 characters. Rate keys are in `rl:`, room keys
+  in `htn-signal:`.
+
+  The dev server builds its `Request` without the browser's headers, so
+  every dev client shares `unknown`.
+
+  Cost if wrong: a client that sends garbage in both headers shares the
+  `unknown` buckets with every other such client. On Vercel the first
   `x-forwarded-for` entry is the platform's view of the client.
-- Ruling R-T10-10 (Task 10 follow-up): `SignalStore` gains
+- Ruling R-T10-10 (Task 10 follow-ups): `SignalStore` gains
   `incr(key, ttl)`. `UpstashStore` sends one `POST <url>/pipeline` of
   `[["INCR", key], ["EXPIRE", key, ttl, "NX"]]`
   (https://upstash.com/docs/redis/features/restapi, checked 2026-11-02).
   It rejects unless it gets two non-error results and an integer
-  count. `INCR` is atomic, and `EXPIRE … NX` sets the expiry only once,
-  so the window stays fixed. `MemoryStore.incr` is the twin on its
-  injected clock. `UpstashStore`'s default fetch is now
-  `(i, o) => fetch(i, o)`, never a `fetch` called as a method of the
-  store — cost if wrong: a pipeline is not a transaction. If the
-  `EXPIRE` is lost after the `INCR`, the key never expires and that
-  client (or, for `rl:global`, everyone) stays limited until the key is
-  deleted by hand. That needs Upstash to fail between two commands of
-  one request.
+  count. `INCR` is atomic.
+
+  `EXPIRE … NX` is sent on every call. It sets the expiry only when the
+  key has none, so a window stays fixed. A key whose TTL was lost (an
+  `EXPIRE` that failed after its `INCR`, since a pipeline is not a
+  transaction) gets a TTL again on its next count, so it cannot stay
+  limited forever.
+
+  `MemoryStore.incr` is the twin on its injected clock.
+  `UpstashStore`'s default fetch is `(i, o) => fetch(i, o)`, never a
+  `fetch` called as a method of the store.
+
+  Cost if wrong: a key that lost its TTL lives one extra window from its
+  next count, so that counter's window is up to twice as long once.
 
 ## Replaced rungs
 
