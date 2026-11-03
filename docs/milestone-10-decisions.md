@@ -782,6 +782,16 @@ emulator.**
 - whether a laptop's RSSI for a badge held close reads −64 dBm or
   stronger.
 
+**Step 2: no-go (2026-11-02).** The only visible effect is lopsided
+(SYNCED on the emulated badge only, "No badge found" on the real one),
+the window is narrow, and the v335 card and Chrome's support for
+extended advertisements are unproven.
+
+Ruling R-T11-2: Part 5 (hearing real badges through Web Bluetooth) is
+dropped on the human's no-go (2026-11-02) — cost if wrong: users cannot
+bump-pair an emulated badge with a real badge one-way, and Part 5 would
+later restart from the Step 4 spike with the Step 1 evidence above.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -1262,6 +1272,9 @@ emulator.**
   differs in a way the static reading missed, or Chrome never reports
   its extended advertisements, a Step 3–4 spike session is spent to
   learn that, and nothing is built.
+- Ruling R-T11-2 (Task 11 Step 2, `docs: drop Part 5 on the human's
+  no-go`): Part 5 is dropped. The text and its reason are under "Task
+  11 Step 1: does one-way hearing change anything visible?".
 
 ## Replaced rungs
 
@@ -1284,3 +1297,13 @@ emulator.**
   (`721f4df` against `c9d1c42`), accepted at the Task 6 gate. A block
   cache (shelved in Milestone 8) would test the hook ranges once per
   block, not once per step.
+- **Hearing real badges (Part 5, dropped by ruling R-T11-2).** If it is
+  revived, start with Task 11's Step 4 spike: a throwaway Chrome page
+  that runs `requestLEScan` with the flag on, next to the human
+  partner's badge. It answers two open questions:
+  - does Chrome report the badge's extended, non-connectable
+    advertisements at all?
+  - does the v335 badge's bump card arrive as company `0xFFFF`
+    manufacturer data that v392 decodes?
+
+  The Step 1 evidence is in the "Task 11 Step 1" section above.
