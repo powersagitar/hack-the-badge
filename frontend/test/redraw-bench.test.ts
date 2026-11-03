@@ -56,6 +56,9 @@ function makeFake(after: Uint16Array) {
     serialPending: () => 0,
     consoleOutput: () => "",
     setAcceleration() {},
+    setFactoryMac: () => true,
+    radioAdvertisement: () => new Uint8Array(0),
+    deliverAdvertisement: () => false,
     dispose() {},
   };
   // Start somewhere other than zero, so the timing is relative to the press.

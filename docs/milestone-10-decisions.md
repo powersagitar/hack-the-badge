@@ -902,6 +902,71 @@ Measured on v392 in release, with scratch probes (copies of
   radio does not know would trip the radio's `debug_assert` in debug
   builds — cost if wrong: if Connect's home ever shows the identity,
   the organizer's open fails on the hash and needs its own pin.
+- Ruling R-T9-1 (Task 9, `feat: browser radio hub, one badge per
+  browser, Bump`): peer input is checked twice. The hub
+  (`frontend/src/radio/hub.ts`) accepts only a plain object whose `t` is
+  `"adv"` or `"bump"`, and for `"adv"` a canonical padded base64 `b` of
+  at most 316 characters that decodes to 7 to 236 bytes (the core
+  decoder's bounds, R-T8-1); a hostile getter is caught. The Worker
+  checks again that `advIn` is a `Uint8Array` of at most 236 bytes with
+  an integer RSSI in -128..127, so the wasm `i8` never wraps. The core's
+  decoder stays the one place that reads the bytes. The client posts
+  `advIn` only while the runtime runs and the page is visible, and drops
+  it otherwise, never queues it, even before `ready`. An empty local
+  advertisement (stopped advertising) is posted by the Worker as a
+  change but not sent to links — cost if wrong: a peer cannot tell "stopped
+  advertising" from "link quiet"; its controller keeps no report state,
+  so nothing waits on it.
+- Ruling R-T9-2 (Task 9): the bump and the shake share one motion
+  schedule in `firmware-runtime.ts`. Starting one replaces the other, and
+  its first acceleration is applied at the call, not at the end of the
+  next slice as the shake's was. The bump's pulse therefore starts at
+  once and ends at the first slice boundary at or past `BUMP_US`, so it
+  lasts 100 ms to 150 ms of emulated time (a slice is at most 50 ms),
+  inside Connect's 320 ms hold-off — cost if wrong: a shake now plays its
+  first half-period whole, not shortened by up to one slice. Nothing pins
+  the old timing.
+- Ruling R-T9-3 (Task 9): a bump the badge cannot feel is dropped, not
+  replayed: a peer's bump while the hub is paused, and `bump()` on a
+  client that is stopped (Lua mode, a lost badge) or hidden — cost if
+  wrong: a peer bumped while this tab was hidden does not pair with it;
+  the user bumps again.
+- Ruling R-T9-4 (Task 9): Milestone 7's hidden-page pause (its ruling
+  R-T8-10) also pauses the hub, through the client's `onPausedChange`:
+  `true` before its `stop`, `false` after its `start`, so the
+  advertisements the hub held (the latest per peer, in first-heard
+  order) are delivered to a running badge. A runtime started while the
+  page is already hidden does not pause the hub; the client drops what
+  arrives until the page is visible — cost if wrong: in that one case a
+  peer's last advertisement is lost rather than held, and the peer's
+  next re-post (at most 100 ms later, R-PF-3) replaces it.
+- Ruling R-T9-5 (Task 9): one badge per browser over the Web Lock
+  `htn-badge`, `ifAvailable` to acquire. `takeOver()` steals the lock and
+  frees it at once; the page then acquires it as usual. The old tab's
+  request ends with an `AbortError`, which runs its `onLost` (stop the
+  runtime, show the notice). Across tabs that runs in the old tab's
+  event loop, so the new tab can start a few milliseconds before the old
+  one has stopped; within a tab, and in the fake `LockManager` test,
+  the order is strict. With no `navigator.locks`, or one that throws or
+  rejects, the badge runs here. The firmware is started only while the
+  tab holds the badge — cost if wrong: two tabs briefly run one MAC at a
+  takeover, or always where Web Locks are missing; each is its own
+  emulator, so only a peer could notice.
+- Ruling R-T9-6 (Task 9): the factory MAC is set once. The Worker takes
+  the first well-formed `setMac` (6 bytes) before its first `start` and
+  ignores every later one, and `main.ts` sends it right after creating
+  the client, so it is the first queued message. It is kept in
+  `localStorage["htn-badge-mac"]` as lower-case colon hex; a stored value
+  that is malformed or not locally administered unicast is replaced —
+  cost if wrong: a MAC changed in storage takes effect on the next page
+  load only.
+- Ruling R-T9-7 (Task 9): the shell's provisioning controls and the
+  "Badge running in another tab — Run here" notice are built by exported
+  `buildProvisionControls` and `buildBadgeNotice`, which take the
+  container and a `doc`, so `test/shell.test.ts` drives them with a small
+  fake DOM instead of a new DOM dependency. The notice lives in a new
+  `#badge-notice` element, hidden until the badge is found taken — cost
+  if wrong: the fake DOM covers only what the builders use.
 
 ## Replaced rungs
 

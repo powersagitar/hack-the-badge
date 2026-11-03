@@ -24,6 +24,17 @@
  *   `requestAnimationFrame`, so without this the firmware (Snake) would
  *   keep running unseen; this restores Milestone 6's pause (ruling
  *   R-T8-10). A runtime the user stopped (a mode switch) stays stopped.
+ * - The radio (Milestone 10 Task 9): `setMac()` is queued like any
+ *   message, so sent before `start()` it reaches the Worker first.
+ *   `deliverAdvertisement()` posts `advIn` only while the runtime is
+ *   running and visible, and is dropped otherwise, never queued: a peer's
+ *   advertisement is stale by the time a paused badge runs again, and the
+ *   hub (`../radio/hub.ts`) holds the latest per peer while paused.
+ *   `bump()` is dropped the same way. `advOut` goes to the
+ *   `onAdvertisement` option. The hidden-page pause
+ *   calls `onPausedChange(true)` before its `stop`, and
+ *   `onPausedChange(false)` after its `start`, so the hub is paused with
+ *   the badge (ruling R-T9-4).
  * - `provision()` and `reset()` update the cached provisioning state (and
  *   `reset()` the speed) at once, as the in-thread runtime did; the next
  *   `status` replaces them. A `status` the Worker posted before it handled
@@ -67,11 +78,19 @@ export interface WorkerClientOptions {
   scheduleFrame?: FrameScheduler;
   /** Injectable for testing; defaults to the real `cancelAnimationFrame`. */
   cancelFrame?: FrameCanceler;
+  /** Receives each `advOut`: the badge's advertisement, empty when it stops. */
+  onAdvertisement?: (bytes: Uint8Array) => void;
+  /** Told when the hidden-page pause starts (`true`) and ends (`false`). */
+  onPausedChange?: (paused: boolean) => void;
 }
 
 /** The client runtime, plus a promise that settles when the Worker has booted the emulator (or failed to). */
 export interface WorkerFirmwareRuntime extends FirmwareRuntime {
   readonly ready: Promise<void>;
+  /** Gives the badge its factory MAC; send it before the first `start()`. */
+  setMac(mac: Uint8Array): void;
+  /** A linked peer's advertisement, heard at `rssi` dBm; dropped unless running and visible. */
+  deliverAdvertisement(bytes: Uint8Array, rssi: number): void;
 }
 
 export function createWorkerFirmwareRuntime(
@@ -91,6 +110,17 @@ export function createWorkerFirmwareRuntime(
   /** Running, but paused because the page is hidden. */
   let pausedHidden = false;
   const visibility = options.visibility ?? documentVisibility();
+  const { onAdvertisement, onPausedChange } = options;
+
+  /** Calls a listener the client does not own; its failure must not break the client. */
+  function notify<T>(listener: ((v: T) => void) | undefined, v: T): void {
+    if (!listener) return;
+    try {
+      listener(v);
+    } catch (e) {
+      console.error("firmware worker client: listener failed:", e);
+    }
+  }
   const queue: ToWorker[] = [];
   let lastSpeed = 0;
   let lastProvision: ProvisionState | null = null;
@@ -155,6 +185,9 @@ export function createWorkerFirmwareRuntime(
         lastSpeed = msg.speed;
         lastProvision = msg.provision;
         break;
+      case "advOut":
+        if (msg.bytes instanceof Uint8Array) notify(onAdvertisement, msg.bytes);
+        break;
       case "error":
         console.error("firmware worker:", msg.message);
         if (!isReady) rejectReady(new Error(msg.message));
@@ -169,11 +202,13 @@ export function createWorkerFirmwareRuntime(
     const hidden = visibility.hidden();
     if (hidden && !pausedHidden) {
       pausedHidden = true;
+      notify(onPausedChange, true);
       send({ kind: "stop" });
       dropPendingFrame();
     } else if (!hidden && pausedHidden) {
       pausedHidden = false;
       send({ kind: "start" });
+      notify(onPausedChange, false);
     }
   });
 
@@ -204,6 +239,18 @@ export function createWorkerFirmwareRuntime(
     provisionState: () => lastProvision,
     shake(): void {
       send({ kind: "shake" });
+    },
+    bump(): void {
+      // A stopped or hidden badge is not bumped later (ruling R-T9-3).
+      if (!running || pausedHidden) return;
+      send({ kind: "bump" });
+    },
+    setMac(mac: Uint8Array): void {
+      send({ kind: "setMac", mac });
+    },
+    deliverAdvertisement(bytes: Uint8Array, rssi: number): void {
+      if (!isReady || !running || pausedHidden) return;
+      send({ kind: "advIn", bytes, rssi });
     },
     reset(): void {
       lastProvision = null;

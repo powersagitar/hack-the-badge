@@ -165,6 +165,28 @@ describe("emulator-wasm firmware-boot boundary", () => {
     }
   });
 
+  // The radio passthroughs Task 9's Worker uses, through bridge.ts: a MAC
+  // set before the first run, no advertisement off a radio app, and bytes
+  // the core's decoder rejects (or nobody scanning) dropped without a throw.
+  test("the bridge's radio calls cross the boundary", () => {
+    const wasmBytes = readFileSync(
+      new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
+    );
+    initCpuWasmSync(wasmBytes);
+    const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
+    const handle = createFirmwareEmulator(new Uint8Array(image));
+    try {
+      expect(handle.setFactoryMac(new Uint8Array(5))).toBe(false);
+      expect(handle.setFactoryMac(new Uint8Array([0x02, 0, 0, 0, 0x10, 0x01]))).toBe(true);
+      handle.run(10_000);
+      expect([...handle.radioAdvertisement()]).toEqual([]);
+      expect(handle.deliverAdvertisement(new Uint8Array(3), -40)).toBe(false);
+      expect(handle.deliverAdvertisement(new Uint8Array([1, 2, 3, 4, 5, 6, 0, 2, 1, 6]), -40)).toBe(false);
+    } finally {
+      handle.dispose();
+    }
+  });
+
   // softResetCount crosses the boundary: no software reset after
   // construction, and a cold reset() is a power-on that clears the count
   // (the reboot paths themselves are pinned natively in boot_progress.rs).

@@ -53,6 +53,11 @@ export interface ProvisionControls {
   setVisible(visible: boolean): void;
 }
 
+/** The "Badge running in another tab" notice (Milestone 10 Task 9). */
+export interface BadgeNotice {
+  setVisible(visible: boolean): void;
+}
+
 export interface ShellHandles {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
@@ -72,15 +77,100 @@ export interface ShellHandles {
    */
   mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void;
   /**
-   * Mounts the role picker, "Provision test badge" and "Shake" buttons, a
-   * status span and a hint into `#provision-controls` (no-op handles if the
-   * element is missing). `onProvision` gets the selected role string.
+   * Mounts the role picker, "Provision test badge", "Shake" and "Bump"
+   * buttons, a status span and a hint into `#provision-controls` (no-op
+   * handles if the element is missing). `onProvision` gets the selected
+   * role string.
    */
   mountProvisionControls(
     roles: readonly string[],
     onProvision: (role: string) => void,
     onShake: () => void,
+    onBump: () => void,
   ): ProvisionControls;
+  /**
+   * Mounts the "Badge running in another tab — Run here" notice into
+   * `#badge-notice`, hidden (no-op handles if the element is missing).
+   */
+  mountBadgeNotice(onTakeOver: () => void): BadgeNotice;
+}
+
+/**
+ * Builds the provisioning controls into `container` (see
+ * `ShellHandles.mountProvisionControls`). Separate from {@link mountShell}
+ * so it is testable with a fake `doc`.
+ */
+export function buildProvisionControls(
+  container: HTMLElement,
+  doc: Pick<Document, "createElement">,
+  roles: readonly string[],
+  onProvision: (role: string) => void,
+  onShake: () => void,
+  onBump: () => void,
+): ProvisionControls {
+  container.innerHTML = "";
+  const select = doc.createElement("select");
+  select.className = "provision-role";
+  for (const role of roles) {
+    const opt = doc.createElement("option");
+    opt.value = role;
+    opt.textContent = roleLabel(role);
+    select.appendChild(opt);
+  }
+  const button = (label: string, onClick: () => void) => {
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "mode-btn";
+    btn.textContent = label;
+    btn.addEventListener("click", () => onClick());
+    return btn;
+  };
+  const provisionBtn = button("Provision test badge", () => onProvision(select.value));
+  const shakeBtn = button("Shake", onShake);
+  // Connect's bump: pairs with every linked badge that is bumped too.
+  const bumpBtn = button("Bump", onBump);
+  const status = doc.createElement("span");
+  status.className = "provision-status";
+  const hint = doc.createElement("p");
+  hint.className = "provision-hint";
+  hint.textContent =
+    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. In Connect, press Bump.";
+  container.append(select, provisionBtn, shakeBtn, bumpBtn, status, hint);
+  return {
+    setStatus: (text) => {
+      status.textContent = text;
+    },
+    setVisible: (visible) => {
+      container.style.display = visible ? "" : "none";
+    },
+  };
+}
+
+/**
+ * Builds the "Badge running in another tab — Run here" notice into
+ * `container`, hidden until `setVisible(true)`. "Run here" calls
+ * `onTakeOver`.
+ */
+export function buildBadgeNotice(
+  container: HTMLElement,
+  doc: Pick<Document, "createElement">,
+  onTakeOver: () => void,
+): BadgeNotice {
+  container.innerHTML = "";
+  const text = doc.createElement("span");
+  text.className = "badge-notice-text";
+  text.textContent = "Badge running in another tab \u2014 ";
+  const run = doc.createElement("button");
+  run.type = "button";
+  run.className = "mode-btn";
+  run.textContent = "Run here";
+  run.addEventListener("click", () => onTakeOver());
+  container.append(text, run);
+  const setVisible = (visible: boolean) => {
+    container.style.display = visible ? "" : "none";
+  };
+  setVisible(false);
+  return { setVisible };
 }
 
 export function mountShell(): ShellHandles {
@@ -169,44 +259,27 @@ export function mountShell(): ShellHandles {
     roles: readonly string[],
     onProvision: (role: string) => void,
     onShake: () => void,
+    onBump: () => void,
   ): ProvisionControls {
     const container = document.getElementById("provision-controls");
     if (!container) return { setStatus: () => {}, setVisible: () => {} };
-    container.innerHTML = "";
-    const select = document.createElement("select");
-    select.className = "provision-role";
-    for (const role of roles) {
-      const opt = document.createElement("option");
-      opt.value = role;
-      opt.textContent = roleLabel(role);
-      select.appendChild(opt);
-    }
-    const provisionBtn = document.createElement("button");
-    provisionBtn.type = "button";
-    provisionBtn.className = "mode-btn";
-    provisionBtn.textContent = "Provision test badge";
-    provisionBtn.addEventListener("click", () => onProvision(select.value));
-    const shakeBtn = document.createElement("button");
-    shakeBtn.type = "button";
-    shakeBtn.className = "mode-btn";
-    shakeBtn.textContent = "Shake";
-    shakeBtn.addEventListener("click", () => onShake());
-    const status = document.createElement("span");
-    status.className = "provision-status";
-    const hint = document.createElement("p");
-    hint.className = "provision-hint";
-    hint.textContent =
-      "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake.";
-    container.append(select, provisionBtn, shakeBtn, status, hint);
-    return {
-      setStatus: (text) => {
-        status.textContent = text;
-      },
-      setVisible: (visible) => {
-        container.style.display = visible ? "" : "none";
-      },
-    };
+    return buildProvisionControls(container, document, roles, onProvision, onShake, onBump);
   }
 
-  return { canvas, ctx, mountButtons, mountKeyboard, renderLeds, mountModeToggle, mountProvisionControls };
+  function mountBadgeNotice(onTakeOver: () => void): BadgeNotice {
+    const container = document.getElementById("badge-notice");
+    if (!container) return { setVisible: () => {} };
+    return buildBadgeNotice(container, document, onTakeOver);
+  }
+
+  return {
+    canvas,
+    ctx,
+    mountButtons,
+    mountKeyboard,
+    renderLeds,
+    mountModeToggle,
+    mountProvisionControls,
+    mountBadgeNotice,
+  };
 }

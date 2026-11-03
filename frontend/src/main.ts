@@ -31,10 +31,26 @@
  * the one being displayed; only its canvas output is suspended. This is
  * intentional (switching back to Lua mode resumes it mid-state instead of
  * restarting `main.lua` from `on_enter`), not a bug.
+ *
+ * **The radio (Milestone 10 Task 9).** One badge per browser: the firmware
+ * runs only in the tab holding the `htn-badge` Web Lock
+ * (`src/radio/lock.ts`); another tab shows "Badge running in another tab —
+ * Run here", whose button takes the badge over (the old tab stops). The
+ * badge's factory MAC is this browser's (`loadOrCreateMac`), sent to the
+ * Worker before its first start. `src/radio/hub.ts`'s `RadioHub` carries
+ * the badge's advertisements to linked peers and theirs back, and the
+ * Bump button bumps this badge and every linked one. Links come with
+ * Task 10; until then the badge is alone in the room. The hidden-page
+ * pause pauses the hub too.
  */
 import { renderFrame } from "./render/canvas";
-import type { FirmwareRuntime } from "./runtime/firmware-runtime";
-import { createWorkerFirmwareRuntime, type WorkerLike } from "./runtime/firmware-worker-client";
+import { RadioHub } from "./radio/hub";
+import { acquireBadge, type BadgeHold, loadOrCreateMac, takeOver } from "./radio/lock";
+import {
+  createWorkerFirmwareRuntime,
+  type WorkerFirmwareRuntime,
+  type WorkerLike,
+} from "./runtime/firmware-worker-client";
 import { createHttpFileLoader, loadApp } from "./runtime/lifecycle";
 import { TEST_IDENTITY_ROLES, testIdentityUrl } from "./runtime/test-identities";
 import { mountShell, type ButtonInjector, type EmulatorMode } from "./ui/shell";
@@ -67,6 +83,15 @@ function installLogPanel(): void {
     out.textContent += line + "\n";
     out.scrollTop = out.scrollHeight;
   };
+}
+
+/** `localStorage`, or `null` where reading it throws (blocked storage, sandboxed frames). */
+function browserStorage(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
 }
 
 function safeStringify(v: unknown): string {
@@ -117,16 +142,26 @@ function main(): void {
   // lazily, as this file did before: `bridge.ts` imports the gitignored,
   // Rust-toolchain-generated `src/cpu/wasm-pkg/`, and the Lua-only path
   // never creates the Worker, so it never loads `src/cpu/`.
-  let firmwareRuntime: FirmwareRuntime | null = null;
-  let firmwareRuntimePromise: Promise<FirmwareRuntime> | null = null;
+  let firmwareRuntime: WorkerFirmwareRuntime | null = null;
+  let firmwareRuntimePromise: Promise<WorkerFirmwareRuntime> | null = null;
 
-  async function ensureFirmwareRuntime(): Promise<FirmwareRuntime> {
+  const hub = new RadioHub({
+    deliver: (bytes, rssi) => firmwareRuntime?.deliverAdvertisement(bytes, rssi),
+    bumpLocal: () => firmwareRuntime?.bump(),
+  });
+
+  async function ensureFirmwareRuntime(): Promise<WorkerFirmwareRuntime> {
     if (firmwareRuntime) return firmwareRuntime;
     firmwareRuntimePromise ??= (async () => {
       const [wasm, image] = await Promise.all([fetchBytes(CPU_WASM_URL), fetchBytes(FIRMWARE_IMAGE_URL)]);
       const worker = new Worker(new URL("./runtime/firmware-worker.ts", import.meta.url), { type: "module" });
       // A real Worker's handlers take DOM event types; the client needs only `data`.
-      const rt = createWorkerFirmwareRuntime(worker as unknown as WorkerLike, shell.ctx, wasm, image);
+      const rt = createWorkerFirmwareRuntime(worker as unknown as WorkerLike, shell.ctx, wasm, image, {
+        onAdvertisement: (bytes) => hub.fromLocal(bytes),
+        onPausedChange: (paused) => hub.setPaused(paused),
+      });
+      // Before any start: the firmware reads its factory MAC at boot.
+      rt.setMac(loadOrCreateMac(browserStorage()));
       try {
         await new Promise<void>((resolve, reject) => {
           rt.ready.then(resolve, reject);
@@ -148,6 +183,56 @@ function main(): void {
       throw e;
     });
     return firmwareRuntimePromise;
+  }
+
+  // One badge per browser (src/radio/lock.ts): the firmware runs only while
+  // this tab holds the badge.
+  let badgeHold: BadgeHold | null = null;
+  let claiming: Promise<boolean> | null = null;
+  const badgeNotice = shell.mountBadgeNotice(() => {
+    void runHere();
+  });
+
+  /** Another tab took the badge over: stop here and offer it back. */
+  function onBadgeLost(): void {
+    badgeHold = null;
+    firmwareRuntime?.stop();
+    if (mode === "firmware") badgeNotice.setVisible(true);
+  }
+
+  /** Takes the badge if no other tab holds it; `true` if this tab holds it. */
+  function claimBadge(): Promise<boolean> {
+    if (badgeHold) return Promise.resolve(true);
+    claiming ??= acquireBadge(onBadgeLost).then((hold) => {
+      claiming = null;
+      badgeHold = hold;
+      return hold !== null;
+    });
+    return claiming;
+  }
+
+  /** Starts the firmware if this tab holds (or can take) the badge, else shows the notice. */
+  async function startFirmware(): Promise<void> {
+    if (!(await claimBadge())) {
+      if (mode === "firmware") badgeNotice.setVisible(true);
+      return;
+    }
+    badgeNotice.setVisible(false);
+    const rt = await ensureFirmwareRuntime();
+    // The user switched away, or another tab took the badge, while it booted.
+    if (mode !== "firmware" || !badgeHold) return;
+    rt.start();
+  }
+
+  /** "Run here": takes the badge from the other tab (which stops), then starts it here. */
+  async function runHere(): Promise<void> {
+    await takeOver();
+    if (mode !== "firmware") return;
+    try {
+      await startFirmware();
+    } catch (e) {
+      console.error("Failed to start real-firmware mode:", e);
+    }
   }
 
   const inject: ButtonInjector = (button, kind) => {
@@ -180,6 +265,7 @@ function main(): void {
     refreshModeToggle();
 
     if (next === "lua") {
+      badgeNotice.setVisible(false);
       startLuaPaintLoop();
       return;
     }
@@ -187,9 +273,7 @@ function main(): void {
     // next === "firmware"
     shell.renderLeds([]); // real-firmware mode models no LED peripheral yet
     try {
-      const rt = await ensureFirmwareRuntime();
-      if (mode !== "firmware") return; // user switched away again before boot finished
-      rt.start();
+      await startFirmware();
     } catch (e) {
       console.error("Failed to start real-firmware mode:", e);
       // Fall back to Lua-sandbox mode rather than leaving the canvas frozen
@@ -216,6 +300,7 @@ function main(): void {
       }
     },
     () => firmwareRuntime?.shake(),
+    () => hub.bump(),
   );
   setInterval(() => {
     provisionControls.setVisible(mode === "firmware");
@@ -244,6 +329,7 @@ function main(): void {
   window.addEventListener("beforeunload", () => {
     luaRuntime.stop();
     firmwareRuntime?.dispose();
+    badgeHold?.release();
   });
 }
 

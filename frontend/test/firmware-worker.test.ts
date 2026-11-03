@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import {
+  BUMP_US,
   MAX_FRAME_DELTA_MS,
   PRESS_HOLD_US,
   RAW_SLOT_BY_BUTTON,
@@ -8,8 +9,13 @@ import {
   WORKER_STEPS_PER_SLICE,
 } from "../src/runtime/firmware-runtime";
 import { createWorkerState, handleMessage, type WorkerHost, type WorkerState } from "../src/runtime/firmware-worker";
-import { createWorkerFirmwareRuntime, type VisibilitySource, type WorkerLike } from "../src/runtime/firmware-worker-client";
-import type { FromWorker, ToWorker } from "../src/runtime/firmware-worker-protocol";
+import {
+  createWorkerFirmwareRuntime,
+  type VisibilitySource,
+  type WorkerClientOptions,
+  type WorkerLike,
+} from "../src/runtime/firmware-worker-client";
+import { ADV_REPOST_MS, type FromWorker, type ToWorker } from "../src/runtime/firmware-worker-protocol";
 
 /** `bun test` has no `ImageData`; the client's paint blits with one (see test/framebuffer.test.ts). */
 class FakeImageData {
@@ -34,6 +40,10 @@ function makeFakeHandle(usPerStep = 1) {
   const buttonCalls: Array<[number, boolean]> = [];
   const accel: Array<[number, number, number]> = [];
   const typed: string[] = [];
+  const macs: number[][] = [];
+  const delivered: Array<{ bytes: number[]; rssi: number }> = [];
+  let adv = new Uint8Array(0);
+  let advReads = 0;
   const summary = (n: number): CpuRunSummary => ({
     steps: n,
     traps: 0,
@@ -70,6 +80,19 @@ function makeFakeHandle(usPerStep = 1) {
     setAcceleration: (x, y, z) => {
       accel.push([x, y, z]);
     },
+    setFactoryMac(mac) {
+      macs.push([...mac]);
+      return mac.length === 6;
+    },
+    radioAdvertisement() {
+      advReads++;
+      // A fresh copy, as the wasm glue returns.
+      return adv.slice();
+    },
+    deliverAdvertisement(bytes, rssi) {
+      delivered.push({ bytes: [...bytes], rssi });
+      return true;
+    },
     dispose() {},
   };
   return {
@@ -78,6 +101,10 @@ function makeFakeHandle(usPerStep = 1) {
     buttonCalls,
     accel,
     typed,
+    macs,
+    delivered,
+    setAdv: (bytes: number[]) => (adv = new Uint8Array(bytes)),
+    advReads: () => advReads,
     print: (s: string) => (consoleText += s),
     setTimeUs: (t: number) => (timeUs = t),
   };
@@ -281,6 +308,125 @@ describe("firmware worker", () => {
   });
 });
 
+const advsOf = (posted: FromWorker[]) =>
+  posted.filter((m) => m.kind === "advOut").map((m) => [...(m as Extract<FromWorker, { kind: "advOut" }>).bytes]);
+
+describe("firmware worker radio", () => {
+  test("setMac is applied once, before the first start", async () => {
+    const { fake, send } = await bootedRig();
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) });
+    expect(fake.macs).toEqual([[2, 0, 0, 0, 0x10, 1]]);
+    // A second MAC, or one after start, is ignored: the firmware reads it at boot.
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 2]) });
+    send({ kind: "start" });
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 3]) });
+    expect(fake.macs).toEqual([[2, 0, 0, 0, 0x10, 1]]);
+  });
+
+  test("a malformed setMac is ignored without throwing", async () => {
+    const { fake, posted, send } = await bootedRig();
+    for (const mac of [null, "02:00:00:00:10:01", [2, 0, 0, 0, 0x10, 1], new Uint8Array(5), new Uint8Array(7)]) {
+      expect(() => send({ kind: "setMac", mac } as unknown as ToWorker)).not.toThrow();
+    }
+    expect(fake.macs).toEqual([]);
+    expect(posted).toEqual([]);
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) });
+    expect(fake.macs).toHaveLength(1);
+  });
+
+  test("setMac after a start is ignored", async () => {
+    const { fake, send } = await bootedRig();
+    send({ kind: "start" });
+    send({ kind: "stop" });
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) });
+    expect(fake.macs).toEqual([]);
+  });
+
+  test("advIn reaches the emulator; malformed ones are dropped", async () => {
+    const { fake, posted, send } = await bootedRig();
+    const ok = new Uint8Array([1, 2, 3, 4, 5, 6, 0, 2, 1, 6]);
+    send({ kind: "advIn", bytes: ok, rssi: -40 });
+    expect(fake.delivered).toEqual([{ bytes: [...ok], rssi: -40 }]);
+    const bad: unknown[] = [
+      { kind: "advIn", bytes: [1, 2, 3, 4, 5, 6, 0], rssi: -40 },
+      { kind: "advIn", bytes: "AAAA", rssi: -40 },
+      { kind: "advIn", bytes: ok, rssi: "-40" },
+      { kind: "advIn", bytes: ok, rssi: -40.5 },
+      { kind: "advIn", bytes: ok, rssi: -129 },
+      { kind: "advIn", bytes: ok, rssi: 128 },
+      { kind: "advIn", bytes: ok, rssi: Number.NaN },
+      { kind: "advIn", bytes: new Uint8Array(237), rssi: -40 },
+      { kind: "advIn" },
+    ];
+    for (const m of bad) expect(() => send(m as ToWorker)).not.toThrow();
+    expect(fake.delivered).toHaveLength(1);
+    expect(posted).toEqual([]);
+  });
+
+  test("bump plays the pulse in emulated time", async () => {
+    const { fake, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    send({ kind: "bump" });
+    expect(fake.accel).toEqual([[1000, 0, 1000]]);
+    sliceAt(50);
+    sliceAt(99);
+    expect(fake.accel).toHaveLength(1);
+    sliceAt(100);
+    expect(fake.handle.emulatedTimeUs()).toBe(BUMP_US);
+    expect(fake.accel.at(-1)).toEqual([0, 0, 1000]);
+  });
+
+  test("advOut is posted on a change, and re-posted every ADV_REPOST_MS while advertising", async () => {
+    expect(ADV_REPOST_MS).toBe(100);
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    sliceAt(10);
+    // Not advertising (Connect's idle home): nothing posted.
+    expect(advsOf(posted)).toEqual([]);
+    fake.setAdv([1, 2, 3, 4, 5, 6, 0, 3, 0xff, 0xff, 0xff]);
+    sliceAt(20);
+    expect(advsOf(posted)).toEqual([[1, 2, 3, 4, 5, 6, 0, 3, 0xff, 0xff, 0xff]]);
+    sliceAt(30);
+    sliceAt(119);
+    expect(advsOf(posted)).toHaveLength(1);
+    // A change goes out at once, not at the next re-post.
+    fake.setAdv([1, 2, 3, 4, 5, 6, 0, 4, 0x42, 0x50, 0x41, 0x31]);
+    sliceAt(121);
+    expect(advsOf(posted)).toHaveLength(2);
+    expect(advsOf(posted).at(-1)).toEqual([1, 2, 3, 4, 5, 6, 0, 4, 0x42, 0x50, 0x41, 0x31]);
+    // The same advertisement again after 100 ms.
+    for (let t = 125; t <= 213; t += 8) sliceAt(t);
+    expect(advsOf(posted)).toHaveLength(2);
+    sliceAt(221);
+    expect(advsOf(posted)).toHaveLength(3);
+    // At most 10 Hz over a second of slices.
+    for (let t = 230; t <= 1_230; t += 4) sliceAt(t);
+    expect(advsOf(posted).length).toBeLessThanOrEqual(3 + 10);
+    expect(advsOf(posted).length).toBeGreaterThanOrEqual(3 + 9);
+    // Stopping advertising is a change: one empty advOut, then silence.
+    const n = advsOf(posted).length;
+    fake.setAdv([]);
+    sliceAt(1_240);
+    expect(advsOf(posted)).toHaveLength(n + 1);
+    expect(advsOf(posted).at(-1)).toEqual([]);
+    for (let t = 1_250; t <= 2_000; t += 10) sliceAt(t);
+    expect(advsOf(posted)).toHaveLength(n + 1);
+  });
+
+  test("a stopped worker posts no advOut", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    fake.setAdv([1, 2, 3, 4, 5, 6, 0, 1, 0]);
+    send({ kind: "start" });
+    sliceAt(0);
+    expect(advsOf(posted)).toHaveLength(1);
+    send({ kind: "stop" });
+    for (let t = 100; t <= 1_000; t += 100) sliceAt(t);
+    expect(advsOf(posted)).toHaveLength(1);
+  });
+});
+
 /** A fake Worker that records what the client posts and lets the test reply. */
 function fakeWorker() {
   const sent: ToWorker[] = [];
@@ -305,7 +451,7 @@ function makeCtx() {
 }
 
 /** A client over a fake Worker with a manual animation-frame queue. */
-function clientRig() {
+function clientRig(options: WorkerClientOptions = {}) {
   const fw = fakeWorker();
   const { ctx, puts } = makeCtx();
   const rafs = new Map<number, (t: number) => void>();
@@ -318,6 +464,7 @@ function clientRig() {
     cancelFrame: (id) => {
       rafs.delete(id);
     },
+    ...options,
   });
   const animationFrame = () => {
     const cbs = [...rafs.values()];
@@ -463,6 +610,93 @@ describe("firmware worker client", () => {
     rt.dispose();
     expect(terminated()).toBe(1);
     expect(() => rt.start()).toThrow();
+  });
+});
+
+describe("firmware worker client radio", () => {
+  test("setMac is sent before start, and bump is forwarded", () => {
+    const { rt, sent, reply } = clientRig();
+    rt.setMac(new Uint8Array([2, 0, 0, 0, 0x10, 1]));
+    rt.start();
+    reply({ kind: "ready" });
+    rt.bump();
+    expect(sent.slice(1)).toEqual([
+      { kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) },
+      { kind: "start" },
+      { kind: "bump" },
+    ]);
+  });
+
+  test("advOut reaches onAdvertisement, and a throwing listener does not escape", () => {
+    const heard: number[][] = [];
+    const { rt, reply } = clientRig({ onAdvertisement: (b) => heard.push([...b]) });
+    reply({ kind: "ready" });
+    rt.start();
+    reply({ kind: "advOut", bytes: new Uint8Array([1, 2, 3]) });
+    expect(heard).toEqual([[1, 2, 3]]);
+    reply({ kind: "advOut", bytes: "nope" } as unknown as FromWorker);
+    expect(heard).toHaveLength(1);
+    const throwing = clientRig({
+      onAdvertisement: () => {
+        throw new Error("hub gone");
+      },
+    });
+    throwing.reply({ kind: "ready" });
+    throwing.rt.start();
+    const original = console.error;
+    console.error = () => {};
+    try {
+      expect(() => throwing.reply({ kind: "advOut", bytes: new Uint8Array([1]) })).not.toThrow();
+    } finally {
+      console.error = original;
+    }
+  });
+
+  test("deliverAdvertisement posts advIn only while running and visible", () => {
+    const vis = fakeVisibility();
+    const { rt, sent, reply } = clientRig({ visibility: vis.source });
+    const adv = new Uint8Array([1, 2, 3, 4, 5, 6, 0, 1, 0]);
+    rt.deliverAdvertisement(adv, -40); // not ready, not started: dropped, not queued
+    reply({ kind: "ready" });
+    rt.deliverAdvertisement(adv, -40); // not started
+    rt.start();
+    rt.deliverAdvertisement(adv, -40);
+    vis.set(true);
+    rt.deliverAdvertisement(adv, -40); // hidden
+    vis.set(false);
+    rt.stop();
+    rt.deliverAdvertisement(adv, -40); // stopped
+    expect(sent.filter((m) => m.kind === "advIn")).toEqual([{ kind: "advIn", bytes: adv, rssi: -40 }]);
+  });
+
+  test("bump is dropped while stopped or hidden, not replayed later", () => {
+    const vis = fakeVisibility();
+    const { rt, sent, reply } = clientRig({ visibility: vis.source });
+    reply({ kind: "ready" });
+    rt.bump(); // not started
+    rt.start();
+    vis.set(true);
+    rt.bump(); // hidden
+    vis.set(false);
+    rt.bump();
+    rt.stop();
+    rt.bump(); // stopped
+    expect(sent.filter((m) => m.kind === "bump")).toHaveLength(1);
+  });
+
+  test("the hidden-page pause calls onPausedChange: paused before stop, resumed after start", () => {
+    const vis = fakeVisibility();
+    const log: string[] = [];
+    const { rt, sent, reply } = clientRig({
+      visibility: vis.source,
+      onPausedChange: (p) => log.push(`${p ? "pause" : "resume"} after ${sent.at(-1)?.kind}`),
+    });
+    reply({ kind: "ready" });
+    rt.start();
+    vis.set(true);
+    vis.set(false);
+    expect(log).toEqual(["pause after start", "resume after start"]);
+    expect(sent.map((m) => m.kind).filter((k) => k === "stop" || k === "start")).toEqual(["start", "stop", "start"]);
   });
 });
 

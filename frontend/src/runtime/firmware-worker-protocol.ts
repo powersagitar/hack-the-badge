@@ -11,6 +11,20 @@
  *   painting (or after dropping a frame while stopped).
  * - `status` carries the speed reading and the provisioning state, at most
  *   every 250 ms (`STATUS_INTERVAL_MS`).
+ *
+ * The radio (Milestone 10 Task 9):
+ *
+ * - `setMac` gives the badge its per-browser factory MAC. The Worker
+ *   applies it once, before the first `start` (the firmware reads it at
+ *   boot), and ignores it after that.
+ * - `advIn` is a linked peer's advertisement (the peer's `advOut` bytes),
+ *   already validated by `../radio/hub.ts`; the Worker checks the types
+ *   and bounds again and hands it to the emulator at `rssi` dBm.
+ * - `bump` plays the bump pulse on the accelerometer.
+ * - `advOut` is this badge's advertisement (`addr(6) ‖ addr_type(1) ‖
+ *   data`, empty when it stops advertising). The Worker posts it at once
+ *   when it changes, and re-posts it every `ADV_REPOST_MS` while it
+ *   advertises (ruling R-PF-3), so at most 10 Hz without a change.
  */
 import type { ButtonName } from "../badge/input";
 import type { ProvisionState } from "./provisioner";
@@ -22,6 +36,9 @@ export type ToWorker =
   | { kind: "button"; button: ButtonName; pressed: boolean }
   | { kind: "provision"; identityJson: string }
   | { kind: "shake" }
+  | { kind: "bump" }
+  | { kind: "setMac"; mac: Uint8Array }
+  | { kind: "advIn"; bytes: Uint8Array; rssi: number }
   | { kind: "reset" }
   | { kind: "frameAck" }
   | { kind: "dispose" };
@@ -30,7 +47,11 @@ export type FromWorker =
   | { kind: "ready" }
   | { kind: "frame"; pixels: ArrayBuffer; width: number; height: number }
   | { kind: "status"; speed: number; provision: ProvisionState | null }
+  | { kind: "advOut"; bytes: Uint8Array }
   | { kind: "error"; message: string };
 
 /** Least wall time (ms) between two `status` messages. */
 export const STATUS_INTERVAL_MS = 250;
+
+/** Least wall time (ms) between two `advOut` messages with the same advertisement (ruling R-PF-3). */
+export const ADV_REPOST_MS = 100;

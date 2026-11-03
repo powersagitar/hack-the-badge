@@ -100,6 +100,23 @@ export interface FirmwareEmulatorHandle {
    * (default: lying face up, `(0, 0, 1000)`); survives `reset()`.
    */
   setAcceleration(xMg: number, yMg: number, zMg: number): void;
+  /**
+   * Gives the badge its factory MAC (6 bytes); `false` otherwise. Set it
+   * before the first run: the firmware reads it at boot (ruling R-T4-1).
+   */
+  setFactoryMac(mac: Uint8Array): boolean;
+  /**
+   * What the badge advertises now, as `addr(6) ‖ addr_type(1) ‖ data`
+   * (ruling R-T8-1); empty while it is not advertising.
+   */
+  radioAdvertisement(): Uint8Array;
+  /**
+   * The badge hears a peer's advertisement (the bytes of the peer's
+   * {@link radioAdvertisement}) at `rssi` dBm (an integer in -128..127).
+   * `false` if dropped (nobody scanning) or malformed; never throws for
+   * bad bytes.
+   */
+  deliverAdvertisement(bytes: Uint8Array, rssi: number): boolean;
   /** Releases the WASM-side emulator. Calling anything else afterwards throws. */
   dispose(): void;
 }
@@ -223,6 +240,18 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     setAcceleration(xMg: number, yMg: number, zMg: number): void {
       assertLive();
       wasm.setAcceleration(xMg, yMg, zMg);
+    },
+    setFactoryMac(mac: Uint8Array): boolean {
+      assertLive();
+      return wasm.setFactoryMac(mac);
+    },
+    radioAdvertisement(): Uint8Array {
+      assertLive();
+      return wasm.radioAdvertisement();
+    },
+    deliverAdvertisement(bytes: Uint8Array, rssi: number): boolean {
+      assertLive();
+      return wasm.deliverAdvertisement(bytes, rssi);
     },
     dispose(): void {
       if (disposed) return;

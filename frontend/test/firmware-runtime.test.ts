@@ -16,6 +16,8 @@ import {
   SHAKE_HALF_US,
   shakeAcceleration,
   stepFirmwareFrame,
+  BUMP_US,
+  bumpAcceleration,
 } from "../src/runtime/firmware-runtime";
 
 /**
@@ -119,6 +121,9 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
     serialPending: () => 0,
     consoleOutput: () => "",
     setAcceleration: () => {},
+    setFactoryMac: () => true,
+    radioAdvertisement: () => new Uint8Array(0),
+    deliverAdvertisement: () => false,
     dispose(): void {
       counters.disposeCalls++;
     },
@@ -536,6 +541,58 @@ describe("FirmwareRuntime shake", () => {
     setTimeUs(SHAKE_HALF_US);
     frame();
     expect(accel.length).toBe(n);
+  });
+});
+
+describe("bumpAcceleration", () => {
+  // Task 8's `bump` (emulator-core/tests/boot_progress.rs, ruling R-T8-2):
+  // (1000, 0, 1000) mg for 100 ms, then rest.
+  test("matches Task 8's pulse at its sample points", () => {
+    expect(BUMP_US).toBe(100_000);
+    expect(bumpAcceleration(0)).toEqual([1000, 0, 1000]);
+    expect(bumpAcceleration(50_000)).toEqual([1000, 0, 1000]);
+    expect(bumpAcceleration(BUMP_US - 1)).toEqual([1000, 0, 1000]);
+    expect(bumpAcceleration(BUMP_US)).toBeNull();
+    expect(bumpAcceleration(10 * BUMP_US)).toBeNull();
+  });
+});
+
+describe("FirmwareRuntime bump", () => {
+  test("starts the pulse at once, holds it BUMP_US of emulated time, then rests", () => {
+    const { rt, accel, frame, setTimeUs } = rig();
+    setTimeUs(700);
+    rt.start();
+    rt.bump();
+    expect(accel).toEqual([[1000, 0, 1000]]);
+    frame();
+    setTimeUs(700 + BUMP_US - 1);
+    frame();
+    expect(accel).toHaveLength(1);
+    setTimeUs(700 + BUMP_US);
+    frame();
+    expect(accel.at(-1)).toEqual([0, 0, 1000]);
+    setTimeUs(700 + 5 * BUMP_US);
+    frame();
+    expect(accel).toHaveLength(2);
+  });
+
+  test("a bump replaces a running shake, and reset cancels a bump", () => {
+    const { rt, accel, frame, setTimeUs } = rig();
+    rt.start();
+    rt.shake();
+    frame();
+    expect(accel.at(-1)).toEqual([2000, 2000, 1000]);
+    rt.bump();
+    expect(accel.at(-1)).toEqual([1000, 0, 1000]);
+    setTimeUs(SHAKE_HALF_US);
+    frame();
+    expect(accel.at(-1)).toEqual([1000, 0, 1000]);
+    rt.reset();
+    expect(accel.at(-1)).toEqual([0, 0, 1000]);
+    const n = accel.length;
+    setTimeUs(SHAKE_HALF_US + BUMP_US);
+    frame();
+    expect(accel).toHaveLength(n);
   });
 });
 

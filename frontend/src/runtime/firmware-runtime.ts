@@ -16,7 +16,7 @@
  * at `WORKER_STEPS_PER_SLICE` steps, timed by the `now` option, and
  * `present` posts the framebuffer to the main thread, where
  * `./firmware-worker-client.ts` paints it. The button tap queue, the
- * shake schedule and the provisioner below therefore all live in the
+ * shake and bump schedule and the provisioner below therefore all live in the
  * Worker, unchanged. The in-thread shape (a `requestAnimationFrame` loop
  * whose `present` blits with `src/render/framebuffer.ts`, capped at
  * `DEFAULT_STEPS_PER_FRAME`) is what the unit tests drive.
@@ -185,6 +185,24 @@ export function shakeAcceleration(elapsedUs: number): [number, number, number] |
   return [s * 2000, s * 2000, 1000];
 }
 
+/** Emulated µs a bump's pulse lasts (`BUMP_US` in boot_progress.rs, ruling R-T8-2). */
+export const BUMP_US = 100_000;
+/** The bump's acceleration (mg): +1,000 mg on x over the face-up rest (`BUMP_MG`). */
+const BUMP_ACCELERATION: [number, number, number] = [1000, 0, 1000];
+
+/**
+ * The acceleration (mg) `elapsedUs` of emulated time into a bump:
+ * (1000, 0, 1000) for `BUMP_US`, then `null` (done; the caller restores
+ * the rest acceleration). Mirrors `bump()` in
+ * `emulator-core/tests/boot_progress.rs` (ruling R-T8-2): one step on one
+ * axis, more than the 400 mg Connect's detector needs between two
+ * samples, held longer than its longest sample gap (70 ms) and shorter
+ * than its hold-off (320 ms).
+ */
+export function bumpAcceleration(elapsedUs: number): [number, number, number] | null {
+  return elapsedUs < BUMP_US ? [...BUMP_ACCELERATION] : null;
+}
+
 export type FrameScheduler = (cb: (timeMs: number) => void) => number;
 export type FrameCanceler = (handle: number) => void;
 /** Receives a frame's framebuffer: RGB565, row-major, `width * height` elements. */
@@ -269,6 +287,12 @@ export interface FirmwareRuntime {
   provisionState(): ProvisionState | null;
   /** Shakes the emulated accelerometer (the onboarding's "Shake it!" page). */
   shake(): void;
+  /**
+   * Bumps the badge ({@link bumpAcceleration}): Connect's bump, which
+   * starts its radio. Replaces a shake still playing, as a shake replaces
+   * a bump; the pulse starts at once (ruling R-T9-2).
+   */
+  bump(): void;
   /** Re-boots the firmware from the same image, keeping held buttons. */
   reset(): void;
   /**
@@ -337,9 +361,12 @@ export function createFirmwareRuntime(
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
-  /** Emulated time (µs) at which the current shake began, or `null`. */
-  let shakeStartedAt: number | null = null;
-  let lastShakeAccel: string | null = null;
+  /**
+   * The accelerometer motion playing (a shake or a bump): its profile and
+   * the emulated time (µs) it began, or `null`.
+   */
+  let motion: { profile: (elapsedUs: number) => [number, number, number] | null; startedAt: number } | null = null;
+  let lastMotionAccel: string | null = null;
   /**
    * Per button: its taps in order, each `true` once the user has let go
    * (at most `MAX_QUEUED_TAPS`). The first is the one held in the emulator
@@ -364,19 +391,31 @@ export function createFirmwareRuntime(
     }
   }
 
-  function pollShake(now: number): void {
-    if (shakeStartedAt === null) return;
-    const a = shakeAcceleration(now - shakeStartedAt);
+  function pollMotion(now: number): void {
+    if (motion === null) return;
+    const a = motion.profile(now - motion.startedAt);
     if (a === null) {
-      shakeStartedAt = null;
-      lastShakeAccel = null;
+      motion = null;
+      lastMotionAccel = null;
       handle.setAcceleration(...REST_ACCELERATION);
       return;
     }
     const key = a.join(",");
-    if (key === lastShakeAccel) return;
-    lastShakeAccel = key;
+    if (key === lastMotionAccel) return;
+    lastMotionAccel = key;
     handle.setAcceleration(...a);
+  }
+
+  /**
+   * Starts `profile` now, replacing any motion playing, and applies its
+   * first acceleration at once, so the whole first period is played
+   * (ruling R-T9-2).
+   */
+  function startMotion(profile: (elapsedUs: number) => [number, number, number] | null): void {
+    const now = handle.emulatedTimeUs();
+    motion = { profile, startedAt: now };
+    lastMotionAccel = null;
+    pollMotion(now);
   }
 
   /**
@@ -446,7 +485,7 @@ export function createFirmwareRuntime(
     // The provisioner's timeout is in steps; holds and shakes in emulated time.
     pollProvisioner(handle.totalSteps());
     const nowUs = handle.emulatedTimeUs();
-    pollShake(nowUs);
+    pollMotion(nowUs);
     pollTaps(nowUs);
     onFrame?.(r, delta);
     if (frameHandle !== null) {
@@ -498,15 +537,18 @@ export function createFirmwareRuntime(
   }
 
   function shake(): void {
-    shakeStartedAt = handle.emulatedTimeUs();
-    lastShakeAccel = null;
+    startMotion(shakeAcceleration);
+  }
+
+  function bump(): void {
+    startMotion(bumpAcceleration);
   }
 
   function reset(): void {
     provisioner = null;
     lastState = null;
-    shakeStartedAt = null;
-    lastShakeAccel = null;
+    motion = null;
+    lastMotionAccel = null;
     flushTaps();
     // Emulated time restarts at zero: a still-held tap counts as held long
     // enough, so it is released as soon as the user lets go, and the
@@ -537,6 +579,7 @@ export function createFirmwareRuntime(
     provision,
     provisionState: () => lastState,
     shake,
+    bump,
     speed: () => speed,
     isExitRequested: () => false,
     dispose,

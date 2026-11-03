@@ -31,6 +31,17 @@
  * `status` (speed and provisioning state) goes out at most every
  * `STATUS_INTERVAL_MS`.
  *
+ * ## The radio (Milestone 10 Task 9)
+ *
+ * `setMac` is applied once, before the first `start`: the firmware reads
+ * the factory MAC at boot. After each slice the Worker reads the badge's
+ * advertisement and posts `advOut` when it changed, or when it is
+ * unchanged, non-empty and `ADV_REPOST_MS` have passed since the last
+ * post (ruling R-PF-3). A stopped Worker runs no slices, so it posts
+ * none. `advIn` is checked (a `Uint8Array` of at most
+ * `MAX_ADVERTISEMENT_BYTES`, an integer RSSI in -128..127) before the
+ * emulator sees it; the emulator's decoder rejects the rest.
+ *
  * {@link handleMessage} is pure apart from its `WorkerHost`, so it is
  * tested under `bun test` without a real Worker (`test/firmware-worker.test.ts`);
  * the `self.onmessage` wiring at the bottom runs only inside a Worker.
@@ -42,7 +53,8 @@ import {
   isButtonName,
   WORKER_STEPS_PER_SLICE,
 } from "./firmware-runtime";
-import { type FromWorker, STATUS_INTERVAL_MS, type ToWorker } from "./firmware-worker-protocol";
+import { MAX_ADVERTISEMENT_BYTES } from "../radio/hub";
+import { ADV_REPOST_MS, type FromWorker, STATUS_INTERVAL_MS, type ToWorker } from "./firmware-worker-protocol";
 
 export type Post = (m: FromWorker, transfer?: Transferable[]) => void;
 
@@ -77,6 +89,12 @@ export interface WorkerState {
   /** The token of the one live scheduled slice; `0` when none. */
   liveSlice: number;
   sliceSeq: number;
+  /** A MAC was set, or the runtime was started: `setMac` is ignored from now on. */
+  macLocked: boolean;
+  /** The advertisement last posted as `advOut` (empty: none, or not advertising). */
+  lastAdv: Uint8Array;
+  /** `host.now()` of the last `advOut`, or `null` (none yet). */
+  lastAdvMs: number | null;
 }
 
 export function createWorkerState(host: WorkerHost): WorkerState {
@@ -91,6 +109,9 @@ export function createWorkerState(host: WorkerHost): WorkerState {
     lastStatusMs: null,
     liveSlice: 0,
     sliceSeq: 0,
+    macLocked: false,
+    lastAdv: new Uint8Array(0),
+    lastAdvMs: null,
   };
 }
 
@@ -104,6 +125,36 @@ function ownBuffer(fb: Uint16Array): ArrayBuffer {
     return fb.buffer;
   }
   return fb.slice().buffer as ArrayBuffer;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Posts the badge's advertisement when it changed, or re-posts it every `ADV_REPOST_MS` while it advertises. */
+function pollAdvertisement(state: WorkerState, handle: FirmwareEmulatorHandle, post: Post, t: number): void {
+  const adv = handle.radioAdvertisement();
+  const changed = !sameBytes(adv, state.lastAdv);
+  const due = adv.length > 0 && (state.lastAdvMs === null || t - state.lastAdvMs >= ADV_REPOST_MS);
+  if (!changed && !due) return;
+  state.lastAdv = adv;
+  state.lastAdvMs = t;
+  // Not transferred: the Worker keeps it to compare, and it is small.
+  post({ kind: "advOut", bytes: adv.slice() });
+}
+
+/** A peer's advertisement as the emulator takes it: bytes within bounds, an `i8` RSSI. */
+function isAdvIn(msg: { bytes?: unknown; rssi?: unknown }): msg is { bytes: Uint8Array; rssi: number } {
+  return (
+    msg.bytes instanceof Uint8Array &&
+    msg.bytes.length <= MAX_ADVERTISEMENT_BYTES &&
+    typeof msg.rssi === "number" &&
+    Number.isInteger(msg.rssi) &&
+    msg.rssi >= -128 &&
+    msg.rssi <= 127
+  );
 }
 
 function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: Post): FirmwareRuntime {
@@ -122,6 +173,7 @@ function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: 
       onFrame: (r) => {
         state.lastCapped = r.capped;
         const t = host.now();
+        pollAdvertisement(state, handle, post, t);
         if (state.lastStatusMs === null || t - state.lastStatusMs >= STATUS_INTERVAL_MS) {
           state.lastStatusMs = t;
           post({ kind: "status", speed: rt.speed(), provision: rt.provisionState() });
@@ -195,6 +247,7 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
       case "start":
         // A fresh start has no previous slice to have been capped.
         state.lastCapped = false;
+        state.macLocked = true;
         rt.start();
         break;
       case "stop":
@@ -208,6 +261,18 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
         break;
       case "shake":
         rt.shake();
+        break;
+      case "bump":
+        rt.bump();
+        break;
+      case "setMac":
+        // Once, before the first start: the firmware reads it at boot.
+        if (state.macLocked || !(msg.mac instanceof Uint8Array) || msg.mac.length !== 6) break;
+        state.macLocked = true;
+        state.handle?.setFactoryMac(msg.mac);
+        break;
+      case "advIn":
+        if (isAdvIn(msg)) state.handle?.deliverAdvertisement(msg.bytes, msg.rssi);
         break;
       case "reset":
         rt.reset();
