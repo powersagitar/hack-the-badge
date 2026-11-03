@@ -500,8 +500,9 @@ through `Radio::deliver` (a temporary passthrough, deleted).
    `LINKED_PEER_RSSI = -40` dBm.
 4. **The two-range hook design and its cost are accepted** (ruling
    R-T3-5). `721f4df` against `c9d1c42`: native 1.7 to 4.4 % slower,
-   Bun's WASM 0.8 to 3.9 % slower
-   (`.superpowers/sdd/2026-10-29-milestone10-badge-radio/bench-721f4df.md`).
+   Bun's WASM 0.8 to 3.9 % slower, every row and every pair of three
+   (HOME, DOWN, onboarding and the walk; step counts identical; the
+   per-pair table stayed in an uncommitted scratch file).
    A cheaper check, or the block cache, is in the Milestone 11 backlog.
 
 ### Two badges pair (Task 8)
@@ -792,6 +793,74 @@ dropped on the human's no-go (2026-11-02) — cost if wrong: users cannot
 bump-pair an emulated badge with a real badge one-way, and Part 5 would
 later restart from the Step 4 spike with the Step 1 evidence above.
 
+### The Task 12 gate: the human partner's answers (2026-11-03)
+
+1. **Success criterion 5 passes.** On two real devices, over the LAN
+   dev server (`bun run dev -- --host`, the in-memory store; no
+   deploy): Connect's and Sync's home screens; the two badges linked
+   through the signaling function, Connect open on both, a Bump, and
+   "SYNCED" on both; and one manual (copy-paste) pairing. This is also
+   the first proof that a WebRTC link reaches "connected": the
+   automated Chrome of Task 10's smoke test could not resolve mDNS host
+   candidates, even for two connections in one page, so that check was
+   moved to this gate.
+2. **The rate limiter is accepted as is** (ruling R-T10-8). This is a
+   toy project, and few simultaneous users are expected, so the
+   per-client cap of 600 requests per 10 min, which counts polls (about
+   10 browsers waiting at once behind one NAT lock it out for the
+   window), stays.
+3. **Mobile Safari is very slow**: the emulator runs at about 0.0x to
+   0.2x there (a remark, not a measurement). It is in the Milestone 11
+   backlog.
+
+### Final suite and benchmarks (Task 12)
+
+Measured at `76bb87a` (the docs pass changes no code), on the
+development machine, warm, times from `/usr/bin/time -p`:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all` | no change |
+| `cargo test --workspace` | 719 passed, 1 ignored (601 unit tests, the 87 rungs in debug, 31 in the other test binaries); real 22.9 s. See the note below |
+| `cargo test -p emulator-core --release --test boot_progress` | 87 passed, 1 ignored; real 15.58 s and 15.64 s in two runs, under the 90 s limit (Milestone 9 ended at 82 and 11.8 s) |
+| `cargo clippy --workspace --all-targets` | the 3 known warnings (two in `boot.rs`, one in a `console.rs` test) |
+| `bun run build:wasm` | builds |
+| `bun test` | 275 passed, 0 failed, 20 files; 11.3 s |
+| `bun run typecheck` | clean |
+| `bun run build` | builds |
+
+`execution_digest_is_unchanged` and `hacker_walk_totals_are_unchanged`
+pass; the only pins changed against `BASE` are the replaced rungs below.
+
+**A flaky test, not from this milestone.** In two of three runs of
+`cargo test --workspace`, `riscv_integration`'s
+`toy_sum_loop_computes_correct_sum` failed with a `rust-lld` error
+("cannot open …/target/tmp/toy_sum.src.<hash>-cgu.0.rcgu.o"). It and
+`toy_sum_loop_handles_zero_input` compile the same fixture to the same
+`CARGO_TARGET_TMPDIR` path in parallel, so one `rustc`'s temporary
+object is removed under the other's linker. It passes with
+`--test-threads=1` and passed in the third full run. The file is
+unchanged since the core's first commits; it is in the Milestone 11
+backlog.
+
+**Benchmarks**, one session each at `76bb87a`, not an A/B (Apple M5
+Pro; native is `bench_redraws`' `factor`, Bun 1.4.4 is the median of
+`bun run bench:wasm`'s 3 runs, its `pin_factor`; 1.0x is the badge):
+
+| Redraw | Native | Bun's WASM |
+|---|---|---|
+| HOME | 1.083x | 0.629x |
+| DOWN | 1.145x | 0.851x |
+| Onboarding | 1.627x | 1.115x |
+| Walk, M steps/s | 65.63 | 40.74 |
+
+The step counts match Task 1's tables (native HOME 18,292,336, DOWN
+7,942,619, onboarding 2,547,134, walk 342,600,776). Against Milestone
+9's v392 numbers in Bun (HOME 0.623x, DOWN 0.857x, onboarding 1.110x)
+the WASM build is unchanged within noise. The A/Bs that measure this
+milestone's costs are Task 1's, Task 3's and the Task 6 gate's
+(R-T3-5).
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -852,8 +921,12 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   partner's decision at the Task 6 gate, together with fix round 1's
   tagged page filter: slower natively, but faster than `ff14e3c` and
   near `c9d1c42` in WASM (measurements above). No behaviour was changed
-  to chase it — cost if wrong: before any hook table is installed,
-  Snake and the launcher run that much slower than they could.
+  to chase it. The human partner accepted the two-range design and its
+  cost at the Task 6 gate (2026-10-30), measured again then with the
+  table installed (`721f4df` against `c9d1c42`: native 1.7 to 4.4 %,
+  Bun's WASM 0.8 to 3.9 % slower); a cheaper check is in the Milestone
+  11 backlog — cost if wrong: Snake and the launcher run that much
+  slower than they could.
 - Ruling R-T4-1 (Task 4, `feat: opt-in eFuse factory MAC`): the
   firmware reads the MAC before the radio (measurement 2, step
   27,120,644, during provisioning, and `esp_read_mac` caches it for the
@@ -1010,9 +1083,10 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   Connect and Sync no hook is ever hit: `no_radio_without_a_radio_app`
   shows zero hits and zero inits on hacker's whole walk, and both
   equivalence rungs pass unchanged. The per-step check is the same two
-  range tests as with Task 3's empty table; it was not benchmarked again
-  — cost if wrong: a speed change from the non-empty ranges, which
-  `bench_redraws` would show.
+  range tests as with Task 3's empty table. Task 6 did not benchmark it;
+  the Task 6 gate's A/B did (`721f4df` against `c9d1c42`, R-T3-5), and
+  it measured within Task 3's range — cost if wrong: a speed change from
+  the non-empty ranges, which `bench_redraws` would show.
 - Ruling R-T6-4 (Task 6): two mask-ROM libgcc stubs, each observed
   faulting once the radio was up: `__popcountsi2` (`0x4000_0888`, a new
   `Int32UnaryOp::Popcount`; `ble_hs_id_set_rnd`) and `__lesf2`
@@ -1030,8 +1104,9 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   for the NVS write; neither is done, because a committed token is
   credential data beyond the eleven fake identities (Data-handling) —
   cost if wrong: "No sync station in range" and the upload path stay
-  untested; the human partner decides at the gate whether a fake token
-  and the stub are wanted.
+  untested. At the Task 6 gate the human partner amended success
+  criterion 3 to accept "Badge not ready to sync" with the fake
+  identities, and put the empty-room path in the Milestone 11 backlog.
 - Ruling R-T6-6 (Task 6): Connect's home animates without pause, so it
   is pinned by its title and footer bands held for
   `AFTER_PRESS_STABLE_FOR`, plus the whole frame at the first step they
@@ -1114,11 +1189,8 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   behind `CONNECT_OPEN`, unchanged). That function asserts the same
   `CONNECT_BANDS` and `CONNECT_HOME_HASH`, measured identical for the
   organizer, within the same `CONNECT_RESPONSE_STEPS` budget (a cap,
-  not a step pin; both open in 5.75M steps). The runtime test hook
-  id 1 in `runtime.rs` (`hooked_count_loop`), which collides with the
-  radio's `HOOK_INIT`, is left as it was. Changing it to an id the
-  radio does not know would trip the radio's `debug_assert` in debug
-  builds — cost if wrong: if Connect's home ever shows the identity,
+  not a step pin; both open in 5.75M steps) — cost if wrong: if
+  Connect's home ever shows the identity,
   the organizer's open fails on the hash and needs its own pin.
 - Ruling R-T9-1 (Task 9, `feat: browser radio hub, one badge per
   browser, Bump`): peer input is checked twice. The hub
@@ -1273,8 +1345,12 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   its extended advertisements, a Step 3–4 spike session is spent to
   learn that, and nothing is built.
 - Ruling R-T11-2 (Task 11 Step 2, `docs: drop Part 5 on the human's
-  no-go`): Part 5 is dropped. The text and its reason are under "Task
-  11 Step 1: does one-way hearing change anything visible?".
+  no-go`): Part 5 (hearing real badges through Web Bluetooth) is
+  dropped on the human partner's no-go (2026-11-02); the reasons are
+  under "Task 11 Step 1: does one-way hearing change anything visible?"
+  — cost if wrong: users cannot bump-pair an emulated badge with a real
+  badge one-way, and Part 5 would later restart from the Step 4 spike
+  with the Step 1 evidence.
 - Ruling R-T10-8 (Task 10 follow-ups, `fix: rate-limit the signaling
   endpoint`, replaced by `fix: fairer rate limits for the signaling
   endpoint` under the human's R-T12-RL4): `handleSignal` first
@@ -1309,11 +1385,14 @@ later restart from the Step 4 spike with the Step 1 evidence above.
 
   `test/signal-handler.test.ts` pins these numbers.
 
-  Cost if wrong:
+  This is a toy project, and few simultaneous users are expected. The
+  human partner accepted the per-client trade-off below on that basis
+  at the Task 12 gate (2026-11-03): the caps stay as they are — cost if
+  wrong:
   - A venue NAT shares 600 requests per 10 min. A waiting host polls
     about 60 times a minute, so the NAT gets about 4 to 5 full two-minute
-    waits per 10 min before its pairings are refused for the rest of
-    the window.
+    waits per 10 min, and about 10 browsers waiting at once behind one
+    NAT lock it out for the rest of the window.
   - Five thousand requests in 10 min, from 9 or more IPs, stop new links
     for everyone until that window ends.
 - Ruling R-T10-9 (Task 10 follow-ups): the client is the first
@@ -1328,9 +1407,8 @@ later restart from the Step 4 spike with the Step 1 evidence above.
   in `htn-signal:`.
 
   The dev server builds its `Request` without the browser's headers, so
-  every dev client shares `unknown`.
-
-  Cost if wrong: a client that sends garbage in both headers shares the
+  every dev client shares `unknown` — cost if wrong: a client that
+  sends garbage in both headers shares the
   `unknown` buckets with every other such client. On Vercel the first
   `x-forwarded-for` entry is the platform's view of the client.
 - Ruling R-T10-10 (Task 10 follow-ups): `SignalStore` gains
@@ -1348,10 +1426,17 @@ later restart from the Step 4 spike with the Step 1 evidence above.
 
   `MemoryStore.incr` is the twin on its injected clock.
   `UpstashStore`'s default fetch is `(i, o) => fetch(i, o)`, never a
-  `fetch` called as a method of the store.
-
-  Cost if wrong: a key that lost its TTL lives one extra window from its
+  `fetch` called as a method of the store — cost if wrong: a key that
+  lost its TTL lives one extra window from its
   next count, so that counter's window is up to twice as long once.
+- Ruling R-PF-3 (the orchestrator's preflight ruling, committed in Task
+  9's Worker): the Worker posts `advOut` at once when the badge's
+  advertisement changes, and posts the current one again every 100 ms
+  while it advertises (at most 10 Hz for an unchanged advertisement),
+  as a real advertiser repeats. A peer drops reports while it is not
+  scanning (Review Focus 3), so a one-shot post would be lost to a peer
+  that starts scanning later — cost if wrong: a little more message
+  traffic on each link.
 
 ## Replaced rungs
 
@@ -1363,17 +1448,46 @@ later restart from the Step 4 spike with the Step 1 evidence above.
 
 ## Milestone 11 backlog
 
+Milestone 9's backlog (`docs/milestone-9-decisions.md`, "Milestone 10
+backlog") is carried below, minus what this milestone closed:
+- the radio (the lead);
+- Milestone 9's three deferred tests (Task 2; `run_to_the_bluetooth_fault`
+  was replaced in Task 6);
+- the panic handler's reboot after the Bluetooth fault (the fault is
+  gone);
+- the native slowdown from the per-step reset check, and the WASM A/B
+  between `b25a68c` and Milestone 9 (Task 1);
+- `soft_reset_count()` in `emulator-wasm` (Task 2).
+
+### Found in Milestone 10
+
 - **Sync's empty-room path** ("No sync station in range"). Sync checks
   an NVS upload credential (`badge_upload` / `credential`) before it
   looks for a station (ruling R-T6-5). Reaching that screen needs a fake
   credential typed through `badge_token set`, cleared with the
   organizers like the fake identities. It also needs a ROM `crc32_le`
   stub (`0x4000_0628`) for the NVS write.
+- **Share's radio transfer.** Share opens (after its reboot), but
+  sending an app from one emulated badge to another over the radio is
+  neither traced nor tested; it may need connections, which the model
+  does not have (R-T5-8; Task 7 was skipped).
 - **A cheaper hook check, or the block cache.** The two-range check
   costs 1.7 to 4.4 % natively and 0.8 to 3.9 % in Bun's WASM
-  (`721f4df` against `c9d1c42`), accepted at the Task 6 gate. A block
-  cache (shelved in Milestone 8) would test the hook ranges once per
-  block, not once per step.
+  (`721f4df` against `c9d1c42`), accepted at the Task 6 gate (R-T3-5).
+  A block cache would test the hook ranges once per block, not once per
+  step. It merges with Milestone 8's shelved block-cache lead (below).
+- **Mobile Safari runs at about 0.0x to 0.2x** (the human partner's
+  remark, 2026-11-03). Measure it on `/bench.html` first; desktop
+  browsers were not re-measured on v392 either.
+- **The Vercel build of `frontend/api/signal.ts` is unverified.** Only
+  the dev middleware has served it. A preview deploy, the human
+  partner's call, must check that a bad request gets 400 and a missing
+  env var a bare 500, and that the `.js` import specifier resolves
+  (R-T10-3).
+- **Upstash plan limits** must be checked against the rate caps
+  (R-T10-8: up to 5,000 counted requests per 10 min, each one to three
+  counter pipelines plus the room's own reads and writes) before a
+  public deploy.
 - **Hearing real badges (Part 5, dropped by ruling R-T11-2).** If it is
   revived, start with Task 11's Step 4 spike: a throwaway Chrome page
   that runs `requestLEScan` with the flag on, next to the human
@@ -1384,3 +1498,134 @@ later restart from the Step 4 spike with the Step 1 evidence above.
     manufacturer data that v392 decodes?
 
   The Step 1 evidence is in the "Task 11 Step 1" section above.
+- **The test hook id 1** in `runtime.rs` (`hooked_count_loop`) collides
+  with the radio's `HOOK_INIT`, so those unit tests run the radio's init
+  semantics by accident. An id the radio does not know trips the
+  radio's `debug_assert` in debug builds, so the fix needs a test-only
+  way past it (from R-T8-4).
+- **A flaky `riscv_integration` test**: `toy_sum_loop_computes_correct_sum`
+  and `toy_sum_loop_handles_zero_input` compile the same fixture to the
+  same `CARGO_TARGET_TMPDIR` path in parallel ("Final suite" above).
+  Compile each fixture once (a `OnceLock`) or to a per-test path.
+- Core review minors left open:
+  - `radio/hci.rs`'s docs near lines 1322 and 1375 still say the
+    resolving list is always empty (R-T6-1 keeps identities);
+  - the ordering risk in R-T6-2 (a report popped in `send_packet` ahead
+    of a reply; `host_rcv_pkt` blocking the idle task) has no test;
+  - `deliver_rejects_malformed_bytes` cannot tell rejection from
+    not-scanning (its synthetic image never scans); feed a scanning
+    guest instead;
+  - `boot_progress.rs`'s radio section header says 1 ms swaps after
+    each slice, but the bump runs one blocking 100 ms slice (R-T8-3);
+  - no tests for `set_app_hooks` dropping a pass-through, or for a clone
+    carrying a pending hit or pass-through; `hook_step`'s doc could say
+    a WFI-parked core returns before the hook check;
+  - `EFUSE_RANGE` has no disjointness test of its own, and `efuse.rs`
+    does not cite the MAC's builder call site (`0x42010344`);
+  - the HCI fuzz test rarely reaches the report path, and repeats one
+    address byte; LE Set Extended Advertising Enable accepts duplicate
+    handles; Set Extended Scan Enable accepts Filter_Duplicates 2 with
+    Period 0;
+  - the WASM `soft_reset_count` is tested only at 0, and
+    `cpu-wasm.test.ts` is outside `tsconfig` (not type-checked).
+- Browser review minors left open:
+  - the badge lock is not released on a switch to Lua mode or when the
+    firmware runtime fails to start, so other tabs show "running in
+    another tab" while nothing runs (take-over still works);
+  - Provision boots a Worker in a tab that does not hold the badge (it
+    never starts), and that tab's canvas shows the Lua sandbox's last
+    frame behind the notice;
+  - the Worker posts every advertisement change at once (R-PF-3's
+    10 Hz bound holds only for an unchanged one), and sets `macLocked`
+    even when `setFactoryMac` returns false;
+  - R-T9-2 changed the existing Shake's timing (its first acceleration
+    now applies at the call); no pin moved, but it is a change to
+    Milestone 6 behaviour for the human partner to note;
+  - a joiner's link reaches the hub up to 1 s after its channel opens
+    (`waitOpen` polls), so a bump in that window is lost;
+  - a cancelled or expired host room stays joinable until its 300 s
+    TTL; the joiner then waits 120 s for "no direct path" instead of
+    "room expired";
+  - `vite.config.ts` imports `./src/radio/signal-handler` without an
+    extension, which Vite's native config loader warns about; the dev
+    middleware reads an oversized body to its end (dev only);
+  - `shell.test.ts`'s "shows a room code" sets and reads its own status
+    text;
+  - the per-client limits trust the first `x-forwarded-for` entry
+    (sound on Vercel, which overwrites it), and an IPv6 client rotating
+    through its /64 sidesteps them.
+
+### Carried from Milestone 9 (still open)
+
+- The console survives soft resets, so the provisioner's first-prompt
+  scan (`frontend/src/runtime/provisioner.ts`, its `prompt` phase) could
+  match a stale `badge> ` from before a reboot. Low risk: it needs a
+  provision started during a reboot.
+- The RTC timer restarts at 0 at a software reset; on the badge the RTC
+  domain keeps counting. Nothing observed depends on it.
+- A reboot takes no emulated time (the shortcut boot); the badge's
+  reboot time is not measured.
+- Both reset stubs are the same full re-boot; only the reported reason
+  differs (`rom.rs` entry 26).
+- `STORE4` keeps the app's value across a reset, where the bootloader
+  would rewrite it with the XTAL frequency (Milestone 9's R-T3-3).
+- A soft reset starts the unmapped-access log and the ROM-stub index
+  drop count afresh.
+- On v392, `prov apply`'s `PROV FAIL` is followed by 3.0M busy steps
+  before the next prompt, against 0.2M on v335; not traced.
+- No v392 frame is compared with hardware: the badge runs v335 (a
+  reflash is the human partner's call). The full dump also stays v335.
+- Chrome, Safari and the dev bench page were not re-benchmarked on v392.
+- v392's early log timestamps have not been compared with any badge's.
+
+### Carried from Milestone 8's backlog (still open)
+
+Word for word in `docs/milestone-9-decisions.md`, "Carried from
+Milestone 8's backlog (still open)", under its headings; listed here by
+item, with Milestone 10 facts added:
+
+- **Shelved lead: a block cache** (HOME is short of the badge; R-M8-1).
+  Now merged with the cheaper hook check above. At the end of Milestone
+  10, Bun's WASM runs HOME at 0.629x and DOWN at 0.851x ("Final suite and
+  benchmarks").
+- **Found in Milestone 8:** one button fed by two sources shares one tap
+  queue; a queued, not yet pressed tap is dropped by `stop()`; the tap
+  queue's small lag on fast bursts (`RELEASE_GAP_US`); the release-gap
+  probe is not a committed rung.
+- **Found in Milestone 7:** decode cache size `1 << 16` vs `1 << 14`
+  not re-measured untagged; `WORKER_STEPS_PER_SLICE` never tuned in a
+  browser; the frontend and Rust provisioning hosts reach the launcher
+  740,001 steps apart (untraced); the status line can show a pre-reset
+  state for up to 250 ms.
+- **From Milestone 7's final review:** `stepFirmwareFrame` copies the
+  framebuffer on every slice; a Worker error after ready only logs; the
+  shadowed `now` in `serviceTaps`/`pollTaps`; a held button stays held
+  across a mode switch or a hidden tab.
+- **Speed and timing:** Snake's late game-over after an eat; CPI 1
+  calibrated only against timer-paced apps; zero-latency RMT, I2C0 and
+  SPIMEM1; the cycle counter ignores PCER/PCMR;
+  `PROVISION_TIMEOUT_STEPS` counted in steps.
+- **Apps and UI:** no app's deeper screens are tested (Connect's
+  pairing and Sync's "not ready" now are, Milestone 10); a
+  browser-supplied RNG seed; a console pane; motion input beyond the
+  Shake and Bump buttons (`DeviceMotionEvent`); Milestone 5 Task 7's
+  provisioning-fetch minors; small Task 7 cleanups (`speed()`'s 0
+  sentinel, the literal middle dot, `pollShake`'s double clear); only
+  role hacker's frames compared with hardware.
+- **Peripherals:** RMT not decoded (no LEDs); NFC not modeled; the busy
+  phase after START on the first-run screen; SC7A20H simplifications;
+  I2C0's empty-FIFO `OP_WRITE`; the `put` task's CPU time per packet;
+  `R_M5_3`'s closure follows direct calls only; `strtol`/`atoi` and
+  `errno`, and the untested 8 MiB stub cap; unmapped ASSIST_DEBUG and
+  RTC_CNTL `0x6000_80bc` accesses at idle; early log timestamps.
+- **Build and tests:** the release suite's wall time is one chain (15.6
+  s at the end of Milestone 10, with two radio walks and the two-badge
+  rung); Milestone 6's test minors (`snake_eats`,
+  `run_until_a_past_target_runs_nothing`, the `DEFAULT_STEPS_PER_FRAME`
+  test, `snake_moves_on_its_own`'s gap pin).
+- **Carried from Milestones 3 and 4:** ST7789 `MADCTL` unmodeled; GPIO0
+  routing stored only; the eFuse block beyond the factory MAC (chip
+  revision v0.0 against the badge's v0.4); flagged ROM-stub guesses;
+  simplified edge interrupts; GDMA's unmodeled corners;
+  `boot_until_console_contains`' 250,000-step chunks; small
+  duplications in the stub arms and test helpers.

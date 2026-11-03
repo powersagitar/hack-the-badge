@@ -21,28 +21,34 @@ wired in `frontend/src/main.ts`):
 
 **Current state:** the firmware boots to My Badge's first-run screen,
 provisions a fake test identity through its own USB console, walks the
-11-page onboarding app, and reaches the launcher. 14 of the launcher's 16
-apps open, each pinned by a rung. v392 enters five apps (Scanner, Sync,
-Share, Sponsors, Workshop Quest) by rebooting, through the emulated
-software reset. Connect, and Sync after its reboot, stop at the
-Bluetooth controller in mask ROM, which is Milestone 10. Every frame
+11-page onboarding app, and reaches the launcher. All 16 of the
+launcher's apps open, each pinned by a rung. v392 enters five apps
+(Scanner, Sync, Share, Sponsors, Workshop Quest) by rebooting, through
+the emulated software reset. Connect and Sync run on a fake BLE
+controller that replaces the mask-ROM one at bt.c's VHCI seam, through
+app-image hooks at v392's addresses. Two emulated badges pair in Connect
+("SYNCED" on both after a bump), in a rung and in two browsers linked
+by WebRTC on the same network (checked by the human partner on two
+devices). Sync shows "Badge not ready to sync": the fake identities have
+no upload credential. No browser can advertise BLE, so emulated badges
+hear only each other. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
 the browser the emulator runs in a Web Worker, paced to wall-clock time.
 Snake plays at about 1.0x, and every tap of a quick burst registers (a
 per-button tap queue in the browser). On v392, in Bun's WASM bench, a
-launcher move (DOWN) plays at about 0.86x and entering the launcher
-(the HOME redraw) at about 0.6x, because the WASM core does about 40M
-steps/s against the badge's 80M; browsers were not re-measured on
-v392. Before assuming anything else works, read
+launcher move (DOWN) plays at about 0.85x and entering the launcher
+(the HOME redraw) at about 0.63x, because the WASM core does about 41M
+steps/s against the badge's 80M; desktop browsers were not re-measured
+on v392, and mobile Safari runs far slower (about 0.0x to 0.2x). Before
+assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-9-decisions.md`.
+`docs/milestone-3-decisions.md` through `docs/milestone-10-decisions.md`.
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
-the v335 → v392 re-pins and the Milestone 10 backlog, led by the
-Bluetooth spec
-(`docs/superpowers/specs/2026-10-22-milestone10-badge-radio-design.md`).
+the v335 → v392 re-pins. Milestone 10's has the radio's rulings and the
+Milestone 11 backlog.
 
 ## Repository layout
 
@@ -63,10 +69,12 @@ commands from the repo root.
 
 - `bun run install:frontend` (from root) or `bun install` (in `frontend/`).
 - `bun run dev`: dev server at http://localhost:5173. It also serves the
-  dev-only bench page `/bench.html`.
+  dev-only bench page `/bench.html` and `/api/signal` over an in-memory
+  store. `bun run dev -- --host` serves the LAN, for two-device radio
+  links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 182 of them, about 10 s. Most of that is the
+- `bun test`: unit tests, 275 of them, about 11 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.
@@ -82,14 +90,14 @@ plus `wasm-pack`.
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 82 rungs plus 1 ignored benchmark, about
-  12 s.
+  real-firmware boot ratchet, 87 rungs plus 1 ignored benchmark, about
+  16 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
-  - `cargo test --workspace` runs the same rungs in debug, about 17 s.
+  - `cargo test --workspace` runs the same rungs in debug, about 23 s.
 - `cargo clippy --workspace --all-targets` has 3 known warnings (two in
   `boot.rs`, one in a `console.rs` test).
 - Benchmarks are never part of a test run; results go in
@@ -116,13 +124,17 @@ plus `wasm-pack`.
   to re-pin. The equivalence rungs `execution_digest_is_unchanged` and
   `hacker_walk_totals_are_unchanged` guard this.
 - **Keep the core chip-agnostic.** `emulator-core/src/cpu/` and
-  `clock.rs` hold no ESP32-C3 constant. Chip data lives in `rom.rs`,
-  `mem/soc.rs` and `peripherals/`.
+  `clock.rs` hold no ESP32-C3 or v392 constant. Chip data lives in
+  `rom.rs`, `mem/soc.rs` and `peripherals/`; app-image addresses live in
+  `radio/v392.rs`, each cited with its disassembly evidence.
 - `FirmwareBus` uses ordered, concrete named fields, with no `dyn` dispatch.
   SPI reads GPIO's D/C pin directly.
 - **Unmapped *data* access never panics** (it reads 0 and drops writes,
   logged). An **unmapped instruction fetch always traps**. This asymmetry
-  is load-bearing. Browser input never panics the emulator.
+  is load-bearing. Browser, peer and network input never panics the
+  emulator; a malformed peer packet never crashes a tab.
+- The radio links use `iceServers: []` (no STUN, TURN or relay), and the
+  only server the page calls is `/api/signal`.
 - `emulator-core` has no wasm-bindgen dependency. `emulator-wasm` stays
   logic-free: one-line passthroughs only. `framebuffer()` returns an owned
   `Vec`, to avoid a use-after-free across WASM heap growth.
@@ -174,7 +186,9 @@ frontend/src/
                         step-capped; a capped frame drops its debt), the
                         button name -> raw slot table, the per-button tap
                         queue (press hold, release gap), provision() and
-                        shake(). It runs inside the Worker.
+                        shake() and bump() (one motion schedule). It runs
+                        inside the Worker, which also posts the badge's
+                        advertisement (advOut) and takes peers' (advIn).
   runtime/firmware-worker.ts
                         Web Worker that owns the runtime and runs it in
                         capped slices: one frame in flight, a throttled
@@ -190,14 +204,37 @@ frontend/src/
                         into the emulated USB console, paced in 64-byte
                         chunks. Mirrors emulator-core's
                         tests/common/provision.rs.
+  radio/hub.ts          The radio hub on the main thread: sends the badge's
+                        advertisement and bumps to every link, validates
+                        peers' messages, holds the latest per peer while
+                        paused (hidden page).
+  radio/lock.ts         One badge per browser (Web Lock `htn-badge`,
+                        take-over), and the per-browser locally
+                        administered MAC in localStorage.
+  radio/peer-link.ts    A WebRTC link: one ordered data channel,
+                        iceServers: [], no trickle; the manual copy-paste
+                        codes (deflate-raw, base64url).
+  radio/signal-client.ts
+                        Hosts or joins a room on /api/signal (1 s polls,
+                        120 s budget).
+  radio/signal-handler.ts
+                        Pure signaling handler (Request in, Response out)
+                        over a SignalStore: offer/answer mailbox, 300 s
+                        TTL, four rate-limit counters. MemoryStore for dev
+                        and tests, UpstashStore (REST) for Vercel.
   render/canvas.ts      Pure widget-tree painter, testable with a fake 2D
                         context.
   render/framebuffer.ts Blits the firmware's framebuffer.
   cpu/bridge.ts         Loads the wasm-pkg. Only the Worker imports it, and
                         lazily, so Lua-only use never loads the WASM.
   bench/                The WASM redraw benchmark and the dev-only bench page.
-  ui/shell.ts, main.ts  Page chrome, input bindings, the mode toggle and the
-                        provisioning controls; main.ts wires it together.
+  ui/shell.ts, main.ts  Page chrome, input bindings, the mode toggle, the
+                        provisioning controls, the badge notice and the
+                        link panel; main.ts wires it together.
+frontend/api/signal.ts  The Vercel function for /api/signal: the handler
+                        over Upstash Redis (KV_REST_API_URL/_TOKEN; a
+                        missing one is a bare 500). Vite's dev middleware
+                        serves the same handler.
 frontend/public/
   apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
                         because require() must return synchronously.
@@ -212,7 +249,12 @@ emulator-core/src/
                         RV32IM encoder for ROM code blobs) and
                         decode_cache.rs (a direct-mapped table validated by
                         the raw bits on every fetch, so it needs no
-                        invalidation; 256 KiB per clone).
+                        invalidation; 256 KiB per clone). app_hooks.rs:
+                        app-image hooks; a step at a hooked pc records a
+                        HookHit and raises the attention flag, and the
+                        driver returns, passes through or redirects. The
+                        per-step check is two ranges learned from the
+                        table.
   clock.rs              Converts steps to 16 MHz SYSTIMER ticks at the
                         firmware-selected CPU frequency, without drift. Every
                         timer reads it.
@@ -231,9 +273,20 @@ emulator-core/src/
                         TIMG, RTC_CNTL (the RTC timer; STORE0..7, kept
                         across a software reset), USB-Serial-JTAG (the
                         console, in both directions), I2C0 plus the SC7A20H
-                        accelerometer, RMT,
+                        accelerometer, RMT, efuse.rs (only the factory MAC,
+                        opt-in; set it at power-on),
                         the flash MMU, and flash.rs (a synthetic 4 MiB flash
                         and the SPI1 controller).
+  radio/                The fake BLE controller. hci.rs: a pure LE-only HCI
+                        model in H4 framing (extended advertising and
+                        scanning, event masks, duplicate filter, a bounded
+                        event queue; connectionless). mod.rs: Radio, which
+                        hooks bt.c's controller init/enable and VHCI
+                        functions and feeds NimBLE through a guest
+                        trampoline in free mask-ROM space (reports from the
+                        idle hook); the peers' wire form and
+                        LINKED_PEER_RSSI (-40 dBm). v392.rs: the hook
+                        addresses, each with its evidence.
   rom.rs                The ESP32-C3 mask-ROM HLE stub table (including
                         the software_reset/software_reset_cpu stubs that
                         request a reset, and the reset reason
@@ -252,6 +305,10 @@ emulator-core/src/
                         re-boots the image, keeping the flash, RTC_CNTL's
                         STORE registers, RTC memory, the panel, the console
                         text, held input and host time (soft_reset_count).
-                        reset() stays a cold power-on.
+                        reset() stays a cold power-on. attend(), the cold
+                        path behind the attention flag, takes resets and
+                        hook hits. The radio host API: set_factory_mac,
+                        radio_advertisement(_bytes),
+                        deliver_advertisement(_bytes).
 emulator-wasm/          The logic-free wasm-bindgen shim.
 ```

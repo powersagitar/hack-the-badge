@@ -601,7 +601,18 @@ new boot, and host time keeps counting (see "Software reset" under
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 9)
+### Current state (end of Milestone 10)
+
+**Milestone 10 emulates the badge radio.** All 16 launcher apps open:
+Connect, and Sync after its reboot, now run through a fake BLE
+controller that replaces the mask-ROM controller at bt.c's VHCI seam
+(`emulator-core/src/radio/`; "The radio (Milestone 10)" below). Two
+emulated badges pair in Connect: a bump ends in "SYNCED" on both, in the
+rung `two_badges_pair_to_synced` and, on 2026-11-03, on two real devices
+linked browser to browser over WebRTC (the human partner's gate, below).
+Everything else in this section is unchanged from Milestone 9: no pin
+outside the radio rungs moved (`docs/milestone-10-decisions.md`,
+"Replaced rungs").
 
 **The firmware is the official v392** (`v0.1.2-392-gd3089c4`, compiled
 Sep 17 2026, 2,651,840 bytes), committed unpadded as
@@ -621,8 +632,8 @@ Real-firmware boot runs from the shortcut boot of `firmware.bin` on blank
 synthetic flash through `app_main` to My Badge's first-run screen, and
 from there, provisioned through the firmware's own USB console with a
 committed fake identity, through the onboarding app to the app launcher,
-which responds to navigation and opens 14 of its 16 apps; Connect and
-Sync stop at the Bluetooth controller in mask ROM (Milestone 10). Snake
+which responds to navigation and opens all 16 of its apps (Connect and
+Sync through the fake BLE controller, since Milestone 10). Snake
 is playable. From a cold boot (release build, role hacker; step counts
 are emulated steps, not time, under the Milestone 6 clock; see "Timing
 model" above for how steps relate to emulated time). Step numbers are
@@ -702,9 +713,10 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   after A), Workshop Quest, Mood LEDs, Socials, Schedule, Info & Rules,
   Museum and Progress; Snake and Dice keep their rungs. Scanner, Sponsors
   and Workshop Quest log `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE`
-  (NFC is not modeled) and still draw. Connect and Sync stop at mask-ROM
-  `0x4000_08ec` (limitation 1 below). None of these frames was compared
-  with hardware.
+  (NFC is not modeled) and still draw. Connect and Sync open since
+  Milestone 10 (the radio bullet below); in Milestone 9 they stopped at
+  mask-ROM `0x4000_08ec`. None of these frames was compared with
+  hardware.
 - **Software reset (Milestone 9).** v392 opens Scanner, Sync, Share,
   Sponsors and Workshop Quest by rebooting into them (`app_reboot: reboot
   into <app>`, a persisted `/littlefs/config/reboot.cfg`); `esp_restart()`
@@ -722,12 +734,56 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   from Scanner is a direct return to the launcher, with no second reset
   (`scanner_home_returns_to_the_launcher`); so is HOME from Share,
   Sponsors and Workshop Quest (`share_`, `sponsors_` and
-  `workshop_quest_home_returns_to_the_launcher`). After Connect's and Sync's
-  Bluetooth fault the panic handler's `Rebooting...` now soft-resets too,
-  and the badge boots once into My Badge (`boot: reset reason=4`;
-  measured, not pinned) instead of v335's endless "Panic handler entered
-  multiple times". The host's reset button stays a cold power-on (blank
-  flash, `POWERON_RESET`, count 0).
+  `workshop_quest_home_returns_to_the_launcher`). Sync reboots into
+  itself once and opens (`sync_opens_after_its_reboot`). A panic
+  handler's `Rebooting...` soft-resets too: in Milestone 9, after
+  Connect's and Sync's Bluetooth fault (gone since Milestone 10), the
+  badge booted once into My Badge (`boot: reset reason=4`; measured, not
+  pinned) instead of v335's endless "Panic handler entered multiple
+  times". The host's reset button stays a cold power-on (blank flash,
+  `POWERON_RESET`, count 0).
+- **The radio (Milestone 10).** NimBLE talks to a fake BLE controller
+  (`radio/hci.rs`: an LE-only HCI model in H4 framing, with extended
+  advertising and scanning, the event masks, a duplicate filter and a
+  32-event queue). App-image hooks (`cpu/app_hooks.rs`) replace bt.c's
+  `esp_bt_controller_init`/`enable` and the three `esp_vhci_host_*`
+  functions at their v392 addresses (`radio/v392.rs`, each cited); the
+  replies and the peers' advertising reports reach NimBLE through a
+  guest-executed trampoline in free mask-ROM space (ruling R-T6-2). The
+  radio starts only when a radio app opens (`hal_radio: init_once`): on
+  the hacker walk no hook is hit (`no_radio_without_a_radio_app`), and
+  both equivalence rungs are unchanged. Connect opens to its animated
+  home and reopens after HOME without a second init
+  (`connect_opens_with_the_radio_up`, `connect_reopens_after_home`);
+  Sync reboots, opens, and answers "sync now" with "Badge not ready to
+  sync", because the fake identities carry no upload credential
+  (`sync_now_without_a_credential_is_not_ready`, R-T6-5, the human
+  partner's amendment). A soft reset resets the controller with the
+  guest, and the radio initializes again cleanly
+  (`sync_after_connect_initializes_the_radio_again`). Each badge needs its
+  own factory MAC, an opt-in eFuse value set at power-on
+  (`peripherals/efuse.rs`, `set_factory_mac`); the BLE random address is
+  built from it. A peer's advertisement enters through
+  `deliver_advertisement(_bytes)` at `LINKED_PEER_RSSI` (−40 dBm, above
+  Connect's −64 dBm gate) and is dropped unless the controller is
+  scanning. A bump is a 100 ms +1 g pulse on x (R-T8-2). Hacker
+  (`…10:01`) and organizer (`…10:02`), run in 1 ms lockstep and bumped at
+  the same emulated time, show "SYNCED" 93 ms after the bump and
+  "Contacts: 1" on each home (`two_badges_pair_to_synced`).
+- **The radio in the browser (Milestone 10).** One badge per browser
+  (the Web Lock `htn-badge`; a second tab shows "Badge running in another
+  tab — Run here"), with a per-browser locally administered MAC kept in
+  `localStorage`. The hub (`frontend/src/radio/hub.ts`) carries the
+  Worker's advertisements and the Bump button to linked peers, and
+  validates what peers send. Links are direct WebRTC data channels with
+  `iceServers: []`, set up through the signaling function `/api/signal`
+  (an offer/answer mailbox: Upstash Redis on Vercel, an in-memory store
+  under `bun run dev`; rate-limited, R-T10-8) or by copy-paste codes
+  behind "Manual". The human partner's gate (2026-11-03, `bun run dev --
+  --host` on the LAN, two real devices): Connect's and Sync's home
+  screens, a room link, a Bump with "SYNCED" on both, and a manual
+  pairing all worked. That was also the first time a link reached
+  "connected": the automated Chrome cannot resolve mDNS host candidates.
 - **A built-in app: Dice** (Milestone 5 Task 9 stretch, rung
   `launcher_opens_dice`).
   From the launcher, DOWN x3 and RIGHT x3 select Dice, and A launches it
@@ -759,6 +815,22 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 10** (details in
+[`milestone-10-decisions.md`](milestone-10-decisions.md) and the history
+below):
+
+- Connect and Sync open (Milestone 9's limitation 1): a fake BLE
+  controller behind bt.c's VHCI seam, through app-image hooks (Tasks 3,
+  5 and 6).
+- An opt-in eFuse factory MAC, so each badge has its own radio identity
+  (Task 4).
+- Two emulated badges pair to "SYNCED", natively (Task 8) and in two
+  browsers on two devices over WebRTC (Tasks 9 and 10; the human
+  partner's gate, 2026-11-03).
+- Milestone 9's native slowdown from the per-step reset check: the check
+  is off the hot loop (Task 1); `soft_reset_count` reaches the browser
+  and the reboot line is asserted (Task 2).
 
 **Resolved in Milestone 9** (details in
 [`milestone-9-decisions.md`](milestone-9-decisions.md) and the history
@@ -870,21 +942,39 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 10 candidates)** (the Milestone 10 backlog
-in `milestone-9-decisions.md` is the complete list):
+**Open limitations (Milestone 11 candidates)** (the Milestone 11 backlog
+in `milestone-10-decisions.md` is the complete list):
 
-1. **Bluetooth: Connect, and Sync after its reboot, stop at the
-   Bluetooth controller ROM.** After `hal_radio: init_once` both fetch
-   mask-ROM `0x4000_08ec`, `btdm_controller_rom_data_init`
-   (`esp32c3.rom.bt_funcs.ld`), which has no stub, and take an
-   instruction access fault (rungs
-   `connect_stops_at_the_bluetooth_controller` and
-   `sync_reboots_then_stops_at_the_bluetooth_controller`, which stop at
-   the register dump, `MEPC    : 0x400008ec`). The panic handler then
-   reboots once into My Badge. The controller is a closed blob in mask
-   ROM that this project does not have; Milestone 10
-   (`docs/superpowers/specs/2026-10-22-milestone10-badge-radio-design.md`)
-   replaces it with a fake BLE controller.
+1. **The radio is a model, not the controller.** The closed controller
+   blob and its mask-ROM half never run. `radio/hci.rs` answers only the
+   HCI commands v392's NimBLE sends (others get Unknown HCI Command) and
+   is connectionless: advertising and scanning on LE 1M, with no
+   connections, scan responses, air timing, timeouts or address
+   resolution (rulings R-T5-1 to R-T5-8, R-T6-1). Because the blob is
+   skipped, two boot lines no longer print when the radio starts:
+   `BLE_INIT` "BT controller compile version" (in
+   `esp_bt_controller_init`) and "Feature Config …" (bt.c's
+   `btdm_funcs_table_ready_wrapper`, a callback the blob calls).
+   - **Emulated badges hear only emulated badges.** No browser can
+     advertise BLE, so a real badge or sync desk never hears the
+     emulator. Hearing real badges through Chrome's Web Bluetooth scan
+     (Part 5) was dropped on the human partner's no-go (R-T11-2): its
+     only visible effect would be a lopsided bump. Sync therefore never
+     finds a station; with the fake identities it stops earlier anyway,
+     at "Badge not ready to sync" (no upload credential, R-T6-5).
+   - **Links are same-network only.** `iceServers: []` (no STUN, TURN or
+     relay), so two browsers must reach each other by host or mDNS
+     candidates; a network or OS setting that blocks mDNS (macOS Local
+     Network permission, client isolation) blocks the link. Every peer
+     is heard at a fixed `LINKED_PEER_RSSI` (−40 dBm), whatever the
+     distance.
+   - **The hook addresses are v392's.** `radio/v392.rs` holds bt.c's
+     function addresses in this one image (no symbols; each cited from
+     the disassembly). A different `firmware.bin` needs them found
+     again, or Connect and Sync fault as in Milestone 9.
+   - The signaling function's rate limits (R-T10-8) are sized for a toy
+     project with few simultaneous users; about 10 browsers waiting
+     behind one NAT lock that NAT out for 10 min.
 2. **The RTC timer restarts at a software reset.** The reset builds a
    fresh bus, and the RTC timer counts the new SYSTIMER clock, so it
    starts again at 0. On the badge the RTC domain keeps counting through
@@ -919,7 +1009,11 @@ in `milestone-9-decisions.md` is the complete list):
    Milestone 7, and the lower v392 speed at Milestone 9's Task 5 gate;
    the block cache is shelved (R-M8-1). Every built-in app now has an
    open rung, but only Dice and Snake were compared with the badge
-   (on v335), and no app's deeper screens are tested.
+   (on v335), and no app's deeper screens are tested. Milestone 10's
+   per-step hook check costs a further 1.7 to 4.4 % natively and 0.8 to
+   3.9 % in Bun's WASM (R-T3-5, accepted). On mobile Safari the emulator
+   runs at about 0.0x to 0.2x (the human partner's remark, 2026-11-03;
+   not measured).
 5. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
@@ -937,7 +1031,7 @@ in `milestone-9-decisions.md` is the complete list):
    (item 5) and simplified edge interrupts (item 9). (Items 6 and 7 are
    resolved; so is the old `CPU_FREQ_MHZ` = 160 stub, see "Resolved in
    Milestone 6".)
-8. **The eFuse block is not modeled**, so the emulated boot logs
+8. **The eFuse block is mostly not modeled**, so the emulated boot logs
    `efuse_init: Chip rev: v0.0` where the real badge reports v0.4 (see
    "Ground truth from the physical badge"). Nothing has stalled on it.
    The one exception (Milestone 10 Task 4) is an opt-in factory MAC
@@ -3096,6 +3190,70 @@ persisted `/littlefs/config/reboot.cfg`) and the reboot calls mask-ROM
   from the per-step reset check, not session variance (Milestone 9
   decisions, "Benchmarks on v392"); recovering it is Milestone 10
   backlog.
+
+### Milestone 10: the badge radio
+
+The spec (`docs/superpowers/specs/2026-10-22-milestone10-badge-radio-design.md`)
+replaces the closed BLE controller with a fake one at bt.c's VHCI seam
+and links emulated badges browser to browser. Its "Measured on v392"
+section traced both apps from `hal_radio: init_once` to the fault and
+read the seam's addresses from a disassembly. Rulings and measurements
+are in `docs/milestone-10-decisions.md`.
+
+- **Task 1** took the soft-reset check off the hot loop: one attention
+  flag, raised by a reset request (and, from Task 3, a hook hit), and a
+  `#[cold]` `attend` path. The native redraws are back to `b25a68c`'s
+  speed; the walk stays about 2 % behind it (R-T1-2). The WASM A/B that
+  Milestone 9 lacked shows Bun was never slower.
+- **Task 2** closed Milestone 9's test gaps: a released button does not
+  replay after a soft reset, the launcher rungs assert each `reboot
+  into <slug>` line, and `softResetCount` reaches the browser.
+- **Task 3** added app-image hooks (`cpu/app_hooks.rs`): a step at a
+  hooked `pc` records a hit and returns to the driver, which returns,
+  passes through or redirects. The check is two learned address ranges
+  per step. It costs 2 to 3.5 % natively and up to 4.8 % in WASM; a
+  page filter tried in a fix round was slower natively (a little faster
+  in WASM) and was not kept. The human partner
+  accepted the cost at the Task 6 gate (R-T3-5).
+- **Task 4** measured where the MAC comes from (eFuse
+  `EFUSE_RD_MAC_SPI_SYS_0/1`, read once during provisioning, step
+  27,120,644) and added `peripherals/efuse.rs`: with no MAC set it reads
+  0 and logs as before; with one, a MAC'd walk reaches the launcher 95
+  steps sooner, with the same frames (R-T4-1, R-T4-2).
+- **Task 5** built the HCI model (`radio/hci.rs`), pure and unwired.
+- **Task 6** wired it in: hooks on bt.c's controller and VHCI functions
+  (`radio/v392.rs`), replies through a guest trampoline in free mask-ROM
+  space, reports from the idle hook (R-T6-2). The trace added six
+  commands and two libgcc ROM stubs (`__popcountsi2`, `__lesf2`). The
+  two Milestone 9 fault rungs were replaced by six radio rungs. Sync's
+  planned "No sync station in range" needs an upload credential the
+  fake identities lack, so its rung pins "Badge not ready to sync"; the
+  human partner amended the criterion (R-T6-5). At the gate they also
+  confirmed connectionless pairing, so Task 7 (a connection model) was
+  skipped, and set `LINKED_PEER_RSSI` to −40 dBm.
+- **Task 8** added the host API (`radio_advertisement`,
+  `deliver_advertisement`, the wire form `addr ‖ addr_type ‖ data`) and
+  the rung `two_badges_pair_to_synced`: hacker and organizer badges,
+  bumped together, show "SYNCED" 93 ms later. The release suite went
+  from 11.7 s to 15.5 s.
+- **Task 9** brought the radio to the browser: the hub, the Bump
+  button, one badge per browser over a Web Lock, a per-browser MAC, and
+  the hidden-page pause extended to the hub (R-T9-1 to R-T9-7).
+- **Task 10** linked browsers over WebRTC (`iceServers: []`), set up
+  through `/api/signal` (Vercel, Upstash Redis; a Vite middleware in
+  dev) or by copy-paste codes. Two follow-ups rate-limited the endpoint
+  with four fixed-window counters (R-T10-8 to R-T10-10). The automated
+  Chrome could not resolve mDNS host candidates, so "connected" was left
+  for the human's two-device gate.
+- **Task 11** read the firmware for Part 5, hearing real badges through
+  Web Bluetooth: the only visible effect would be on Connect's bump
+  path, and only on the emulated side (R-T11-1). The human partner said
+  no-go, and Part 5 was dropped (R-T11-2).
+- **Task 12**, the browser gate (2026-11-03): on two real devices over
+  the LAN dev server, Connect's and Sync's home screens, a room link, a
+  Bump to "SYNCED" on both, and a manual pairing all worked. The human
+  partner accepted the rate limiter as is: this is a toy project, and
+  few simultaneous users are expected.
 
 ## Emulated flash chip: what it contains
 
