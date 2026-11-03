@@ -971,6 +971,78 @@ Measured on v392 in release, with scratch probes (copies of
   fake DOM instead of a new DOM dependency. The notice lives in a new
   `#badge-notice` element, hidden until the badge is found taken — cost
   if wrong: the fake DOM covers only what the builders use.
+- Ruling R-T10-1 (Task 10, `feat: WebRTC radio links signaled through
+  Vercel, with copy-paste fallback`; the orchestrator's R-PF-T10-1):
+  `hub.bump()` sends `{t:"bump"}` to every link even when the local
+  runtime is not running (Lua mode, a lost badge, a hidden tab), because
+  a bump is physical contact: the peer felt it whether or not this
+  badge did. Only the local half is dropped (R-T9-3) — cost if wrong: a
+  running peer's Connect feels a bump from a tab that cannot answer, and
+  its pairing attempt times out alone, as a one-sided bump would.
+- Ruling R-T10-2 (Task 10): the signaling protocol, beyond the plan's
+  four calls. `GET want=answer` and `POST op:"answer"` answer 404 when
+  the room's offer is gone (unknown or expired), so the host stops
+  polling a dead room and the joiner gets a clear message; any method
+  other than GET and POST is 405; a create that finds 8 random codes
+  taken is 503. The body cap is `2 × 16 KiB + 1 KiB`, since JSON
+  escaping doubles an SDP's CRLFs; the SDP itself is capped at 16 KiB
+  characters. Keys are `htn-signal:<room>:offer|answer`, each with its
+  own 300 s TTL from when it was written. Every reply is
+  `Cache-Control: no-store`. A store failure is a bare 500; nothing is
+  ever logged — cost if wrong: an answer written at 299 s outlives its
+  offer by up to 300 s, harmless since nobody polls it.
+- Ruling R-T10-3 (Task 10): `frontend/api/signal.ts` uses the `fetch`
+  Web Standard export (`export default { fetch(request) }`), per
+  https://vercel.com/docs/functions/functions-api-reference (checked
+  2026-11-02). It reads only `KV_REST_API_URL` and `KV_REST_API_TOKEN`
+  (a missing one is a bare 500), reaches `process.env` through
+  `globalThis` (no Node types), and imports `../src/radio/signal-handler.js`
+  with an explicit extension; `signal-handler.ts` imports nothing, so
+  Node ESM resolves the function unbundled. `tsconfig.json` now includes
+  `api/`. Upstash goes through its REST API over `fetch`, with no
+  client library — cost if wrong: if Vercel's TypeScript build does not
+  map the `.js` specifier to the `.ts` file, `/api/signal` fails at
+  import on the first preview deploy, and the fix is a one-file inline.
+- Ruling R-T10-4 (Task 10): a link joins the hub as soon as it exists
+  (its `send` drops everything until the channel opens) and leaves the
+  hub when it closes; a closed link stays in the list, "disconnected",
+  until its Remove. One hosted room at a time: Host link again cancels a
+  room nobody joined yet. The 120 s budget (1 s polls) runs from the
+  start of `hostRoom`/`joinRoom` and covers both the answer and the
+  channel opening; at its end the link is closed with "Could not
+  connect to the peer: no direct path…". A join resolves only once the
+  channel is open, so a joining link enters the list already
+  connected. Typed room codes follow Crockford's decoding (case-free,
+  hyphens and spaces ignored, I/L → 1, O → 0) — cost if wrong: a slow
+  ICE path that would open after 120 s is given up on; the user links
+  again.
+- Ruling R-T10-5 (Task 10): manual codes are `offer:` or `answer:` plus
+  the SDP, `deflate-raw` compressed and base64url without padding, so a
+  pasted code says which step it is, and an answer pasted where no offer
+  waits gets a message. Whitespace in a pasted code is ignored. Decoding
+  never rejects: a code over 32 KiB, bad base64url, a deflate error, an
+  inflated size over 16 KiB (a deflate bomb is cut off while reading),
+  or invalid UTF-8 gives `null`. A manual link has no timeout; it stays
+  "connecting…" until removed — cost if wrong: an abandoned manual offer
+  holds one idle `RTCPeerConnection` until Remove or unload.
+- Ruling R-T10-6 (Task 10): a `PeerLink` passes on only a string data
+  message of at most 1024 characters that parses as JSON (the largest
+  real one is about 330); the hub then validates the shape (R-T9-1). A
+  throwing handler is caught inside the channel callback. ICE gathering
+  is waited on for at most 10 s, after which the SDP goes out with the
+  candidates gathered so far — cost if wrong: a future, larger hub
+  message over 1024 characters would be dropped silently; the cap must
+  grow with it.
+- Ruling R-T10-7 (Task 10): the link panel lives in a new `#link-panel`,
+  shown only in real-firmware mode like the provisioning controls, and
+  is built by an exported `buildLinkPanel(container, doc, handlers)` in
+  `shell.ts` (the R-T9-7 pattern). Its order: "Host link", the room code
+  input, "Join link", "Manual", the status line, the manual section
+  ("Create code", the code to copy, the code to paste, "Use code"),
+  then the link list, each row "Link n (room CODE|manual) — state" with
+  "Remove". The dev server serves `/api/signal` through a Vite plugin
+  (`apply: "serve"`) over a `MemoryStore` — cost if wrong: dev rooms
+  vanish when the dev server restarts.
 
 ## Replaced rungs
 

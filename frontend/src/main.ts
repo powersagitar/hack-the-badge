@@ -39,12 +39,20 @@
  * badge's factory MAC is this browser's (`loadOrCreateMac`), sent to the
  * Worker before its first start. `src/radio/hub.ts`'s `RadioHub` carries
  * the badge's advertisements to linked peers and theirs back, and the
- * Bump button bumps this badge and every linked one. Links come with
- * Task 10; until then the badge is alone in the room. The hidden-page
+ * Bump button bumps this badge and every linked one. The hidden-page
  * pause pauses the hub too.
+ *
+ * **Links (Milestone 10 Task 10).** The link panel ({@link mountLinks})
+ * makes WebRTC links (`src/radio/peer-link.ts`) to other browsers: "Host
+ * link" creates a room on `/api/signal` and shows its code, "Join link"
+ * joins one, and "Manual" swaps the same offer and answer as copy-paste
+ * codes instead. Each link joins the hub as soon as it exists; it carries
+ * nothing until its channel opens, and leaves the hub when it closes.
  */
 import { renderFrame } from "./render/canvas";
 import { RadioHub } from "./radio/hub";
+import { acceptOffer, createOffer, decodeManualCode, encodeManualCode, type PeerLink } from "./radio/peer-link";
+import { type HostedRoom, SignalError, hostRoom, joinRoom, normalizeRoomCode } from "./radio/signal-client";
 import { acquireBadge, type BadgeHold, loadOrCreateMac, takeOver } from "./radio/lock";
 import {
   createWorkerFirmwareRuntime,
@@ -53,7 +61,7 @@ import {
 } from "./runtime/firmware-worker-client";
 import { createHttpFileLoader, loadApp } from "./runtime/lifecycle";
 import { TEST_IDENTITY_ROLES, testIdentityUrl } from "./runtime/test-identities";
-import { mountShell, type ButtonInjector, type EmulatorMode } from "./ui/shell";
+import { mountShell, type ButtonInjector, type EmulatorMode, type LinkPanel, type ShellHandles } from "./ui/shell";
 
 const APP_DIR = "smoke-test";
 const FIRMWARE_IMAGE_URL = "/firmware/firmware.bin";
@@ -100,6 +108,142 @@ function safeStringify(v: unknown): string {
   } catch {
     return String(v);
   }
+}
+
+function errorText(e: unknown, fallback: string): string {
+  return e instanceof SignalError ? e.message : fallback;
+}
+
+/**
+ * Mounts the link panel and runs its links into `hub`: one hosted room at
+ * a time (hosting again cancels a room no one has joined yet), any number
+ * of links, and the manual codes. Returns the panel and a function that
+ * closes every link (for unload).
+ */
+function mountLinks(shell: ShellHandles, hub: RadioHub): { panel: LinkPanel; closeAll(): void } {
+  const links = new Map<string, { link: PeerLink; label: string }>();
+  let made = 0;
+  let hosting: HostedRoom | null = null;
+  /** This browser's manual offer, waiting for the peer's answer code. */
+  let manualOffer: PeerLink | null = null;
+
+  const refresh = () =>
+    panel.setLinks([...links.values()].map(({ link, label }) => ({ id: link.id, label, state: link.state })));
+
+  function track(link: PeerLink, how: string): void {
+    links.set(link.id, { link, label: `Link ${++made} (${how})` });
+    hub.addLink(link);
+    link.onStateChange((state) => {
+      if (state === "closed") hub.removeLink(link.id);
+      refresh();
+    });
+    refresh();
+  }
+
+  async function host(): Promise<void> {
+    hosting?.cancel();
+    hosting = null;
+    panel.setStatus("Creating a room\u2026");
+    try {
+      const h = await hostRoom();
+      hosting = h;
+      track(h.link, `room ${h.room}`);
+      panel.setStatus(`Room ${h.room}: enter this code in the other browser\u2019s Join link, within 2 minutes.`);
+      h.connected.then(
+        () => {
+          if (hosting === h) hosting = null;
+          panel.setStatus(`Room ${h.room}: linked.`);
+        },
+        (e: unknown) => {
+          if (hosting !== h) return; // replaced or removed: its status is stale
+          hosting = null;
+          panel.setStatus(errorText(e, "Linking failed."));
+        },
+      );
+    } catch (e) {
+      panel.setStatus(errorText(e, "Could not host a room."));
+    }
+  }
+
+  async function join(code: string): Promise<void> {
+    panel.setStatus(`Joining ${code.trim()}\u2026`);
+    try {
+      const link = await joinRoom(code);
+      track(link, `room ${normalizeRoomCode(code) ?? code.trim()}`);
+      panel.setStatus("Linked.");
+    } catch (e) {
+      panel.setStatus(errorText(e, "Could not join the room."));
+    }
+  }
+
+  async function manualCreate(): Promise<void> {
+    try {
+      if (manualOffer && manualOffer.state === "connecting") remove(manualOffer.id);
+      const { link, offer } = await createOffer();
+      manualOffer = link;
+      track(link, "manual");
+      panel.setManualOutput(await encodeManualCode("offer", offer));
+      panel.setStatus("Copy this offer code to the other browser, then paste its answer code here and press Use code.");
+    } catch {
+      panel.setStatus("This browser could not start a WebRTC link.");
+    }
+  }
+
+  async function manualUse(code: string): Promise<void> {
+    const decoded = await decodeManualCode(code);
+    if (!decoded) {
+      panel.setStatus("That is not a link code.");
+      return;
+    }
+    try {
+      if (decoded.kind === "offer") {
+        const { link, answer } = await acceptOffer(decoded.sdp);
+        track(link, "manual");
+        panel.setManualOutput(await encodeManualCode("answer", answer));
+        panel.setStatus("Copy this answer code back to the other browser.");
+        return;
+      }
+      const offerer = manualOffer;
+      if (!offerer || offerer.state !== "connecting") {
+        panel.setStatus("An answer code completes this browser\u2019s offer: press Create code first.");
+        return;
+      }
+      await offerer.complete(decoded.sdp);
+      manualOffer = null;
+      panel.setStatus("Answer applied: connecting\u2026");
+    } catch {
+      panel.setStatus("That code could not be used.");
+    }
+  }
+
+  function remove(id: string): void {
+    const entry = links.get(id);
+    if (!entry) return;
+    if (hosting?.link === entry.link) {
+      hosting.cancel();
+      hosting = null;
+    }
+    if (manualOffer === entry.link) manualOffer = null;
+    links.delete(id);
+    hub.removeLink(id);
+    entry.link.close();
+    refresh();
+  }
+
+  const panel = shell.mountLinkPanel({
+    onHost: () => void host(),
+    onJoin: (code) => void join(code),
+    onManualCreate: () => void manualCreate(),
+    onManualUse: (code) => void manualUse(code),
+    onRemove: remove,
+  });
+  return {
+    panel,
+    closeAll() {
+      hosting?.cancel();
+      for (const { link } of links.values()) link.close();
+    },
+  };
 }
 
 function main(): void {
@@ -149,6 +293,7 @@ function main(): void {
     deliver: (bytes, rssi) => firmwareRuntime?.deliverAdvertisement(bytes, rssi),
     bumpLocal: () => firmwareRuntime?.bump(),
   });
+  const radioLinks = mountLinks(shell, hub);
 
   async function ensureFirmwareRuntime(): Promise<WorkerFirmwareRuntime> {
     if (firmwareRuntime) return firmwareRuntime;
@@ -304,6 +449,7 @@ function main(): void {
   );
   setInterval(() => {
     provisionControls.setVisible(mode === "firmware");
+    radioLinks.panel.setVisible(mode === "firmware");
     const st = firmwareRuntime?.provisionState() ?? null;
     let text = fetchError;
     if (st) {
@@ -330,6 +476,7 @@ function main(): void {
     luaRuntime.stop();
     firmwareRuntime?.dispose();
     badgeHold?.release();
+    radioLinks.closeAll();
   });
 }
 

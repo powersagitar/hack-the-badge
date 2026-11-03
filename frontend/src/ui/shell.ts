@@ -12,6 +12,10 @@
  *   Space                   -> AUX1
  * (unmapped: none needed for the smoke-test app; extend KEY_TO_BUTTON as needed.)
  *
+ * The radio link panel ({@link buildLinkPanel}, Milestone 10 Task 10)
+ * hosts or joins a WebRTC link, or swaps codes by hand; `main.ts` does the
+ * linking.
+ *
  * The button pad, keyboard bindings and canvas are shared between modes —
  * `shell.ts` itself has no notion of "which runtime"; `src/main.ts` owns
  * both runtimes and passes this module a single `ButtonInjector` that it
@@ -93,6 +97,11 @@ export interface ShellHandles {
    * `#badge-notice`, hidden (no-op handles if the element is missing).
    */
   mountBadgeNotice(onTakeOver: () => void): BadgeNotice;
+  /**
+   * Mounts the radio link panel into `#link-panel` (no-op handles if the
+   * element is missing); see {@link buildLinkPanel}.
+   */
+  mountLinkPanel(handlers: LinkPanelHandlers): LinkPanel;
 }
 
 /**
@@ -171,6 +180,132 @@ export function buildBadgeNotice(
   };
   setVisible(false);
   return { setVisible };
+}
+
+/** One row of the link list: a radio link and its state. */
+export interface LinkRow {
+  id: string;
+  label: string;
+  state: "connecting" | "open" | "closed";
+}
+
+export interface LinkPanelHandlers {
+  /** "Host link": create a room. */
+  onHost(): void;
+  /** "Join link", with the code input's text as typed. */
+  onJoin(code: string): void;
+  /** Manual "Create code": an offer code to copy to the peer. */
+  onManualCreate(): void;
+  /** Manual "Use code", with the pasted code (an offer or an answer). */
+  onManualUse(code: string): void;
+  /** A row's "Remove". */
+  onRemove(id: string): void;
+}
+
+/** The radio link panel (Milestone 10 Task 10). */
+export interface LinkPanel {
+  setStatus(text: string): void;
+  /** Shows a code for the user to copy, in the manual section. */
+  setManualOutput(code: string): void;
+  setLinks(links: readonly LinkRow[]): void;
+  setVisible(visible: boolean): void;
+}
+
+const LINK_STATE_LABEL: Record<LinkRow["state"], string> = {
+  connecting: "connecting…",
+  open: "connected",
+  closed: "disconnected",
+};
+
+/**
+ * Builds the radio link panel into `container`, in this order: "Host link",
+ * the room code input, "Join link", the "Manual" toggle, a status line,
+ * the manual section (hidden until "Manual" is on: "Create code", a
+ * read-only code to copy, a code to paste, "Use code"), and the link list,
+ * each row with "Remove".
+ */
+export function buildLinkPanel(
+  container: HTMLElement,
+  doc: Pick<Document, "createElement">,
+  handlers: LinkPanelHandlers,
+): LinkPanel {
+  container.innerHTML = "";
+  const button = (label: string, onClick: () => void) => {
+    const btn = doc.createElement("button");
+    btn.type = "button";
+    btn.className = "mode-btn";
+    btn.textContent = label;
+    btn.addEventListener("click", () => onClick());
+    return btn;
+  };
+
+  const row = doc.createElement("div");
+  row.className = "link-row";
+  const code = doc.createElement("input");
+  code.className = "link-code";
+  code.type = "text";
+  code.placeholder = "room code";
+  code.maxLength = 16;
+  code.autocomplete = "off";
+  code.spellcheck = false;
+  const host = button("Host link", () => handlers.onHost());
+  const join = button("Join link", () => handlers.onJoin(code.value));
+  let manualOn = false;
+  const manualToggle = button("Manual", () => {
+    manualOn = !manualOn;
+    manualToggle.className = "mode-btn" + (manualOn ? " active" : "");
+    manual.style.display = manualOn ? "" : "none";
+  });
+  row.append(host, code, join, manualToggle);
+
+  const status = doc.createElement("span");
+  status.className = "link-status";
+
+  const manual = doc.createElement("div");
+  manual.className = "link-manual";
+  manual.style.display = "none";
+  const out = doc.createElement("textarea");
+  out.className = "link-manual-out";
+  out.readOnly = true;
+  out.rows = 3;
+  out.placeholder = "your code appears here: copy it to the other browser";
+  const paste = doc.createElement("textarea");
+  paste.className = "link-manual-in";
+  paste.rows = 3;
+  paste.placeholder = "paste the other browser's code here";
+  manual.append(
+    button("Create code", () => handlers.onManualCreate()),
+    out,
+    paste,
+    button("Use code", () => handlers.onManualUse(paste.value)),
+  );
+
+  const list = doc.createElement("ul");
+  list.className = "link-list";
+
+  container.append(row, status, manual, list);
+  return {
+    setStatus: (text) => {
+      status.textContent = text;
+    },
+    setManualOutput: (text) => {
+      out.value = text;
+    },
+    setLinks: (links) => {
+      list.innerHTML = "";
+      for (const link of links) {
+        const item = doc.createElement("li");
+        item.className = `link-item link-${link.state}`;
+        const label = doc.createElement("span");
+        label.textContent = `${link.label} — ${LINK_STATE_LABEL[link.state]} `;
+        item.append(label, button("Remove", () => handlers.onRemove(link.id)));
+        list.appendChild(item);
+      }
+    },
+    setVisible: (visible) => {
+      container.style.display = visible ? "" : "none";
+    },
+  };
 }
 
 export function mountShell(): ShellHandles {
@@ -272,6 +407,12 @@ export function mountShell(): ShellHandles {
     return buildBadgeNotice(container, document, onTakeOver);
   }
 
+  function mountLinkPanel(handlers: LinkPanelHandlers): LinkPanel {
+    const container = document.getElementById("link-panel");
+    if (!container) return { setStatus() {}, setManualOutput() {}, setLinks() {}, setVisible() {} };
+    return buildLinkPanel(container, document, handlers);
+  }
+
   return {
     canvas,
     ctx,
@@ -281,5 +422,6 @@ export function mountShell(): ShellHandles {
     mountModeToggle,
     mountProvisionControls,
     mountBadgeNotice,
+    mountLinkPanel,
   };
 }
