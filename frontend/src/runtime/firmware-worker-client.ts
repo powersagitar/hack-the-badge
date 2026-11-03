@@ -33,8 +33,8 @@
  *   `bump()` is dropped the same way. `advOut` goes to the
  *   `onAdvertisement` option. The hidden-page pause
  *   calls `onPausedChange(true)` before its `stop`, and
- *   `onPausedChange(false)` after its `start`, so the hub is paused with
- *   the badge (ruling R-T9-4).
+ *   `onPausedChange(false)` after its `start` (or after a `stop()` that
+ *   ends the pause), so the hub is paused with the badge (ruling R-T9-4).
  * - `provision()` and `reset()` update the cached provisioning state (and
  *   `reset()` the speed) at once, as the in-thread runtime did; the next
  *   `status` replaces them. A `status` the Worker posted before it handled
@@ -223,11 +223,15 @@ export function createWorkerFirmwareRuntime(
     },
     stop(): void {
       running = false;
+      // The hidden-page pause ends with the run: tell the listener, or the
+      // hub would stay paused after a stop while hidden (a takeover).
+      const wasPaused = pausedHidden;
       pausedHidden = false;
       // Sent even when paused or never started: stop() also flushes deferred
       // releases and queued taps.
       send({ kind: "stop" });
       dropPendingFrame();
+      if (wasPaused) notify(onPausedChange, false);
     },
     injectButton(button: ButtonName, kind: "pressed" | "released"): void {
       send({ kind: "button", button, pressed: kind === "pressed" });

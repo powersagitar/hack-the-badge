@@ -13,8 +13,10 @@ import {
   createWorkerFirmwareRuntime,
   type VisibilitySource,
   type WorkerClientOptions,
+  type WorkerFirmwareRuntime,
   type WorkerLike,
 } from "../src/runtime/firmware-worker-client";
+import { encodeBase64, LINKED_PEER_RSSI, RadioHub } from "../src/radio/hub";
 import { ADV_REPOST_MS, type FromWorker, type ToWorker } from "../src/runtime/firmware-worker-protocol";
 
 /** `bun test` has no `ImageData`; the client's paint blits with one (see test/framebuffer.test.ts). */
@@ -667,6 +669,40 @@ describe("firmware worker client radio", () => {
     rt.stop();
     rt.deliverAdvertisement(adv, -40); // stopped
     expect(sent.filter((m) => m.kind === "advIn")).toEqual([{ kind: "advIn", bytes: adv, rssi: -40 }]);
+  });
+
+  test("a stop during the hidden-page pause ends the pause: the hub is resumed", () => {
+    const vis = fakeVisibility();
+    // Wired as main.ts wires it: the hub delivers to the client.
+    let client: WorkerFirmwareRuntime | null = null;
+    const hub = new RadioHub({
+      deliver: (b, r) => client?.deliverAdvertisement(b, r),
+      bumpLocal: () => client?.bump(),
+    });
+    const paused: boolean[] = [];
+    const { rt, sent, reply } = clientRig({
+      visibility: vis.source,
+      onPausedChange: (p) => {
+        paused.push(p);
+        hub.setPaused(p);
+      },
+    });
+    client = rt;
+    reply({ kind: "ready" });
+    rt.start();
+    vis.set(true); // hidden: paused
+    rt.stop(); // a takeover's onLost while hidden
+    expect(paused).toEqual([true, false]);
+    vis.set(false); // visible, but stopped: nothing changes
+    rt.start(); // the badge taken back
+    expect(paused).toEqual([true, false]);
+    expect(sent.at(-1)).toEqual({ kind: "start" });
+    // The hub is un-paused: a peer's advert reaches the running badge.
+    let heard: ((m: unknown) => void) | null = null;
+    hub.addLink({ id: "p", send: () => {}, onMessage: (cb) => (heard = cb) });
+    const adv = new Uint8Array([1, 2, 3, 4, 5, 6, 0, 1, 0]);
+    heard!({ t: "adv", b: encodeBase64(adv) });
+    expect(sent.filter((m) => m.kind === "advIn")).toEqual([{ kind: "advIn", bytes: adv, rssi: LINKED_PEER_RSSI }]);
   });
 
   test("bump is dropped while stopped or hidden, not replayed later", () => {

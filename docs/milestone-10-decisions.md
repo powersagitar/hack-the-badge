@@ -935,7 +935,11 @@ Measured on v392 in release, with scratch probes (copies of
   R-T8-10) also pauses the hub, through the client's `onPausedChange`:
   `true` before its `stop`, `false` after its `start`, so the
   advertisements the hub held (the latest per peer, in first-heard
-  order) are delivered to a running badge. A runtime started while the
+  order) are delivered to a running badge. A `stop()` during the pause
+  (a takeover's `onLost` in a hidden tab) ends it and also calls
+  `onPausedChange(false)`, so the hub never stays paused after the
+  runtime stops; what it held then reaches a stopped client and is
+  dropped. A runtime started while the
   page is already hidden does not pause the hub; the client drops what
   arrives until the page is visible — cost if wrong: in that one case a
   peer's last advertisement is lost rather than held, and the peer's
