@@ -574,6 +574,214 @@ Measured on v392 in release, with scratch probes (copies of
   - Both bumping with the swaps running during the pulse also paired:
     the contacts were saved at 85 ms after the pulse began.
 
+### Task 11 Step 1: does one-way hearing change anything visible?
+
+The question: if the emulated badge hears a real badge's advertisements
+at a real RSSI, but cannot answer and is never heard, does anything
+change on the emulated badge's screen in Connect or Sync (v392)? The
+evidence comes from two sources. The first is a static reading of
+`firmware.bin`'s segments, using `local/m10-tools/` and llvm-objdump.
+The second is scratch probes (copies of `boot_progress.rs`, since
+deleted). In the probes the organizer badge (`…10:02`) stands in for
+the real badge: the hacker badge (`…10:01`) hears it, and it hears
+nothing.
+
+**Verdict: visible effect, in Connect's bump path only.** A real badge
+that was just bumped advertises its `BMP2` card for about 1 s. If the
+emulated badge is bumped (the Bump button) while that card is still on
+the air, and hears it at −64 dBm or stronger, its screen shows
+"SYNCED" / "Conversation Starters unlocked!" / "Contacts: n+1". It
+shows "Already connected" if the contact was saved before. It also
+saves the real badge as a contact. The real badge never hears the
+emulator, so it shows "No badge found, try again". Hearing changes
+nothing visible in Connect's both-hold-A pairing or anywhere in Sync.
+
+**Connect, both-hold-A pairing (`BPA1`): two-way, no visible effect.**
+- **The payload.** `0x4201cb7a` builds it as `BPA1` + this badge's
+  session nonce (u32 LE, nonzero; Connect + `0x1cc`) + an echo word +
+  the `BMP2` card. Advertising (`0x4201d280`, at `0x4201d314`/
+  `0x4201d316`) fills the echo with the peer nonce this badge latched
+  (Connect + `0x1d0`). `0x4201cc2a` decodes the two words.
+  - This decodes Task 6's "8 undecoded bytes". The probe's hacker sent
+    `27 13 22 b1 00 00 00 00`: nonce `0xb1221327`, echo 0. Once it had
+    heard the organizer it sent `27 13 22 b1 27 13 22 b1`. Both
+    emulated badges draw the same nonce, from the fixed-seed RNG.
+- **The receive loop.** `0x4201ed4a` works through up to 8 queued
+  reports per tick. Its checks, in order:
+  - RSSI ≠ `0x7F` and ≥ −64 dBm;
+  - `BPA1` (`0x3c155834`);
+  - an A session is open and within its window;
+  - the card decodes;
+  - the badge ID is not this badge's own.
+
+  Reports that pass go to `0x4201ec46`, with the session at Connect +
+  `0x1b8`.
+- **`0x4201ec46` latches the peer.**
+  - It rejects a report whose echo is nonzero and differs from this
+    badge's nonce (`0x4201eca4`–`0x4201eca8`).
+  - It latches the first peer's nonce and address, and rejects any
+    other peer.
+  - Only when the echo equals this badge's nonce does it set the
+    "mutual" byte (session + `0x22`, Connect + `0x1da`, at `0x4201ed1a`).
+- **Saving the contact needs that byte.** `0x4201d98a` (`contacts_store:
+  saved contact …`) is called at `0x4201ee8a` only when Connect +
+  `0x1da` is set (`0x4201ee54`).
+- **What one-way hearing changes.** A real badge that never hears the
+  emulator echoes 0 or another badge's nonce, so the byte is never set.
+  Latching the peer changes only the emulated badge's own advertisement
+  (the echo word, which nobody hears) and how long it keeps advertising
+  (`0x4201cb0e`).
+- **The screen cannot show the latch.** Connect's renderer (`0x4201dae4`)
+  reads the session from Connect + `0x1cc`, `0x1b8`, `0x1c0` and
+  `0x1e0`, never `0x1d0` or `0x1da`. "PAIRING..." (`0x3c1383fc`, at
+  `0x4201dce8`) shows either way.
+- **Probe.** Both badges held A for 2.5 s, from the same emulated time;
+  2,016 of the organizer's reports reached the hacker at −40 dBm.
+  - Both frames were identical at every 250 ms sample.
+  - Neither badge saved a contact.
+  - Both ended on "No badge found,\ntry again" with "Contacts: 0"
+    (`uitree`).
+
+**Connect, bump pairing (`BMP2`): one-way, visible.**
+- **What a bump starts** (`0x4201f182` on):
+  - the 4-slot peer table at Connect + `0x238` is cleared;
+  - a window opens, from now (Connect + `0x208`) to now + 1 s
+    (Connect + `0x210`, `lui a4, 0xf4; addi a4, a4, 0x240` at
+    `0x4201f1ce`);
+  - the badge advertises its bare `BMP2` card while scanning.
+- **The receive branch** (`0x4201ee96`) needs:
+  - no A session (Connect + `0x1cc` = 0);
+  - an open bump window;
+  - the report's timestamp inside that window;
+  - a card that decodes (`0x42049ec6`: `BMP2` at `0x3c1383d8`, version
+    `02`);
+  - a badge ID that is not this badge's own.
+
+  The RSSI gate above applies first.
+- **No nonce, no echo, no check that the peer heard this badge.**
+  - `0x4201d3d0` finds or claims a peer-table slot by the 6-byte
+    address.
+  - `0x4201dab2` calls `0x4201d98a` once per slot. That saves the
+    contact, then calls `0x4201d652(…, 0)`, the 3 s result screen: green
+    "SYNCED" (`0x3c138538`, at `0x4201dc32`) when the contact is new,
+    otherwise yellow "Already connected" (`0x3c138524`, at
+    `0x4201db40`). It also sets the label to "Conversation Starters
+    unlocked!" (`0x3c138504`).
+- **When the window closes** (`0x4201f23e` on), a badge that saved no
+  contact (Connect + `0x218` = 0) gets `0x4201d652(…, 1)`: red "No badge
+  found,\ntry again" (`0x3c13854c`, at `0x4201dbf8`).
+- **Probes.** Both badges are on Connect's home, the organizer is
+  bumped, and only the organizer's advertisement is delivered to the
+  hacker, every 1 ms.
+
+  | Hacker bumped | RSSI | Hacker | Organizer |
+  |---|---|---|---|
+  | same time | −40 | `SYNCED_HASH` at 93 ms; saved `test-fake-badge-0002`; `uitree` "SYNCED", "Conversation Starters unlocked!", "Contacts: 1" | no contact; "No badge found,\ntry again", "Contacts: 0" |
+  | same time | −64 | as at −40 | as at −40 |
+  | same time | −65 | no contact; "No badge found,\ntry again" | as at −40 |
+  | 600 ms later | −40 | `SYNCED_HASH` 93 ms after its own bump; saved | as at −40 |
+
+- **The time limit.** The emulated badge's bump must land while the
+  real badge's card is still advertised, and inside its own 1 s window.
+  That is about 1 s either side, measured on v392 (`stop extended
+  advertising` about 1.01 s after a bump).
+
+**Sync: no visible effect from any badge.**
+- **What drives "station nearby".** Sync's status line (`0x42043f04`)
+  asks `0x42049b92`, which says a station is near only if one was seen
+  within 4 s (`lui a5, 0x3d1; addi a5, a5, -0x700`). The line then
+  reads "Ready to sync" (`0x3c13d0cc`) and "station nearby   %d dBm"
+  (`0x3c13d110`), or "%s   %d dBm" (`0x3c137a8c`) with the station's
+  name. Otherwise it reads "Find a sync station" / "looking for a
+  station..." (`0x3c13d0dc`, `0x3c13d128`).
+- **Where the "seen" time comes from.** The only writer is
+  `0x42048af6`, called only from `0x420490b0`. That is the advertisement
+  handler `0x42048fea` (via the callback `0x420433e8`). The handler needs
+  at least 18 bytes, the frame magic `BBX1` (`0x42048a1e`, byte by byte:
+  `42 42 58 31`), and frame type `0x15`. It also accepts types `0x11`
+  and `0x13`, `0x14`, `0x16` for the upload protocol; the last three
+  must name this badge (the 6-byte compare at `0x4204904e`).
+- **Which side sends what.** The badge's own frame builder
+  (`0x42048b56`) is called with types `0x03` (`0x42048d74`), `0x10`
+  (`0x42048da2`), `0x12` (`0x42048f54`) and `0x17` (`0x42049642`). None
+  is a type the receiver accepts. So `0x15` and the other accepted
+  types are station frames.
+- **What badges advertise.** Connect's payloads are `BPA1`, `BMP2` or
+  empty. Sync's own advertisement is `03 ff ff ff` (probe: Sync's home,
+  `radio_advertisement()`). No badge payload can pass the `BBX1` check.
+- **Probes on Sync's home** (scanning; 100 deliveries at −40 dBm, 10 ms
+  apart, then 300 ms):
+  - `03 ff ff ff`, a `BMP2` card, a `BPA1` card, and `BBX1` frames of
+    the badge types `0x03`, `0x10`, `0x12` and `0x17`: each left the
+    frame at `SYNC_HOME_HASH`, with "looking for a station..." in
+    `uitree`.
+  - The positive control, a `BBX1` type `0x15` frame named
+    `probe-desk`, changed it to "Ready to sync" / "probe-desk   -40 dBm".
+- **So only a desk moves Sync's screen.** Hearing a real *sync station*
+  would show "station nearby". That is a desk, not a badge, and it is
+  out of Part 5's scope. Its frame layout beyond the magic, type and
+  name is unread.
+
+**What a real badge advertises, and whether it can reach a scanning
+emulator.**
+- **On the launcher:** nothing until a radio app has opened, since
+  hal_radio's `init_once` runs only then. After that the controller
+  stays up.
+- **In Connect:**
+  - on its home, nothing: it stops advertising and scanning (Task 6's
+    commands 24 to 26, Task 8's probe);
+  - for about 1 s after a bump, the `BMP2` card;
+  - while A is held, `03 ff ff ff`, then `BPA1`.
+- **In Sync:** `03 ff ff ff`, plus `BBX1` badge frames during an upload.
+- **Unproven:** what a real badge advertises after leaving Sync. It
+  carries nothing Connect or Sync acts on in any case.
+- **When the emulator hears anything.** It scans only during its own
+  bump window or A session (Connect) or on Sync's home. A report that
+  arrives while it is not scanning is dropped (Task 5,
+  `advertisement_without_scanning_is_dropped`).
+- **So the only reachable visible case is the bump case above.** The
+  real badge and the emulated badge are bumped within about 1 s of each
+  other.
+
+**The physical badge runs v335, not v392.** The committed v335 image is
+`b25a68c^:frontend/public/firmware/firmware.bin`.
+- Its card builder (`0x42048170`) writes `BMP2` (`0x3c138038`) and
+  version `02` (`li a5, 0x2; sb a5, 0x4(a0)` at `0x420481a2`), the
+  header v392's decoder checks.
+- Its Connect code references `BPA1` (`0x3c15512c`) and `BMP2` in a
+  receive filter at `0x4201bb7c`.
+- **Unproven:**
+  - that v335 advertises the card after a bump in the same AD structure
+    (manufacturer data, company `0xFFFF`), for the same ~1 s;
+  - that v335's TLVs decode under v392's `0x42049ec6`.
+
+  Neither was traced. Step 4's spike would show the first.
+
+**The spec's "Measured on v392" items that bear on this.**
+- **Connectionless only.** Confirmed again: everything above is
+  advertising reports. One-way hearing needs no connection, scan
+  response or GATT.
+- **The random address from the eFuse MAC.** The real badge's address
+  keys the emulator's peer table (`0x4201d3d0`) and the `BPA1` latch.
+  The emulator's own address is irrelevant, since it is never heard.
+- **The VHCI seam and the 229-byte single-report limit.** A heard report
+  would enter through the same `deliver_advertisement` path Task 8
+  pinned. Badge cards are 45 to 57 bytes.
+- **Part 5's expectation** ("Connect's pairing is two-way … and fails
+  without an answer; Sync shows 'station nearby' only for a desk"):
+  - right for both-hold-A and for Sync;
+  - wrong for the bump, which is one-way.
+
+**Unproven, and left for the spike (Step 4):**
+- whether Chrome's `requestLEScan` reports the badge's *extended*,
+  non-connectable advertisements at all;
+- whether it exposes company `0xFFFF`'s manufacturer data. The
+  emulator needs only that payload, not the raw PDU: the badge
+  advertises one manufacturer AD structure, which the bridge can
+  rebuild as `len ff ff ff …`;
+- whether a laptop's RSSI for a badge held close reads −64 dBm or
+  stronger.
+
 ## Rulings
 
 - Ruling R-T1-1 (Task 1, `perf: take the soft-reset check off the hot
@@ -1043,6 +1251,17 @@ Measured on v392 in release, with scratch probes (copies of
   "Remove". The dev server serves `/api/signal` through a Vite plugin
   (`apply: "serve"`) over a `MemoryStore` — cost if wrong: dev rooms
   vanish when the dev server restarts.
+- Ruling R-T11-1 (Task 11 Step 1, `docs: Part 5 go/no-go evidence`):
+  the Step 1 verdict is **visible effect**, limited to Connect's bump
+  path. On v392 that path saves a contact and shows "SYNCED" from the
+  peer's `BMP2` card alone, with no nonce or echo. Both-hold-A needs
+  the peer's echo of this badge's nonce, and Sync reacts only to `BBX1`
+  station frames, so neither shows any change. Part 5 is therefore not
+  dropped on Step 1's grounds; the go/no-go stays with the human
+  partner at Step 2 — cost if wrong: if the v335 badge's bump card
+  differs in a way the static reading missed, or Chrome never reports
+  its extended advertisements, a Step 3–4 spike session is spent to
+  learn that, and nothing is built.
 
 ## Replaced rungs
 
