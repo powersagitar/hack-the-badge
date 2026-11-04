@@ -1440,6 +1440,9 @@ milestone's costs are Task 1's, Task 3's and the Task 6 gate's
   synthetic test addresses stay (they mirror v392's `bt.c` addresses
   with the top byte changed; not chip constants) — cost if wrong: a
   later reader mistakes them for chip constants; a one-commit rename.
+  Superseded: the human overrode it on 2026-11-03 and the addresses
+  were renamed to neutral values (0x1000_1000 cluster, 0x2000_0000
+  outlier) in the follow-up fix — cost if wrong: none.
 
 ## Replaced rungs
 
@@ -1512,10 +1515,6 @@ backlog") is carried below, minus what this milestone closed:
 - **Map a signaling 429 to a "busy, try again in N min" message.**
   `signal-client.ts`'s host/join polling ends a 429 with the generic
   "Signaling server error (HTTP 429)" and ignores `Retry-After`.
-- **Rename `app_hooks.rs`'s synthetic test addresses** (ruling R-FR-1):
-  they mirror v392's `bt.c` addresses with the top byte changed and are
-  not chip constants; a comment or a rename would stop a reader taking
-  them for ones.
 - Core review minors left open:
   - the ordering risk in R-T6-2 (a report popped in `send_packet` ahead
     of a reply; `host_rcv_pkt` blocking the idle task) has no test;

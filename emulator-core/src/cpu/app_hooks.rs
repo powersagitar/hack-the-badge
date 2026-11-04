@@ -1,7 +1,8 @@
 //! App-image hooks (Milestone 10 Task 3): addresses *inside the loaded
 //! app image* whose arrival the driver wants to intercept, so a host-side
-//! model can stand in for a guest function (Milestone 10's fake BLE
-//! controller replaces bt.c's VHCI functions this way).
+//! model can stand in for a guest function (chip-specific code, such as a
+//! high-level model of a peripheral's driver, can replace guest functions
+//! this way).
 //!
 //! This is the counterpart of [`super::rom_stubs`] with the work moved out
 //! of the core: a ROM stub runs its effect inside [`super::Cpu::step`],
@@ -31,8 +32,8 @@
 //! subtract and a compare, with one branch ([`AppHookTable::in_ranges`];
 //! seven AArch64 instructions in the release build). The
 //! registered addresses are split into two ranges at their largest gap, so
-//! a table shaped like the one Milestone 10 installs (a cluster of bt.c
-//! entries plus one address elsewhere in the image) covers its cluster and
+//! a typical table (a cluster of entries in one module
+//! plus one outlier elsewhere in the image) covers its cluster and
 //! its outlier but not the code between them. An empty range has length 0
 //! and matches nothing, so an empty table (the default) never hits and
 //! changes nothing a step does. Only a `pc` inside a range pays the
@@ -171,7 +172,7 @@ mod tests {
     fn empty_table_never_hits() {
         let table = AppHookTable::new();
         assert!(table.is_empty());
-        for addr in [0, 2, 0x1008_0c64, 0x1008_1218, u32::MAX - 1, u32::MAX] {
+        for addr in [0, 2, 0x1000_1000, 0x1000_1400, u32::MAX - 1, u32::MAX] {
             assert_eq!(table.lookup(addr), None, "{addr:#x}");
         }
     }
@@ -179,16 +180,16 @@ mod tests {
     #[test]
     fn insert_and_lookup_round_trip_and_replace() {
         let mut table = AppHookTable::new();
-        table.insert(0x1008_0c64, 1).insert(0x1008_0c84, 2);
-        assert_eq!(table.lookup(0x1008_0c64), Some(1));
-        assert_eq!(table.lookup(0x1008_0c84), Some(2));
+        table.insert(0x1000_1000, 1).insert(0x1000_1020, 2);
+        assert_eq!(table.lookup(0x1000_1000), Some(1));
+        assert_eq!(table.lookup(0x1000_1020), Some(2));
         assert_eq!(
-            table.lookup(0x1008_0c66),
+            table.lookup(0x1000_1002),
             None,
             "inside the range, not hooked"
         );
-        table.insert(0x1008_0c64, 9);
-        assert_eq!(table.lookup(0x1008_0c64), Some(9), "an insert replaces");
+        table.insert(0x1000_1000, 9);
+        assert_eq!(table.lookup(0x1000_1000), Some(9), "an insert replaces");
         assert_eq!(table.len(), 2);
     }
 
@@ -199,27 +200,27 @@ mod tests {
     fn a_cluster_and_an_outlier_get_one_range_each() {
         let mut table = AppHookTable::new();
         table
-            .insert(0x1008_0c64, 0)
-            .insert(0x1008_0c84, 1)
-            .insert(0x1008_1218, 2)
-            .insert(0x1001_0b80, 3);
+            .insert(0x1000_1000, 0)
+            .insert(0x1000_1020, 1)
+            .insert(0x1000_1400, 2)
+            .insert(0x2000_0000, 3);
         for (addr, id) in [
-            (0x1008_0c64, 0),
-            (0x1008_0c84, 1),
-            (0x1008_1218, 2),
-            (0x1001_0b80, 3),
+            (0x1000_1000, 0),
+            (0x1000_1020, 1),
+            (0x1000_1400, 2),
+            (0x2000_0000, 3),
         ] {
             assert_eq!(table.lookup(addr), Some(id), "{addr:#x}");
         }
-        assert!(table.in_ranges(0x1008_0d00), "inside the cluster's range");
+        assert!(table.in_ranges(0x1000_1100), "inside the cluster's range");
         assert!(
-            !table.in_ranges(0x1004_0000),
+            !table.in_ranges(0x1800_0000),
             "the gap between is uncovered"
         );
-        assert!(!table.in_ranges(0x1001_0b7e));
-        assert!(!table.in_ranges(0x1001_0b82));
-        assert!(!table.in_ranges(0x1008_0c62));
-        assert!(!table.in_ranges(0x1008_121a));
+        assert!(!table.in_ranges(0x1fff_fffe));
+        assert!(!table.in_ranges(0x2000_0002));
+        assert!(!table.in_ranges(0x1000_0ffe));
+        assert!(!table.in_ranges(0x1000_1402));
     }
 
     #[test]
