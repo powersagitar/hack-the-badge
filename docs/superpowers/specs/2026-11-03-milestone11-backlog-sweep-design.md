@@ -3,7 +3,7 @@
 Status: scope agreed in conversation with the human partner (2026-11-03).
 main @ `7f3960d` (the Milestone 10 merge `e614117` plus the human's
 `.gitignore` commit), and `origin/main` is the same: Milestone 10 is
-pushed. **Not yet approved.**
+pushed. **Approved by the human partner on 2026-11-04.**
 
 ## Why
 
@@ -531,7 +531,7 @@ plus `png` as a dev-dependency) and the frontend (`fengari`,
 | `md5.rs`: the 64 rounds | Hand-written compression function | `md-5`'s `compress` (RustCrypto) | Keeps `md5.rs`'s guest-memory Plumb context and its byte-exact writes; only the block compression is the crate's. Pure Rust, builds for wasm32 |
 | HCI fuzz test, `runtime.rs`'s serial fuzz test | `XorShift`, hand-picked seeds | `proptest` (dev) | Generated inputs with shrinking. Fixes Part 3.7's coverage item (the report path, every address byte) |
 | `riscv_integration.rs`: the fixture loader | Shells out to `rust-objcopy`/`llvm-objcopy` | `object` (dev), reading the ELF's loadable segments | Drops the `llvm-tools-preview` requirement |
-| `shell.test.ts` and its `FakeElement` | A hand-written fake DOM | `happy-dom` (dev, through `@happy-dom/global-registrator` in `bun test`) | A real DOM for the shell's tests. Part 4.8's "asserts through the real update path" needs one |
+| `shell.test.ts` and its `FakeElement` | A hand-written fake DOM | `happy-dom` (dev; a `Window` per test file, not the global registrator, which would change globals other tests detect) | A real DOM for the shell's tests. Part 4.8's "asserts through the real update path" needs one |
 
 **Keep, recorded with the reason:**
 

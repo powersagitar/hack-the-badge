@@ -118,6 +118,11 @@ plus `wasm-pack`.
 
 ## Rules
 
+- **New dependencies are allowed** (npm or Cargo) wherever a library fits
+  better than hand-written code; no need to ask first. Tell the human
+  partner about each one you add (package, exact version, why), and pin
+  the exact version. The structural rules below still hold: for example,
+  `emulator-core` takes no wasm-bindgen dependency.
 - **Performance work must not change emulated behaviour.** Every step
   count, console needle, emulated time and frame hash in the suites stays
   byte-identical. A pin that moves is a bug in the change, never something
