@@ -469,6 +469,19 @@ Each gets a test or a doc fix:
     Worker posts a status at once when a soft reset happens, outside the
     throttle; it needs one new field in the status message.
 
+12. **The reboot shows in the browser** (the human partner, 2026-11-04).
+    The Worker's pacing measures from the current emulated time, so a
+    soft reset's `REBOOT_US` jump would otherwise be absorbed at once.
+    Instead:
+    - the runtime reports the jump;
+    - the pacing carries it as wall-clock debt, so the screen holds for
+      about 466 ms, as the badge's does;
+    - the speed readout leaves the jump out;
+    - a tap hold or release gap in progress is measured in wall time
+      across the jump, so it is not cut short.
+
+    Checked at Gate 3, by opening Scanner.
+
 ### Part 5: Signaling
 
 1. **A 429 gets a message.** `signal-client.ts` maps it to "Busy, try
@@ -591,6 +604,7 @@ reverted and recorded under "Keep".
 1. **Part 1's table**, before any reset code.
 2. **Part 1's moved pins and any moved frame**, before Part 2.
 3. **The browser checks**, after Parts 4 and 5:
+   - the reboot's pause, opening Scanner;
    - the 429 message;
    - room closed;
    - the lock freed on a switch to Lua mode;
@@ -621,7 +635,8 @@ Plus the standing ones:
      "imports nothing";
    - also, with any of them, lower the global cap so a month cannot be
      spent in hours.
-2. **Whether the reboot's 466 ms shows in the browser.** The browser's
+2. **Whether the reboot's 466 ms shows in the browser.** *Answered
+   (2026-11-04): it shows, as on the badge (Part 4.12).* The browser's
    pacing measures from the current emulated time, so today the jump
    would be absorbed at once:
    - the screen would not pause;
