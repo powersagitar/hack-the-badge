@@ -1,0 +1,527 @@
+# Milestone 11: decisions and the Milestone 12 backlog
+
+Milestone 11 sweeps the Milestone 11 backlog
+(`docs/milestone-10-decisions.md`, "Milestone 11 backlog", with its
+Milestone 9 and Milestone 8 carry-overs). Spec:
+`docs/superpowers/specs/2026-11-03-milestone11-backlog-sweep-design.md`;
+plan: `docs/superpowers/plans/2026-11-04-milestone11-backlog-sweep.md`.
+
+## Why
+
+The human partner chose to clear the whole backlog (2026-11-03). The large
+features are set aside (Share's radio transfer and Sync's empty-room path
+go to Milestone 12), and the items that need work nobody will do are
+closed in writing (below). What is left is of two kinds:
+
+- small faults, mostly from reviews, in the core, the browser and the
+  signaling function;
+- three places where the emulated reboot differs from the badge's: the
+  RTC timer restarts, a reboot takes no time, and a CPU-only reset is
+  treated as a full system reset.
+
+Every item ends as a fix with a test, a trace whose result is recorded,
+or a written closing that cites who decided it.
+
+## Measurements
+
+### Copied from the spec ("Measured (2026-11-03)")
+
+#### A software reboot on the physical badge (v335)
+
+Two captures, through the badge's own console command `reboot` (its help
+text is "Restart the badge"), over `/dev/cu.usbmodem101` with pyserial
+from `local/.venv`. The logs are in
+`local/m11-badge/reboot_log_{1,2}.txt` (local only). Only the timestamps,
+tags and segment sizes were read from them.
+
+- **The reset reason** is `rst:0xc (RTC_SW_CPU_RST)`: `esp_restart()`
+  ends in ROM `software_reset_cpu`, a CPU-only reset, as `crate::rom`
+  entry 26 says.
+- **The USB-Serial-JTAG link survived the reset.** The host port never
+  disconnected, and the ROM banner and the bootloader's log arrived on
+  the same open port. ESP-IDF's `esp_restart_noos` keeps the BBPLL on
+  "so that USB Serial JTAG can log at 1st stage bootloader".
+- **The timeline is identical in both runs, to the millisecond:**
+
+  | Stage | Timestamp (ms, the bootloader's log clock) |
+  |---|---|
+  | 2nd-stage bootloader's first line | 24 |
+  | `esp_image` segment 0 (map, 1,277,576 B) | 26 → 230 |
+  | segment 1 (load, 33,128 B) | 230 → 236 |
+  | segment 2 (map, 1,219,404 B) | 236 → 431 |
+  | segment 3 (load, 27,260 B) | 431 → 436 |
+  | segment 4 (load, 105,324 B) | 436 → 456 |
+  | segment 5 (load, 32 B), then the image hash | 456 → 467 |
+  | the app's `cpu_start` (first line) | 468 |
+
+- **The cold boot looks the same.** The real cold boot log
+  (`local/boot_log.txt`, `USB_UART_CHIP_RESET`) has the same timeline,
+  within 1 ms per line (`cpu_start` at 468).
+- **Checking a segment costs a steady amount per byte:** 0.160 µs per
+  byte for the two mapped segments (204 ms and 195 ms), and about
+  0.18–0.19 µs per byte for the loaded ones.
+- **Scaled to v392's segments** (from `firmware.bin`'s header), the delta
+  against v335 is:
+
+  | Segments | Size change | Time |
+  |---|---|---|
+  | Mapped | +13,420 B | +2.1 ms |
+  | Loaded | −24,416 B | −4.6 ms |
+
+  So v392's reset-to-app time is about 466 ms, against v335's measured
+  468.
+
+#### Upstash's free plan (upstash.com/pricing/redis, fetched 2026-11-03)
+
+| Limit | Value |
+|---|---|
+| Commands | 500K per month |
+| Rate | 10,000 commands per second |
+| Data | 250 MB (the comparison table says 256 MB) |
+| Bandwidth | 10 GB per month |
+| Request size | 10 MB at most |
+
+Today's limiter (`frontend/src/radio/signal-handler.ts`) costs about 7
+commands per valid request:
+- each request counts against three windows;
+- each count is an `INCR` and an `EXPIRE … NX` in one pipeline;
+- then the room's own `GET` or `SET`.
+
+What that buys:
+- **A typical pairing** (one create, about 10–30 polls, one answer) is
+  about 70–210 commands, so the free month covers a few thousand
+  pairings.
+- **At the global cap** (5,000 requests per 10 min) the month's quota is
+  spent in about 2.4 hours.
+
+When the quota is gone, Upstash errors, and every request gets the bare
+500 (the store-failure path). The 10K per second rate cannot be reached
+under the caps.
+
+#### Facts read for the reset fixes
+
+- **What `esp_restart_noos` resets.** Read from ESP-IDF v5.5.3,
+  `components/esp_system/port/soc/esp32c3/system_internal.c`, before the
+  CPU reset:
+  - it disables the TG0 and TG1 watchdogs;
+  - it arms the RTC watchdog for 1 s;
+  - it disables the ICache;
+  - it rewrites `GPIO_FUNC0..5_IN_SEL_CFG` to `0x30`;
+  - `esp_system_reset_modules_on_exit()` pulses three reset groups:
+
+    | Register | What it resets |
+    |---|---|
+    | `SYSTEM_CORE_RST_EN` | the WiFi, BT and SDIO blocks |
+    | `SYSTEM_PERIP_RST_EN0` | `TIMERS`, `SPI01`, `UART`, `SYSTIMER` |
+    | `SYSTEM_PERIP_RST_EN1` | `DMA` and the crypto blocks |
+
+  - `rtc_clk_cpu_set_to_default_config()` puts the CPU back on XTAL.
+
+  Nothing else is reset by software. In particular these keep their
+  state: SPI2, I2C0, RMT, GPIO (except the six input selects), the
+  interrupt matrix, USB-Serial-JTAG and APB_CTRL.
+- **What the emulator does today.** `FirmwareRuntime::soft_reset`
+  (`emulator-core/src/runtime.rs`) rebuilds every peripheral, whichever
+  stub asked. It keeps the flash, `STORE0..7`, RTC fast memory, the
+  panel, the console text and the host input, and drops queued serial
+  input.
+- **No pin depends on a reset before the launcher.** The walk to hacker's
+  launcher crosses no soft reset (Connect's rungs assert
+  `soft_reset_count() == 0` from the launcher). So
+  `execution_digest_is_unchanged` and `hacker_walk_totals_are_unchanged`
+  cannot move from Part 1. The hardware-compared frames cannot either,
+  since none of them follow a reboot.
+
+**Correction (Task 1).** The paragraph after "What `esp_restart_noos`
+resets" above lists SPI2, I2C0 and RMT among what keeps its state. That
+holds for `esp_restart_noos` alone. The app's own startup then resets
+all three on every boot, CPU resets included (`esp_perip_clk_init`;
+see "What a CPU reset keeps", rows SPI2, I2C0 and RMT). Also,
+`SYSTEM_TIMERS_RST` in `SYSTEM_PERIP_RST_EN0` is not the timer groups:
+the TRM lists TIMG0 and TIMG1 under their own bits (row TIMG).
+
+### Baselines (Task 1, at `5fb5704`)
+
+For Part 7's before-and-after. `bun run build` (Vite; gzip sizes as Vite
+printed them):
+
+| File | Bytes | Vite's gzip |
+|---|---|---|
+| `dist/index.html` | 984 | 0.46 kB |
+| `dist/assets/bridge-BE-WtxC7.js` | 5,773 | (not printed) |
+| `dist/assets/firmware-worker-BLgjDQZt.js` | 7,636 | (not printed) |
+| `dist/assets/emulator_wasm_bg-mdhHNDGh.wasm` | 137,533 | 60.61 kB |
+| `dist/assets/index-XRjmGPO9.css` | 2,962 | 1.01 kB |
+| `dist/assets/index-DKp2lptT.js` | 276,964 | 92.23 kB |
+
+`bun test`: 275 pass, 0 fail, 17,823 `expect()` calls, 20 files,
+10.74 s.
+
+## What a CPU reset keeps
+
+v392 reboots through `esp_restart()`, which ends in `esp_restart_noos()`
+and the ROM's `software_reset_cpu` (`crate::rom` entry 26), a CPU reset:
+reset reason `0x0C`, "Software CPU reset", triggered by
+`RTC_CNTL_SW_PROCPU_RST` (TRM Table 6.1-1, p. 193; the bit is
+`RTC_CNTL_OPTIONS0_REG` bit 5, TRM Register 9.1, p. 233). The badge's
+captures show `rst:0xc (RTC_SW_CPU_RST)` (Measurements). ROM
+`software_reset` is the core reset: reason `0x03`, "Software system
+reset", by `RTC_CNTL_SW_SYS_RST` (Table 6.1-1, p. 193; `OPTIONS0` bit 31,
+Register 9.1, p. 233). Task 3 implements this table row by row for the
+CPU reset. The core reset keeps today's `soft_reset` path, with Task 2's
+changes (spec, Part 1.3).
+
+### Sources
+
+All fetched into the session scratchpad, never into the repo.
+
+- **TRM**: *ESP32-C3 Technical Reference Manual*, Version 1.4
+  (`https://www.espressif.com/sites/default/files/documentation/esp32-c3_technical_reference_manual_en.pdf`,
+  fetched 2026-11-04; text extracted with `pypdf` 6.19.0, already in
+  `local/.venv`). Its printed page numbers equal the PDF's page numbers.
+  - **§6.1.1, p. 191**: "All reset types mentioned above (except Chip
+    Reset) maintain the data stored in internal memory."
+  - **§6.1.3, pp. 191–192**: "CPU Reset: Only resets CPU core." "Core
+    Reset: Resets the whole digital system except RTC, including CPU,
+    peripherals, Wi-Fi, Bluetooth® LE, and digital GPIOs." Also, p. 192:
+    "If CPU is reset, PMS registers will be reset, too." (Figure 6.1-1,
+    the scope diagram, is a picture and was not read.)
+  - **Table 6.1-1, p. 193**: the reset codes above.
+  - **§1.1, p. 31**: "CPU core complex has an interrupt-controller
+    (INTC), debug module (DM) and system bus (SYS BUS) interfaces".
+    **§1.5.1, p. 42**: the INTC's registers are Chapter 8's "CPU
+    Interrupt Registers".
+  - **§9.3.3, p. 224**: "any reset / sleep other than power-up reset
+    will not stop or reset the RTC timer."
+  - **§9.4.1, p. 226**: the RTC power domain holds the "Power management
+    unit (PMU), including RTC timer, fast memory, Always-on registers".
+  - **§12.2.2.2, p. 308** (WDT timeout actions): "CPU reset – Reset a CPU
+    core"; "Core reset – … the main system (which includes MWDTs, CPU,
+    and all peripherals) will be reset. The power management unit and
+    RTC peripheral will not be reset."
+  - **Table 16.3-2, pp. 430–431**: each peripheral's reset bit. "TIMER"
+    is `SYSTEM_TIMERS_RST`; "Timer Group0" is `SYSTEM_TIMERGROUP_RST`
+    and "Timer Group1" `SYSTEM_TIMERGROUP1_RST`; "SPI0 / SPI1" is
+    `SYSTEM_SPI01_RST`. Footnote 3: "Reset registers cannot be cleared by
+    hardware. Therefore, SW reset clear is required after setting the
+    reset registers."
+  - **§2.6.1, p. 67**: GDMA is reset through `SYSTEM_DMA_RST`.
+  - **§30.3.4, p. 768**: "the USB Serial/JTAG Controller itself is not
+    affected by SRST" (SRST being the JTAG line that causes "a digital
+    system reset").
+- **ESP-IDF v5.5.3**
+  (`https://raw.githubusercontent.com/espressif/esp-idf/v5.5.3/<path>`),
+  cited by short name and line:
+  - `system_internal.c` = `components/esp_system/port/soc/esp32c3/system_internal.c`
+    (`esp_system_reset_modules_on_exit` :31–61, `esp_restart_noos`
+    :67–116);
+  - `clk.c` = `components/esp_system/port/soc/esp32c3/clk.c`
+    (`esp_perip_clk_init` :212–327, called by the app at `cpu_start.c`
+    :775);
+  - `cpu_start.c` = `components/esp_system/port/cpu_start.c`;
+  - `bootloader_esp32c3.c` = `components/bootloader_support/src/esp32c3/bootloader_esp32c3.c`
+    (`bootloader_init` :127–194);
+  - `bootloader_clock_init.c` = `components/bootloader_support/src/bootloader_clock_init.c`;
+  - `bootloader_init.c` = `components/bootloader_support/src/bootloader_init.c`;
+  - `bootloader_utility.c` = `components/bootloader_support/src/bootloader_utility.c`;
+  - `bootloader_console.c` = `components/bootloader_support/src/bootloader_console.c`;
+  - `rtc_clk.c`, `rtc_clk_init.c` = `components/esp_hw_support/port/esp32c3/`;
+  - `clk_tree_ll.h`, `gpio_ll.h`, `clk_gate_ll.h` = `components/hal/esp32c3/include/hal/`;
+  - `mmu_hal.c` = `components/hal/mmu_hal.c`;
+  - `system_reg.h` = `components/soc/esp32c3/register/soc/system_reg.h`;
+  - `uart_channel.h` = `components/soc/esp32c3/include/soc/uart_channel.h`;
+  - `rom/rtc.h` = `components/esp_rom/esp32c3/include/esp32c3/rom/rtc.h`;
+  - `esp_system/Kconfig` = `components/esp_system/Kconfig`;
+  - `vfs_console.c` = `components/esp_vfs_console/vfs_console.c`.
+
+### Three facts the rows lean on
+
+1. **The model drops reset-bit writes.** `crate::peripherals::system`
+   models only `FROM_CPU_0..3`, `CPU_PER_CONF` and `SYSCLK_CONF`;
+   `SYSTEM_PERIP_RST_EN0/1` (`system_reg.h` :320, :508) fall through the
+   bus's catch-all, so no peripheral sees them. Every reset the guest
+   requests by writing them, in `esp_restart_noos` or later, is a no-op
+   today. The spec's rule (Part 1.3): such a peripheral is reset at the
+   reset step instead, and recorded.
+2. **The app resets SPI2, I2C0 and RMT itself on every boot.**
+   `esp_perip_clk_init` (`clk.c` :270–287, comment "Reset the
+   communication peripherals like I2C, SPI, UART, I2S and bring them to
+   known state") always adds `SYSTEM_SPI2_CLK_EN`, `SYSTEM_I2C_EXT0_CLK_EN`,
+   `SYSTEM_RMT_CLK_EN` (and others) to the set it gates off and holds in
+   reset (:306–307). It never adds `SYSTEM_USB_DEVICE_CLK_EN` (:289). On a
+   CPU reset it otherwise touches only clocks that were already off
+   (:219–229). This runs as guest code in the emulator, at `cpu_start.c`
+   :775, but its writes are dropped (fact 1), so those three are reset at
+   the reset step (ruling R-T1-1).
+3. **The 2nd-stage bootloader runs the full clock init after this
+   reset.** `bootloader_clock_configure` skips `rtc_clk_init` only for
+   `RESET_REASON_CPU0_SW` with the stored APB frequency still at least
+   `APB_CLK_FREQ`, 80 MHz (`bootloader_clock_init.c` :55;
+   `components/soc/esp32c3/include/soc/soc.h` :140). `esp_restart_noos` has just moved the
+   CPU to XTAL (`system_internal.c` :109 → `rtc_clk.c` :322–327, :339–348),
+   which stores 40 MHz as the APB frequency, so `rtc_clk_init` runs
+   (:83). It leaves the CPU at 80 MHz on the PLL (`rtc_clk_init.c` :63 →
+   `rtc_clk.c` :186–192), `STORE4` = the XTAL value (`rtc_clk_init.c`
+   :52), and `STORE5` = 80 MHz (`rtc_clk.c` :191). The same code the
+   shortcut boot already stands in for at a cold boot (`crate::rom`,
+   `esp32c3_rom_ram_initializers`, items 3 to 5).
+
+The mask ROM's own reset path is not published. Where a row says nothing
+of the ROM, neither the TRM nor ESP-IDF documents a ROM effect on it.
+
+### The table
+
+"Kept" means Task 3 moves the old `FirmwareBus` field into the new bus by
+its concrete name. "Reset" means the new boot's fresh field, as today.
+Field names are `FirmwareBus`'s (`emulator-core/src/mem/bus.rs`).
+
+| # | Peripheral (`FirmwareBus` field) | CPU reset: kept or reset | Citation | Reproduced how (Task 3) |
+|---|---|---|---|---|
+| 1 | SYSTIMER (`systimer`) | **Reset** | `system_internal.c` :52–54 pulses `SYSTEM_SYSTIMER_RST` (`system_reg.h` :335, bit 29; TRM Table 16.3-2, p. 430) | Fresh `systimer`, and `clock` restarts at 0 (spec, "My calls") |
+| 2 | INTC (`intc`) | **Silent → reset** | MAP half: kept by the TRM (§6.1.3), but the app rewrites the MAP of every source below `ETS_MAX_INTR_SOURCE` before interrupts are on (`cpu_start.c` :782 → :171–195). CPU-line half (enable, type, priority, threshold): part of the "CPU core complex" (§1.1, p. 31); whether a CPU reset clears it, the TRM does not say | Fresh `intc`, as today (ruling R-T1-2) |
+| 3 | SYSTEM (`system`) | **Kept, with `SYSCLK_CONF` and `CPU_PER_CONF` rewritten as the bootloader does** | Kept: §6.1.3. Rewritten: fact 3; `clk_tree_ll.h` :442–447 (`CPUPERIOD_SEL` = 0), :481–485 (`PRE_DIV_CNT` = 0), :398–406 (`SOC_CLK_SEL` = 1) | Move `old.system`; then set `SYSCLK_CONF`'s `SOC_CLK_SEL` [11:10] = 1 and `PRE_DIV_CNT` [9:0] = 0 (`system_reg.h` :803–814), and `CPU_PER_CONF`'s `CPUPERIOD_SEL` [1:0] = 0 (:61–66), fields only. `FROM_CPU_0..3` stay as they were |
+| 4 | APB_CTRL RNG (`apb_ctrl`) | **Kept** | §6.1.3; no reset bit is pulsed (`system_internal.c` :31–61); the app's `periph_module_enable(PERIPH_RNG_MODULE)` (`clk.c` :326) has no reset bit (`clk_gate_ll.h` :87–162, `default: return 0`) | Move `old.apb_ctrl`: the xorshift sequence continues (ruling R-T1-5) |
+| 5 | GPIO (`gpio`, without the 74HC165) | **Kept, with GPIO21's output enable cleared as the bootloader does** | Kept: §6.1.3 (only a core reset resets "digital GPIOs"). `esp_restart_noos` writes `GPIO_FUNC0..5_IN_SEL_CFG` = `0x30` (`system_internal.c` :98–103), which the model does not hold. Rewritten: `bootloader_console.c` :28–34 (`release_default_console_io`, called at :138 for a USB-Serial-JTAG console, :41 for none) → `gpio_ll_output_disable(&GPIO, 21)` = `enable_w1tc = 1 << 21` (`gpio_ll.h` :233–236; `uart_channel.h` :14) | Move `old.gpio`; then clear `ENABLE` bit 21, as a `GPIO_ENABLE_W1TC_REG` write of `1 << 21` does (ruling R-T1-4) |
+| 6 | 74HC165 (`gpio.hc165`) | **Kept** | External chip, outside the SoC: no reset in the TRM's scope reaches it | Moves with `gpio`; held buttons re-applied, as today |
+| 7 | SPI2 (`spi`, without the panel) | **Reset** | Fact 2: `clk.c` :278, :306–307 (`SYSTEM_SPI2_RST`, `system_reg.h` :473, bit 6) | Fresh `spi`, as today |
+| 8 | ST7789 panel (`spi.st7789`) | **Kept** | External chip (already kept since Milestone 9, `runtime.rs` module doc) | As today: `spi.st7789 = old.spi.st7789` |
+| 9 | GDMA (`gdma`) | **Reset** | `system_internal.c` :58–60 pulses `SYSTEM_DMA_RST` (`system_reg.h` :529, bit 6; TRM §2.6.1, p. 67) | Fresh `gdma`, as today |
+| 10 | TIMG0, TIMG1 (`timg0`, `timg1`) | **Kept** | §6.1.3; §12.2.2.2, p. 308. `esp_restart_noos` only disables both MWDTs (`system_internal.c` :82–91), as guest writes the model stores. Its `SYSTEM_TIMERS_RST` (:53) is not the timer groups (Table 16.3-2, p. 430: `SYSTEM_TIMERGROUP_RST`, `SYSTEM_TIMERGROUP1_RST`; `system_reg.h` :503 vs :431, :419). `esp_perip_clk_init`'s always-reset set leaves them out (`clk.c` :271–287) | Move `old.timg0` and `old.timg1` (ruling R-T1-6) |
+| 11 | RTC_CNTL (`rtc_cntl`) | **Kept, with `STORE4` and `STORE5` rewritten as the bootloader does** | Kept: §6.1.3 ("except RTC"); §9.3.3, p. 224 (the RTC timer); §9.4.1, p. 226 (always-on registers). Rewritten: fact 3; `STORE4` = `clk_ll_xtal_store_freq_mhz(40)` (`rtc_clk_init.c` :52; `crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE`); `STORE5` = `clk_ll_apb_store_freq_hz(80 MHz)` (`rtc_clk.c` :186–192; `clk_tree_ll.h` :665–669; `rom/rtc.h` :53, :63) = `0x4C4B_4C4B` | Move the whole `old.rtc_cntl` (every stored word, not only `STORE0..7`), keeping Task 2's timer offset; then write `STORE4` (Task 2) and `STORE5` (ruling R-T1-3) |
+| 12 | USB-Serial-JTAG (`usb_serial_jtag`) | **Kept**, queued host input included | §6.1.3; §30.3.4, p. 768. `esp_restart_noos` pulses no `SYSTEM_USB_DEVICE_RST` (`system_internal.c` :52–60; bit 23, `system_reg.h` :371) and keeps the BBPLL on "so that USB Serial JTAG can log at 1st stage bootloader" (:107). The app never resets it on a CPU reset (`clk.c` :289; the pad-off branch :260–267 is the non-CPU-reset path). The badge's port stayed open (Measurements) | Move `old.usb_serial_jtag` whole: registers, `INT_RAW`, the host queue, the OUT FIFO and the packet pacing |
+| 13 | I2C0 (`i2c0`, without the accelerometer) | **Reset** | Fact 2: `clk.c` :279, :306–307 (`SYSTEM_I2C_EXT0_RST`, `system_reg.h` :467, bit 7) | Fresh `i2c0` |
+| 14 | SC7A20H (`i2c0.accel`) | **Kept** | External chip, outside the SoC | Move `old.i2c0.accel` into the fresh `i2c0` (its registers, `CTRL_REG1` and the rest, survive); the host acceleration is re-applied, as today |
+| 15 | RMT (`rmt`) | **Reset** | Fact 2: `clk.c` :281, :306–307 (`SYSTEM_RMT_RST`, `system_reg.h` :455, bit 9) | Fresh `rmt`, as today |
+| 16 | eFuse (`efuse`) | **Kept** | §6.1.3; no reset bit is pulsed (`system_internal.c` :31–61); the model holds only the host-set factory MAC | As today: the MAC is re-applied (equivalent to moving `old.efuse`) |
+| 17 | Flash MMU (`mmu`) | **Kept, with every entry rewritten as the bootloader does** | Kept: §6.1.3. Rewritten: `mmu_hal_init` (`bootloader_esp32c3.c` :164) → `mmu_hal_unmap_all` (`mmu_hal.c` :18–26, :28–39); `set_cache_and_start_app` (`bootloader_utility.c` :1036) unmaps all again (:1064) and maps the app's DROM, entry 127 and IROM (:1082, :1086, :1105). `esp_restart_noos` disables the ICache (`system_internal.c` :94) | Fresh `mmu`, as today: `FirmwareBus::seed_mmu_like_bootloader` already writes exactly the bootloader's table. Mappings the old app added at run time go, as on the badge |
+| 18 | SPI1 controller (`spimem1`) | **Reset** | `system_internal.c` :52–54 pulses `SYSTEM_SPI01_RST` (`system_reg.h` :497, bit 1; TRM Table 16.3-2, p. 430, "SPI0 / SPI1"). The bootloader then sets it up again (`bootloader_init_spi_flash`, `bootloader_esp32c3.c` :181) | Fresh `spimem1`; the shortcut boot's ROM `.data` seeds stand for the bootloader's flash setup, as at a cold boot (`crate::rom`, `esp32c3_rom_ram_initializers` items 1 and 2) |
+| 19 | Flash chip (`flash_chip`) | **Kept** | External chip | As today: `flash_chip = old.flash_chip` |
+
+**Totals:** 8 kept (rows 4, 6, 8, 10, 12, 14, 16, 19), 4 kept with
+registers rewritten (rows 3, 5, 11, 17), 6 reset (rows 1, 7, 9, 13, 15,
+18), 1 silent → reset (row 2).
+
+### Each row's three parts
+
+The core-reset scope is the same for every on-chip row: TRM §6.1.3,
+"Resets the whole digital system except RTC, including CPU, peripherals,
+Wi-Fi, Bluetooth® LE, and digital GPIOs", and §12.2.2.2, p. 308. So every
+digital peripheral is reset by a core reset, and RTC_CNTL is kept.
+External chips are outside every SoC reset. The spec keeps the core reset
+on today's path (Part 1.3); the two places where today's path is narrower
+than the TRM are in the Milestone 12 backlog.
+
+1. **SYSTIMER.** CPU reset: not the CPU core, so the reset itself keeps
+   it (§6.1.3). `esp_restart_noos`: resets it (`system_internal.c`
+   :52–54). Bootloader: nothing. Choice: reset.
+2. **INTC.** CPU reset: the interrupt-matrix MAP registers are a
+   peripheral (Chapter 8), so kept. The CPU interrupt registers belong to
+   the "CPU core complex" (§1.1, p. 31), and §6.1.3 says only that a CPU
+   reset "only resets CPU core"; neither the TRM nor ESP-IDF says which
+   side of that line they fall on. `esp_restart_noos`: turns interrupts
+   off in `mstatus` (`system_internal.c` :70), a CPU register. The app:
+   `core_intr_matrix_clear` routes every source below
+   `ETS_MAX_INTR_SOURCE` to `ETS_INVALID_INUM` (`cpu_start.c` :171–195,
+   called at :782, before the scheduler), so a kept MAP is overwritten
+   before it can route anything. Choice: silent → reset.
+3. **SYSTEM.** CPU reset: kept. `esp_restart_noos`:
+   `rtc_clk_cpu_set_to_default_config` writes `SYSCLK_CONF` for XTAL,
+   divider 1 (`system_internal.c` :109; `rtc_clk.c` :322–327, :339–348),
+   which runs as guest code. Bootloader: back to 80 MHz on the PLL (fact
+   3). `FROM_CPU_0..3` (`system_reg.h` :616–640): nobody writes them.
+   Choice: kept, with the clock fields rewritten.
+4. **APB_CTRL.** CPU reset: kept. Nothing resets or rewrites the RNG
+   register. Bootloader: `bootloader_enable_random` (`bootloader_esp32c3.c`
+   :191) turns on an entropy source, not modeled. Choice: kept.
+5. **GPIO.** CPU reset: kept; a core reset resets "digital GPIOs".
+   `esp_restart_noos`: the six `FUNCn_IN_SEL_CFG` writes (unmodeled, so
+   nothing to carry). Bootloader: `release_default_console_io` on the
+   USB-Serial-JTAG or no-console build. Which build v392 is: its
+   `firmware.bin` holds `"/dev/uart/-1"` at file offset `0x48B8`, the
+   `console_access` path `"/dev/uart/" STRINGIFY(CONFIG_ESP_CONSOLE_UART_NUM)`
+   (`vfs_console.c` :140), and `CONFIG_ESP_CONSOLE_UART_NUM` is `-1`
+   exactly when the console is not a UART (`esp_system/Kconfig` :348–353).
+   The remaining choices are USB CDC (ESP32-S2 and S3 only, :283–286), USB
+   Serial/JTAG (:287–289) and none (:292–293); the first is impossible on
+   this chip, and both others call `release_default_console_io` (:138,
+   :41). GPIO21 is `HC165_CLK` on the badge (`crate::peripherals::gpio`'s
+   pin map). Its `gpio_ll_func_sel` (IO_MUX) and
+   `esp_rom_gpio_connect_in_signal` (`FUNCn_IN_SEL`) parts touch
+   registers the model does not hold. Choice: kept, `ENABLE` bit 21
+   cleared.
+6. **74HC165.** External; no SoC reset reaches it. Choice: kept.
+7. **SPI2.** CPU reset: kept by the reset itself. `esp_restart_noos`:
+   nothing. The app: reset on every boot (fact 2). Choice: reset.
+8. **ST7789.** External. Choice: kept (unchanged since Milestone 9).
+9. **GDMA.** CPU reset: kept by the reset itself. `esp_restart_noos`:
+   resets it (`system_internal.c` :58–60). Choice: reset.
+10. **TIMG0, TIMG1.** CPU reset: kept. `esp_restart_noos`: MWDT0 and
+    MWDT1 disabled (guest writes). Bootloader: after the reset the
+    flash-boot protection of MWDT0 is on and the bootloader clears it
+    (`bootloader_init.c` :73–74, :95–99); the model's watchdog words are
+    inert storage, so this is not reproduced. The app: TIMG0 and TIMG1
+    are outside the always-reset set; on a CPU reset a peripheral is
+    reset only if its clock was already off (`clk.c` :219–229, :306–307),
+    and the model has no clock gates (ruling R-T1-6). Choice: kept.
+11. **RTC_CNTL.** CPU and core reset: kept (RTC domain). The RTC timer
+    keeps counting (§9.3.3), which is Task 2's offset. `STORE2`/`STORE3`
+    hold the boot time (`rom/rtc.h` :50–51, :60–61), so the app's time of
+    day carries over with them, as on the badge. `esp_restart_noos`: arms
+    the RTC watchdog for 1 s (`system_internal.c` :71–80) and writes
+    `STORE5` = 40 MHz through `rtc_clk_cpu_set_to_default_config` (fact
+    3). Bootloader: `STORE4`, `STORE5` (fact 3), plus RTC clock tuning
+    and source words (`rtc_clk_init.c` :36–43, :78–80), the RTC watchdog's
+    flash-boot bit (`bootloader_init.c` :78–82) and the super watchdog's
+    auto-feed (`bootloader_esp32c3.c` :79–84). The model keeps all words
+    other than the timer and `STORE4` as plain storage; of the
+    bootloader's writes only `STORE4` and `STORE5` are reproduced
+    (ruling R-T1-7). Choice: kept, `STORE4` and `STORE5` rewritten.
+12. **USB-Serial-JTAG.** CPU reset: kept. Neither `esp_restart_noos` nor
+    the app resets it (row citation). Bootloader: `bootloader_console_init`
+    for this console only switches the ROM's output channel
+    (`bootloader_console.c` :133–149). Choice: kept, with its queued host
+    input, which closes the provisioner's stale-prompt item one way:
+    a provision typed across a reboot reaches the new console (Part 4.10
+    still scans only text written after the provision started).
+13. **I2C0.** As SPI2: the app resets it on every boot (fact 2). Choice:
+    reset.
+14. **SC7A20H.** External. Choice: kept.
+15. **RMT.** As SPI2 (fact 2). Choice: reset.
+16. **eFuse.** CPU reset: kept. Nothing rewrites it. Choice: kept.
+17. **Flash MMU.** CPU reset: kept by the reset itself. Bootloader:
+    unmaps every entry and maps the app (row citation). Choice: kept,
+    every entry rewritten, which is the cold boot's seed.
+18. **SPI1.** `esp_restart_noos`: resets SPI0 and SPI1
+    (`system_internal.c` :52–54). Bootloader: configures it for the
+    flash again. Choice: reset.
+19. **Flash chip.** External. Choice: kept (unchanged since Milestone 9).
+
+### Not peripherals, for completeness
+
+- **The CPU core** (registers, CSRs, the cycle counter, PMS): reset
+  (§6.1.3, and p. 192 for PMS). A fresh `Cpu`, as today.
+- **Internal SRAM:** the TRM keeps it (§6.1.1, p. 191). The bootloader
+  reloads the image's loaded segments, and the app zeroes `.bss`
+  (`cpu_start.c` :424–449). The emulator starts every other RAM byte at
+  0, as today, so anything the firmware keeps in a DRAM `.noinit`
+  section would be lost. Not seen; recorded for the Milestone 12 backlog.
+- **RTC fast memory:** kept, as today (RTC domain, §9.4.1).
+
+## Moved pins
+
+None yet. Tasks 2 and 3 record each move here (rung | constant | before
+| after | cause).
+
+## Traces
+
+None yet (Task 4).
+
+## Dependencies added
+
+None yet.
+
+## Closed in writing
+
+Each closed without work by the human partner's decision of 2026-11-03,
+as the spec records it ("Decided by the human partner (2026-11-03)"),
+unless another date is given.
+
+- **The block cache, and with it the cheaper hook check**
+  (`docs/milestone-10-decisions.md`, R-T3-5; Milestone 8's shelved lead,
+  R-M8-1). Closed: speed needs no work, it is normal in the prod build.
+- **Mobile Safari's 0.0x–0.2x.** Closed: a dev-build effect (same
+  decision).
+- **Re-measuring desktop Chrome and Safari (and the dev bench page) on
+  v392.** Closed (same decision).
+- **The decode cache's untagged size** (`1 << 16` against `1 << 14`,
+  Milestone 7). Closed (same decision).
+- **Tuning `WORKER_STEPS_PER_SLICE`** (Milestone 7). Closed (same
+  decision).
+- **The unverified Vercel build of `frontend/api/signal.ts`** (R-T10-3).
+  Closed: the human partner checked that the Vercel preview deploy works.
+  R-T10-3's "imports nothing" is revisited by Part 5.3, and the new
+  dependencies are re-checked on the next preview deploy (Gate 3).
+- **Upstash's plan limits** (R-T10-8). Checked: the free plan, measured
+  above ("Upstash's free plan").
+- **No v392 frame compared with hardware**, and **v392's early log
+  timestamps compared with no badge.** Closed: reflashing the badge to
+  v392 is dismissed; the badge stays on v335.
+- **The tap queue's lag on fast bursts (`RELEASE_GAP_US`).** Closed:
+  `RELEASE_GAP_US` stays 40 ms (R-M8-4 stands; the human partner called
+  the lag tiny; spec Part 4.9).
+- **Hearing real badges.** Stays dropped (ruling R-T11-2, the human
+  partner's no-go of 2026-11-02; spec, "Non-goals").
+
+## Rulings
+
+- Ruling R-T1-1: the app's own `esp_perip_clk_init` resets of SPI2, I2C0
+  and RMT (`clk.c` :270–287, :306–307) are reproduced at the reset step,
+  like `esp_restart_noos`'s, because the model drops
+  `SYSTEM_PERIP_RST_EN0/1` writes. The spec's facts list (copied above)
+  had these three as kept. — cost if wrong: if the badge kept them, the
+  new boot's drivers would read reset values instead of the old boot's;
+  they program every register they use before using it, and none of the
+  three is touched between the reset and `cpu_start.c` :775.
+- Ruling R-T1-2: INTC is reset whole (silent → reset). The MAP half the
+  TRM keeps is rewritten by the app's `core_intr_matrix_clear` before
+  interrupts are enabled, and for the CPU-line half the TRM is silent. —
+  cost if wrong: a CPU-line enable, type or priority the old boot left
+  would differ from the badge's until the new boot allocates that line.
+- Ruling R-T1-3: `STORE5` is rewritten with the bootloader's
+  `0x4C4B_4C4B` (80 MHz), not only `STORE4`. The carried value is the
+  40 MHz that `esp_restart_noos` stored a step before the reset, which the
+  badge's bootloader always overwrites (fact 3). It applies to both reset
+  kinds, since the bootloader runs after both, so Task 2's test
+  `store4_is_the_bootloaders_after_a_soft_reset` should except `STORE5`
+  from "keep the guest's values" if the human partner accepts this row.
+  A cold boot is unchanged (it leaves `STORE5` at its reset value 0, as
+  today), because changing it would move pins before the launcher. —
+  cost if wrong: if the badge kept the 40 MHz, a read of
+  `rtc_clk_apb_freq_get()` before the app's own clock init would see
+  80 MHz in the emulator and 40 MHz on the badge; at a cold boot the
+  emulator still reads 0.
+- Ruling R-T1-4: GPIO21's output enable is cleared at a CPU reset, as the
+  bootloader's `release_default_console_io` does, on the evidence that
+  v392 is built with a non-UART console (`"/dev/uart/-1"` in
+  `firmware.bin`). — cost if wrong: on a UART-console build the badge keeps GPIO21
+  (`HC165_CLK`) an output across the reboot, while the emulator leaves it
+  undriven until the app configures it.
+- Ruling R-T1-5: the RNG is kept, so its xorshift sequence continues
+  across a reset rather than restarting from `RNG_SEED`. The badge's RNG
+  never restarts its output. — cost if wrong: random values after a
+  reboot differ from the restart-from-seed sequence; neither is the
+  badge's entropy.
+- Ruling R-T1-6: TIMG0 and TIMG1 are kept, although on the badge one
+  whose clock was off at the reset is held in reset by the app
+  (`clk.c` :224–229, :306–307), and the model has no clock gates. —
+  cost if wrong: the model holds only calibration state and inert
+  watchdog words, and the app calibrates again at boot.
+- Ruling R-T1-7: of the bootloader's RTC_CNTL writes, only `STORE4` and
+  `STORE5` are reproduced. The rest (clock tuning and source words, the
+  watchdogs) land in words the model stores but nothing models, and the
+  cold boot does not reproduce them either. — cost if wrong: a guest
+  read of one of those words after a reboot sees the old app's value
+  instead of the bootloader's.
+
+## Milestone 12 backlog
+
+Started by Task 1; later tasks add what they leave open.
+
+- **Share's radio transfer** (the human partner, 2026-11-03).
+- **Sync's empty-room path:** the fake upload credential and the ROM
+  `crc32_le` stub (the human partner, 2026-11-03).
+- **A cold power-on's boot time.** The shortcut boot starts the app at
+  0 µs; the badge takes about 466 ms (spec, "Non-goals").
+- **The core reset is narrower than the TRM.** A core reset keeps the
+  whole RTC domain (§6.1.3), but `soft_reset`'s core path keeps only
+  `STORE0..7` and the timer; and it drops USB-Serial-JTAG, which §30.3.4
+  says a digital system reset through SRST does not touch. v392 is not
+  seen to use a core reset.
+- **The SYSTEM clock-gate and reset bits are not modeled**
+  (`SYSTEM_PERIP_CLK_EN0/1`, `SYSTEM_PERIP_RST_EN0/1`), so a driver's own
+  reset pulse after boot does nothing. Table rows 1, 7, 9, 13, 15 and 18
+  stand in for the resets around a reboot only.
+- **DRAM `.noinit` data** is not kept across a reset (the TRM keeps
+  internal SRAM).
+- **The RTC and timer-group watchdogs** are inert storage, so the 1 s RTC
+  watchdog `esp_restart_noos` arms is never checked.
