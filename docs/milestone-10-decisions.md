@@ -788,10 +788,8 @@ emulator.**
 the window is narrow, and the v335 card and Chrome's support for
 extended advertisements are unproven.
 
-Ruling R-T11-2: Part 5 (hearing real badges through Web Bluetooth) is
-dropped on the human's no-go (2026-11-02) — cost if wrong: users cannot
-bump-pair an emulated badge with a real badge one-way, and Part 5 would
-later restart from the Step 4 spike with the Step 1 evidence above.
+Ruling R-T11-2: Part 5 is dropped on the human's no-go (2026-11-02);
+see the Rulings list for the full entry.
 
 ### The Task 12 gate: the human partner's answers (2026-11-03)
 
@@ -840,8 +838,9 @@ pass; the only pins changed against `BASE` are the replaced rungs below.
 `CARGO_TARGET_TMPDIR` path in parallel, so one `rustc`'s temporary
 object is removed under the other's linker. It passes with
 `--test-threads=1` and passed in the third full run. The file is
-unchanged since the core's first commits; it is in the Milestone 11
-backlog.
+unchanged since the core's first commits.
+Fixed after the final review: `compile_fixture` now holds a static
+mutex, so the two tests no longer compile at once.
 
 **Benchmarks**, one session each at `76bb87a`, not an A/B (Apple M5
 Pro; native is `bench_redraws`' `factor`, Bun 1.4.4 is the median of
@@ -1437,6 +1436,10 @@ milestone's costs are Task 1's, Task 3's and the Task 6 gate's
   scanning (Review Focus 3), so a one-shot post would be lost to a peer
   that starts scanning later — cost if wrong: a little more message
   traffic on each link.
+- Ruling R-FR-1 (the orchestrator, final review): `app_hooks.rs`'s
+  synthetic test addresses stay (they mirror v392's `bt.c` addresses
+  with the top byte changed; not chip constants) — cost if wrong: a
+  later reader mistakes them for chip constants; a one-commit rename.
 
 ## Replaced rungs
 
@@ -1503,13 +1506,17 @@ backlog") is carried below, minus what this milestone closed:
   semantics by accident. An id the radio does not know trips the
   radio's `debug_assert` in debug builds, so the fix needs a test-only
   way past it (from R-T8-4).
-- **A flaky `riscv_integration` test**: `toy_sum_loop_computes_correct_sum`
-  and `toy_sum_loop_handles_zero_input` compile the same fixture to the
-  same `CARGO_TARGET_TMPDIR` path in parallel ("Final suite" above).
-  Compile each fixture once (a `OnceLock`) or to a per-test path.
+- **Gate `hub.bump()` on the running state.** It still sends `{t:"bump"}`
+  to links while the local runtime is stopped or hidden (ruling
+  R-T10-1 stands; revisit if the one-sided bump proves confusing).
+- **Map a signaling 429 to a "busy, try again in N min" message.**
+  `signal-client.ts`'s host/join polling ends a 429 with the generic
+  "Signaling server error (HTTP 429)" and ignores `Retry-After`.
+- **Rename `app_hooks.rs`'s synthetic test addresses** (ruling R-FR-1):
+  they mirror v392's `bt.c` addresses with the top byte changed and are
+  not chip constants; a comment or a rename would stop a reader taking
+  them for ones.
 - Core review minors left open:
-  - `radio/hci.rs`'s docs near lines 1322 and 1375 still say the
-    resolving list is always empty (R-T6-1 keeps identities);
   - the ordering risk in R-T6-2 (a report popped in `send_packet` ahead
     of a reply; `host_rcv_pkt` blocking the idle task) has no test;
   - `deliver_rejects_malformed_bytes` cannot tell rejection from

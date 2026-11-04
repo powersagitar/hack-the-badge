@@ -101,7 +101,7 @@ plus `wasm-pack`.
 - `cargo clippy --workspace --all-targets` has 3 known warnings (two in
   `boot.rs`, one in a `console.rs` test).
 - Benchmarks are never part of a test run; results go in
-  `docs/milestone-7-decisions.md`:
+  the current milestone's decisions doc (Milestone 7's has the profiles):
   - `cargo test -p emulator-core --release --test boot_progress bench_redraws -- --ignored --nocapture`
     (native);
   - `bun run bench:wasm` (Bun);
@@ -134,7 +134,7 @@ plus `wasm-pack`.
   is load-bearing. Browser, peer and network input never panics the
   emulator; a malformed peer packet never crashes a tab.
 - The radio links use `iceServers: []` (no STUN, TURN or relay), and the
-  only server the page calls is `/api/signal`.
+  only server endpoint is `/api/signal`.
 - `emulator-core` has no wasm-bindgen dependency. `emulator-wasm` stays
   logic-free: one-line passthroughs only. `framebuffer()` returns an owned
   `Vec`, to avoid a use-after-free across WASM heap growth.

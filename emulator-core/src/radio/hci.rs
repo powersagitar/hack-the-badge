@@ -1319,8 +1319,9 @@ mod tests {
 
     /// Task 6's trace: NimBLE's startup clears the resolving list
     /// (`0x2029`) after turning address resolution off. Privacy is not
-    /// modeled, so the list is always empty; 7.8.40 disallows the command
-    /// only while address resolution is on and advertising or scanning is.
+    /// modeled, so the list only ever holds the identities added to it
+    /// (R-T6-1); 7.8.40 disallows the command only while address
+    /// resolution is on and advertising or scanning is.
     #[test]
     fn le_clear_resolving_list_succeeds_unless_resolution_is_busy() {
         let mut c = HciController::new(PUBLIC);
@@ -1372,7 +1373,7 @@ mod tests {
     /// Task 6's trace: with address resolution on, NimBLE adds its own
     /// identity and IRK to the resolving list (`0x2027`, 39 parameter
     /// octets). Privacy is not modeled (R-T5-8): a well-formed entry is
-    /// accepted and not kept; 7.8.38 disallows the command while address
+    /// accepted and its identity kept (the IRKs are not; R-T6-1); 7.8.38 disallows the command while address
     /// resolution is on and advertising or scanning is.
     #[test]
     fn le_add_device_to_resolving_list_accepts_a_well_formed_entry() {

@@ -974,7 +974,7 @@ in `milestone-10-decisions.md` is the complete list):
      again, or Connect and Sync fault as in Milestone 9.
    - The signaling function's rate limits (R-T10-8) are sized for a toy
      project with few simultaneous users; about 10 browsers waiting
-     behind one NAT lock that NAT out for 10 min.
+     behind one NAT lock that NAT out for the rest of the window (at most 10 min).
 2. **The RTC timer restarts at a software reset.** The reset builds a
    fresh bus, and the RTC timer counts the new SYSTIMER clock, so it
    starts again at 0. On the badge the RTC domain keeps counting through
