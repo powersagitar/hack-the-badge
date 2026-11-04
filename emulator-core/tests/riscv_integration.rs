@@ -170,6 +170,11 @@ fn read_elf_entry(elf_path: &Path) -> u32 {
 /// plus the entry point address (see [`read_elf_entry`]) to set `cpu.regs.pc`
 /// to before running.
 fn compile_fixture(name: &str) -> (Vec<u8>, u32) {
+    // Tests run in parallel and share one output path per fixture, so two
+    // `rustc`s would delete each other's intermediate `.rcgu.o`. Serialize.
+    static COMPILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = COMPILE.lock().unwrap_or_else(|e| e.into_inner());
+
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture_dir = manifest_dir.join("tests/fixtures").join(name);
     let src = fixture_dir.join("src.rs");
