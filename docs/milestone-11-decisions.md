@@ -478,8 +478,10 @@ public source, and is labelled.
 
 Ruling R-T4-1: `PROV FAIL`'s busy steps are the firmware's own work, and
 no emulator change follows — cost if wrong: a slow redraw would hide an
-emulator effect, but the trace found no MMIO spin, no new unmapped access
-and no idle time to explain.
+emulator effect, but the trace found no MMIO spin and no new unmapped
+access. SPI transfers are instant in this model, so the ruling covers the
+redraw's CPU work only. The gap's zero idle time and the console's position
+relative to the redraw are not hardware claims.
 
 Ruling R-T4-2: both provisioning hosts are valid, neither changes, and
 `provisioner_pacing_matches_the_rust_host` pins their shared schedule —
@@ -489,8 +491,19 @@ matches on both.
 ### `PROV FAIL`'s 3.0M busy steps: firmware behaviour, not ours
 
 **Result.** The steps are a full-screen LVGL redraw on the firmware's
-`taskLVGL`. It preempts the console in the middle of the result line. The
-redraw repaints identical pixels.
+`taskLVGL`. In the emulator it runs ahead of the console in the middle of
+the result line. The redraw repaints identical pixels.
+
+**What this does and does not say about hardware.** The steps are guest
+LVGL code, and instant SPI adds none of them, so the redraw's CPU work is
+the finding. The eight flushes go through SPI2, and a transfer here takes
+no emulated time (`docs/firmware-emulator-notes.md`: "a transfer is
+instant at `SPI_USR`"; `peripherals/spi.rs`'s module doc). So `taskLVGL`
+(priority 4) may never wait on a flush here. Whether the firmware's flush
+wait blocks or spins was not established. On hardware, a blocking wait
+could let the console task finish its line during the redraw. The zero
+idle time, the uninterrupted console gap and its 35,293 µs below describe
+this model, not the badge.
 
 **How it was measured.** A clone of `first_run_screen()`, then
 `provision::put_file` with the payload `{}`, then `prov apply\n`, stepping
@@ -517,7 +530,8 @@ sampled on a coarse grid: the next prompt was seen by 19,357,500 at
 
 **In the gap:**
 
-- `idle_ticks` grows by 0, and the flash controller makes 0 transactions.
+- `idle_ticks` grows by 0 (in this model; see the caveat above), and the
+  flash controller makes 0 transactions.
 - The unmapped log is identical before and after, so there is no new
   unmapped access.
 - The panel window moves through eight 30-line strips, `(0,319,0,29)` to
@@ -581,13 +595,15 @@ each:**
 
 So the redraw follows `prov apply`, and not `prov show` or an empty line.
 With no file, `PROV FAIL` was seen by step 15,800,000 and the prompt by
-16,000,000 (50,000-step sampling), and the redraw came after both. Where
-the redraw lands against the prompt is scheduling: in the `{}` case it
-delays the prompt, and in the no-file case it does not.
+16,000,000 (50,000-step sampling), and the redraw came after both. In the
+`{}` case the redraw delays the prompt, and in the no-file case it does
+not. Inferred, not traced: that ordering comes from task scheduling, and
+instant SPI transfers may shape it (see the caveat above).
 
 **Not established:** why v335 showed 0.2M here. v335 was not re-traced.
 Whether v335 lacks this rebuild, or only scheduled it after the prompt
-(as the no-file case above does on v392), is open.
+(as the no-file case above does on v392), is open, and instant SPI could
+bear on the second case.
 
 `boot_progress.rs`'s doc on `CONSOLE_DEADLINE` still says "not traced";
 no constant changes for this.
