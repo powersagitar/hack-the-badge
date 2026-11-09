@@ -95,6 +95,7 @@ export interface ShellHandles {
   /**
    * Mounts the "Badge running in another tab — Run here" notice into
    * `#badge-notice`, hidden (no-op handles if the element is missing).
+   * Showing it clears the canvas to the page's background.
    */
   mountBadgeNotice(onTakeOver: () => void): BadgeNotice;
   /**
@@ -401,10 +402,32 @@ export function mountShell(): ShellHandles {
     return buildProvisionControls(container, document, roles, onProvision, onShake, onBump);
   }
 
+  /**
+   * Paints the whole canvas in the page's background, `shell.css`'s
+   * `--bg` (the body's computed background if the token is missing), so
+   * the notice does not sit over the Lua sandbox's last frame.
+   */
+  const clearScreen = (): void => {
+    const view = document.defaultView;
+    const bg =
+      view?.getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() ||
+      (view && document.body ? view.getComputedStyle(document.body).backgroundColor : "");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!bg) return;
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  };
+
   function mountBadgeNotice(onTakeOver: () => void): BadgeNotice {
     const container = document.getElementById("badge-notice");
     if (!container) return { setVisible: () => {} };
-    return buildBadgeNotice(container, document, onTakeOver);
+    const notice = buildBadgeNotice(container, document, onTakeOver);
+    return {
+      setVisible(visible) {
+        notice.setVisible(visible);
+        if (visible) clearScreen();
+      },
+    };
   }
 
   function mountLinkPanel(handlers: LinkPanelHandlers): LinkPanel {

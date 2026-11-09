@@ -794,6 +794,15 @@ at exactly that gap and not one step before.
   guards (spec, Part 7). A failure is a 400, never a throw. The client
   bundle does not carry it today (tree-shaken; "The signaling function's
   cost").
+- `happy-dom` 21.0.4 (dev, frontend, Task 12): a real DOM for
+  `test/shell.test.ts`, in place of its hand-written `FakeElement` (spec,
+  Part 7), so the shell and the badge controller are tested through the
+  page's own skeleton (`index.html`'s body, `shell.css` inline). One
+  `Window` per test, set as `globalThis.document` and restored after; no
+  global registrator. Brings `entities` 7.0.1, `whatwg-mimetype` 3.0.0,
+  `ws` 8.22.2, `buffer-image-size` 0.6.4 and the types
+  `@types/whatwg-mimetype` 3.0.2 and `@types/ws` 8.18.2 (`@types/node` was
+  already there). Tests only: nothing under `src/` imports it.
 
 ## Closed in writing
 
@@ -1059,6 +1068,36 @@ unless another date is given.
   `setFactoryMac` returns `true`; a refusal or a throw (posted as
   `error`) leaves the next `setMac` free to try. `start` still locks it
   — cost if wrong: none; the browser sends one MAC per Worker.
+- Ruling R-T12-1 (Task 12, `fix: release the badge on Lua mode or a
+  failed start; happy-dom for the shell tests`): `main.ts` runs itself on
+  import and reaches `fetch`, `Worker` and `navigator.locks` directly, so
+  its badge wiring moved into `src/ui/badge-controller.ts`:
+  `createBadgeController(deps)` (the mode switch, the Worker, the lock and
+  its notice, the provisioning controls, the bump gate's three
+  `hub.setRunning` calls with their markers, `onPausedChange` to
+  `hub.setPaused`) and `mountLinks` (with Task 10's `cancelHosting`).
+  `main.ts` passes them the browser's and keeps the Lua paint loop, the
+  log panel and unload — cost if wrong: none at run time; a later edit to
+  the page wiring is made in two files.
+- Ruling R-T12-2 (Task 12): the badge is freed (released once, then
+  dropped) on a switch to Lua mode, when the first boot fails, at unload,
+  and when a claim that was in flight lands after a switch to Lua. Provision
+  claims the badge before it boots anything: without it, it shows the
+  notice and creates no Worker. A waiting tab still needs "Run here" (the
+  spec's call) — cost if wrong: none found; a tab that switches to Lua and
+  back retakes the badge, and loses it if another tab took it meanwhile.
+- Ruling R-T12-3 (Task 12): showing the badge notice clears the canvas
+  (`clearRect`, then a `fillRect` of the whole canvas) in `shell.css`'s
+  `--bg`, read from the page's computed style (the body's computed
+  background if the token is missing; only `clearRect` if both are) —
+  cost if wrong: the canvas reads as the page behind the badge frame's
+  darker `#05070a`, not as an off screen.
+- Ruling R-T12-4 (Task 12): pressing "Host link" again, or cancelling,
+  while a room is still being created now closes that room as soon as
+  `hostRoom` returns (a counter of presses and cancels), instead of
+  orphaning it until its TTL; its failure no longer overwrites the newer
+  status (Task 10's review) — cost if wrong: none; the room was never
+  shown.
 
 ## Milestone 12 backlog
 
