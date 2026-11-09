@@ -7,6 +7,10 @@ edition = "2021"
 name = "emulator_core"
 path = "src/lib.rs"
 
+[dependencies]
+md-5 = { version = "=0.11.0", default-features = false }
+
 [dev-dependencies]
+object = { version = "=0.40.0", default-features = false, features = ["read_core", "elf"] }
 png = "0.17"
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }

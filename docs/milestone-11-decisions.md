@@ -847,6 +847,35 @@ unless another date is given.
   `deliver_rejects_malformed_bytes`, the only xorshift in that file (peer
   bytes, in the wire form). Only that loop changed; the rest of the test
   stands — cost if wrong: none.
+- `md-5` =0.11.0 (`emulator-core`, Task 7; RustCrypto): `md5.rs`'s
+  block compression is its `block_api::compress`, in place of the
+  hand-written 64 rounds and their two constant tables (spec, Part 7).
+  `default-features = false`: no `alloc` or `oid`. Its tree is `cfg-if`,
+  `digest` 0.11.3, `block-buffer`, `crypto-common`, `hybrid-array` and
+  `typenum`, all pure Rust and `no_std`; on `wasm32-unknown-unknown` the
+  crate takes its `soft` backend (only LoongArch64 has assembly). The
+  Plumb context, its 88-byte guest image and every byte-exact write stay
+  in `md5.rs`; RFC 1321's suite, the ROM-stub tests and
+  `PARTITION_TABLE_MD5` pass unchanged. The WASM grew from 140,003 B to
+  141,861 B (+1,858 B, +1.3%), measured with `ls -l` of
+  `frontend/src/cpu/wasm-pkg/emulator_wasm_bg.wasm` after `bun run
+  build:wasm` at `1c8aeb6` and after the change.
+- Ruling R-T7-1: the crate's library is named `md5`, like the module
+  `emulator_core::md5`. `md5.rs` calls it by the absolute path
+  `::md5::block_api::compress`, with no rename in `Cargo.toml` and no
+  `use` alias — cost if wrong: none; a build error if it were ambiguous.
+- `object` =0.40.0 (dev, `emulator-core`, Task 7): `riscv_integration.rs`
+  flattens each fixture ELF by copying its `PT_LOAD` segments' file bytes
+  to their physical addresses, in place of shelling out to
+  `rust-objcopy`/`llvm-objcopy`, so the `llvm-tools-preview` component is
+  no longer needed (spec, Part 7). `default-features = false, features =
+  ["read_core", "elf"]`: no `std`, `compression` or other formats. A
+  dev-dependency: neither the WASM build nor `emulator-wasm`'s tree has
+  it. Checked against the objcopy route at `1c8aeb6`: both fixtures' flat
+  images are byte-identical (`toy_sum` 42 B, `toy_mul` 489 B in two
+  segments), with the same entry points (0 and 2). No segment has
+  `p_memsz` above `p_filesz`. The loader, like `objcopy -O binary`,
+  stops at the last file byte, and `FlatBus` starts zeroed anyway.
 
 ## Milestone 12 backlog
 

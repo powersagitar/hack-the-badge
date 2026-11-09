@@ -8,17 +8,15 @@
 //! compiler's own code-size optimization, not opcodes this test's author
 //! picked.
 //!
-//! Requires (both already set up in this dev environment per the task
-//! brief's pre-flight notes):
-//! - `rustup target add riscv32imc-unknown-none-elf`
-//! - the `llvm-tools-preview` rustup component (for `rust-objcopy`/
-//!   `llvm-objcopy`, used to turn the linked ELF into a flat binary)
-//!
-//! If either is missing, these tests fail loudly with a message explaining
-//! what to install, rather than silently skipping.
+//! Requires `rustup target add riscv32imc-unknown-none-elf`. If it is
+//! missing, these tests fail loudly with a message explaining what to
+//! install, rather than silently skipping.
 
 use emulator_core::cpu::Cpu;
 use emulator_core::mem::Bus;
+use object::elf::PT_LOAD;
+use object::read::elf::{ElfFile32, ProgramHeader};
+use object::{LittleEndian, Object};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -94,81 +92,40 @@ impl Bus for FlatBus {
     }
 }
 
-/// Finds `rust-objcopy` (preferred) or `llvm-objcopy` alongside the active
-/// `rustc`, via its sysroot (`<sysroot>/lib/rustlib/<host-triple>/bin/`).
-/// This is where `rustup component add llvm-tools-preview` installs them.
-fn find_objcopy() -> PathBuf {
-    let sysroot = run_capture("rustc", &["--print", "sysroot"]);
-    let sysroot = sysroot.trim();
-    let host = host_triple();
-    for name in ["rust-objcopy", "llvm-objcopy"] {
-        let candidate = Path::new(sysroot)
-            .join("lib/rustlib")
-            .join(&host)
-            .join("bin")
-            .join(name);
-        if candidate.exists() {
-            return candidate;
+/// Flattens a linked ELF: each `PT_LOAD` segment's file bytes go at its
+/// physical address, with any gaps zero-filled, so byte 0 of the image is
+/// address 0. The image ends at the last file byte: a trailing `.bss`
+/// (`p_memsz` past `p_filesz`) adds nothing, and is zero in a fresh
+/// `FlatBus` anyway. Also returns the entry point, because the linker
+/// script only pins the lowest address of `.text` to 0: rustc/LLVM are free
+/// to order the functions within it (generated panic-handling helpers
+/// sometimes land before user code), so `_start` need not be first.
+fn flatten_elf(bytes: &[u8]) -> (Vec<u8>, u32) {
+    let elf = ElfFile32::<LittleEndian>::parse(bytes).expect("parsing a little-endian ELF32");
+    let endian = elf.endian();
+    let mut image = Vec::new();
+    for segment in elf.elf_program_headers() {
+        if segment.p_type(endian) != PT_LOAD || segment.p_filesz(endian) == 0 {
+            continue;
         }
-    }
-    panic!(
-        "rust-objcopy/llvm-objcopy not found under {sysroot}/lib/rustlib/{host}/bin/. \
-         Install with: rustup component add llvm-tools-preview"
-    );
-}
-
-fn host_triple() -> String {
-    let out = run_capture("rustc", &["-vV"]);
-    for line in out.lines() {
-        if let Some(rest) = line.strip_prefix("host: ") {
-            return rest.trim().to_string();
+        let start = segment.p_paddr(endian) as usize;
+        let data = segment
+            .data(endian, bytes)
+            .expect("reading a PT_LOAD segment's file bytes");
+        let end = start + data.len();
+        if image.len() < end {
+            image.resize(end, 0);
         }
+        image[start..end].copy_from_slice(data);
     }
-    panic!("could not determine host triple from `rustc -vV` output:\n{out}");
-}
-
-fn run_capture(cmd: &str, args: &[&str]) -> String {
-    let out = Command::new(cmd)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run `{cmd} {args:?}`: {e}"));
-    assert!(
-        out.status.success(),
-        "`{cmd} {args:?}` failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// Reads the ELF32 entry point (`e_entry`, a little-endian `u32` at byte
-/// offset 0x18 of the ELF header) directly from the linked `.elf` file.
-///
-/// We need this because `objcopy -O binary` flattens the image but does
-/// *not* guarantee `_start` ends up at offset 0 of that flat blob — our
-/// linker script only pins the lowest address of the `.text` *section* to
-/// 0, and rustc/LLVM are free to order the functions/sections within
-/// `.text` however they like (in practice, generated panic-handling
-/// helpers sometimes land before user code). Reading the real entry point
-/// avoids assuming `_start` is first.
-fn read_elf_entry(elf_path: &Path) -> u32 {
-    let bytes = std::fs::read(elf_path).expect("reading ELF for entry point");
-    assert!(
-        bytes.len() >= 0x1c,
-        "ELF file too short to contain a header"
-    );
-    assert_eq!(&bytes[0..4], &[0x7f, b'E', b'L', b'F'], "not an ELF file");
-    assert_eq!(bytes[4], 1, "expected ELF32");
-    assert_eq!(bytes[5], 1, "expected little-endian ELF");
-    u32::from_le_bytes(bytes[0x18..0x1c].try_into().unwrap())
+    (image, elf.entry() as u32)
 }
 
 /// Compiles `fixtures/<name>/src.rs` for `riscv32imc-unknown-none-elf`,
 /// links it with `fixtures/<name>/link.ld` (which places `.text` at
 /// address 0, entry `_start`), and returns the flat little-endian machine
-/// code (via `objcopy -O binary`), ready to load into a `Bus` at address 0,
-/// plus the entry point address (see [`read_elf_entry`]) to set `cpu.regs.pc`
-/// to before running.
+/// code (see [`flatten_elf`]), ready to load into a `Bus` at address 0, plus
+/// the entry point address to set `cpu.regs.pc` to before running.
 fn compile_fixture(name: &str) -> (Vec<u8>, u32) {
     // Tests run in parallel and share one output path per fixture, so two
     // `rustc`s would delete each other's intermediate `.rcgu.o`. Serialize.
@@ -182,7 +139,6 @@ fn compile_fixture(name: &str) -> (Vec<u8>, u32) {
 
     let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     let elf_path = out_dir.join(format!("{name}.elf"));
-    let bin_path = out_dir.join(format!("{name}.bin"));
 
     let status = Command::new("rustc")
         .args([
@@ -214,22 +170,7 @@ fn compile_fixture(name: &str) -> (Vec<u8>, u32) {
          (is `rustup target add {RISCV_TARGET}` done?)"
     );
 
-    let objcopy = find_objcopy();
-    let status = Command::new(&objcopy)
-        .args(["-O", "binary"])
-        .arg(&elf_path)
-        .arg(&bin_path)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", objcopy.display()));
-    assert!(
-        status.success(),
-        "{} failed on {name}.elf",
-        objcopy.display()
-    );
-
-    let entry = read_elf_entry(&elf_path);
-    let code = std::fs::read(&bin_path).expect("reading objcopy output");
-    (code, entry)
+    flatten_elf(&std::fs::read(&elf_path).expect("reading the linked ELF"))
 }
 
 /// Runs `cpu.step()` until it observes an `EBREAK` trap (our fixtures'
