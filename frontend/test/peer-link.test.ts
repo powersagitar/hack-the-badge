@@ -97,7 +97,8 @@ describe("peer link", () => {
     hubB.addLink(b);
     const hubA = new RadioHub({ deliver: () => {}, bumpLocal: () => {} });
     hubA.addLink(a);
-    hubA.bump();
+    hubA.setRunning(true); // the bump is gated on the sender's running badge
+    expect(hubA.bump()).toBe(true);
     await tick();
     expect(bumps).toBe(1);
   });

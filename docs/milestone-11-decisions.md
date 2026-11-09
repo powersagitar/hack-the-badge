@@ -1029,6 +1029,36 @@ unless another date is given.
   than that `sleep` is never called — cost if wrong: none in the
   browser; a test that wants a sleep-free open would need a second
   injected timer.
+- Ruling R-T11-1 (Task 11, `fix: gate the bump on the running badge;
+  coalesce advertisements`): Milestone 10's R-T10-1 (bump ungated) is
+  revised, as the spec's "Part 4: Browser items" item 4 says, by the
+  human partner's choice. `hub.bump()` sends no `{t:"bump"}` to any
+  link, does not bump the local badge, and returns `false` unless the
+  local runtime is running *and* the hub is not paused: running is
+  `Hub.setRunning`, which `main.ts` sets at each `rt.start()` and
+  `firmwareRuntime?.stop()` (a mode switch, a lost badge); hidden is the
+  hub's existing pause (`onPausedChange`). The two combine as an AND,
+  and neither is remembered: a bump refused while stopped or hidden is
+  not sent later. A peer's bump is unchanged (it reaches the local badge,
+  which drops it when stopped or hidden, R-T9-3). So that a `start()`
+  made while the page is hidden also gates it, the Worker client now
+  calls `onPausedChange(true)` at that start, not only at a later hide —
+  cost if wrong: two people who tap Bump in a tab whose badge is not
+  running see nothing happen on either side, where before the peer felt
+  it.
+- Ruling R-T11-2 (Task 11): the Worker posts `advOut` at most every
+  `ADV_REPOST_MS` (100 ms). It reads the advertisement only when that
+  much time has passed since its last post, and then posts it if it
+  changed or is non-empty; the first change after a quiet window still
+  goes out at once. Twenty changes inside 100 ms are therefore at most
+  two posts, the second the latest, and a last change (stopping
+  advertising included) goes out on the next tick, up to 100 ms later
+  than before — cost if wrong: a peer hears an advertisement change up
+  to 100 ms later, inside Connect's scan windows.
+- Ruling R-T11-3 (Task 11): `macLocked` is set only when the emulator's
+  `setFactoryMac` returns `true`; a refusal or a throw (posted as
+  `error`) leaves the next `setMac` free to try. `start` still locks it
+  — cost if wrong: none; the browser sends one MAC per Worker.
 
 ## Milestone 12 backlog
 

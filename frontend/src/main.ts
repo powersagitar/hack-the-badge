@@ -39,8 +39,10 @@
  * badge's factory MAC is this browser's (`loadOrCreateMac`), sent to the
  * Worker before its first start. `src/radio/hub.ts`'s `RadioHub` carries
  * the badge's advertisements to linked peers and theirs back, and the
- * Bump button bumps this badge and every linked one. The hidden-page
- * pause pauses the hub too.
+ * Bump button bumps this badge and every linked one, only while the badge
+ * runs here and the page is visible: each `rt.start()` and
+ * `firmwareRuntime?.stop()` below is paired with `hub.setRunning`, and the
+ * hidden-page pause pauses the hub (`onPausedChange`), Milestone 11 Task 11.
  *
  * **Links (Milestone 10 Task 10).** The link panel ({@link mountLinks})
  * makes WebRTC links (`src/radio/peer-link.ts`) to other browsers: "Host
@@ -353,6 +355,7 @@ function main(): void {
   function onBadgeLost(): void {
     badgeHold = null;
     firmwareRuntime?.stop();
+    hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
     if (mode === "firmware") badgeNotice.setVisible(true);
   }
 
@@ -378,6 +381,7 @@ function main(): void {
     // The user switched away, or another tab took the badge, while it booted.
     if (mode !== "firmware" || !badgeHold) return;
     rt.start();
+    hub.setRunning(true); // the bump gate (Milestone 11 Task 11)
   }
 
   /** "Run here": takes the badge from the other tab (which stops), then starts it here. */
@@ -415,6 +419,7 @@ function main(): void {
       stopLuaPaintLoop();
     } else {
       firmwareRuntime?.stop();
+      hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
     }
 
     mode = next;

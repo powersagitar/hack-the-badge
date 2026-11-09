@@ -48,6 +48,8 @@ function makeFakeHandle(usPerStep = 1) {
   let advReads = 0;
   let softResets = 0;
   let rebootArmed = false;
+  /** What `setFactoryMac` does: succeed, refuse (`false`) or throw. */
+  let macOutcome: "ok" | "refuse" | "throw" = "ok";
   const summary = (n: number): CpuRunSummary => ({
     steps: n,
     traps: 0,
@@ -92,7 +94,8 @@ function makeFakeHandle(usPerStep = 1) {
     },
     setFactoryMac(mac) {
       macs.push([...mac]);
-      return mac.length === 6;
+      if (macOutcome === "throw") throw new Error("emulator gone");
+      return macOutcome === "ok" && mac.length === 6;
     },
     radioAdvertisement() {
       advReads++;
@@ -117,6 +120,7 @@ function makeFakeHandle(usPerStep = 1) {
     delivered,
     setAdv: (bytes: number[]) => (adv = new Uint8Array(bytes)),
     advReads: () => advReads,
+    setMacOutcome: (o: "ok" | "refuse" | "throw") => (macOutcome = o),
     print: (s: string) => (consoleText += s),
     setTimeUs: (t: number) => (timeUs = t),
     /** The next `runUntil` ends in one soft reset. */
@@ -371,6 +375,29 @@ describe("firmware worker radio", () => {
     expect(fake.macs).toHaveLength(1);
   });
 
+  test("mac_locked_only_when_set_factory_mac_succeeds", async () => {
+    const { fake, state, posted, send } = await bootedRig();
+    // Refused: still unlocked, so a later MAC is tried.
+    fake.setMacOutcome("refuse");
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) });
+    expect(state.macLocked).toBe(false);
+    // Thrown: posted as an error, still unlocked.
+    fake.setMacOutcome("throw");
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) });
+    expect(state.macLocked).toBe(false);
+    expect(posted.map((m) => m.kind)).toEqual(["error"]);
+    // Accepted: locked, and the next is ignored.
+    fake.setMacOutcome("ok");
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 2]) });
+    expect(state.macLocked).toBe(true);
+    send({ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 3]) });
+    expect(fake.macs).toEqual([
+      [2, 0, 0, 0, 0x10, 1],
+      [2, 0, 0, 0, 0x10, 1],
+      [2, 0, 0, 0, 0x10, 2],
+    ]);
+  });
+
   test("setMac after a start is ignored", async () => {
     const { fake, send } = await bootedRig();
     send({ kind: "start" });
@@ -414,7 +441,7 @@ describe("firmware worker radio", () => {
     expect(fake.accel.at(-1)).toEqual([0, 0, 1000]);
   });
 
-  test("advOut is posted on a change, and re-posted every ADV_REPOST_MS while advertising", async () => {
+  test("advOut is posted on a change, at most every ADV_REPOST_MS, and re-posted that often while advertising", async () => {
     expect(ADV_REPOST_MS).toBe(100);
     const { fake, posted, send, sliceAt } = await bootedRig();
     send({ kind: "start" });
@@ -428,7 +455,7 @@ describe("firmware worker radio", () => {
     sliceAt(30);
     sliceAt(119);
     expect(advsOf(posted)).toHaveLength(1);
-    // A change goes out at once, not at the next re-post.
+    // A change once ADV_REPOST_MS have passed goes out at once.
     fake.setAdv([1, 2, 3, 4, 5, 6, 0, 4, 0x42, 0x50, 0x41, 0x31]);
     sliceAt(121);
     expect(advsOf(posted)).toHaveLength(2);
@@ -442,14 +469,40 @@ describe("firmware worker radio", () => {
     for (let t = 230; t <= 1_230; t += 4) sliceAt(t);
     expect(advsOf(posted).length).toBeLessThanOrEqual(3 + 10);
     expect(advsOf(posted).length).toBeGreaterThanOrEqual(3 + 9);
-    // Stopping advertising is a change: one empty advOut, then silence.
+    // Stopping advertising is a change: one empty advOut, on the next tick, then silence.
     const n = advsOf(posted).length;
     fake.setAdv([]);
-    sliceAt(1_240);
+    sliceAt(1_340);
     expect(advsOf(posted)).toHaveLength(n + 1);
     expect(advsOf(posted).at(-1)).toEqual([]);
-    for (let t = 1_250; t <= 2_000; t += 10) sliceAt(t);
+    for (let t = 1_350; t <= 2_000; t += 10) sliceAt(t);
     expect(advsOf(posted)).toHaveLength(n + 1);
+  });
+
+  test("changed_advertisements_are_coalesced_to_10_hz", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    // 20 changes in 100 ms, a slice after each.
+    const advAt = (i: number) => [1, 2, 3, 4, 5, 6, 0, 2, 0xff, i];
+    for (let i = 0; i < 20; i++) {
+      fake.setAdv(advAt(i));
+      sliceAt(1_000 + 5 * i);
+    }
+    // The first change after a quiet spell goes out at once.
+    expect(advsOf(posted)).toEqual([advAt(0)]);
+    sliceAt(1_099);
+    expect(advsOf(posted)).toHaveLength(1);
+    // The tick: the latest, not the ones between.
+    sliceAt(1_100);
+    expect(advsOf(posted)).toEqual([advAt(0), advAt(19)]);
+    // A final change is not dropped: it goes out on the next tick.
+    fake.setAdv([]);
+    sliceAt(1_150);
+    expect(advsOf(posted)).toHaveLength(2);
+    sliceAt(1_200);
+    expect(advsOf(posted).at(-1)).toEqual([]);
+    expect(advsOf(posted)).toHaveLength(3);
   });
 
   test("a stopped worker posts no advOut", async () => {
@@ -738,6 +791,17 @@ describe("firmware worker client radio", () => {
     const adv = new Uint8Array([1, 2, 3, 4, 5, 6, 0, 1, 0]);
     heard!({ t: "adv", b: encodeBase64(adv) });
     expect(sent.filter((m) => m.kind === "advIn")).toEqual([{ kind: "advIn", bytes: adv, rssi: LINKED_PEER_RSSI }]);
+  });
+
+  test("a start while hidden pauses the hub until the page is visible", () => {
+    const vis = fakeVisibility(true);
+    const paused: boolean[] = [];
+    const { rt, reply } = clientRig({ visibility: vis.source, onPausedChange: (p) => paused.push(p) });
+    reply({ kind: "ready" });
+    rt.start();
+    expect(paused).toEqual([true]);
+    vis.set(false);
+    expect(paused).toEqual([true, false]);
   });
 
   test("bump is dropped while stopped or hidden, not replayed later", () => {

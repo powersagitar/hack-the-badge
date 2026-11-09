@@ -32,7 +32,8 @@
  *   hub (`../radio/hub.ts`) holds the latest per peer while paused.
  *   `bump()` is dropped the same way. `advOut` goes to the
  *   `onAdvertisement` option. The hidden-page pause
- *   calls `onPausedChange(true)` before its `stop`, and
+ *   calls `onPausedChange(true)` before its `stop` (or at a `start()` while
+ *   the page is hidden, Milestone 11 Task 11), and
  *   `onPausedChange(false)` after its `start` (or after a `stop()` that
  *   ends the pause), so the hub is paused with the badge (ruling R-T9-4).
  * - `provision()` and `reset()` update the cached provisioning state (and
@@ -219,7 +220,9 @@ export function createWorkerFirmwareRuntime(
       if (running) return;
       running = true;
       pausedHidden = visibility.hidden();
-      if (!pausedHidden) send({ kind: "start" });
+      // Started while hidden: the hub is paused with the badge from the start.
+      if (pausedHidden) notify(onPausedChange, true);
+      else send({ kind: "start" });
     },
     stop(): void {
       running = false;

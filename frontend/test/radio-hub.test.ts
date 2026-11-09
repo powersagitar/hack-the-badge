@@ -107,6 +107,7 @@ describe("RadioHub", () => {
     const good = fakeLink("good");
     hub.addLink(bad.link);
     hub.addLink(good.link);
+    hub.setRunning(true);
     quietly(() => {
       expect(() => hub.fromLocal(ADV)).not.toThrow();
       expect(() => hub.bump()).not.toThrow();
@@ -177,10 +178,45 @@ describe("RadioHub", () => {
     const b = fakeLink("b");
     hub.addLink(a.link);
     hub.addLink(b.link);
-    hub.bump();
+    hub.setRunning(true);
+    expect(hub.bump()).toBe(true);
     expect(localBumps()).toBe(1);
     expect(a.sent).toEqual([{ t: "bump" }]);
     expect(b.sent).toEqual([{ t: "bump" }]);
+  });
+
+  test("bump_while_stopped_sends_nothing", () => {
+    const { hub, localBumps } = hubRig();
+    const a = fakeLink("a");
+    hub.addLink(a.link);
+    // A new hub's badge is not running yet.
+    expect(hub.bump()).toBe(false);
+    hub.setRunning(true);
+    hub.setRunning(false);
+    expect(hub.bump()).toBe(false);
+    expect(a.sent).toEqual([]);
+    expect(localBumps()).toBe(0);
+    hub.setRunning(true);
+    expect(hub.bump()).toBe(true);
+    expect(a.sent).toEqual([{ t: "bump" }]);
+    expect(localBumps()).toBe(1);
+  });
+
+  test("bump_while_hidden_sends_nothing", () => {
+    const { hub, localBumps } = hubRig();
+    const a = fakeLink("a");
+    hub.addLink(a.link);
+    hub.setRunning(true);
+    hub.setPaused(true);
+    expect(hub.bump()).toBe(false);
+    expect(a.sent).toEqual([]);
+    expect(localBumps()).toBe(0);
+    // Not replayed when the page is visible again.
+    hub.setPaused(false);
+    expect(a.sent).toEqual([]);
+    expect(hub.bump()).toBe(true);
+    expect(a.sent).toEqual([{ t: "bump" }]);
+    expect(localBumps()).toBe(1);
   });
 
   test("a peer's bump bumps only the local badge", () => {
@@ -261,6 +297,7 @@ describe("RadioHub", () => {
     });
     const a = fakeLink("a");
     hub.addLink(a.link);
+    hub.setRunning(true);
     quietly(() => {
       expect(() => a.receive({ t: "adv", b: encodeBase64(ADV) })).not.toThrow();
       expect(() => a.receive({ t: "bump" })).not.toThrow();

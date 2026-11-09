@@ -12,16 +12,22 @@
  *   advertising) is not sent: a peer's controller keeps no report state,
  *   so silence is enough.
  * - **In.** A link's message is validated here, before it reaches the
- *   Worker: an object whose `t` is `"adv"` or `"bump"`, and for `"adv"` a
- *   canonical base64 string decoding to 7 to `MAX_ADVERTISEMENT_BYTES`
- *   bytes (the core's decoder bounds, ruling R-T8-1). Anything else,
- *   including a hostile getter, is dropped without a throw. An advert is
- *   delivered at {@link LINKED_PEER_RSSI}.
+ *   Worker, by a `valibot` schema (Milestone 11 Task 11): an object whose
+ *   `t` is `"adv"` or `"bump"`, and for `"adv"` a string `b` of at most
+ *   `MAX_BASE64_CHARS`, which must then be canonical base64 decoding to 7
+ *   to `MAX_ADVERTISEMENT_BYTES` bytes (the core's decoder bounds, ruling
+ *   R-T8-1). Anything else, including a hostile getter, is dropped without
+ *   a throw. An advert is delivered at {@link LINKED_PEER_RSSI}.
  * - **No hop.** A peer's message is never forwarded to another link: a
  *   radio does not relay what it hears.
  * - **Bump.** {@link RadioHub.bump} (the page's Bump button) bumps the
  *   local badge and sends `{ t: "bump" }` to every link; a peer's bump
- *   bumps only the local badge.
+ *   bumps only the local badge. It is gated on the local badge: while it
+ *   is not running ({@link RadioHub.setRunning}, which `main.ts` calls at
+ *   the runtime's start and stop) or the hub is paused (the page is
+ *   hidden), `bump()` sends nothing, bumps nothing and returns `false`
+ *   (Milestone 11's ruling R-T11-1, revising Milestone 10's R-T10-1). A
+ *   new hub is not running.
  * - **Paused** (the hidden-page pause, Milestone 7's ruling R-T8-10): the
  *   hub keeps only the latest advertisement per peer, and delivers those
  *   when it resumes. A bump heard while paused is dropped, not replayed
@@ -30,6 +36,7 @@
  * Every call into a link or the target is guarded: a link that throws on
  * send, or a target whose Worker is gone, does not stop the others.
  */
+import * as v from "valibot";
 
 /**
  * The RSSI (dBm) a linked peer is heard at: the same value as
@@ -92,13 +99,19 @@ export function decodeBase64(s: string): Uint8Array | null {
 
 type Incoming = { kind: "adv"; bytes: Uint8Array } | { kind: "bump" };
 
+/** A peer's message on the wire; unknown keys are ignored. */
+const PeerMessageSchema = v.variant("t", [
+  v.object({ t: v.literal("adv"), b: v.pipe(v.string(), v.maxLength(MAX_BASE64_CHARS)) }),
+  v.object({ t: v.literal("bump") }),
+]);
+
 /** A peer's message, validated; `null` if malformed. May throw on a hostile object (the caller guards). */
 function parse(msg: unknown): Incoming | null {
-  if (typeof msg !== "object" || msg === null || Array.isArray(msg)) return null;
-  const { t, b } = msg as { t?: unknown; b?: unknown };
-  if (t === "bump") return { kind: "bump" };
-  if (t !== "adv" || typeof b !== "string" || b.length > MAX_BASE64_CHARS) return null;
-  const bytes = decodeBase64(b);
+  if (Array.isArray(msg)) return null;
+  const parsed = v.safeParse(PeerMessageSchema, msg);
+  if (!parsed.success) return null;
+  if (parsed.output.t === "bump") return { kind: "bump" };
+  const bytes = decodeBase64(parsed.output.b);
   if (!bytes || bytes.length < ADVERTISEMENT_HEADER_BYTES || bytes.length > MAX_ADVERTISEMENT_BYTES) return null;
   return { kind: "adv", bytes };
 }
@@ -106,6 +119,8 @@ function parse(msg: unknown): Incoming | null {
 export class RadioHub {
   private readonly links = new Map<string, RadioLink>();
   private paused = false;
+  /** The local badge's runtime is started (`main.ts`); a new hub's is not. */
+  private running = false;
   /** While paused: the latest advertisement per peer id, in first-heard order. */
   private readonly held = new Map<string, Uint8Array>();
 
@@ -133,10 +148,21 @@ export class RadioHub {
     this.broadcast({ t: "adv", b: encodeBase64(bytes) });
   }
 
-  /** The page's Bump button: bumps the local badge and every linked peer. */
-  bump(): void {
+  /**
+   * The page's Bump button: bumps the local badge and every linked peer,
+   * and returns `true`. While the badge is not running, or the hub is
+   * paused, it does nothing and returns `false`.
+   */
+  bump(): boolean {
+    if (!this.running || this.paused) return false;
     this.guard(() => this.target.bumpLocal());
     this.broadcast({ t: "bump" });
+    return true;
+  }
+
+  /** Whether the local badge's runtime is started; gates {@link bump}. */
+  setRunning(running: boolean): void {
+    this.running = running;
   }
 
   setPaused(paused: boolean): void {

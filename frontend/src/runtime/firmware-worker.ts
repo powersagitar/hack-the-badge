@@ -37,11 +37,16 @@
  * ## The radio (Milestone 10 Task 9)
  *
  * `setMac` is applied once, before the first `start`: the firmware reads
- * the factory MAC at boot. After each slice the Worker reads the badge's
- * advertisement and posts `advOut` when it changed, or when it is
- * unchanged, non-empty and `ADV_REPOST_MS` have passed since the last
- * post (ruling R-PF-3). A stopped Worker runs no slices, so it posts
- * none. `advIn` is checked (a `Uint8Array` of at most
+ * the factory MAC at boot. Only a `setFactoryMac` that returns `true`
+ * locks it; a refused or failed one leaves the next `setMac` to try
+ * (Milestone 11 Task 11). After a slice that ends `ADV_REPOST_MS` or more
+ * after the last `advOut` (R-PF-3's 10 Hz bound), the Worker reads the
+ * badge's advertisement and posts it if it changed, or is unchanged and
+ * non-empty (the re-post). A change inside the window
+ * is not posted at once: the next post, on the tick, carries the latest
+ * advertisement, so changes between are coalesced and the last is never
+ * dropped (Milestone 11 Task 11). A stopped Worker runs no slices, so it
+ * posts none. `advIn` is checked (a `Uint8Array` of at most
  * `MAX_ADVERTISEMENT_BYTES`, an integer RSSI in -128..127) before the
  * emulator sees it; the emulator's decoder rejects the rest.
  *
@@ -94,7 +99,7 @@ export interface WorkerState {
   /** The token of the one live scheduled slice; `0` when none. */
   liveSlice: number;
   sliceSeq: number;
-  /** A MAC was set, or the runtime was started: `setMac` is ignored from now on. */
+  /** A MAC was accepted, or the runtime was started: `setMac` is ignored from now on. */
   macLocked: boolean;
   /** The advertisement last posted as `advOut` (empty: none, or not advertising). */
   lastAdv: Uint8Array;
@@ -133,18 +138,15 @@ function ownBuffer(fb: Uint16Array): ArrayBuffer {
   return fb.slice().buffer as ArrayBuffer;
 }
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-/** Posts the badge's advertisement when it changed, or re-posts it every `ADV_REPOST_MS` while it advertises. */
+/**
+ * Posts the badge's latest advertisement at most every `ADV_REPOST_MS`:
+ * on the tick, if it changed since the last post, or to re-post it while
+ * it advertises.
+ */
 function pollAdvertisement(state: WorkerState, handle: FirmwareEmulatorHandle, post: Post, t: number): void {
+  if (state.lastAdvMs !== null && t - state.lastAdvMs < ADV_REPOST_MS) return;
   const adv = handle.radioAdvertisement();
-  const changed = !sameBytes(adv, state.lastAdv);
-  const due = adv.length > 0 && (state.lastAdvMs === null || t - state.lastAdvMs >= ADV_REPOST_MS);
-  if (!changed && !due) return;
+  if (adv.length === 0 && state.lastAdv.length === 0) return;
   state.lastAdv = adv;
   state.lastAdvMs = t;
   // Not transferred: the Worker keeps it to compare, and it is small.
@@ -280,8 +282,8 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
       case "setMac":
         // Once, before the first start: the firmware reads it at boot.
         if (state.macLocked || !(msg.mac instanceof Uint8Array) || msg.mac.length !== 6) break;
-        state.macLocked = true;
-        state.handle?.setFactoryMac(msg.mac);
+        // Locked only when the emulator took it; a refusal (or a throw) leaves it open.
+        if (state.handle?.setFactoryMac(msg.mac) === true) state.macLocked = true;
         break;
       case "advIn":
         if (isAdvIn(msg)) state.handle?.deliverAdvertisement(msg.bytes, msg.rssi);

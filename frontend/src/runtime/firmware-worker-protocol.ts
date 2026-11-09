@@ -23,9 +23,10 @@
  *   and bounds again and hands it to the emulator at `rssi` dBm.
  * - `bump` plays the bump pulse on the accelerometer.
  * - `advOut` is this badge's advertisement (`addr(6) ‖ addr_type(1) ‖
- *   data`, empty when it stops advertising). The Worker posts it at once
- *   when it changes, and re-posts it every `ADV_REPOST_MS` while it
- *   advertises (ruling R-PF-3), so at most 10 Hz without a change.
+ *   data`, empty when it stops advertising). The Worker posts it at most
+ *   every `ADV_REPOST_MS` (ruling R-PF-3's 10 Hz bound): on the tick, the
+ *   latest when it changed, and a re-post while it advertises. Changes
+ *   inside one window are coalesced (Milestone 11 Task 11).
  */
 import type { ButtonName } from "../badge/input";
 import type { ProvisionState } from "./provisioner";
