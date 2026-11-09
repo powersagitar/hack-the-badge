@@ -46,6 +46,8 @@ function makeFakeHandle(usPerStep = 1) {
   const delivered: Array<{ bytes: number[]; rssi: number }> = [];
   let adv = new Uint8Array(0);
   let advReads = 0;
+  let softResets = 0;
+  let rebootArmed = false;
   const summary = (n: number): CpuRunSummary => ({
     steps: n,
     traps: 0,
@@ -61,6 +63,12 @@ function makeFakeHandle(usPerStep = 1) {
       timeUs = Math.max(before, Math.min(Math.floor(targetUs), before + maxSteps * usPerStep));
       const n = Math.round((timeUs - before) / usPerStep);
       steps += n;
+      if (rebootArmed) {
+        // A soft reset at the target: the core adds REBOOT_US at once.
+        rebootArmed = false;
+        softResets++;
+        timeUs += REBOOT_US;
+      }
       return summary(n);
     },
     reset() {},
@@ -95,6 +103,8 @@ function makeFakeHandle(usPerStep = 1) {
       delivered.push({ bytes: [...bytes], rssi });
       return true;
     },
+    softResetCount: () => softResets,
+    rebootUs: () => REBOOT_US,
     dispose() {},
   };
   return {
@@ -109,8 +119,13 @@ function makeFakeHandle(usPerStep = 1) {
     advReads: () => advReads,
     print: (s: string) => (consoleText += s),
     setTimeUs: (t: number) => (timeUs = t),
+    /** The next `runUntil` ends in one soft reset. */
+    armReboot: () => (rebootArmed = true),
   };
 }
+
+/** `emulator_core::rom::REBOOT_US` (test/cpu-wasm.test.ts checks the passthrough). */
+const REBOOT_US = 466_000;
 
 /** A Worker state over a fake handle, a settable wall clock and a manual slice queue. */
 function workerRig(usPerStep = 1) {
@@ -216,7 +231,26 @@ describe("firmware worker", () => {
     const statuses = posted.filter((m) => m.kind === "status");
     // At 0, 250, 500, 750 and 1,000 ms.
     expect(statuses).toHaveLength(5);
-    expect(statuses.at(-1)).toEqual({ kind: "status", speed: expect.closeTo(1, 5), provision: null });
+    expect(statuses.at(-1)).toEqual({ kind: "status", speed: expect.closeTo(1, 5), provision: null, softResets: 0 });
+  });
+
+  test("status_is_posted_at_once_on_a_soft_reset", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0); // posts the first status
+    sliceAt(10);
+    expect(posted.filter((m) => m.kind === "status")).toHaveLength(1);
+    // A reset 20 ms in, well inside the 250 ms throttle window.
+    fake.armReboot();
+    sliceAt(20);
+    const statuses = posted.filter((m) => m.kind === "status");
+    expect(statuses).toHaveLength(2);
+    expect(statuses.at(-1)).toEqual({ kind: "status", speed: expect.closeTo(1, 5), provision: null, softResets: 1 });
+    // No reset since: back to the throttle.
+    sliceAt(30);
+    expect(posted.filter((m) => m.kind === "status")).toHaveLength(2);
+    sliceAt(270);
+    expect(posted.filter((m) => m.kind === "status")).toHaveLength(3);
   });
 
   test("a button message for an unknown name is ignored without throwing", async () => {
@@ -282,6 +316,7 @@ describe("firmware worker", () => {
       kind: "status",
       speed: expect.any(Number),
       provision: null,
+      softResets: 0,
     });
   });
 
@@ -589,7 +624,7 @@ describe("firmware worker client", () => {
     reply({ kind: "ready" });
     rt.provision("{}");
     expect(rt.provisionState()).toEqual({ kind: "waiting" });
-    reply({ kind: "status", speed: 0.75, provision: { kind: "typing" } as never });
+    reply({ kind: "status", speed: 0.75, provision: { kind: "typing" } as never, softResets: 0 });
     expect(rt.speed()).toBe(0.75);
     expect(rt.provisionState()).toEqual({ kind: "typing" } as never);
     rt.reset();

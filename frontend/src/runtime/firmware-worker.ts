@@ -28,8 +28,11 @@
  *
  * A slice with no frame in flight posts the current framebuffer, its
  * buffer transferred; the next frame waits for the client's `frameAck`.
- * `status` (speed and provisioning state) goes out at most every
- * `STATUS_INTERVAL_MS`.
+ * `status` (speed, provisioning state and the software reset count) goes
+ * out at most every `STATUS_INTERVAL_MS`, and at once, outside that
+ * throttle, when the reset count changed since the last `status`
+ * (Milestone 11 Task 8), so the status line never shows the old boot's
+ * state for up to 250 ms.
  *
  * ## The radio (Milestone 10 Task 9)
  *
@@ -86,6 +89,8 @@ export interface WorkerState {
   lastCapped: boolean;
   /** `host.now()` of the last `status`, or `null` (none yet). */
   lastStatusMs: number | null;
+  /** The `softResets` the last `status` carried. */
+  lastStatusSoftResets: number;
   /** The token of the one live scheduled slice; `0` when none. */
   liveSlice: number;
   sliceSeq: number;
@@ -107,6 +112,7 @@ export function createWorkerState(host: WorkerHost): WorkerState {
     frameInFlight: false,
     lastCapped: false,
     lastStatusMs: null,
+    lastStatusSoftResets: 0,
     liveSlice: 0,
     sliceSeq: 0,
     macLocked: false,
@@ -174,9 +180,15 @@ function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: 
         state.lastCapped = r.capped;
         const t = host.now();
         pollAdvertisement(state, handle, post, t);
-        if (state.lastStatusMs === null || t - state.lastStatusMs >= STATUS_INTERVAL_MS) {
+        const softResets = handle.softResetCount();
+        if (
+          state.lastStatusMs === null ||
+          t - state.lastStatusMs >= STATUS_INTERVAL_MS ||
+          softResets !== state.lastStatusSoftResets
+        ) {
           state.lastStatusMs = t;
-          post({ kind: "status", speed: rt.speed(), provision: rt.provisionState() });
+          state.lastStatusSoftResets = softResets;
+          post({ kind: "status", speed: rt.speed(), provision: rt.provisionState(), softResets });
         }
       },
       scheduleFrame: (cb) => {

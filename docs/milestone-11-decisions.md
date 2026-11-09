@@ -876,6 +876,20 @@ unless another date is given.
   segments), with the same entry points (0 and 2). No segment has
   `p_memsz` above `p_filesz`. The loader, like `objcopy -O binary`,
   stops at the last file byte, and `FlatBus` starts zeroed anyway.
+- Ruling R-T8-1: the reboot's debt is paid by each frame's *clamped*
+  wall delta (at most `MAX_FRAME_DELTA_MS`), as new emulated time is, so
+  a tab back from the background pays 50 ms of the pause, not all of it;
+  a cold `reset()` drops the debt — cost if wrong: a pause up to 466 ms
+  longer after a backgrounded reboot.
+- Ruling R-T8-2: the speed reading counts the debt a frame paid as
+  emulated time (and leaves the jump out), so the readout stays at the
+  core's speed through the pause instead of dropping to 0x — cost if
+  wrong: a readout that hides a 466 ms freeze, which is the badge's own.
+- Ruling R-T8-3: only the tap queue's `downSince`/`upSince` move past the
+  jump; a shake or bump playing across a reboot is not shifted, so its
+  remaining pulse is cut short — cost if wrong: a shake or bump timed
+  across a reboot misses its last periods (v392's five apps that open by
+  rebooting are entered by a button, and Connect's bump does not reboot).
 
 ## Milestone 12 backlog
 

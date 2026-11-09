@@ -9,8 +9,9 @@
  *   a transferred buffer. At most one is in flight: the Worker posts the
  *   next only after the client's `frameAck`, which the client sends after
  *   painting (or after dropping a frame while stopped).
- * - `status` carries the speed reading and the provisioning state, at most
- *   every 250 ms (`STATUS_INTERVAL_MS`).
+ * - `status` carries the speed reading, the provisioning state and the
+ *   software reset count, at most every 250 ms (`STATUS_INTERVAL_MS`),
+ *   and at once when the reset count changes (Milestone 11 Task 8).
  *
  * The radio (Milestone 10 Task 9):
  *
@@ -46,7 +47,7 @@ export type ToWorker =
 export type FromWorker =
   | { kind: "ready" }
   | { kind: "frame"; pixels: ArrayBuffer; width: number; height: number }
-  | { kind: "status"; speed: number; provision: ProvisionState | null }
+  | { kind: "status"; speed: number; provision: ProvisionState | null; softResets: number }
   | { kind: "advOut"; bytes: Uint8Array }
   | { kind: "error"; message: string };
 

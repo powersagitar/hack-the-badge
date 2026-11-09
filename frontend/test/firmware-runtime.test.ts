@@ -124,14 +124,37 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
     setFactoryMac: () => true,
     radioAdvertisement: () => new Uint8Array(0),
     deliverAdvertisement: () => false,
+    softResetCount: () => softResets,
+    rebootUs: () => REBOOT_US,
     dispose(): void {
       counters.disposeCalls++;
     },
     ...overrides,
   };
 
-  return { handle, runBudgets, runUntilCalls, buttonCalls, counters };
+  let softResets = 0;
+  let rebootsArmed = 0;
+  /**
+   * The next `runUntil` reaches its target and then soft-resets `n` times,
+   * as the core does: each reset adds `REBOOT_US` to emulated time at once.
+   */
+  const armReboot = (n = 1) => (rebootsArmed = n);
+  const plainRunUntil = handle.runUntil;
+  handle.runUntil = (targetUs, maxSteps) => {
+    const s = plainRunUntil(targetUs, maxSteps);
+    if (rebootsArmed > 0) {
+      softResets += rebootsArmed;
+      timeUs += rebootsArmed * REBOOT_US;
+      rebootsArmed = 0;
+    }
+    return s;
+  };
+
+  return { handle, runBudgets, runUntilCalls, buttonCalls, counters, armReboot };
 }
+
+/** `emulator_core::rom::REBOOT_US`, which the wasm `rebootUs` passes through (test/cpu-wasm.test.ts checks it). */
+const REBOOT_US = 466_000;
 
 describe("RAW_SLOT_BY_BUTTON", () => {
   test("is a total mapping over BUTTON_NAMES with no duplicate slots", () => {
@@ -189,7 +212,7 @@ describe("stepFirmwareFrame", () => {
     const { present, getPutImageDataCalls } = makeStubCtx();
     const r = stepFirmwareFrame(handle, present, 16, 1_000_000);
     expect(runUntilCalls).toEqual([[16_000, 1_000_000]]);
-    expect(r).toEqual({ emulatedDeltaUs: 16_000, capped: false });
+    expect(r).toEqual({ emulatedDeltaUs: 16_000, capped: false, rebootUs: 0 });
     expect(getPutImageDataCalls()).toBe(1);
   });
   test("a capped frame drops its debt", () => {
@@ -389,7 +412,7 @@ function pacedRig(opts: { usPerStep?: number; stepsPerFrame?: number } = {}) {
     cancelFrame: () => {},
   });
   const frameAt = (t: number) => queued.shift()?.(t);
-  return { rt, frameAt, fake: fake.handle, buttonCalls: fake.buttonCalls };
+  return { rt, frameAt, fake: fake.handle, buttonCalls: fake.buttonCalls, armReboot: fake.armReboot };
 }
 
 describe("FirmwareRuntime pacing", () => {
@@ -439,6 +462,134 @@ describe("FirmwareRuntime pacing", () => {
     for (let t = 1_000; t <= 1_000 + 4 * 50; t += 50) frameAt(t);
     const releasesOfA = buttonCalls.filter(([slot, p]) => slot === RAW_SLOT_BY_BUTTON.A && !p);
     expect(releasesOfA.length).toBe(1);
+  });
+});
+
+describe("FirmwareRuntime reboot pause", () => {
+  test("reboot_is_paced_as_wall_time", () => {
+    const { rt, frameAt, fake, armReboot } = pacedRig();
+    rt.start();
+    frameAt(0);
+    frameAt(16);
+    expect(rt.speed()).toBeCloseTo(1, 5);
+    // The frame to 32 ms ends in a soft reset: emulated time jumps by REBOOT_US.
+    const armed = 32_000 + REBOOT_US;
+    armReboot();
+    frameAt(32);
+    expect(fake.emulatedTimeUs()).toBe(armed);
+    // The jump frame's speed leaves the jump out.
+    expect(rt.speed()).toBeCloseTo(1, 5);
+    // The pause: REBOOT_US / 1000 ms of wall time run no emulated time.
+    for (let t = 48; t < 32 + REBOOT_US / 1000; t += 16) {
+      frameAt(t);
+      expect(fake.emulatedTimeUs()).toBe(armed);
+      expect(rt.speed()).toBeCloseTo(1, 5);
+    }
+    // 512 ms: the last 2 ms of the pause, then 14 ms of new time.
+    frameAt(512);
+    expect(fake.emulatedTimeUs()).toBe(armed + 14_000);
+    frameAt(528);
+    expect(fake.emulatedTimeUs()).toBe(armed + 30_000);
+    expect(rt.speed()).toBeCloseTo(1, 5);
+  });
+
+  test("several soft resets in one frame pay n x rebootUs", () => {
+    const { rt, frameAt, fake, armReboot } = pacedRig();
+    rt.start();
+    frameAt(0);
+    armReboot(2);
+    frameAt(16);
+    const armed = 16_000 + 2 * REBOOT_US;
+    expect(fake.emulatedTimeUs()).toBe(armed);
+    for (let t = 66; t < 16 + (2 * REBOOT_US) / 1000; t += 50) {
+      frameAt(t);
+      expect(fake.emulatedTimeUs()).toBe(armed);
+    }
+    // 16 + 932 = 948 ms ends the pause; the frame at 966 runs 18 ms.
+    frameAt(966);
+    expect(fake.emulatedTimeUs()).toBe(armed + 18_000);
+  });
+
+  test("a frame longer than MAX_FRAME_DELTA_MS pays only the clamped delta", () => {
+    const { rt, frameAt, fake, armReboot } = pacedRig();
+    rt.start();
+    frameAt(0);
+    armReboot();
+    frameAt(16);
+    const armed = 16_000 + REBOOT_US;
+    // A 10 s background gap pays 50 ms of the pause, not all of it.
+    frameAt(10_016);
+    expect(fake.emulatedTimeUs()).toBe(armed);
+  });
+
+  test("a cold reset() drops the pause", () => {
+    const { rt, frameAt, fake, armReboot } = pacedRig();
+    rt.start();
+    frameAt(0);
+    armReboot();
+    frameAt(16);
+    const armed = fake.emulatedTimeUs();
+    rt.reset();
+    frameAt(32); // first frame after reset: runs nothing
+    frameAt(48);
+    expect(fake.emulatedTimeUs()).toBe(armed + 16_000);
+  });
+
+  test("tap_held_across_a_reboot_keeps_its_hold", () => {
+    const { rt, frameAt, fake, buttonCalls, armReboot } = pacedRig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    rt.start();
+    frameAt(0);
+    frameAt(16);
+    // Pressed at 16,000 µs and let go at once: held for PRESS_HOLD_US.
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([[A, true]]);
+    // The firmware reboots 16 ms into the hold.
+    armReboot();
+    frameAt(32);
+    // 84 ms of hold remain after the pause (which ends at 498 ms): the
+    // release fires at 582 ms of wall time, not in the jump frame.
+    for (let t = 48; t <= 576; t += 16) {
+      frameAt(t);
+      expect(buttonCalls).toEqual([[A, true]]);
+    }
+    frameAt(592);
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    // Not stuck down, and released exactly once.
+    for (let t = 608; t <= 800; t += 16) frameAt(t);
+    expect(buttonCalls.at(-1)).toEqual([A, false]);
+    expect(buttonCalls.filter(([, p]) => !p)).toHaveLength(1);
+    expect(fake.emulatedTimeUs()).toBe(800_000);
+  });
+
+  test("a release gap across a reboot counts only non-jump time", () => {
+    const { rt, frameAt, buttonCalls, armReboot } = pacedRig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    rt.start();
+    frameAt(0);
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    rt.injectButton("A", "pressed");
+    rt.injectButton("A", "released");
+    for (let t = 16; t <= 96; t += 16) frameAt(t);
+    frameAt(100); // released at 100,000 µs; the next press waits RELEASE_GAP_US
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    armReboot();
+    frameAt(116); // reboot 16 ms into the gap
+    // The pause ends at 582 ms; 24 ms of gap remain: the press is due at 606 ms.
+    for (let t = 132; t < 606; t += 16) {
+      frameAt(t);
+      expect(buttonCalls).toHaveLength(2);
+    }
+    frameAt(606);
+    expect(buttonCalls.at(-1)).toEqual([A, true]);
   });
 });
 

@@ -81,6 +81,23 @@
  * cap does not bind (each one advances only 50 ms), and the readout has to
  * show that. A tab returning from the background therefore contributes one
  * near-zero sample, at the smoothing's 0.1 weight.
+ *
+ * ## The reboot's pause (Milestone 11 Task 8)
+ *
+ * A software reset adds `rebootUs()` (the core's `REBOOT_US`, 466 ms) to
+ * emulated time in one jump, inside the frame that reached it. Measured
+ * from the new emulated time, the pacing would absorb the jump at once.
+ * Instead the frame reports it ({@link FrameResult.rebootUs}, `n` resets
+ * x `rebootUs()`), and the runtime carries it as wall-clock debt: each
+ * later frame's clamped wall delta pays the debt down before it runs any
+ * new emulated time, so the screen holds for about 466 ms, as the
+ * badge's does. While the debt is paid, emulated time does not move.
+ *
+ * The speed reading leaves the jump out, and counts the debt a frame paid
+ * as emulated time: the badge is rebooting at its own speed, not running
+ * slow. A tap's `downSince` and `upSince` move forward by the jump, so a
+ * hold or a release gap counts only non-jump emulated time, and a tap
+ * held across a reboot still lasts its full `PRESS_HOLD_US`.
  */
 import type { ButtonName } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
@@ -240,10 +257,15 @@ export function frameTargetUs(emulatedUs: number, wallDeltaMs: number): number {
 
 /** What one {@link stepFirmwareFrame} did. */
 export interface FrameResult {
-  /** Emulated time (µs) the frame advanced. */
+  /** Emulated time (µs) the frame advanced, any reboot's jump included. */
   emulatedDeltaUs: number;
   /** The step cap stopped the frame short of its target (the debt is dropped). */
   capped: boolean;
+  /**
+   * Emulated time (µs) the frame's software resets added in one jump:
+   * the resets it ran x `rebootUs()`, or 0. See "The reboot's pause".
+   */
+  rebootUs: number;
 }
 
 /**
@@ -261,13 +283,19 @@ export function stepFirmwareFrame(
   stepsPerFrame: number,
 ): FrameResult {
   const before = handle.emulatedTimeUs();
+  const resetsBefore = handle.softResetCount();
   const target = frameTargetUs(before, wallDeltaMs);
   handle.runUntil(target, stepsPerFrame);
   const after = handle.emulatedTimeUs();
+  const resets = handle.softResetCount() - resetsBefore;
   present(handle.framebuffer(), handle.screenWidth, handle.screenHeight);
   // The wasm shim truncates the target to whole µs (`target_us as u64`), so
   // an uncapped frame with a fractional rAF delta ends at floor(target).
-  return { emulatedDeltaUs: after - before, capped: after < Math.floor(target) };
+  return {
+    emulatedDeltaUs: after - before,
+    capped: after < Math.floor(target),
+    rebootUs: resets > 0 ? resets * handle.rebootUs() : 0,
+  };
 }
 
 export interface FirmwareRuntime {
@@ -357,6 +385,11 @@ export function createFirmwareRuntime(
   let lastWallMs: number | null = null;
   /** Exponentially smoothed emulated/wall ratio; `0` before the second frame. */
   let speed = 0;
+  /**
+   * Emulated µs of reboot jumps not yet paid in wall time: later frames
+   * run no new emulated time until it is paid. See "The reboot's pause".
+   */
+  let rebootDebtUs = 0;
 
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
@@ -446,6 +479,17 @@ export function createFirmwareRuntime(
   }
 
   /**
+   * Moves every tap's `downSince` and `upSince` forward by a reboot's
+   * jump (`jumpUs`), so holds and release gaps count only non-jump time.
+   */
+  function shiftTapsPastReboot(jumpUs: number): void {
+    for (const state of buttonTaps.values()) {
+      if (state.downSince !== null) state.downSince += jumpUs;
+      if (state.upSince !== null) state.upSince += jumpUs;
+    }
+  }
+
+  /**
    * Drops every queued tap and releases a button held down in the emulator
    * that the user has let go of. One the user is still holding stays down,
    * as its only tap. Release times are kept: emulated time does not move
@@ -476,10 +520,20 @@ export function createFirmwareRuntime(
     const wallMs = now ? now() : timeMs;
     const delta = lastWallMs === null ? 0 : wallMs - lastWallMs;
     lastWallMs = wallMs;
-    const r = stepFirmwareFrame(handle, present, delta, stepsPerFrame);
+    // The clamped wall delta pays the reboot's debt first; the rest runs.
+    // Without debt the delta passes through untouched (no µs round trip).
+    const paidUs = Math.min(rebootDebtUs, frameTargetUs(0, delta));
+    rebootDebtUs -= paidUs;
+    const runMs = paidUs > 0 ? Math.min(Math.max(delta, 0), MAX_FRAME_DELTA_MS) - paidUs / 1000 : delta;
+    const r = stepFirmwareFrame(handle, present, runMs, stepsPerFrame);
+    if (r.rebootUs > 0) {
+      rebootDebtUs += r.rebootUs;
+      shiftTapsPastReboot(r.rebootUs);
+    }
     if (delta > 0) {
-      // The real frame time, not the clamped one: see "Pacing" above.
-      const ratio = r.emulatedDeltaUs / (delta * 1000);
+      // The real frame time, not the clamped one: see "Pacing" above. The
+      // jump is left out and the paid debt counted: see "The reboot's pause".
+      const ratio = (r.emulatedDeltaUs - r.rebootUs + paidUs) / (delta * 1000);
       speed = speed === 0 ? ratio : 0.9 * speed + 0.1 * ratio;
     }
     // The provisioner's timeout is in steps; holds and shakes in emulated time.
@@ -559,6 +613,8 @@ export function createFirmwareRuntime(
     }
     speed = 0;
     lastWallMs = null;
+    // A cold power-on starts at 0 µs with no reboot to wait out.
+    rebootDebtUs = 0;
     // The emulator's acceleration survives a reset; put it back at rest.
     handle.setAcceleration(...REST_ACCELERATION);
     handle.reset();

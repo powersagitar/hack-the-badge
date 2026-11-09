@@ -156,6 +156,9 @@ describe("emulator-wasm firmware-boot boundary", () => {
     const handle = createFirmwareEmulator(new Uint8Array(image));
     try {
       expect(handle.emulatedTimeUs()).toBe(0);
+      // Task 8's pause: the core's REBOOT_US, and no reset yet.
+      expect(handle.rebootUs()).toBe(466_000);
+      expect(handle.softResetCount()).toBe(0);
       const s = handle.runUntil(1_000, 1_000_000);
       expect(handle.emulatedTimeUs()).toBeGreaterThanOrEqual(1_000);
       expect(s.steps).toBe(handle.totalSteps());

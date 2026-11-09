@@ -117,6 +117,13 @@ export interface FirmwareEmulatorHandle {
    * bad bytes.
    */
   deliverAdvertisement(bytes: Uint8Array, rssi: number): boolean;
+  /** Software resets since construction or the last `reset()`. */
+  softResetCount(): number;
+  /**
+   * Emulated µs each software reset adds to {@link emulatedTimeUs} at once
+   * (the core's `REBOOT_US`): the reboot's duration.
+   */
+  rebootUs(): number;
   /** Releases the WASM-side emulator. Calling anything else afterwards throws. */
   dispose(): void;
 }
@@ -252,6 +259,14 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     deliverAdvertisement(bytes: Uint8Array, rssi: number): boolean {
       assertLive();
       return wasm.deliverAdvertisement(bytes, rssi);
+    },
+    softResetCount(): number {
+      assertLive();
+      return wasm.softResetCount;
+    },
+    rebootUs(): number {
+      assertLive();
+      return wasm.rebootUs;
     },
     dispose(): void {
       if (disposed) return;

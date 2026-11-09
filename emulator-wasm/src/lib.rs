@@ -180,6 +180,14 @@ impl FirmwareEmulator {
         self.inner.soft_reset_count()
     }
 
+    /// Emulated µs each software reset adds at once (`emulator_core::rom::REBOOT_US`),
+    /// which the browser's pacing holds the screen for. `f64` for a plain
+    /// JS `number`, as [`FirmwareEmulator::total_steps`].
+    #[wasm_bindgen(getter, js_name = rebootUs)]
+    pub fn reboot_us(&self) -> f64 {
+        emulator_core::rom::REBOOT_US as f64
+    }
+
     /// Everything the firmware has printed to its console so far. A method
     /// (not a getter) since it does real work (lossy UTF-8 decode of the
     /// capped console ring) on every call rather than exposing cheap state.
