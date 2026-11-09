@@ -21,6 +21,13 @@ export const BUTTON_NAMES = [
 ] as const;
 export type ButtonName = (typeof BUTTON_NAMES)[number];
 
+/**
+ * Where a press or release came from: the keyboard or the on-screen pad.
+ * The firmware runtime holds a button down while any source holds it
+ * (Milestone 11 Task 13); the Lua sandbox ignores it.
+ */
+export type ButtonSource = "key" | "pad";
+
 export const BUTTON_IDS: Record<ButtonName, number> = BUTTON_NAMES.reduce(
   (acc, name, i) => {
     acc[name] = 1 << i;

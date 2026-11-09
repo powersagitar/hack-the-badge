@@ -295,7 +295,7 @@ function badgeRig(opts: { otherTab?: boolean; boot?: "ready" | "error" } = {}) {
   const el = (id: string) => doc().getElementById(id)!;
   const pick = (label: string) => button(el("mode-toggle"), label).click();
   const noticeShown = () => el("badge-notice").style.display !== "none";
-  return { controller, locks, workers, running, fills, el, pick, noticeShown, canvas };
+  return { controller, shell, locks, workers, running, fills, el, pick, noticeShown, canvas };
 }
 
 /** Runs `body` with `console.error` silenced, returning what it was called with. */
@@ -374,6 +374,33 @@ describe("badge controller", () => {
     expect(r.workers).toHaveLength(0);
     expect(r.noticeShown()).toBe(true);
     expect(r.locks.held()).toBe(true); // still the other tab's
+  });
+
+  test("the keyboard's buttons reach the Worker as the key source, the pad's as the pad", async () => {
+    const r = badgeRig();
+    // mountKeyboard listens on the global window; happy-dom's, for this test.
+    const savedWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    Object.defineProperty(globalThis, "window", { value: win, configurable: true, writable: true });
+    try {
+      r.shell.mountButtons(r.controller.inject);
+      r.shell.mountKeyboard(r.controller.inject);
+      r.pick("Real Firmware");
+      await settle();
+      const sent = r.workers[0]!.sent;
+      win.dispatchEvent(new win.KeyboardEvent("keydown", { code: "KeyZ" }));
+      button(r.el("button-pad"), "A").dispatchEvent(new win.MouseEvent("mousedown"));
+      button(r.el("button-pad"), "A").dispatchEvent(new win.MouseEvent("mouseup"));
+      win.dispatchEvent(new win.KeyboardEvent("keyup", { code: "KeyZ" }));
+      expect(sent.filter((m) => m.kind === "button")).toEqual([
+        { kind: "button", button: "A", pressed: true, source: "key" },
+        { kind: "button", button: "A", pressed: true, source: "pad" },
+        { kind: "button", button: "A", pressed: false, source: "pad" },
+        { kind: "button", button: "A", pressed: false, source: "key" },
+      ]);
+    } finally {
+      if (savedWindow) Object.defineProperty(globalThis, "window", savedWindow);
+      else delete (globalThis as { window?: unknown }).window;
+    }
   });
 
   test("notice_clears_the_canvas", async () => {

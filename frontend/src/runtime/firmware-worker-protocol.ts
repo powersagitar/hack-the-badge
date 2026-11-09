@@ -28,14 +28,15 @@
  *   latest when it changed, and a re-post while it advertises. Changes
  *   inside one window are coalesced (Milestone 11 Task 11).
  */
-import type { ButtonName } from "../badge/input";
+import type { ButtonName, ButtonSource } from "../badge/input";
 import type { ProvisionState } from "./provisioner";
 
 export type ToWorker =
   | { kind: "init"; wasm: ArrayBuffer; image: ArrayBuffer }
   | { kind: "start" }
   | { kind: "stop" }
-  | { kind: "button"; button: ButtonName; pressed: boolean }
+  /** `source` is optional: a message without one (or with an unknown one) is the pad's. */
+  | { kind: "button"; button: ButtonName; pressed: boolean; source?: ButtonSource }
   | { kind: "provision"; identityJson: string }
   | { kind: "shake" }
   | { kind: "bump" }

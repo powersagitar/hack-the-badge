@@ -19,6 +19,15 @@
  * out in [`PUT_CHUNK_BYTES`] chunks at least [`PUT_CHUNK_GAP_STEPS`] steps
  * apart (measured with `handle.totalSteps()`), at most one per poll. `put`
  * blocks until all bytes arrive, so a slower poller only takes longer.
+ *
+ * The first prompt (Milestone 11 Task 13): the console keeps its text
+ * across a soft reset, so the old boot's idle `badge> ` is still in it
+ * after a reboot, and that REPL is gone. The first `put` is typed only
+ * once a prompt appears at or after `bootConsoleStart()`, the console
+ * offset where the current boot began (the firmware runtime records it at
+ * each soft reset; 0 without one). A prompt the current boot printed
+ * before `provision()` still counts: its REPL is idle at it, and prints no
+ * new one until it gets a line.
  */
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 
@@ -57,7 +66,16 @@ function completeLine(text: string, at: number): string | undefined {
   return end < 0 ? undefined : text.slice(start, end).trim();
 }
 
-export function createProvisioner(handle: FirmwareEmulatorHandle, identityJson: string): Provisioner {
+/**
+ * `bootConsoleStart` returns the console offset where the current boot
+ * began (see the module doc); it is read at every poll, so a reboot while
+ * the provisioner waits for its first prompt moves it on.
+ */
+export function createProvisioner(
+  handle: FirmwareEmulatorHandle,
+  identityJson: string,
+  bootConsoleStart: () => number = () => 0,
+): Provisioner {
   const encoder = new TextEncoder();
   const payload = encoder.encode(identityJson);
   type Phase = "prompt" | "ready" | "payload" | "putReply" | "applyReply" | "done";
@@ -68,7 +86,8 @@ export function createProvisioner(handle: FirmwareEmulatorHandle, identityJson: 
    * (`CONSOLE_CAPACITY`, emulator-core `console.rs`), far above what boot
    * and provisioning print (an idle badge holds about 2.3 KB). Past a wrap,
    * `since()` is a shifted window: it may re-see older output or, with the
-   * buffer full, show nothing new, and the caller's timeout fires.
+   * buffer full, show nothing new, and the caller's timeout fires. The same
+   * holds for `bootConsoleStart()`.
    */
   let marker = 0;
   let sent = 0;
@@ -116,7 +135,7 @@ export function createProvisioner(handle: FirmwareEmulatorHandle, identityJson: 
     poll(): ProvisionState {
       switch (phase) {
         case "prompt":
-          if (!handle.consoleOutput().includes(PROMPT)) return result;
+          if (handle.consoleOutput().indexOf(PROMPT, bootConsoleStart()) < 0) return result;
           result = { kind: "typing" };
           if (typeLine(`put ${IDENTITY_PATH} ${payload.length}`)) phase = "ready";
           return result;

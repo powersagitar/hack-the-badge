@@ -268,7 +268,9 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
         rt.stop();
         break;
       case "button":
-        if (isButtonName(msg.button)) rt.injectButton(msg.button, msg.pressed === true ? "pressed" : "released");
+        if (isButtonName(msg.button)) {
+          rt.injectButton(msg.button, msg.pressed === true ? "pressed" : "released", msg.source === "key" ? "key" : "pad");
+        }
         break;
       case "provision":
         if (typeof msg.identityJson === "string") rt.provision(msg.identityJson);

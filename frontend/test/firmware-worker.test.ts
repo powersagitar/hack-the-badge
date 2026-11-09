@@ -285,6 +285,23 @@ describe("firmware worker", () => {
     expect(fake.handle.emulatedTimeUs()).toBe(PRESS_HOLD_US);
   });
 
+  test("a button message's source reaches the runtime; a missing or unknown one is the pad", async () => {
+    const { fake, send, sliceAt } = await bootedRig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    send({ kind: "start" });
+    sliceAt(0);
+    send({ kind: "button", button: "A", pressed: true, source: "key" });
+    send({ kind: "button", button: "A", pressed: true });
+    send({ kind: "button", button: "A", pressed: false, source: "bogus" } as unknown as ToWorker);
+    for (let t = 50; t <= 500; t += 50) sliceAt(t);
+    expect(fake.buttonCalls).toEqual([[A, true]]);
+    send({ kind: "button", button: "A", pressed: false, source: "key" });
+    expect(fake.buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+  });
+
   test("stop cancels the scheduled slice and a restart runs one chain", async () => {
     const { fake, send, sliceAt, slices } = await bootedRig();
     send({ kind: "start" });
@@ -578,15 +595,17 @@ describe("firmware worker client", () => {
     expect(sent.map((m) => m.kind)).toEqual(["init"]);
     reply({ kind: "ready" });
     expect(sent.slice(1)).toEqual([
-      { kind: "button", button: "A", pressed: true },
+      { kind: "button", button: "A", pressed: true, source: "pad" },
       { kind: "provision", identityJson: '{"a":1}' },
       { kind: "start" },
-      { kind: "button", button: "A", pressed: false },
+      { kind: "button", button: "A", pressed: false, source: "pad" },
       { kind: "stop" },
     ]);
     // After ready, messages go straight through.
     rt.shake();
     expect(sent.at(-1)).toEqual({ kind: "shake" });
+    rt.injectButton("B", "pressed", "key");
+    expect(sent.at(-1)).toEqual({ kind: "button", button: "B", pressed: true, source: "key" });
   });
 
   test("init transfers the WASM bytes and the image", () => {

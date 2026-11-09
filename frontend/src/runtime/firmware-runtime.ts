@@ -98,8 +98,22 @@
  * slow. A tap's `downSince` and `upSince` move forward by the jump, so a
  * hold or a release gap counts only non-jump emulated time, and a tap
  * held across a reboot still lasts its full `PRESS_HOLD_US`.
+ *
+ * ## Tap sources and taps across `stop()` (Milestone 11 Task 13)
+ *
+ * A button can be held by the keyboard and the pad at once
+ * ({@link ButtonSource}). It is down while any source holds it, and its
+ * tap is let go when every source has; a source releasing a button it
+ * never pressed changes nothing. `stop()` releases a tap whose user has
+ * let go (its deferred release, R-M8-6) but keeps the taps queued behind
+ * it: emulated time does not run while stopped, so they play after the
+ * next `start()`, with their full hold and release gap.
+ *
+ * The runtime also records where the current boot's console text begins
+ * (the console's length at the frame that ended at a soft reset), for the
+ * provisioner's first prompt (`./provisioner.ts`).
  */
-import type { ButtonName } from "../badge/input";
+import type { ButtonName, ButtonSource } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
 
@@ -302,13 +316,16 @@ export interface FirmwareRuntime {
   /** Begins the per-frame step+blit loop. Idempotent while already running. */
   start(): void;
   /**
-   * Stops the loop, releases any button whose release was deferred (see
-   * `PRESS_HOLD_US`) and drops queued taps (see `MAX_QUEUED_TAPS`). Does
-   * not dispose the underlying emulator handle.
+   * Stops the loop and releases any button whose release was deferred (see
+   * `PRESS_HOLD_US`). Taps queued behind it are kept, and play after the
+   * next `start()`. Does not dispose the underlying emulator handle.
    */
   stop(): void;
-  /** Mirrors `lifecycle.ts`'s `AppRuntime.injectButton` signature. */
-  injectButton(button: ButtonName, kind: "pressed" | "released"): void;
+  /**
+   * `lifecycle.ts`'s `AppRuntime.injectButton`, plus the press's source
+   * (default `"pad"`): see "Tap sources and taps across `stop()`".
+   */
+  injectButton(button: ButtonName, kind: "pressed" | "released", source?: ButtonSource): void;
   /** Starts typing the provisioning flow for `identityJson`, replacing any in flight. */
   provision(identityJson: string): void;
   /** The current provisioning state, or `null` if none was started since the last reset. */
@@ -395,6 +412,13 @@ export function createFirmwareRuntime(
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
   /**
+   * Console offset where the current boot's text begins: 0 until a soft
+   * reset, then the console's length in the frame that ended at it (the
+   * core's `run_until` stops at a reset whose jump passes the target,
+   * which a frame's at most 50 ms target always is).
+   */
+  let bootConsoleStart = 0;
+  /**
    * The accelerometer motion playing (a shake or a bump): its profile and
    * the emulated time (µs) it began, or `null`.
    */
@@ -405,11 +429,14 @@ export function createFirmwareRuntime(
    * (at most `MAX_QUEUED_TAPS`). The first is the one held in the emulator
    * while `downSince` is set; the rest wait their turn. `upSince` is the
    * emulated time (µs) of the button's last release, for `RELEASE_GAP_US`.
+   * `held` is the sources holding the last tap: it is non-empty exactly
+   * while the last tap exists and is not yet let go.
    */
   interface ButtonTaps {
     taps: boolean[];
     downSince: number | null;
     upSince: number | null;
+    held: Set<ButtonSource>;
   }
   const buttonTaps = new Map<ButtonName, ButtonTaps>();
 
@@ -490,25 +517,44 @@ export function createFirmwareRuntime(
   }
 
   /**
-   * Drops every queued tap and releases a button held down in the emulator
-   * that the user has let go of. One the user is still holding stays down,
-   * as its only tap. Release times are kept: emulated time does not move
-   * while the loop is stopped, so the next press still waits
-   * `RELEASE_GAP_US`.
+   * At `stop()`: releases a tap held down in the emulator that the user
+   * has let go of (its deferred release), so nothing is left down while
+   * the loop is stopped. The taps behind it stay queued, and one the user
+   * is still holding stays down. The release time is kept: emulated time
+   * does not move while stopped, so the next press still waits
+   * `RELEASE_GAP_US` after the next `start()`.
    */
-  function flushTaps(): void {
+  function releaseLetGoTaps(): void {
+    const nowUs = handle.emulatedTimeUs();
+    for (const [button, state] of buttonTaps) {
+      if (state.downSince === null || !state.taps[0]) continue;
+      handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+      state.taps.shift();
+      state.downSince = null;
+      state.upSince = nowUs;
+    }
+  }
+
+  /**
+   * At a cold `reset()`: drops every queued tap and releases a button held
+   * down in the emulator that the user has let go of. One the user is
+   * still holding stays down, as its only tap, and counts as held long
+   * enough: emulated time restarts at zero, so it is released as soon as
+   * the user lets go, and the firmware boots with no release to keep a gap
+   * from.
+   */
+  function dropTapsForReset(): void {
     for (const [button, state] of buttonTaps) {
       if (state.downSince !== null && !state.taps[0]) {
-        state.taps.length = 1;
-        continue;
-      }
-      if (state.downSince !== null) {
+        state.downSince = -PRESS_HOLD_US;
+      } else {
         // Don't strand a button whose deferred release we are dropping.
-        handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
-        state.upSince = handle.emulatedTimeUs();
+        if (state.downSince !== null) handle.setRawButton(RAW_SLOT_BY_BUTTON[button], false);
+        state.taps.length = 0;
+        state.downSince = null;
+        state.held.clear();
       }
-      state.taps.length = 0;
-      state.downSince = null;
+      state.upSince = null;
     }
   }
 
@@ -529,6 +575,7 @@ export function createFirmwareRuntime(
     if (r.rebootUs > 0) {
       rebootDebtUs += r.rebootUs;
       shiftTapsPastReboot(r.rebootUs);
+      bootConsoleStart = handle.consoleOutput().length;
     }
     if (delta > 0) {
       // The real frame time, not the clamped one: see "Pacing" above. The
@@ -560,32 +607,38 @@ export function createFirmwareRuntime(
       cancelFrame(frameHandle);
       frameHandle = null;
     }
-    // With the loop stopped nothing would play the queued taps.
-    flushTaps();
+    // A deferred release would wait for the loop; the queued taps can.
+    releaseLetGoTaps();
   }
 
-  function injectButton(button: ButtonName, kind: "pressed" | "released"): void {
+  function injectButton(button: ButtonName, kind: "pressed" | "released", source: ButtonSource = "pad"): void {
     if (!isButtonName(button)) return;
     let state = buttonTaps.get(button);
     if (!state) {
-      state = { taps: [], downSince: null, upSince: null };
+      state = { taps: [], downSince: null, upSince: null, held: new Set() };
       buttonTaps.set(button, state);
     }
-    const last = state.taps.length - 1;
     if (kind === "pressed") {
-      // A press while the last tap is still held is a repeat, not a tap.
-      if (last >= 0 && !state.taps[last]) return;
-      if (state.taps.length >= MAX_QUEUED_TAPS) return;
-      state.taps.push(false);
+      // A press from a source already holding it is a repeat, not a tap.
+      if (state.held.has(source)) return;
+      // A second source joins the held tap; otherwise this is a new tap.
+      if (state.held.size === 0) {
+        if (state.taps.length >= MAX_QUEUED_TAPS) return;
+        state.taps.push(false);
+      }
+      state.held.add(source);
     } else {
-      if (last < 0 || state.taps[last]) return;
-      state.taps[last] = true;
+      // A source that never pressed it releases nothing.
+      if (!state.held.delete(source)) return;
+      // Let go only once every source has.
+      if (state.held.size > 0) return;
+      state.taps[state.taps.length - 1] = true;
     }
     serviceTaps(button, state, handle.emulatedTimeUs());
   }
 
   function provision(identityJson: string): void {
-    provisioner = createProvisioner(handle, identityJson);
+    provisioner = createProvisioner(handle, identityJson, () => bootConsoleStart);
     lastState = { kind: "waiting" };
     provisionStartedAt = handle.totalSteps();
   }
@@ -603,14 +656,9 @@ export function createFirmwareRuntime(
     lastState = null;
     motion = null;
     lastMotionAccel = null;
-    flushTaps();
-    // Emulated time restarts at zero: a still-held tap counts as held long
-    // enough, so it is released as soon as the user lets go, and the
-    // firmware boots with no release to keep a gap from.
-    for (const state of buttonTaps.values()) {
-      if (state.downSince !== null) state.downSince = -PRESS_HOLD_US;
-      state.upSince = null;
-    }
+    dropTapsForReset();
+    // A cold power-on starts an empty console.
+    bootConsoleStart = 0;
     speed = 0;
     lastWallMs = null;
     // A cold power-on starts at 0 µs with no reboot to wait out.

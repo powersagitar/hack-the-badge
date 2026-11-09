@@ -22,10 +22,11 @@
  * internally routes to whichever one is currently active. This module only
  * reports *which* mode was picked, via `mountModeToggle`'s callback.
  */
-import { BUTTON_NAMES, type ButtonName } from "../badge/input";
+import { BUTTON_NAMES, type ButtonName, type ButtonSource } from "../badge/input";
 import type { Rgb } from "../badge/led";
 
-export type ButtonInjector = (button: ButtonName, kind: "pressed" | "released") => void;
+/** `source` is `"pad"` from `mountButtons` and `"key"` from `mountKeyboard`. */
+export type ButtonInjector = (button: ButtonName, kind: "pressed" | "released", source?: ButtonSource) => void;
 
 /** The two emulator modes `CLAUDE.md`'s architecture section describes. */
 export type EmulatorMode = "lua" | "firmware";
@@ -325,15 +326,15 @@ export function mountShell(): ShellHandles {
       btn.className = "badge-btn";
       btn.addEventListener("mousedown", (e) => {
         e.preventDefault();
-        inject(name, "pressed");
+        inject(name, "pressed", "pad");
       });
       btn.addEventListener("mouseup", (e) => {
         e.preventDefault();
-        inject(name, "released");
+        inject(name, "released", "pad");
       });
       // Release if the mouse is dragged off the button while held, so a
       // button can't get stuck "down" forever.
-      btn.addEventListener("mouseleave", () => inject(name, "released"));
+      btn.addEventListener("mouseleave", () => inject(name, "released", "pad"));
       pad.appendChild(btn);
     }
   }
@@ -346,14 +347,14 @@ export function mountShell(): ShellHandles {
       e.preventDefault();
       if (heldKeys.has(e.code)) return; // ignore OS auto-repeat while held
       heldKeys.add(e.code);
-      inject(button, "pressed");
+      inject(button, "pressed", "key");
     });
     window.addEventListener("keyup", (e) => {
       const button = KEY_TO_BUTTON[e.code];
       if (!button) return;
       e.preventDefault();
       heldKeys.delete(e.code);
-      inject(button, "released");
+      inject(button, "released", "key");
     });
   }
 

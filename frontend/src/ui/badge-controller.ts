@@ -227,11 +227,11 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     }
   }
 
-  const inject: ButtonInjector = (button, kind) => {
+  const inject: ButtonInjector = (button, kind, source) => {
     if (mode === "lua") {
       lua.injectButton(button, kind);
     } else {
-      firmwareRuntime?.injectButton(button, kind);
+      firmwareRuntime?.injectButton(button, kind, source);
     }
   };
 

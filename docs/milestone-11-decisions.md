@@ -1098,6 +1098,47 @@ unless another date is given.
   orphaning it until its TTL; its failure no longer overwrites the newer
   status (Task 10's review) — cost if wrong: none; the room was never
   shown.
+- Ruling R-T13-1 (Task 13, `fix: tap sources, taps across stop, and the
+  provisioner's prompt scan`): a button's sources are a set per button
+  (`"key"`, `"pad"`), not a count: a second press from the same source
+  is a repeat and ignored, a second source joins the held tap instead of
+  queueing a new one, the tap is let go when the set empties, and a
+  release from a source not in the set changes nothing. The set is
+  non-empty exactly while the last tap is unreleased; a press dropped by
+  `MAX_QUEUED_TAPS` adds no source, and `reset()` clears the set with
+  the taps it drops. A missing or unknown `source` (the Worker message's
+  field is optional) is the pad — cost if wrong: two pads or two
+  keyboards on one button would act as one source; the page has one of
+  each.
+- Ruling R-T13-2 (Task 13): `stop()` still releases a tap that is down
+  in the emulator and let go (R-M8-6's deferred release, so nothing is
+  left down while stopped), but keeps the taps queued behind it; they
+  play after the next `start()` with their full `PRESS_HOLD_US` and the
+  `RELEASE_GAP_US` from that release, all in emulated time, which does
+  not run while stopped (so non-paused time, as Task 8's reboot shift
+  counts non-jump time). A release that arrives while stopped is
+  honoured. `reset()` still drops the queue (R-M8-6) — cost if wrong:
+  the tap that was down at the stop gets a hold shorter than
+  `PRESS_HOLD_US`, as before; a burst replays after a resume.
+- Ruling R-T13-3 (Task 13): the provisioner's first prompt is matched
+  from the console offset where the *current boot* began, not from the
+  console's length at `provision()`. Measured: with the brief's
+  start-length scan, the WASM twin (`test/cpu-wasm.test.ts`, "provisions
+  the test identity…") stays `waiting`, because the REPL prints its
+  prompt once at boot and none again until it gets a line, so an idle
+  badge (the browser's usual case, a click well after boot) never
+  prompts after the start. The runtime records the boot's start as the
+  console's length in the frame that ended at a soft reset (`run_until`
+  stops there, since a reboot's 466 ms jump passes any frame's 50 ms
+  target), 0 at power-on and after a cold `reset()`; the provisioner
+  reads it at each poll, so a reboot while it waits also drops the old
+  boot's prompt. The console text is kept across a soft reset and never
+  shrinks (only a cold reset empties it); it is trimmed only past its
+  256 KiB ring (`CONSOLE_CAPACITY`), where every provisioner offset is
+  already a shifted window (the existing limit) — cost if wrong: a
+  provision started after 256 KiB of console output could miss the new
+  boot's prompt and time out; an idle badge's console holds about
+  2.3 KB.
 
 ## Milestone 12 backlog
 

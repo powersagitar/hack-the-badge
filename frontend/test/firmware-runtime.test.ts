@@ -395,6 +395,7 @@ function rig() {
     print: (s: string) => (consoleText += s),
     setSteps: (n: number) => (steps = n),
     setTimeUs: (n: number) => (timeUs = n),
+    armReboot: fake.armReboot,
   };
 }
 
@@ -594,6 +595,37 @@ describe("FirmwareRuntime reboot pause", () => {
 });
 
 describe("FirmwareRuntime provisioning", () => {
+  test("a provision after a reboot waits for the new boot's prompt", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.start();
+    print("old boot\r\nbadge> ");
+    armReboot();
+    frame(); // ends at the soft reset; the console keeps the old text
+    rt.provision('{"a":1}');
+    frame();
+    frame();
+    expect(typed).toEqual([]);
+    print("new boot\r\nbadge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
+  test("a reboot while the provision waits drops the old boot's prompt", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.provision('{"a":1}');
+    rt.start();
+    frame();
+    // The old boot prompts, then reboots within the same frame.
+    print("badge> ");
+    armReboot();
+    frame();
+    frame();
+    expect(typed).toEqual([]);
+    print("new boot\r\nbadge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
   test("provision() types once the prompt appears, polled by the frame loop", () => {
     const { rt, typed, frame, print } = rig();
     rt.provision('{"a":1}');
@@ -883,24 +915,94 @@ describe("FirmwareRuntime press hold", () => {
     expect(releases).toBe(MAX_QUEUED_TAPS);
   });
 
-  test("stop() drops queued taps", () => {
+  test("queued_tap_survives_stop_and_plays_on_start", () => {
     const { rt, buttonCalls, frame, setTimeUs } = rig();
+    const A = RAW_SLOT_BY_BUTTON.A;
     rt.start();
+    // Two taps: the first is down in the emulator, the second waits its
+    // turn, and the user still holds it when the loop stops.
     rt.injectButton("A", "pressed");
     rt.injectButton("A", "released");
     rt.injectButton("A", "pressed");
-    rt.injectButton("A", "released");
     rt.stop();
+    // The first tap's deferred release is flushed; nothing is left down.
     expect(buttonCalls).toEqual([
-      [RAW_SLOT_BY_BUTTON.A, true],
-      [RAW_SLOT_BY_BUTTON.A, false],
+      [A, true],
+      [A, false],
     ]);
+    // Let go while stopped: the release is honoured for the queued tap.
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toHaveLength(2);
     rt.start();
-    for (let t = 0; t <= 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
+    setTimeUs(RELEASE_GAP_US - 1);
+    frame();
+    expect(buttonCalls).toHaveLength(2);
+    setTimeUs(RELEASE_GAP_US);
+    frame();
+    expect(buttonCalls.at(-1)).toEqual([A, true]);
+    // Its full hold, then its release.
+    setTimeUs(RELEASE_GAP_US + PRESS_HOLD_US - 1);
+    frame();
+    expect(buttonCalls).toHaveLength(3);
+    setTimeUs(RELEASE_GAP_US + PRESS_HOLD_US);
+    frame();
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+      [A, true],
+      [A, false],
+    ]);
+    for (let t = RELEASE_GAP_US + PRESS_HOLD_US; t <= 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
       setTimeUs(t);
       frame();
     }
-    expect(buttonCalls.length).toBe(2);
+    expect(buttonCalls).toHaveLength(4);
+  });
+
+  test("pad_release_does_not_release_a_key_held_button", () => {
+    const { rt, buttonCalls, frame, setTimeUs } = rig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    rt.start();
+    rt.injectButton("A", "pressed", "key");
+    // The pad joins the key's hold: one tap, not two.
+    rt.injectButton("A", "pressed", "pad");
+    setTimeUs(10);
+    rt.injectButton("A", "released", "pad");
+    for (let t = 10; t <= 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    expect(buttonCalls).toEqual([[A, true]]);
+    // Every source has let go: released, and no second tap follows.
+    rt.injectButton("A", "released", "key");
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    for (let t = 4 * (PRESS_HOLD_US + RELEASE_GAP_US); t <= 8 * (PRESS_HOLD_US + RELEASE_GAP_US); t += 1_000) {
+      setTimeUs(t);
+      frame();
+    }
+    expect(buttonCalls).toHaveLength(2);
+  });
+
+  test("a release from a source that never pressed is ignored", () => {
+    const { rt, buttonCalls, setTimeUs } = rig();
+    const A = RAW_SLOT_BY_BUTTON.A;
+    rt.start();
+    // No source argument: the pad.
+    rt.injectButton("A", "pressed");
+    setTimeUs(PRESS_HOLD_US);
+    rt.injectButton("A", "released", "key");
+    expect(buttonCalls).toEqual([[A, true]]);
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toEqual([
+      [A, true],
+      [A, false],
+    ]);
+    // A second release from the same source is a no-op too.
+    rt.injectButton("A", "released");
+    expect(buttonCalls).toHaveLength(2);
   });
 
   test("a tap right after stop() and start() still waits RELEASE_GAP_US", () => {

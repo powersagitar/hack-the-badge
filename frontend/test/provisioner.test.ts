@@ -187,4 +187,29 @@ describe("provisioner", () => {
     p.poll();
     expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
   });
+
+  // Review Focus 1: the console keeps the old boot's text across a soft
+  // reset, so its idle `badge> ` must not be taken for the new REPL's.
+  test("provisioner_ignores_a_prompt_from_before_the_provision", () => {
+    const f = fakeHandle();
+    f.print("I (10) app: started\r\nbadge> ");
+    // The firmware reboots here: the new boot's console starts at this offset.
+    let bootStart = f.handle.consoleOutput().length;
+    const p = createProvisioner(f.handle, "{}", () => bootStart);
+    expect(p.poll().kind).toBe("waiting");
+    f.advance(1_000_000);
+    // The new boot prints, but has not prompted yet.
+    f.print("I (5) boot: ESP-IDF\r\n");
+    expect(p.poll().kind).toBe("waiting");
+    expect(f.typed).toEqual([]);
+    f.print("badge> ");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+    // A prompt is taken once: a later reboot does not retype the command.
+    bootStart = f.handle.consoleOutput().length;
+    f.print("badge> ");
+    p.poll();
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+  });
+
 });
