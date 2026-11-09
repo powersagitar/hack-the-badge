@@ -117,6 +117,49 @@ describe("peer link", () => {
     expect(() => a.send({ t: "bump" })).not.toThrow();
   });
 
+  test("opened resolves on the channel's open event, on both sides", async () => {
+    const net = new FakeNetwork();
+    const { link: a, offer } = await createOffer({ factory: net.factory });
+    const { link: b, answer } = await acceptOffer(offer, { factory: net.factory });
+    let aOpen = false;
+    let bOpen = false;
+    void a.opened.then(() => (aOpen = true));
+    void b.opened.then(() => (bOpen = true));
+    await tick();
+    expect(aOpen).toBe(false);
+    await a.complete(answer);
+    await Promise.all([a.opened, b.opened]);
+    expect(aOpen && bOpen).toBe(true);
+    expect(a.state).toBe("open");
+    // Closing after open leaves it resolved.
+    a.close();
+    await expect(a.opened).resolves.toBeUndefined();
+  });
+
+  test("opened rejects on close before open, unhandled by nobody", async () => {
+    const unhandled: unknown[] = [];
+    const onRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const net = new FakeNetwork();
+      const { link: watched } = await createOffer({ factory: net.factory });
+      const { link: ignored } = await createOffer({ factory: net.factory });
+      watched.close();
+      ignored.close(); // nobody awaits its `opened`
+      await expect(watched.opened).rejects.toThrow();
+      // The remote end's channel closing before open rejects too.
+      const { link: c, offer } = await createOffer({ factory: net.factory });
+      const { link: d } = await acceptOffer(offer, { factory: net.factory });
+      d.close();
+      await expect(d.opened).rejects.toThrow();
+      c.close();
+      await tick(20);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    expect(unhandled).toEqual([]);
+  });
+
   test("a bad answer or offer rejects (the caller reports it), never throws synchronously", async () => {
     const net = new FakeNetwork();
     const { link } = await createOffer({ factory: net.factory });

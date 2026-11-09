@@ -48,6 +48,9 @@
  * joins one, and "Manual" swaps the same offer and answer as copy-paste
  * codes instead. Each link joins the hub as soon as it exists; it carries
  * nothing until its channel opens, and leaves the hub when it closes.
+ * Cancelling a hosted room ({@link mountLinks}'s `cancelHosting`: hosting
+ * again, removing its link, unload) also closes the room on the server,
+ * best effort (Milestone 11 Task 10).
  */
 import { renderFrame } from "./render/canvas";
 import { RadioHub } from "./radio/hub";
@@ -140,9 +143,20 @@ function mountLinks(shell: ShellHandles, hub: RadioHub): { panel: LinkPanel; clo
     refresh();
   }
 
-  async function host(): Promise<void> {
-    hosting?.cancel();
+  /**
+   * The cancel wiring (Milestone 11 Task 10): stops waiting on the hosted
+   * room, closes its link, and has `hostRoom`'s cancel send `close` (best
+   * effort, never throws), so a later joiner hears "Room closed or
+   * expired." at once. Every path that drops a hosted room comes here.
+   */
+  function cancelHosting(): void {
+    const h = hosting;
     hosting = null;
+    h?.cancel();
+  }
+
+  async function host(): Promise<void> {
+    cancelHosting();
     panel.setStatus("Creating a room\u2026");
     try {
       const h = await hostRoom();
@@ -219,10 +233,7 @@ function mountLinks(shell: ShellHandles, hub: RadioHub): { panel: LinkPanel; clo
   function remove(id: string): void {
     const entry = links.get(id);
     if (!entry) return;
-    if (hosting?.link === entry.link) {
-      hosting.cancel();
-      hosting = null;
-    }
+    if (hosting?.link === entry.link) cancelHosting();
     if (manualOffer === entry.link) manualOffer = null;
     links.delete(id);
     hub.removeLink(id);
@@ -240,7 +251,7 @@ function mountLinks(shell: ShellHandles, hub: RadioHub): { panel: LinkPanel; clo
   return {
     panel,
     closeAll() {
-      hosting?.cancel();
+      cancelHosting();
       for (const { link } of links.values()) link.close();
     },
   };

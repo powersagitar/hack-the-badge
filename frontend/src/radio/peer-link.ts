@@ -13,7 +13,8 @@
  *   signaling function (`./signal-client.ts`) or by hand, as the manual
  *   codes ({@link encodeManualCode}).
  * - **Nothing before open.** {@link PeerLink.send} drops a message unless
- *   the channel is open.
+ *   the channel is open. {@link PeerLink.opened} settles on the channel's
+ *   own events (Milestone 11 Task 10), so a waiter needs no polling.
  * - **Peer input is untrusted.** A message is passed on only if it is a
  *   string of at most {@link MAX_PEER_MESSAGE_CHARS} that parses as JSON;
  *   the hub validates its shape. Nothing a peer sends throws out of a
@@ -88,9 +89,19 @@ export class PeerLink implements RadioLink {
   private handler: ((msg: unknown) => void) | null = null;
   private readonly stateHandlers: Array<(s: PeerLinkState) => void> = [];
   private current: PeerLinkState = "connecting";
+  private settleOpened!: (open: boolean) => void;
+
+  /**
+   * Resolves when the data channel opens; rejects if the link closes
+   * first. It settles once, and never goes unhandled: nobody need await it.
+   */
+  readonly opened: Promise<void> = new Promise<void>((resolve, reject) => {
+    this.settleOpened = (open) => (open ? resolve() : reject(new Error("closed before open")));
+  });
 
   /** @internal Use {@link createOffer} or {@link acceptOffer}. */
   constructor(private readonly pc: PeerConnectionLike) {
+    this.opened.catch(() => {});
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
       // A failed connection does not recover without new signaling: free it.
@@ -165,6 +176,8 @@ export class PeerLink implements RadioLink {
   private setState(s: PeerLinkState): void {
     if (s === this.current || this.current === "closed") return;
     this.current = s;
+    // The first change settles `opened`: "open" resolves it, "closed" (before open) rejects it.
+    this.settleOpened(s === "open");
     for (const cb of this.stateHandlers) {
       try {
         cb(s);

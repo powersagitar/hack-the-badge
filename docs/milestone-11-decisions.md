@@ -1008,6 +1008,27 @@ unless another date is given.
   them — cost if wrong: if the token's `SET` fails after the offer's,
   the host gets a 500 and the room, which cannot be closed, expires
   after its 300 s.
+- Ruling R-T10-1 (Milestone 11's numbering; Milestone 10's doc has its
+  own R-T10-k): a 429's message takes `Retry-After` only as whole
+  seconds (1 to 9 digits, surrounding spaces allowed), giving "Signaling
+  server busy, try again in N min." with N = ceil(seconds / 60), at
+  least 1; a missing or malformed header, an HTTP date or a negative
+  number included, gives "Signaling server busy, try again later."
+  without throwing. A 429 or any 5xx during host or join polling ends
+  that side's signaling, as every other error does — cost if wrong: a
+  proxy that rewrites `Retry-After` as a date loses the minute count
+  (this server only sends seconds).
+- Ruling R-T10-2 (Milestone 11's numbering): `waitOpen` races
+  `PeerLink.opened` against one deadline wait (`sleep(remaining)`,
+  cleared through an `AbortSignal` once the wait ends) and the cancel;
+  the deadline still goes through the injected `sleep`, since the
+  120 s give-up tests run on a fake clock. So
+  `waitOpen_resolves_on_the_open_event` asserts that the joiner's clock
+  never moves and its `sleep` is called at most once, for the whole
+  deadline, never a poll interval (its sleeps never resolve), rather
+  than that `sleep` is never called — cost if wrong: none in the
+  browser; a test that wants a sleep-free open would need a second
+  injected timer.
 
 ## Milestone 12 backlog
 

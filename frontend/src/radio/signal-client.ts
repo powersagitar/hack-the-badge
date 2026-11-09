@@ -8,19 +8,30 @@
  * - {@link hostRoom} makes an offer, creates a room for it and returns
  *   the room code at once; its `connected` promise polls for the answer
  *   every {@link POLL_INTERVAL_MS}, applies it and waits for the channel
- *   to open, all within {@link SIGNAL_TIMEOUT_MS} of the start.
+ *   to open, all within {@link SIGNAL_TIMEOUT_MS} of the start. It keeps
+ *   the room's token from `create` to itself; its `cancel` sends `close`
+ *   with it, best effort (Milestone 11 Task 10).
  * - {@link joinRoom} fetches the room's offer, answers it, and waits for
  *   the channel to open within the same budget.
  *
+ * Waiting for the channel is event-driven: {@link PeerLink.opened} raced
+ * against the deadline and the cancel, with no polling.
+ *
  * Every failure is a {@link SignalError} with a message meant for the
- * page's status line; a link that fails is closed.
+ * page's status line, and ends that side's requests; a link that fails is
+ * closed. A 429 says how long to wait ({@link busyMessage}), any 5xx is
+ * "Signaling unavailable." (a store failure is a bare 500), and a 404 on
+ * join is "Room closed or expired.". Nothing is logged.
  */
 import { acceptOffer, createOffer, type PeerConnectionFactory, type PeerLink } from "./peer-link";
-import { CROCKFORD_ALPHABET, ROOM_CODE_LENGTH, isRoomCode } from "./signal-handler";
+import { CROCKFORD_ALPHABET, ROOM_CODE_LENGTH, TOKEN_LENGTH, isRoomCode } from "./signal-handler";
 
 export const SIGNAL_URL = "/api/signal";
 export const POLL_INTERVAL_MS = 1000;
 export const SIGNAL_TIMEOUT_MS = 120_000;
+
+export const SIGNALING_UNAVAILABLE = "Signaling unavailable.";
+export const ROOM_CLOSED = "Room closed or expired.";
 
 export class SignalError extends Error {
   override name = "SignalError";
@@ -29,7 +40,8 @@ export class SignalError extends Error {
 /** Injectable for tests; the defaults are the browser's. */
 export interface SignalDeps {
   fetch?: (input: string, init?: RequestInit) => Promise<Response>;
-  sleep?: (ms: number) => Promise<void>;
+  /** Waits `ms`; `signal`'s abort may cut it short (the promise then never settles). */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
   factory?: PeerConnectionFactory;
 }
@@ -59,10 +71,18 @@ export function normalizeRoomCode(input: string): string | null {
   return isRoomCode(code) ? code : null;
 }
 
+/** The browser's sleep: a timer, cleared if `signal` aborts so it does not outlive the wait. */
+function timerSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => clearTimeout(timer), { once: true });
+  });
+}
+
 function resolveDeps(deps: SignalDeps) {
   return {
     fetch: deps.fetch ?? ((input: string, init?: RequestInit) => fetch(input, init)),
-    sleep: deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+    sleep: deps.sleep ?? timerSleep,
     now: deps.now ?? (() => Date.now()),
     factory: deps.factory,
   };
@@ -77,8 +97,31 @@ async function call(d: Deps, init: RequestInit, query = ""): Promise<Response> {
   }
 }
 
+const RETRY_AFTER_SECONDS = /^\s*(\d{1,9})\s*$/;
+
+/**
+ * A 429's message: `Retry-After` (whole seconds) rounded up to minutes,
+ * at least 1. A missing or malformed header (an HTTP date included, which
+ * this server never sends) says "later" (ruling R-T10-1, Milestone 11).
+ */
+export function busyMessage(retryAfter: string | null): string {
+  const m = retryAfter === null ? null : RETRY_AFTER_SECONDS.exec(retryAfter);
+  if (!m) return "Signaling server busy, try again later.";
+  const minutes = Math.max(1, Math.ceil(Number(m[1]) / 60));
+  return `Signaling server busy, try again in ${minutes} min.`;
+}
+
+/** A reply that ends this side's signaling: busy, unavailable, or another status. */
 function serverError(res: Response): SignalError {
+  if (res.status === 429) return new SignalError(busyMessage(res.headers.get("Retry-After")));
+  if (res.status >= 500) return new SignalError(SIGNALING_UNAVAILABLE);
   return new SignalError(`Signaling server error (HTTP ${res.status}).`);
+}
+
+const TOKEN = new RegExp(`^[A-Za-z0-9_-]{${TOKEN_LENGTH}}$`);
+
+function isToken(s: unknown): s is string {
+  return typeof s === "string" && TOKEN.test(s);
 }
 
 /** A JSON reply's string field, or a {@link SignalError}. */
@@ -93,19 +136,64 @@ async function field(res: Response, name: string): Promise<string> {
   throw new SignalError("Unexpected reply from the signaling server.");
 }
 
-/** Waits until `link` is open, polling its state; closes it and throws on failure or at `deadline`. */
-async function waitOpen(d: Deps, link: PeerLink, deadline: number, cancelled: () => boolean): Promise<void> {
-  for (;;) {
-    if (link.state === "open") return;
-    if (cancelled()) throw new SignalError("Cancelled.");
-    if (link.state === "closed" || d.now() >= deadline) {
-      link.close();
-      throw new SignalError(
-        "Could not connect to the peer: no direct path between the two browsers (are they on the same network?).",
-      );
-    }
-    await d.sleep(Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - d.now())));
+const CANCELLED = "Cancelled.";
+const NO_PATH =
+  "Could not connect to the peer: no direct path between the two browsers (are they on the same network?).";
+
+/** Rejects with "Cancelled." when `signal` aborts; never settles otherwise, and never goes unhandled. */
+function whenAborted(signal: AbortSignal): Promise<never> {
+  const p = new Promise<never>((_, reject) => {
+    const fail = () => reject(new SignalError(CANCELLED));
+    if (signal.aborted) fail();
+    else signal.addEventListener("abort", fail, { once: true });
+  });
+  p.catch(() => {});
+  return p;
+}
+
+/**
+ * Waits for `link` to open: {@link PeerLink.opened} raced against
+ * `deadline` and `signal`, with no polling. Closes the link and throws on
+ * a close, the deadline or a cancel.
+ */
+async function waitOpen(d: Deps, link: PeerLink, deadline: number, signal: AbortSignal): Promise<void> {
+  // Ends the deadline timer once this wait is over, however it ends.
+  const done = new AbortController();
+  const onCancel = () => done.abort();
+  signal.addEventListener("abort", onCancel, { once: true });
+  try {
+    const outcome = await Promise.race([
+      link.opened.then(
+        () => "open" as const,
+        () => "closed" as const,
+      ),
+      d.sleep(Math.max(0, deadline - d.now()), done.signal).then(() => "deadline" as const),
+      whenAborted(signal),
+    ]);
+    if (outcome === "open") return;
+  } catch (e) {
+    link.close();
+    throw e;
+  } finally {
+    signal.removeEventListener("abort", onCancel);
+    done.abort();
   }
+  link.close();
+  throw new SignalError(signal.aborted ? CANCELLED : NO_PATH);
+}
+
+/** Asks the server to close `room`; best effort: never throws or rejects, and its reply is ignored. */
+function sendClose(d: Deps, room: string, token: string): void {
+  call(d, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ op: "close", room, token }),
+    // Let it finish if the page is unloading.
+    keepalive: true,
+  }).then(
+    () => {},
+    () => {},
+  );
 }
 
 /** Hosts a room: returns its code at once, and a promise for the open link. */
@@ -120,6 +208,7 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
     throw new SignalError("This browser could not start a WebRTC link.");
   }
   let room: string;
+  let token: string;
   try {
     const res = await call(d, {
       method: "POST",
@@ -127,19 +216,22 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
       body: JSON.stringify({ op: "create", offer }),
     });
     if (res.status !== 200) throw serverError(res);
-    room = await field(res, "room");
-    if (!isRoomCode(room)) throw new SignalError("Unexpected reply from the signaling server.");
+    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    room = body?.room as string;
+    token = body?.token as string;
+    if (!isRoomCode(room) || !isToken(token)) throw new SignalError("Unexpected reply from the signaling server.");
   } catch (e) {
     link.close();
     throw e;
   }
 
-  let cancelled = false;
+  const cancel = new AbortController();
+  const cancelled = whenAborted(cancel.signal);
   const connected = (async () => {
     try {
       for (;;) {
-        if (cancelled) throw new SignalError("Cancelled.");
-        const res = await call(d, { method: "GET" }, `?room=${room}&want=answer`);
+        if (cancel.signal.aborted) throw new SignalError(CANCELLED);
+        const res = await Promise.race([call(d, { method: "GET" }, `?room=${room}&want=answer`), cancelled]);
         if (res.status === 200) {
           const answer = await field(res, "answer");
           try {
@@ -152,9 +244,9 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
         if (res.status === 404) throw new SignalError(`Room ${room} expired before anyone joined.`);
         if (res.status !== 204) throw serverError(res);
         if (d.now() >= deadline) throw new SignalError(`No one joined room ${room} within 2 minutes.`);
-        await d.sleep(POLL_INTERVAL_MS);
+        await Promise.race([d.sleep(POLL_INTERVAL_MS, cancel.signal), cancelled]);
       }
-      await waitOpen(d, link, deadline, () => cancelled);
+      await waitOpen(d, link, deadline, cancel.signal);
     } catch (e) {
       link.close();
       throw e instanceof SignalError ? e : new SignalError("Linking failed.");
@@ -167,8 +259,10 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
     link,
     connected,
     cancel() {
-      cancelled = true;
+      if (cancel.signal.aborted) return;
+      cancel.abort();
       link.close();
+      sendClose(d, room, token);
     },
   };
 }
@@ -184,7 +278,7 @@ export async function joinRoom(code: string, deps: SignalDeps = {}): Promise<Pee
     );
   }
   const res = await call(d, { method: "GET" }, `?room=${room}&want=offer`);
-  if (res.status === 404) throw new SignalError(`No room ${room}: check the code, or it expired.`);
+  if (res.status === 404) throw new SignalError(ROOM_CLOSED);
   if (res.status !== 200) throw serverError(res);
   const offer = await field(res, "offer");
 
@@ -202,9 +296,9 @@ export async function joinRoom(code: string, deps: SignalDeps = {}): Promise<Pee
       body: JSON.stringify({ op: "answer", room, answer }),
     });
     if (posted.status === 409) throw new SignalError(`Room ${room} was already joined by someone else.`);
-    if (posted.status === 404) throw new SignalError(`Room ${room} expired.`);
+    if (posted.status === 404) throw new SignalError(ROOM_CLOSED);
     if (posted.status !== 204) throw serverError(posted);
-    await waitOpen(d, link, deadline, () => false);
+    await waitOpen(d, link, deadline, new AbortController().signal);
   } catch (e) {
     link.close();
     throw e instanceof SignalError ? e : new SignalError("Linking failed.");
