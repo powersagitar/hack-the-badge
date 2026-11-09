@@ -157,6 +157,40 @@ printed them):
 `bun test`: 275 pass, 0 fail, 17,823 `expect()` calls, 20 files,
 10.74 s.
 
+### The fuzz tests (Task 6)
+
+Both are `proptest` runs from a fixed seed (ruling R-T6-3):
+
+| Test | Cases | Per case | Native, release | `cargo test`, debug profile |
+|---|---|---|---|---|
+| `radio::hci::tests::fuzzed_packets_and_advertisements_stay_bounded` | 512 (`HCI_FUZZ_CASES`) | 1 to 128 operations | 0.04 s | 0.85 s |
+| `runtime::tests::deliver_rejects_malformed_bytes` (the serial bytes) | 2,000 | one byte vector, 0 to 299 long, and an RSSI | under 0.01 s | 0.05 s |
+
+Three runs each; `cargo`'s "finished in". The HCI run comes to 33,394
+operations: 14,049 advertisements heard (the old test: 10,000), 26,515
+packets (the old test: 10,000; these count the well-formed setup
+packets), and 1,695 drains. They reach 7,837 reports, the queue at its
+bound 2,943 times, and all 256 values at each address byte.
+
+The old test's checks all stay (no panic, the bounded queue, an
+advertisement's data length, each drained event's framing); nothing is
+dropped. What differs is the shape: it ran one controller through
+10,000 steps, and each case now starts a new one for up to 128
+operations. Nothing in the controller grows past its queue and its
+filter, and the run does fill the queue.
+
+RED, each from one mutation of `emulator-core`:
+
+| Mutation | What fails |
+|---|---|
+| `open_scanning` sends Enable 0 | HCI: "the fuzz reached the report path" |
+| `deliver` always refuses | HCI: the same; `deliver_rejects_malformed_bytes`: the positive control |
+| `open_scanning` clears the report's LE mask bit | HCI: the same (2 reports, under the 1,000 floor; with a `> 0` it passed) |
+| `hear` repeats one address byte | HCI: "more than one byte value per address" |
+| The queue's bound is 33 | HCI: the bound's `op` assertion |
+| The serial test's well-formed rule is `<= 2` | serial: the `heard == well_formed` assertion |
+| The serial bytes are 0 to 6 long | serial: "the fuzz reached the accepting path" |
+
 ## What a CPU reset keeps
 
 v392 reboots through `esp_restart()`, which ends in `esp_restart_noos()`
@@ -675,6 +709,12 @@ at exactly that gap and not one step before.
 - `@types/bun` 1.4.4 (dev, frontend, Task 5): the type declarations for
   `bun:test` and `node:fs`, so `test/cpu-wasm.test.ts` can join
   `tsconfig.json`'s `include`.
+- `proptest` =1.12.0 (dev, `emulator-core`, Task 6): generated inputs and
+  shrinking for the HCI and serial fuzz tests, in place of the two
+  hand-rolled xorshift generators (spec, Part 7). `default-features =
+  false, features = ["std"]`: no `fork` or `timeout`, so no `rusty-fork`
+  or `tempfile`. A dev-dependency: neither the WASM build nor
+  `emulator-wasm`'s dependency tree has it.
 
 ## Closed in writing
 
@@ -775,6 +815,39 @@ unless another date is given.
   does not depend on the order, and a report was already delayed to the
   idle pass whenever a reply was in the queue.
 
+- Ruling R-T6-1: LE Set Extended Advertising Enable's duplicate-handle
+  check (Core v5.4, Vol 4 Part E, 7.8.56) runs for disabling too, and
+  before the Unknown Advertising Identifier check: 7.8.56 states both
+  rules before "The remainder of this section only applies if Enable is
+  set to 0x01", duplicates first, and leaves the precedence otherwise
+  open — cost if wrong: an error code for a host that names an unknown
+  handle twice; NimBLE on v392 sends one set.
+- Ruling R-T6-2: Filter_Duplicates 2 is refused when Duration or Period
+  is zero, not only Period as the spec says: 7.8.65's one sentence names
+  "either Period or Duration". Only when Enable is 1: with Enable 0 "the
+  remaining parameters shall be ignored" — cost if wrong: none for
+  NimBLE on v392, which sends Filter_Duplicates 0 (`docs/milestone-10-decisions.md`,
+  the command trace).
+- Ruling R-T6-3: the proptest runs are made deterministic in proptest
+  1.12's config, not by a hand-built `TestRng`: `rng_seed:
+  RngSeed::Fixed(..)`, `rng_algorithm: RngAlgorithm::ChaCha`, a fixed
+  `cases` and `failure_persistence: None`, set explicitly so the
+  `PROPTEST_*` environment variables do not change them. Checked: the HCI
+  run's totals are identical, with `PROPTEST_RNG_SEED`,
+  `PROPTEST_RNG_ALGORITHM` and `PROPTEST_CASES` set and with none. The
+  tests call `TestRunner::run`, not the `proptest!` macro, so the
+  coverage counters can outlive the cases — cost if wrong: none: a
+  failure prints its input, and the seed is in the test.
+- Ruling R-T6-4: the HCI fuzz test's coverage assertions are a floor on
+  reports (over 1,000; the run reaches 7,837), not `> 0`, because hostile
+  LE Set Event Mask packets open the masks a few times by themselves — cost
+  if wrong: a change that lowers the report count that far fails the
+  test; lower the floor with evidence.
+- Ruling R-T6-5: `runtime.rs`'s "serial fuzz" is the random-bytes loop of
+  `deliver_rejects_malformed_bytes`, the only xorshift in that file (peer
+  bytes, in the wire form). Only that loop changed; the rest of the test
+  stands — cost if wrong: none.
+
 ## Milestone 12 backlog
 
 Started by Task 1; later tasks add what they leave open.
@@ -795,5 +868,9 @@ Started by Task 1; later tasks add what they leave open.
   stand in for the resets around a reboot only.
 - **DRAM `.noinit` data** is not kept across a reset (the TRM keeps
   internal SRAM).
+- **LE Set Extended Scan Enable's other parameter rules** (Core v5.4,
+  7.8.65): Duration not less than a non-zero Period is `0x12`, and a
+  disable (Enable 0) should ignore an out-of-range Filter_Duplicates, not
+  refuse it. Neither is a form NimBLE on v392 sends. (Task 6)
 - **The RTC and timer-group watchdogs** are inert storage, so the 1 s RTC
   watchdog `esp_restart_noos` arms is never checked.

@@ -1842,6 +1842,10 @@ mod tests {
             LE_SET_EVENT_MASK, LE_SET_EXT_SCAN_ENABLE, LE_SET_EXT_SCAN_PARAMS, SET_EVENT_MASK,
         };
         use crate::radio::LINKED_PEER_RSSI;
+        use proptest::collection::vec;
+        use proptest::prelude::any;
+        use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRunner};
+        use std::cell::{Cell, RefCell};
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
         let mut ok = vec![0x02, 0x10, 0, 0, 0, 0xC2, 1];
         ok.extend_from_slice(&[0x03, 0xFF, 0xFF, 0xFF]);
@@ -1892,26 +1896,34 @@ mod tests {
                 bytes.len()
             );
         }
-        // xorshift32: deterministic random lengths (0 to 299) and bytes.
-        // Now that the guest scans, what is well-formed by the wire form's
-        // own rules is heard, and only that.
-        let mut x: u32 = 0x1234_5678;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            x
-        };
-        let mut well_formed_seen = 0;
-        for _ in 0..2_000 {
-            let len = (next() % 300) as usize;
-            let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
-            let rssi = next() as i8;
-            let well_formed = (7..=7 + 229).contains(&len) && bytes[6] <= 3;
-            well_formed_seen += u32::from(well_formed);
-            assert_eq!(heard(&mut rt, &bytes, rssi), well_formed, "{len} bytes");
+        // Random lengths (0 to 299) and bytes, from a fixed seed. Now that
+        // the guest scans, what is well-formed by the wire form's own rules
+        // is heard, and only that.
+        {
+            let mut runner = TestRunner::new(Config {
+                cases: 2_000,
+                failure_persistence: None,
+                rng_algorithm: RngAlgorithm::ChaCha,
+                rng_seed: RngSeed::Fixed(0x1234_5678),
+                ..Config::default()
+            });
+            let rt = RefCell::new(&mut rt);
+            let well_formed_seen = Cell::new(0u32);
+            let wire = (vec(any::<u8>(), 0..300), any::<i8>());
+            runner
+                .run(&wire, |(bytes, rssi)| {
+                    let well_formed = (7..=7 + 229).contains(&bytes.len()) && bytes[6] <= 3;
+                    well_formed_seen.set(well_formed_seen.get() + u32::from(well_formed));
+                    let was_heard = heard(&mut rt.borrow_mut(), &bytes, rssi);
+                    assert_eq!(was_heard, well_formed, "{} bytes", bytes.len());
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                well_formed_seen.get() > 0,
+                "the fuzz reached the accepting path"
+            );
         }
-        assert!(well_formed_seen > 0, "the fuzz reached the accepting path");
         assert!(heard(&mut rt, &ok, LINKED_PEER_RSSI), "still scanning");
         assert_eq!(rt.radio_advertisement(), None);
         assert!(rt.radio_advertisement_bytes().is_empty());

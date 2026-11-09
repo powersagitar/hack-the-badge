@@ -27,7 +27,10 @@
 //! opening, `docs/milestone-10-decisions.md`) added LE Rand, LE Set Address
 //! Resolution Enable, LE Clear Resolving List, LE Add Device To Resolving
 //! List, LE Set Privacy Mode and LE Remove Advertising Set: with those, the
-//! firmware gets no Unknown HCI Command reply.
+//! firmware gets no Unknown HCI Command reply. The two parameter rules of
+//! Milestone 11 Task 6 (7.8.56's duplicate handles, 7.8.65's
+//! Filter_Duplicates 2) were read from Core **v5.4**'s HTML text, fetched
+//! 2026-11-09: same section numbers.
 //!
 //! - **Framing.** Vol 4 Part A (UART transport) 2: H4 packet indicators
 //!   `0x01` command, `0x02` ACL, `0x03` SCO, `0x04` event, `0x05` ISO.
@@ -738,9 +741,11 @@ impl HciController {
 
     /// 7.8.56: Enable (1), Num_Sets (1), then per set
     /// Advertising_Handle (1), Duration (2), Max_Extended_Advertising_Events
-    /// (1). Disable with Num_Sets 0 disables every set. Every handle is
-    /// checked before any set changes. Duration and the event count are not
-    /// modeled: a set advertises until disabled.
+    /// (1). Disable with Num_Sets 0 disables every set. A set named by more
+    /// than one entry is Invalid HCI Command Parameters, enabling or
+    /// disabling (Core v5.4 7.8.56's wording; checked first, as there).
+    /// Every handle is checked before any set changes. Duration and the
+    /// event count are not modeled: a set advertises until disabled.
     fn set_ext_adv_enable(&mut self, p: &[u8]) -> Vec<u8> {
         let [enable, n, sets @ ..] = p else {
             return status(INVALID_PARAMETERS);
@@ -755,6 +760,9 @@ impl HciController {
             return status(SUCCESS);
         }
         let handles: Vec<u8> = sets.as_chunks::<4>().0.iter().map(|c| c[0]).collect();
+        if (1..handles.len()).any(|i| handles[..i].contains(&handles[i])) {
+            return status(INVALID_PARAMETERS);
+        }
         for &h in &handles {
             let Some(set) = self.adv_sets.iter().find(|s| s.handle == h) else {
                 return status(UNKNOWN_ADV_IDENTIFIER);
@@ -801,12 +809,19 @@ impl HciController {
     /// 7.8.65: Enable (1), Filter_Duplicates (1; 0 off, 1 on, 2 on and
     /// reset each period, here as 1), Duration (2), Period (2). Enabling
     /// resets the duplicate filter, so a repeat is reported again once
-    /// scanning is re-enabled. Duration and Period are not modeled.
+    /// scanning is re-enabled. Duration and Period are not modeled, but
+    /// Filter_Duplicates 2 needs both non-zero or is Invalid HCI Command
+    /// Parameters, and only when enabling: with Enable 0 "the remaining
+    /// parameters shall be ignored" (Core v5.4 7.8.65's wording).
     fn set_ext_scan_enable(&mut self, p: &[u8]) -> Vec<u8> {
         let &[enable, filter, ..] = p else {
             return status(INVALID_PARAMETERS);
         };
         if p.len() != 6 || enable > 1 || filter > 2 {
+            return status(INVALID_PARAMETERS);
+        }
+        let (duration, period) = (&p[2..4], &p[4..6]);
+        if enable == 1 && filter == 2 && (duration == [0, 0] || period == [0, 0]) {
             return status(INVALID_PARAMETERS);
         }
         self.scanning = enable == 1;
@@ -867,6 +882,12 @@ fn splitmix64(state: &mut u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::sample::select;
+    use proptest::test_runner::{Config, RngAlgorithm, RngSeed, TestRunner};
+    use std::cell::RefCell;
+    use std::collections::HashSet;
 
     /// The hacker test MAC (common context), in HCI (little-endian) order.
     const PUBLIC: [u8; 6] = [0x01, 0x10, 0x00, 0x00, 0x00, 0x02];
@@ -1243,21 +1264,87 @@ mod tests {
         assert_eq!(send(&mut c, RESET, &[]), vec![0x00]);
     }
 
-    /// xorshift32 (Marsaglia 2003): seeded and dependency-free.
-    struct XorShift(u32);
-    impl XorShift {
-        fn next(&mut self) -> u32 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            self.0 = x;
-            x
+    /// Core v5.4, Vol 4 Part E, 7.8.56: the same set named by more than one
+    /// entry is Invalid HCI Command Parameters, for enabling and disabling
+    /// alike (the sentence is before "The remainder of this section only
+    /// applies if Enable is set to 0x01"), and nothing changes.
+    #[test]
+    fn ext_adv_enable_rejects_duplicate_handles() {
+        let mut c = HciController::new(PUBLIC);
+        start_advertising(&mut c, &[0x02, 0x01, 0x06]);
+        send_ok(&mut c, LE_SET_EXT_ADV_ENABLE, &[0, 0]);
+        let enable_twice = [1, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(send(&mut c, LE_SET_EXT_ADV_ENABLE, &enable_twice), [0x12]);
+        assert_eq!(
+            c.advertisement(),
+            None,
+            "the refused enable changed nothing"
+        );
+
+        send_ok(&mut c, LE_SET_EXT_ADV_ENABLE, &[1, 1, 0, 0, 0, 0]);
+        let disable_twice = [0, 2, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(send(&mut c, LE_SET_EXT_ADV_ENABLE, &disable_twice), [0x12]);
+        assert!(
+            c.advertisement().is_some(),
+            "the refused disable changed nothing"
+        );
+
+        // The duplicate rule comes first: an unknown handle named twice is
+        // 0x12, not 7.8.56's Unknown Advertising Identifier.
+        let unknown_twice = [1, 2, 9, 0, 0, 0, 9, 0, 0, 0];
+        assert_eq!(send(&mut c, LE_SET_EXT_ADV_ENABLE, &unknown_twice), [0x12]);
+
+        // Duplicates anywhere in the array, not only next to each other.
+        send_ok(&mut c, LE_SET_EXT_ADV_PARAMS, &adv_params(1, 0));
+        let apart = [1, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(send(&mut c, LE_SET_EXT_ADV_ENABLE, &apart), [0x12]);
+
+        // Two different sets are not duplicates.
+        let two_sets = [1, 2, 0, 0, 0, 0, 1, 0, 0, 0];
+        assert_eq!(send(&mut c, LE_SET_EXT_ADV_ENABLE, &two_sets), [SUCCESS]);
+    }
+
+    /// Core v5.4, Vol 4 Part E, 7.8.65: Filter_Duplicates `0x02` "shall only
+    /// be used if both Period and Duration are non-zero", else Invalid HCI
+    /// Command Parameters; with Enable `0x00` "the remaining parameters
+    /// shall be ignored".
+    #[test]
+    fn ext_scan_enable_rejects_filter_duplicates_2_with_period_0() {
+        let mut c = HciController::new(PUBLIC);
+        for (name, enable) in [
+            ("period 0", [1, 2, 1, 0, 0, 0]),
+            ("duration 0", [1, 2, 0, 0, 2, 0]),
+            ("both 0", [1, 2, 0, 0, 0, 0]),
+        ] {
+            assert_eq!(
+                send(&mut c, LE_SET_EXT_SCAN_ENABLE, &enable),
+                [0x12],
+                "{name}"
+            );
+            assert!(!c.is_scanning(), "{name}: refused, so not scanning");
         }
-        fn byte(&mut self) -> u8 {
-            self.next() as u8
+
+        // Both non-zero is the accepted form; a refusal later leaves that
+        // scan running.
+        send_ok(&mut c, LE_SET_EXT_SCAN_ENABLE, &[1, 2, 1, 0, 2, 0]);
+        assert!(c.is_scanning());
+        assert_eq!(
+            send(&mut c, LE_SET_EXT_SCAN_ENABLE, &[1, 2, 1, 0, 0, 0]),
+            [0x12]
+        );
+        assert!(c.is_scanning(), "the refused command changed nothing");
+
+        // Disabling ignores the rest.
+        send_ok(&mut c, LE_SET_EXT_SCAN_ENABLE, &[0, 2, 0, 0, 0, 0]);
+        assert!(!c.is_scanning());
+        // The other filter values have no such rule.
+        for filter in [0, 1] {
+            send_ok(&mut c, LE_SET_EXT_SCAN_ENABLE, &[1, filter, 0, 0, 0, 0]);
         }
     }
+
+    /// The proptest cases of the HCI fuzz test; each is 1 to 128 operations.
+    const HCI_FUZZ_CASES: u32 = 512;
 
     const KNOWN: [u16; 27] = [
         RESET,
@@ -1468,49 +1555,189 @@ mod tests {
         );
     }
 
+    /// One thing the host or a peer does to the controller.
+    #[derive(Clone, Debug)]
+    enum FuzzOp {
+        /// H4 packets from the host, in order.
+        Packets(Vec<Vec<u8>>),
+        /// A peer's advertisement, heard at an RSSI.
+        Hear(Advertisement, i8),
+        /// The host reads every waiting event.
+        Drain,
+    }
+
+    /// Pure noise, any length up to 300.
+    fn noise() -> impl Strategy<Value = FuzzOp> {
+        vec(any::<u8>(), 0..=300).prop_map(|p| FuzzOp::Packets(vec![p]))
+    }
+
+    /// A well-framed command with a known opcode and random parameters, so
+    /// the handlers see garbage.
+    fn garbage_command() -> impl Strategy<Value = FuzzOp> {
+        (select(&KNOWN[..]), vec(any::<u8>(), 0..40))
+            .prop_map(|(op, params)| FuzzOp::Packets(vec![cmd(op, &params)]))
+    }
+
+    /// A command frame whose length field may lie.
+    fn lying_frame() -> impl Strategy<Value = FuzzOp> {
+        (any::<u16>(), any::<u8>(), vec(any::<u8>(), 0..8)).prop_map(|(op, len, tail)| {
+            let mut p = cmd(op, &[]);
+            p[3] = len;
+            p.extend(tail);
+            FuzzOp::Packets(vec![p])
+        })
+    }
+
+    /// The packets that turn scanning on, so the report path is reached:
+    /// both event masks with the report's bits set, parameters on LE 1M,
+    /// and the enable. Everything else is drawn.
+    fn open_scanning() -> impl Strategy<Value = FuzzOp> {
+        (
+            (any::<u64>(), any::<u64>()),
+            (0u8..=3, 0u8..=3, 0u8..=1),
+            (0u8..=2, any::<[u8; 4]>()),
+        )
+            .prop_map(|((mask, le_mask), (own, policy, kind), (filter, times))| {
+                let [d0, d1, p0, p1] = times;
+                FuzzOp::Packets(vec![
+                    cmd(SET_EVENT_MASK, &(mask | EVENT_MASK_LE_META).to_le_bytes()),
+                    cmd(
+                        LE_SET_EVENT_MASK,
+                        &(le_mask | LE_EVENT_MASK_EXT_ADV_REPORT).to_le_bytes(),
+                    ),
+                    cmd(
+                        LE_SET_EXT_SCAN_PARAMS,
+                        &[own, policy, 0x01, kind, 0x10, 0, 0x10, 0],
+                    ),
+                    cmd(LE_SET_EXT_SCAN_ENABLE, &[1, filter, d0, d1, p0, p1]),
+                ])
+            })
+    }
+
+    /// The packets that start one set advertising, with a public own
+    /// address so that no random address is needed. Up to 251 data bytes,
+    /// some of them over [`MAX_ADV_DATA_LEN`].
+    fn open_advertising() -> impl Strategy<Value = FuzzOp> {
+        (0u8..=5, vec(any::<u8>(), 0..=251)).prop_map(|(h, data)| {
+            FuzzOp::Packets(vec![
+                cmd(LE_SET_EXT_ADV_PARAMS, &adv_params(h, 0)),
+                cmd(LE_SET_EXT_ADV_DATA, &adv_data(h, &data)),
+                cmd(LE_SET_EXT_ADV_ENABLE, &[1, 1, h, 0, 0, 0]),
+            ])
+        })
+    }
+
+    /// A peer's advertisement with every address byte drawn. Address type
+    /// 4 and data over [`MAX_ADV_DATA_LEN`] are malformed.
+    fn hear() -> impl Strategy<Value = FuzzOp> {
+        (
+            any::<[u8; 6]>(),
+            0u8..=4,
+            vec(any::<u8>(), 0..240),
+            any::<i8>(),
+        )
+            .prop_map(|(addr, addr_type, data, rssi)| {
+                FuzzOp::Hear(
+                    Advertisement {
+                        addr,
+                        addr_type,
+                        data,
+                    },
+                    rssi,
+                )
+            })
+    }
+
+    /// What the generated cases reached, over the whole run.
+    #[derive(Default)]
+    struct FuzzCoverage {
+        /// Reports queued by `deliver`.
+        reports: u32,
+        /// Reports whose address is not one byte repeated.
+        mixed_addrs: u32,
+        /// The values seen at each address byte, in reports.
+        addr_bytes: [HashSet<u8>; 6],
+        /// Times the queue was seen at [`MAX_QUEUED_EVENTS`].
+        full_queues: u32,
+        /// Times a set was advertising.
+        advertising: u32,
+    }
+
+    /// Whole H4 packets and peers' advertisements, in weighted random
+    /// order, from a fixed seed (`rng_seed` and `rng_algorithm`, so every
+    /// run is the same one; no failure file is written). A hostile packet
+    /// may turn scanning off again, so [`open_scanning`] stays in the mix.
     #[test]
-    fn random_bytes_never_panic() {
-        let mut rng = XorShift(0x1BAD_B002);
-        let mut c = HciController::new(PUBLIC);
-        for i in 0..10_000 {
-            let kind = rng.next() % 4;
-            let packet = match kind {
-                // Pure noise, any length up to 300.
-                0 => (0..rng.next() % 301).map(|_| rng.byte()).collect(),
-                // A well-framed command with a known opcode and random
-                // parameters, so the handlers see garbage.
-                1 | 2 => {
-                    let op = KNOWN[rng.next() as usize % KNOWN.len()];
-                    let len = rng.next() % 40;
-                    let params: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
-                    cmd(op, &params)
+    fn fuzzed_packets_and_advertisements_stay_bounded() {
+        let ops = vec(
+            prop_oneof![
+                2 => noise(),
+                4 => garbage_command(),
+                2 => lying_frame(),
+                1 => open_scanning(),
+                1 => open_advertising(),
+                8 => hear(),
+                1 => Just(FuzzOp::Drain),
+            ],
+            1..=128,
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: HCI_FUZZ_CASES,
+            failure_persistence: None,
+            rng_algorithm: RngAlgorithm::ChaCha,
+            rng_seed: RngSeed::Fixed(0x1BAD_B002),
+            ..Config::default()
+        });
+        let coverage = RefCell::new(FuzzCoverage::default());
+        let outcome = runner.run(&ops, |ops| {
+            let cov = &mut *coverage.borrow_mut();
+            let mut c = HciController::new(PUBLIC);
+            for (i, op) in ops.into_iter().enumerate() {
+                match op {
+                    FuzzOp::Packets(packets) => {
+                        for packet in packets {
+                            c.host_to_controller(&packet);
+                        }
+                    }
+                    FuzzOp::Hear(adv, rssi) => {
+                        if c.deliver(&adv, rssi) {
+                            let report = &c.events.back().expect("just queued").bytes;
+                            assert_eq!(report[..2], [0x04, 0x3E], "op {i}");
+                            assert_eq!(report[8..14], adv.addr, "op {i}");
+                            cov.reports += 1;
+                            cov.mixed_addrs +=
+                                u32::from(adv.addr.iter().any(|b| *b != adv.addr[0]));
+                            for (seen, byte) in cov.addr_bytes.iter_mut().zip(adv.addr) {
+                                seen.insert(byte);
+                            }
+                        }
+                    }
+                    FuzzOp::Drain => {
+                        while let Some(ev) = c.pop_event() {
+                            assert_eq!(ev[0], 0x04, "op {i}");
+                            assert_eq!(ev[2] as usize + 3, ev.len(), "op {i}");
+                        }
+                    }
                 }
-                // A command frame whose length field may lie.
-                _ => {
-                    let mut p = cmd(rng.next() as u16, &[]);
-                    p[3] = rng.byte();
-                    p.extend((0..rng.next() % 8).map(|_| rng.byte()));
-                    p
+                assert!(c.events.len() <= MAX_QUEUED_EVENTS, "op {i}");
+                cov.full_queues += u32::from(c.events.len() == MAX_QUEUED_EVENTS);
+                if let Some(a) = c.advertisement() {
+                    assert!(a.data.len() <= MAX_ADV_DATA_LEN, "op {i}");
+                    cov.advertising += 1;
                 }
-            };
-            c.host_to_controller(&packet);
-            let len = rng.next() as usize % 240;
-            let adv = Advertisement {
-                addr: [rng.byte(); 6],
-                addr_type: rng.byte() % 5,
-                data: (0..len).map(|_| rng.byte()).collect(),
-            };
-            c.deliver(&adv, rng.byte() as i8);
-            assert!(c.events.len() <= MAX_QUEUED_EVENTS, "packet {i}");
-            if let Some(a) = c.advertisement() {
-                assert!(a.data.len() <= MAX_ADV_DATA_LEN);
             }
-            if rng.next().is_multiple_of(3) {
-                while let Some(ev) = c.pop_event() {
-                    assert_eq!(ev[0], 0x04);
-                    assert_eq!(ev[2] as usize + 3, ev.len(), "packet {i}");
-                }
-            }
+            Ok(())
+        });
+        outcome.unwrap();
+        let cov = coverage.into_inner();
+        // A floor, not `> 0`: hostile LE Set Event Mask packets alone open
+        // the masks often enough for a handful of reports.
+        assert!(cov.reports > 1_000, "the fuzz reached the report path");
+        assert!(cov.mixed_addrs > 0, "more than one byte value per address");
+        for (i, seen) in cov.addr_bytes.iter().enumerate() {
+            assert!(seen.len() > 1, "address byte {i} varied");
         }
+        assert!(cov.full_queues > 0, "the fuzz filled the queue");
+        assert!(cov.advertising > 0, "the fuzz reached an advertising set");
     }
 }

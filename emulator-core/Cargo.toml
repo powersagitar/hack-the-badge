@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 png = "0.17"
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
