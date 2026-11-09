@@ -409,8 +409,38 @@ than the TRM are in the Milestone 12 backlog.
 
 ## Moved pins
 
-None yet. Tasks 2 and 3 record each move here (rung | constant | before
-| after | cause).
+Tasks 2 and 3 record each move here (rung | constant | before | after |
+cause).
+
+**Task 2: no pin moved.** All 87 rungs of the release `boot_progress` pass
+unchanged, and no constant or frame hash was re-pinned. The step budgets
+have about 25 % of slack, so a pass alone would not show a small move. A
+scratch probe therefore measured each app that opens by rebooting, at the
+commit before Task 2 (`0e393c3`) and with Task 2's change:
+
+| Rung's end state | Steps (before = after) | Frame hash (before = after) | Emulated time before (µs) | After (µs) | Delta (µs) |
+|---|---|---|---|---|---|
+| Scanner open | 395,720,369 | `SCANNER_OPEN_HASH` | 107,089,383 | 107,555,382 | +465,999 |
+| Sync's home | 405,128,568 | `SYNC_HOME_HASH` | 106,947,376 | 107,413,376 | +466,000 |
+| Share open | 375,750,142 | `0xfc51_aedc_c0ab_617d` | 103,413,941 | 103,879,941 | +466,000 |
+| Sponsors loaded | 467,775,337 | `SPONSORS_LOADED_HASH` | 117,733,891 | 118,199,890 | +465,999 |
+| Workshop Quest open | 430,683,605 | `0x894d_5dae_e0d9_8e2a` | 113,654,025 | 114,120,024 | +465,999 |
+
+HOME's response is also unchanged, measured from the release to the first
+stable `LAUNCHER_HASH`: Scanner 11.75M steps, Share 12.25M, Sponsors
+12.0M, Workshop Quest 12.25M. Their end times move by the same +465,999
+or +466,000 µs.
+
+Three of the five deltas are 1 µs short of `REBOOT_US`, with identical
+step counts. So the new boot's own clock ended up to 1 µs behind, through
+the length of an idle fast-forward. The cause was not traced. No pin
+reads time at that precision after a reboot.
+
+One unit test changed, for the recorded cause (not a pin):
+`emulated_time_is_monotonic_across_a_soft_reset` set a `run_until` target
+50 ms past the reset, which now lies inside the reboot's jump. Its target
+is now `REBOOT_US` + 50 ms past the reset, and it still checks that the
+run stops at the target.
 
 ## Traces
 
@@ -502,6 +532,13 @@ unless another date is given.
   cold boot does not reproduce them either. — cost if wrong: a guest
   read of one of those words after a reboot sees the old app's value
   instead of the bootloader's.
+- Ruling R-T2-1: the unmapped-access log's reset marker is a per-log
+  counter, `FirmwareBus::unmapped_log_resets()`, not a marker entry in the
+  ring. `UnmappedAccess` stays an address and a direction, and the log's
+  capacity is not spent on markers. — cost if wrong: the log says how many
+  resets it crossed but not which entries came before which reset; a
+  diagnosis that needs that split would have to compare the log at the
+  reset.
 
 ## Milestone 12 backlog
 

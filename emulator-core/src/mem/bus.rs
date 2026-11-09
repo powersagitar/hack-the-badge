@@ -430,6 +430,9 @@ pub struct FirmwareBus {
     /// Ring buffer of the most recent catch-all accesses, capped at
     /// [`UNMAPPED_LOG_CAPACITY`].
     unmapped_log: VecDeque<UnmappedAccess>,
+    /// Software resets the log has carried across
+    /// ([`FirmwareBus::unmapped_log_resets`]).
+    unmapped_log_resets: u32,
 }
 
 impl FirmwareBus {
@@ -537,6 +540,7 @@ impl FirmwareBus {
             flash_chip,
             console: Console::new(),
             unmapped_log: VecDeque::with_capacity(UNMAPPED_LOG_CAPACITY),
+            unmapped_log_resets: 0,
         };
         bus.rebuild_ram_spans();
         bus.seed_mmu_like_bootloader(segments);
@@ -875,6 +879,26 @@ impl FirmwareBus {
     /// unmapped/not-yet-modeled address space.
     pub fn unmapped_log(&self) -> &VecDeque<UnmappedAccess> {
         &self.unmapped_log
+    }
+
+    /// How many software resets [`FirmwareBus::unmapped_log`] has been
+    /// carried across, its reset marker (`docs/milestone-11-decisions.md`,
+    /// ruling R-T2-1). 0 from a cold power-on.
+    pub fn unmapped_log_resets(&self) -> u32 {
+        self.unmapped_log_resets
+    }
+
+    /// A software reset's carry: takes `old`'s unmapped-access log ahead of
+    /// anything this new bus has logged, still capped at
+    /// [`UNMAPPED_LOG_CAPACITY`], and counts one more reset.
+    pub fn carry_unmapped_log_from(&mut self, old: &mut FirmwareBus) {
+        let mut log = std::mem::take(&mut old.unmapped_log);
+        log.append(&mut self.unmapped_log);
+        while log.len() > UNMAPPED_LOG_CAPACITY {
+            log.pop_front();
+        }
+        self.unmapped_log = log;
+        self.unmapped_log_resets = old.unmapped_log_resets + 1;
     }
 
     fn record_unmapped(&mut self, addr: u32, is_write: bool) {

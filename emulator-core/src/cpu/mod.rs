@@ -249,6 +249,13 @@ impl Cpu {
         self.last_rom_stub_index_drop
     }
 
+    /// Takes over `old`'s ROM-stub index drop count and last drop, for a
+    /// driver that replaces the core and keeps its diagnostics.
+    pub fn carry_rom_stub_index_drops_from(&mut self, old: &Cpu) {
+        self.rom_stub_index_drops = old.rom_stub_index_drops;
+        self.last_rom_stub_index_drop = old.last_rom_stub_index_drop;
+    }
+
     /// Collects (and clears) the reason code of the last
     /// [`rom_stubs::RomStubEffect::RequestReset`] stub this core ran, if any.
     /// The core itself never resets: the driver checks this after each step

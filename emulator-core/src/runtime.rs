@@ -58,7 +58,12 @@
 //! - **the emulated flash, whole** (the identity, `reboot.cfg`);
 //! - **RTC_CNTL `STORE0..7`** (`crate::peripherals::rtc_cntl`; ESP-IDF's
 //!   reset-reason hint is `STORE6`, `RTC_RESET_CAUSE_REG`, per
-//!   `components/esp_system/port/soc/esp32c3/reset_reason.c`);
+//!   `components/esp_system/port/soc/esp32c3/reset_reason.c`), except
+//!   `STORE4` and `STORE5`, which get the values the 2nd-stage bootloader
+//!   leaves there (`docs/milestone-11-decisions.md`, ruling R-T1-3);
+//! - **the RTC timer**, which keeps counting through the reboot: the new
+//!   `RtcCntl`'s offset is the old timer's value at the reset plus
+//!   [`crate::rom::REBOOT_US`] in slow-clock ticks;
 //! - **RTC fast memory** (`crate::mem::soc::RTC_RANGE`), with the image's
 //!   own RTC segments reloaded over it, as the bootloader would;
 //! - **the panel** (`crate::peripherals::spi::St7789`): an external chip
@@ -69,17 +74,23 @@
 //! - **held buttons and the host-set acceleration**, re-applied;
 //! - **[`FirmwareRuntime::total_steps`] and host time:**
 //!   [`FirmwareRuntime::emulated_time_us`] is the time accumulated before
-//!   the reset plus the new clock's, so it never goes backwards and a
+//!   the reset, plus [`crate::rom::REBOOT_US`] for the reboot the shortcut
+//!   boot skips, plus the new clock's, so it never goes backwards. A
 //!   [`FirmwareRuntime::run_until`] across a reset still stops at its
-//!   target.
+//!   target; one whose target lies inside the reboot's jump returns at the
+//!   reset with time past the target, as an idle overshoot would. The
+//!   jump moves host time and the RTC timer only: the new boot's cycle
+//!   counter and SYSTIMER start at 0, and it runs no steps;
+//! - **two diagnostics:** the bus's unmapped-access log
+//!   ([`crate::mem::bus::FirmwareBus::unmapped_log`], which counts the
+//!   resets it has crossed in
+//!   [`crate::mem::bus::FirmwareBus::unmapped_log_resets`]) and the core's
+//!   [`crate::cpu::Cpu::rom_stub_index_drops`] count (with its last drop).
+//!   They describe the whole run since the last cold power-on.
 //!
-//! Everything else starts fresh with the new boot, including two
-//! diagnostics: the bus's unmapped-access log
-//! ([`crate::mem::bus::FirmwareBus::unmapped_log`]) and the core's
-//! [`crate::cpu::Cpu::rom_stub_index_drops`] count (with its last drop)
-//! begin empty, so after a reset they describe only the new boot.
+//! Everything else starts fresh with the new boot.
 //!
-//! [`FirmwareRuntime::soft_reset_count`] counts them. The host's own
+//! [`FirmwareRuntime::soft_reset_count`] counts the resets. The host's own
 //! [`FirmwareRuntime::reset`] stays a cold power-on.
 //!
 //! ## Checkpoints
@@ -133,6 +144,12 @@ pub struct RunSummary {
     /// mapped and isn't a known ROM stub. The single most useful "why is boot
     /// stuck" signal, so it's surfaced rather than left to a log scrape.
     pub last_instruction_fault: Option<u32>,
+}
+
+/// [`crate::rom::REBOOT_US`] in RTC slow-clock ticks: what the RTC timer
+/// counts during a reboot.
+const fn reboot_rtc_ticks() -> u64 {
+    crate::rom::REBOOT_US * crate::peripherals::timg::RC_SLOW_HZ / 1_000_000
 }
 
 /// The real-firmware emulator: CPU + bus + the image they were built from.
@@ -234,14 +251,27 @@ impl FirmwareRuntime {
             return;
         };
         cpu.set_rom_stubs(crate::rom::esp32c3_rom_stubs_with_reset_reason(reason));
+        cpu.carry_rom_stub_index_drops_from(&self.cpu);
         let rtc_ram: Vec<u8> = RTC_RANGE.map(|a| self.bus.read8(a)).collect();
         let accel = self.acceleration();
-        self.time_base_us += self.bus.clock.elapsed_us();
-        let old = std::mem::replace(&mut self.bus, bus);
+        self.time_base_us += self.bus.clock.elapsed_us() + crate::rom::REBOOT_US;
+        let rtc_at_reset = self
+            .bus
+            .rtc_cntl
+            .rtc_ticks_at(self.bus.systimer.elapsed_ticks());
+        let mut old = std::mem::replace(&mut self.bus, bus);
         self.cpu = cpu;
 
+        self.bus.carry_unmapped_log_from(&mut old);
         self.bus.flash_chip = old.flash_chip;
-        self.bus.rtc_cntl.set_store_regs(old.rtc_cntl.store_regs());
+        // `STORE4` and `STORE5` as the bootloader rewrites them (module doc).
+        let mut store = old.rtc_cntl.store_regs();
+        store[4] = crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE;
+        store[5] = crate::rom::BOOTLOADER_RTC_APB_FREQ_REG_VALUE;
+        self.bus.rtc_cntl.set_store_regs(store);
+        self.bus
+            .rtc_cntl
+            .set_rtc_offset_ticks(rtc_at_reset + reboot_rtc_ticks());
         for (a, b) in RTC_RANGE.zip(rtc_ram) {
             self.bus.write8(a, b);
         }
@@ -293,7 +323,8 @@ impl FirmwareRuntime {
     /// only to the target ([`crate::boot::idle_until`]), so a run that ends
     /// idle ends exactly at the target instead of at the next alarm; a run
     /// that ends busy overshoots by at most one step's time. A software
-    /// reset on the way does not move the target (module doc).
+    /// reset on the way does not move the target, and one whose reboot
+    /// jumps past the target ends the run there (module doc).
     pub fn run_until(&mut self, target_time_us: u64, max_steps: u32) -> RunSummary {
         self.run_impl(max_steps, Some(target_time_us), None)
     }
@@ -955,17 +986,18 @@ mod tests {
             .regs
             .write(crate::cpu::rom_stubs::REG_RA, 0x4200_0020);
         rt.cpu.regs.pc = crate::rom::SOFTWARE_RESET_CPU;
-        let s = rt.run_until(t_before + 50_000, 100_000_000);
+        let target = t_before + crate::rom::REBOOT_US + 50_000;
+        let s = rt.run_until(target, 100_000_000);
         assert_eq!(rt.soft_reset_count(), 1, "the run crossed the reset");
         assert!(s.steps > 1);
         assert!(
-            rt.emulated_time_us() >= t_before + 50_000,
+            rt.emulated_time_us() >= target,
             "{} < {}",
             rt.emulated_time_us(),
-            t_before + 50_000
+            target
         );
         assert!(
-            rt.emulated_time_us() < t_before + 50_100,
+            rt.emulated_time_us() < target + 100,
             "stopped at the target, not past it"
         );
 
@@ -1037,6 +1069,212 @@ mod tests {
         assert!(rt.console_output().starts_with(&before));
         assert_eq!(rt.console_output(), format!("{before}!"));
         assert_eq!(rt.serial_pending(), 0, "queued host input is dropped");
+    }
+
+    /// The RTC timer as `rtc_cntl_ll_get_rtc_time` reads it: `TIME_UPDATE`
+    /// set by a read-modify-write, then `TIME_LOW0` and `TIME_HIGH0`.
+    fn latch_rtc_timer(rt: &mut FirmwareRuntime) -> u64 {
+        use crate::mem::soc::RTC_CNTL_RANGE;
+        use crate::mem::Bus;
+        use crate::peripherals::rtc_cntl::{TIME_HIGH0_REG, TIME_LOW0_REG, TIME_UPDATE_REG};
+        let base = RTC_CNTL_RANGE.start;
+        let update = rt.bus.read32(base + TIME_UPDATE_REG);
+        rt.bus.write32(base + TIME_UPDATE_REG, update | (1 << 31));
+        u64::from(rt.bus.read32(base + TIME_LOW0_REG))
+            | (u64::from(rt.bus.read32(base + TIME_HIGH0_REG)) << 32)
+    }
+
+    /// 466 ms at the RC slow clock's 136 kHz, written out so the test does
+    /// not lean on the conversion it checks.
+    const REBOOT_RTC_TICKS: u64 = 63_376;
+
+    /// 79,999 steps at 80 MHz end one fifth of a tick before 1,000 us, so
+    /// the next step's own time shows in `emulated_time_us`.
+    #[test]
+    fn soft_reset_adds_reboot_time() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(79_999);
+        let mut plain_step = rt.clone();
+        plain_step.run(1);
+        let stepped = plain_step.emulated_time_us();
+        assert!(stepped > rt.emulated_time_us(), "the step's time is seen");
+        let steps = rt.total_steps();
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.emulated_time_us(), stepped + crate::rom::REBOOT_US);
+        assert_eq!(rt.total_steps(), steps + 1, "the jump runs no steps");
+        assert_eq!(
+            rt.bus.clock.total_ticks(),
+            0,
+            "the new boot's clock starts at 0"
+        );
+    }
+
+    #[test]
+    fn rtc_timer_continues_across_a_soft_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(8_000_000);
+        let before = latch_rtc_timer(&mut rt);
+        assert!(before > 0, "the timer has counted");
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        let after = latch_rtc_timer(&mut rt);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        let floor = before + REBOOT_RTC_TICKS;
+        assert!(after >= floor, "{after} < {floor}");
+        assert!(after <= floor + 1, "{after} > {floor} + 1 tick");
+    }
+
+    #[test]
+    fn cold_reset_clears_the_rtc_offset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(8_000_000);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert!(latch_rtc_timer(&mut rt) >= REBOOT_RTC_TICKS);
+
+        rt.reset().expect("reset");
+
+        assert_eq!(rt.bus.rtc_cntl.rtc_offset_ticks(), 0);
+        let first = latch_rtc_timer(&mut rt);
+        assert!(first < 1_000, "{first}");
+    }
+
+    /// The bootloader runs after every software reset and rewrites `STORE4`
+    /// and `STORE5` (decisions doc, ruling R-T1-3); the other six keep the
+    /// guest's values.
+    #[test]
+    fn store4_is_the_bootloaders_after_a_soft_reset() {
+        use crate::mem::soc::RTC_CNTL_RANGE;
+        use crate::mem::Bus;
+        use crate::peripherals::rtc_cntl::{STORE4_REG, STORE5_REG, STORE_REGS};
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let addr = |off: u32| RTC_CNTL_RANGE.start + off;
+        for (i, off) in STORE_REGS.iter().enumerate() {
+            rt.bus.write32(addr(*off), 0xA5A5_0000 + i as u32);
+        }
+        rt.bus.write32(addr(STORE4_REG), 0xdead_beef);
+        rt.bus.write32(addr(STORE5_REG), 0x2626_2626);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(
+            rt.bus.read32(addr(STORE4_REG)),
+            crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE
+        );
+        assert_eq!(rt.bus.read32(addr(STORE4_REG)), 0x0028_0028);
+        assert_eq!(rt.bus.read32(addr(STORE5_REG)), 0x4C4B_4C4B);
+        for (i, off) in STORE_REGS.iter().enumerate() {
+            if *off != STORE4_REG && *off != STORE5_REG {
+                assert_eq!(
+                    rt.bus.read32(addr(*off)),
+                    0xA5A5_0000 + i as u32,
+                    "STORE{i} keeps the guest's value"
+                );
+            }
+        }
+
+        // A cold boot is unchanged: STORE5 goes back to its reset value.
+        rt.reset().expect("reset");
+        assert_eq!(rt.bus.read32(addr(STORE5_REG)), 0);
+    }
+
+    /// An address only the bus's catch-all answers.
+    const UNMAPPED_PROBE: u32 = 0x3ff1_0008;
+
+    #[test]
+    fn diagnostics_carry_across_a_soft_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.read32(UNMAPPED_PROBE);
+        assert_eq!(rt.bus.unmapped_log_resets(), 0);
+        // intr_matrix_set(_, model_num = 64, _): one past the last MAP slot.
+        rt.cpu.regs.write(crate::cpu::rom_stubs::REG_A1, 64);
+        call_stub(&mut rt, crate::rom::INTR_MATRIX_SET);
+        assert_eq!(rt.cpu.rom_stub_index_drops(), 1);
+        let last_drop = rt.cpu.last_rom_stub_index_drop();
+        assert!(last_drop.is_some());
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert!(rt
+            .bus
+            .unmapped_log()
+            .iter()
+            .any(|a| a.addr == UNMAPPED_PROBE));
+        assert_eq!(rt.bus.unmapped_log_resets(), 1);
+        assert_eq!(rt.cpu.rom_stub_index_drops(), 1);
+        assert_eq!(rt.cpu.last_rom_stub_index_drop(), last_drop);
+
+        rt.reset().expect("reset");
+        assert_eq!(rt.bus.unmapped_log_resets(), 0, "a cold power-on");
+        assert!(rt.bus.unmapped_log().is_empty());
+        assert_eq!(rt.cpu.rom_stub_index_drops(), 0);
+    }
+
+    /// Review Focus 2: a `run_until` target inside the reboot's jump. The
+    /// run returns at the reset with time past the target, time never goes
+    /// backwards, a repeat of that target runs nothing, and a later target
+    /// runs normally.
+    #[test]
+    fn run_until_target_inside_the_reboot_jump() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(80_000);
+        let start = rt.emulated_time_us();
+        let target = start + crate::rom::REBOOT_US / 2;
+        rt.cpu
+            .regs
+            .write(crate::cpu::rom_stubs::REG_RA, 0x4200_0020);
+        rt.cpu.regs.pc = crate::rom::SOFTWARE_RESET_CPU;
+
+        let s = rt.run_until(target, 1_000_000);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(s.steps, 1, "returned at the reset");
+        let after = rt.emulated_time_us();
+        assert!(after >= start + crate::rom::REBOOT_US, "{after}");
+        assert!(after > target, "{after} <= {target}");
+
+        let again = rt.run_until(target, 1_000_000);
+        assert_eq!(again.steps, 0, "the target is already past");
+        assert_eq!(rt.emulated_time_us(), after, "time did not go backwards");
+
+        let next = after + 1_000;
+        let s = rt.run_until(next, 10_000_000);
+        assert!(s.steps > 0 && s.steps < 10_000_000, "stopped by the target");
+        assert!(rt.emulated_time_us() >= next);
+        assert!(rt.emulated_time_us() < next + 100);
+        assert_eq!(rt.soft_reset_count(), 1);
+    }
+
+    /// Review Focus 5: a reboot into an app that reboots again.
+    #[test]
+    fn two_soft_resets_accumulate() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.run(8_000_000);
+        let start_us = rt.emulated_time_us();
+        let start_rtc = latch_rtc_timer(&mut rt);
+        rt.bus.read32(UNMAPPED_PROBE);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 2);
+        let two_reboots = 2 * crate::rom::REBOOT_US;
+        let us = rt.emulated_time_us();
+        assert!(us >= start_us + two_reboots, "{us}");
+        assert!(us <= start_us + two_reboots + 1, "{us}: only two steps ran");
+        assert_eq!(rt.bus.unmapped_log_resets(), 2);
+        assert_eq!(rt.total_steps(), 8_000_002);
+        let rtc = latch_rtc_timer(&mut rt);
+        let floor = start_rtc + 2 * REBOOT_RTC_TICKS;
+        assert!(rtc >= floor, "{rtc} < {floor}");
+        assert!(rtc <= floor + 1, "{rtc} > {floor} + 1 tick");
     }
 
     /// The fake hacker MAC the radio rungs use (common context).

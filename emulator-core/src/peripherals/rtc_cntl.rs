@@ -165,6 +165,28 @@
 //! the eight words into the rebuilt peripheral. Only `STORE4` is in
 //! [`RtcCntl::handles`] (unchanged), so the unmapped-access log stays as it
 //! was.
+//!
+//! The bootloader runs after every software reset and rewrites two of them,
+//! so `crate::runtime`'s reset does too: `STORE4`
+//! (`crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE`) and `STORE5`, ESP-IDF's
+//! `RTC_APB_FREQ_REG` (`crate::rom::BOOTLOADER_RTC_APB_FREQ_REG_VALUE`;
+//! `docs/milestone-11-decisions.md`, ruling R-T1-3).
+//!
+//! ## The RTC timer across a software reset (Milestone 11)
+//!
+//! The RTC domain survives both kinds of software reset: a CPU reset "only
+//! resets CPU core", a core reset resets everything "except RTC" (ESP32-C3
+//! TRM v1.4, §6.1.3, pp. 191-192); "any reset / sleep other than power-up
+//! reset will not stop or reset the RTC timer" (§9.3.3, p. 224); and the RTC
+//! power domain holds the RTC timer (§9.4.1, p. 226).
+//!
+//! This model derives the timer from SYSTIMER's tick count, which restarts
+//! with the new boot, so [`RtcCntl::rtc_offset_ticks`] holds what the timer
+//! had counted before: [`RtcCntl::rtc_ticks_at`] adds it to the derived
+//! count, and every latch goes through that. `crate::runtime`'s software
+//! reset sets it to the old timer's value at the reset plus
+//! `crate::rom::REBOOT_US` in `RC_SLOW_HZ` ticks. It is 0 from a cold
+//! power-on, which is the only thing that restarts the timer.
 
 use super::set_byte;
 use super::timg::RC_SLOW_HZ;
@@ -235,6 +257,10 @@ pub struct RtcCntl {
     /// every read. Starts at 0 (no trigger has fired yet), matching real
     /// hardware's reset default for both registers.
     latched: u64,
+    /// RTC slow-clock ticks counted before the current SYSTIMER clock
+    /// started: 0 from power-on until a software reset sets it. See the
+    /// module doc's "The RTC timer across a software reset".
+    rtc_offset_ticks: u64,
 }
 
 impl Default for RtcCntl {
@@ -242,6 +268,7 @@ impl Default for RtcCntl {
         Self {
             regs: [0; REGS_WORDS],
             latched: 0,
+            rtc_offset_ticks: 0,
         }
     }
 }
@@ -277,6 +304,24 @@ impl RtcCntl {
         for (off, v) in STORE_REGS.iter().zip(values) {
             self.regs[(off >> 2) as usize] = v;
         }
+    }
+
+    /// The RTC timer's value when SYSTIMER's `elapsed_ticks()` reads
+    /// `elapsed_ticks`, offset included, masked to the counter's 48 bits.
+    pub fn rtc_ticks_at(&self, elapsed_ticks: u64) -> u64 {
+        let raw = (elapsed_ticks as u128) * (RC_SLOW_HZ as u128) / (SYSTIMER_HZ as u128);
+        (raw as u64).wrapping_add(self.rtc_offset_ticks) & COUNTER_MASK_48
+    }
+
+    /// RTC slow-clock ticks added to the count derived from SYSTIMER.
+    pub fn rtc_offset_ticks(&self) -> u64 {
+        self.rtc_offset_ticks
+    }
+
+    /// Sets [`RtcCntl::rtc_offset_ticks`] (a software reset, whose new
+    /// SYSTIMER clock starts at 0; see the module doc).
+    pub fn set_rtc_offset_ticks(&mut self, ticks: u64) {
+        self.rtc_offset_ticks = ticks;
     }
 
     pub fn read_byte(&mut self, offset: u32) -> u8 {
@@ -330,9 +375,7 @@ impl RtcCntl {
                 // `UNIT0_OP_REG` handling of the same idiom.
                 set_byte(&mut self.regs[widx], idx, val);
                 if idx == 3 && val & TIME_UPDATE_BYTE3_BIT != 0 {
-                    let raw =
-                        (elapsed_ticks as u128) * (RC_SLOW_HZ as u128) / (SYSTIMER_HZ as u128);
-                    self.latched = (raw as u64) & COUNTER_MASK_48;
+                    self.latched = self.rtc_ticks_at(elapsed_ticks);
                 }
             }
             _ => set_byte(&mut self.regs[widx], idx, val),
@@ -453,6 +496,26 @@ mod tests {
             0,
             "TIMER_SYS_RST must survive the trigger write"
         );
+    }
+
+    #[test]
+    fn the_latch_includes_the_offset() {
+        let mut t = RtcCntl::new();
+        assert_eq!(t.rtc_offset_ticks(), 0);
+        t.set_rtc_offset_ticks(5_000);
+        assert_eq!(t.rtc_offset_ticks(), 5_000);
+        assert_eq!(t.rtc_ticks_at(SYSTIMER_HZ), RC_SLOW_HZ + 5_000);
+        w(&mut t, TIME_UPDATE_REG, 1 << 31, SYSTIMER_HZ);
+        assert_eq!(latched_value(&mut t), RC_SLOW_HZ + 5_000);
+    }
+
+    #[test]
+    fn the_offset_wraps_with_the_48_bit_counter() {
+        let mut t = RtcCntl::new();
+        t.set_rtc_offset_ticks(COUNTER_MASK_48);
+        assert_eq!(t.rtc_ticks_at(SYSTIMER_HZ), RC_SLOW_HZ - 1);
+        t.set_rtc_offset_ticks(u64::MAX); // must not panic
+        assert_eq!(t.rtc_ticks_at(SYSTIMER_HZ), RC_SLOW_HZ - 1);
     }
 
     #[test]

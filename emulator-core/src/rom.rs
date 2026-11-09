@@ -2203,6 +2203,26 @@ pub const RTC_XTAL_FREQ_REG: u32 =
 /// `RTC_CLK_CONFIG_DEFAULT()` (`soc/rtc.h`). Module doc, entry 23.
 pub const BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE: u32 = (40 << 16) | 40;
 
+/// The value the 2nd-stage bootloader leaves in `RTC_APB_FREQ_REG`
+/// (`RTC_CNTL_STORE5_REG`, `rom/rtc.h` :53, :63) after every software reset:
+/// `rtc_clk_init` ends on the 80 MHz PLL (`rtc_clk.c` :186-192), and
+/// `clk_ll_apb_store_freq_hz(80 MHz)` (`clk_tree_ll.h` :665-669, ESP-IDF
+/// v5.5.3) writes `apb_freq_hz >> 12` to both halves. Only a software reset
+/// reproduces it; a cold boot leaves the register at 0
+/// (`docs/milestone-11-decisions.md`, table row 11 and ruling R-T1-3).
+pub const BOOTLOADER_RTC_APB_FREQ_REG_VALUE: u32 =
+    ((80_000_000u32 >> 12) << 16) | (80_000_000u32 >> 12);
+
+/// The time from a software reset to the app's first instruction, in
+/// microseconds, spent in the mask ROM and the 2nd-stage bootloader, which
+/// the shortcut boot skips. The badge's two captures of a reboot on v335
+/// (`local/m11-badge/reboot_log_1.txt` and `reboot_log_2.txt`, local only)
+/// both reach `cpu_start` at 468 ms; scaled to v392's segments (+2.1 ms for
+/// the mapped ones, -4.6 ms for the loaded ones), about 466 ms. See
+/// `docs/superpowers/specs/2026-11-03-milestone11-backlog-sweep-design.md`,
+/// "Measured (2026-11-03)". Both kinds of software reset take it.
+pub const REBOOT_US: u64 = 466_000;
+
 /// The ROM writable-`.data` state the shortcut boot must seed, standing in
 /// for the two steps it skips (module doc, entry 20), in application order:
 ///
