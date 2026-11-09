@@ -470,7 +470,189 @@ queued serial input; it now asserts that it stays (row 12).
 
 ## Traces
 
-None yet (Task 4).
+Both traces were made on v392 at `fd96f49`, with scratch probes outside
+the repo, since deleted. The firmware image has no symbols. Below,
+**proven** means a string or a measurement in this section shows it;
+**inferred** means the name comes from matching code shape against the
+public source, and is labelled.
+
+Ruling R-T4-1: `PROV FAIL`'s busy steps are the firmware's own work, and
+no emulator change follows — cost if wrong: a slow redraw would hide an
+emulator effect, but the trace found no MMIO spin, no new unmapped access
+and no idle time to explain.
+
+Ruling R-T4-2: both provisioning hosts are valid, neither changes, and
+`provisioner_pacing_matches_the_rust_host` pins their shared schedule —
+cost if wrong: only test-walk step counts differ, and every pinned frame
+matches on both.
+
+### `PROV FAIL`'s 3.0M busy steps: firmware behaviour, not ours
+
+**Result.** The steps are a full-screen LVGL redraw on the firmware's
+`taskLVGL`. It preempts the console in the middle of the result line. The
+redraw repaints identical pixels.
+
+**How it was measured.** A clone of `first_run_screen()`, then
+`provision::put_file` with the payload `{}`, then `prov apply\n`, stepping
+in slices of 1 to 500 steps and sampling `pc`, `ra`, `sp`, the panel
+window, `idle_ticks`, `transaction_count` and the unmapped log. Emulated
+time is `emulated_time_us()`.
+
+| Step | Emulated µs | Event |
+| --- | --- | --- |
+| 15,900,000 | 1,437,136 | `prov apply` typed |
+| 15,978,329 | | REPL task takes `lvgl_port_lock` (`ra` `0x4200c054`) |
+| 15,978,482 | | identity load `0x4200eb1c` starts |
+| 16,239,137 | | REPL task calls `lvgl_port_unlock` (`ra` `0x4200c060`) |
+| 16,257,250 | 1,441,602 | console has printed `PROV FAIL ` (10 bytes) |
+| 16,260,737 | | `taskLVGL` takes `lvgl_port_lock` (`ra` `0x420a32a4`) |
+| 19,078,809 | | `taskLVGL` calls `lvgl_port_unlock` (`ra` `0x420a32b6`) |
+| 19,080,750 | 1,476,895 | the console's next byte (`invalid or missing …`) |
+
+The silent gap in the console is 2,823,500 steps and 35,293 µs. The lock
+is held for 2,818,072 of those steps. Milestone 9's "3.0M after the
+result line" is this gap, plus the rest of the line and the error return,
+sampled on a coarse grid: the next prompt was seen by 19,357,500 at
+100,000-step sampling.
+
+**In the gap:**
+
+- `idle_ticks` grows by 0, and the flash controller makes 0 transactions.
+- The unmapped log is identical before and after, so there is no new
+  unmapped access.
+- The panel window moves through eight 30-line strips, `(0,319,0,29)` to
+  `(0,319,210,239)`: the whole 320x240 screen.
+- The framebuffer afterwards equals the one before.
+- Sampled `sp` values lie in `0x3fcbe5f0..0x3fcbf0c0`, inside `taskLVGL`'s
+  stack. Its TCB, found by name at `0x3fcbb06c`, gives `pxStack`
+  `0x3fcbb19c` and priority 4.
+
+**Hot code** (2,823,500 traced steps; 87.1 % in `0x420a3200..0x420e2000`,
+LVGL and its port; 5.6 % in IRAM):
+
+| Address | Share | What it is |
+| --- | --- | --- |
+| `0x420b5fd6..0x420b6300` | 13.2 % | Glyph expansion to A8. Inferred: LVGL's `lv_font_get_bitmap_fmt_txt`. Evidence: indexes the tables at `0x3c241f7c` (`0, 85, 170, 255`) and `0x3c241f80` (`0, 17, …, 255`), matching its `opa2_table` and `opa4_table`. |
+| `0x420b5b38..0x420b5c60` | 10.9 % | RGB565 byte swap of the draw buffer, in 8-word blocks. Inferred: `lv_draw_sw_rgb565_swap`, from the code shape. |
+| `0x420c14b6..0x420c14e0` | 3.1 % | Fill: 32-byte blocks, then a byte tail. Inferred: LVGL's `lv_memset`, from the code shape. |
+| The rest | | Spread thin over LVGL's draw code; not named one by one. |
+
+These loops load from RAM and flash. None of them polls a peripheral.
+
+**Names proven by strings:** `0x420a30e4` is `lvgl_port_lock` and
+`0x420a314a` is `lvgl_port_unlock`. Each one's assert passes its function
+name (`0x3c241a40`, `0x3c241a2c`) and `esp_lvgl_port.c` (`0x3c1496fd`).
+
+**Why it redraws.**
+
+1. The `prov apply` handler (the code around `0x4200c050`; it references
+   `PROV FAIL invalid or missing %s\n` at `0x3c134e70`) calls `0x4200eb1c`
+   under the LVGL lock.
+2. `0x4200eb1c` clears the identity struct at `0x3fca3310` and reads
+   `/littlefs/identity.json` (`0x3c134e58`).
+3. On its result paths it adds 1 to the word at `0x3fcb5d70`, a generation
+   counter, through `0x403975b4` (arguments `(addr, 1, 5)`; the body is a
+   critical-section fetch-add; inferred: `__atomic_fetch_add_4`, with 5 as
+   `__ATOMIC_SEQ_CST`). The sites in this function are `0x4200eb72`
+   (success), `0x4200ec0e` (file missing) and `0x4200ec3e` (parse
+   failure), so a failed apply bumps it too. `0x4200f00e` is another
+   site, outside this path.
+4. `0x4200f3d4` reads the counter. `0x42015398` compares it with a saved
+   copy and, on a mismatch, calls `0x4201521c`, which rebuilds the screen.
+   Inferred: this is My Badge. Unprovisioned, `0x4201521c` calls
+   `0x42014f64`, which references `Not registered yet` (`0x3c1374c0`) and
+   sets all six LEDs white. The neighbouring `0x42014d08` references
+   `Badge ID: %s` (`0x3c137488`).
+5. `0x42014f64` was observed running on `taskLVGL`'s stack (a PC at
+   `0x42014f90` at step 16,323,234). Its only direct caller is
+   `0x4201525a`, inside `0x4201521c`. That `0x42015398` was the path taken
+   is inferred: `0x4201521c` has six direct callers, and the probe did not
+   record which one ran.
+
+**Controls, each from the same first-run checkpoint, over 5,000,000 steps
+each:**
+
+| Input | Panel window changes | Steps on `taskLVGL`'s stack (100-step sampling) |
+| --- | --- | --- |
+| None | 0 | 312,900 |
+| `prov show` | 0 | 312,400 |
+| An empty line | 0 | 310,300 |
+| `prov apply`, no file | 8, the first at step 16,999,900 | 2,918,100 |
+
+So the redraw follows `prov apply`, and not `prov show` or an empty line.
+With no file, `PROV FAIL` was seen by step 15,800,000 and the prompt by
+16,000,000 (50,000-step sampling), and the redraw came after both. Where
+the redraw lands against the prompt is scheduling: in the `{}` case it
+delays the prompt, and in the no-file case it does not.
+
+**Not established:** why v335 showed 0.2M here. v335 was not re-traced.
+Whether v335 lacks this rebuild, or only scheduled it after the prompt
+(as the no-file case above does on v392), is open.
+
+`boot_progress.rs`'s doc on `CONSOLE_DEADLINE` still says "not traced";
+no constant changes for this.
+
+### The two provisioning hosts' step difference: both valid
+
+**Result.** The first difference is 2,000 steps, at Chunk 1 in the
+table below (the payload's second 64-byte chunk). The bulk of the difference is that the Rust host waits for the
+prompt after `PROV OK` and the frontend does not.
+
+**How it was measured.** Each input was logged as (total steps, emulated
+µs, event) by wrapping `serial_input` / `serialInput`,
+`set_raw_button` / `setRawButton` and the acceleration setter:
+
+- Rust: a scratch copy of `boot_progress.rs`'s walk to
+  `launcher_for("hacker")`. It ends at 342,600,776 steps, equal to the
+  pinned `HACKER_LAUNCHER_STEPS`.
+- Frontend, twin schedule: `test/cpu-wasm.test.ts`'s walk over the WASM
+  handle (`provisioner.poll()` every 50,000 steps), where Milestone 7's
+  number came from. It ends at 341,368,630 steps on `LAUNCHER_HASH`.
+- Frontend, browser schedule: `createFirmwareRuntime` with
+  `WORKER_STEPS_PER_SLICE` (400,000) and a fake clock of 2, 8 and 20 ms
+  per slice, through `PROV OK` only.
+
+Milestone 7's 740,001 was measured on v335. On v392 the walks are
+1,232,146 steps apart. 740,001 was not re-measured.
+
+| Input | Rust: step (µs) | Twin: step (µs) |
+| --- | --- | --- |
+| `put` command | 15,500,000 (1,427,134) | 15,500,000 (1,427,134) |
+| Chunk 0 | 15,850,000 (1,451,785) | 15,850,000 (1,451,785) |
+| Chunk 1 (first difference) | 15,898,000 (1,452,385) | 15,900,000 (1,452,410) |
+| Chunk 2 | 15,946,000 (1,461,676) | 15,950,000 (1,462,162) |
+| Chunk 3 | 15,994,000 (1,471,799) | 16,000,000 (1,477,138) |
+| Chunk 4 (39 bytes) | 16,042,000 (1,491,653) | 16,050,000 (1,491,738) |
+| `prov apply` | 16,192,000 (1,512,164) | 16,200,000 (1,521,656) |
+| Host finished | 28,542,000 (2,282,145) | 27,300,000 (1,662,006) |
+| First press | 36,542,000 (6,821,813) | 35,300,000 (6,101,690) |
+
+- **Chunk pacing.** Both send 64-byte chunks. The Rust host runs exactly
+  48,000 steps between them. The frontend sends on its first poll at least
+  48,000 steps after the last chunk, so the twin's 50,000-step poll grid
+  makes its gaps 50,000. The browser schedule's gaps were 53,190 to
+  92,981 steps across the three clocks. All are above the 24,000-step
+  threshold measured in Milestone 5 and Milestone 6.
+- **First-prompt wait.** The same in both: the first `put` goes out at
+  step 15,500,000.
+- **The end of provisioning.** The Rust `provision()` returns only after
+  the prompt that follows `PROV OK`, because a test may type more. The
+  frontend's provisioner is done at the complete `PROV OK` line. That is
+  1,242,000 steps and 620,139 µs apart at each host's sampling (the Rust
+  host on its 50,000-step wait, the twin on its 50,000-step poll).
+- **The press schedule.** The same shape: each press comes after the
+  stable-frame wait, 8,000,000 steps after each host's start. The offset
+  of 1,242,000 at the first press shrinks to 1,232,146 by the end. The
+  hold of a press is a fixed emulated time, so its step count depends on
+  the phase (for example 2,632,588 against 2,642,375 for the first). The
+  remaining 9,854 steps were not attributed press by press.
+
+Neither host is wrong against the firmware: every pinned frame matches
+on both. The frontend never types after `PROV OK`, so it does not need
+that prompt. `frontend/test/provisioner.test.ts`'s
+`provisioner_pacing_matches_the_rust_host` reads the Rust host's source
+and pins the chunk size (64), the gap (48,000) and the frontend's sending
+at exactly that gap and not one step before.
 
 ## Dependencies added
 

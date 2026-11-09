@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   createProvisioner,
   PUT_CHUNK_BYTES,
@@ -92,6 +93,40 @@ describe("provisioner", () => {
     p.poll();
     expect(f.typed.slice(1)).toEqual(["x".repeat(64), "x".repeat(64), "x".repeat(22)]);
     expect(f.typed.slice(1).join("")).toBe(json);
+  });
+
+  // docs/milestone-11-decisions.md, "Traces": the two provisioning hosts
+  // pace differently but legally. This pins the frontend's chunk schedule
+  // against the Rust host's (tests/common/provision.rs), read from its
+  // source, so a change to either side fails here.
+  test("provisioner_pacing_matches_the_rust_host", () => {
+    const rust = readFileSync(
+      new URL("../../emulator-core/tests/common/provision.rs", import.meta.url),
+      "utf8",
+    );
+    const rustGap = Number(
+      /pub const PUT_CHUNK_GAP_STEPS: u32 = ([\d_]+);/.exec(rust)?.[1]?.replaceAll("_", ""),
+    );
+    const rustChunk = Number(/payload\.chunks\((\d+)\)/.exec(rust)?.[1]);
+    expect(rustChunk).toBe(64);
+    expect(rustGap).toBe(48_000);
+    expect(PUT_CHUNK_BYTES).toBe(rustChunk);
+    expect(PUT_CHUNK_GAP_STEPS).toBe(rustGap);
+
+    const full = "x".repeat(rustChunk);
+    const { f, p } = toFirstChunk(full + full + "x".repeat(8));
+    expect(f.typed.slice(1)).toEqual([full]);
+    // One step short of the Rust host's gap: nothing goes out.
+    f.advance(rustGap - 1);
+    p.poll();
+    expect(f.typed.slice(1)).toEqual([full]);
+    // At the gap, the next chunk goes out.
+    f.advance(1);
+    p.poll();
+    expect(f.typed.slice(1)).toEqual([full, full]);
+    f.advance(rustGap);
+    p.poll();
+    expect(f.typed.slice(1)).toEqual([full, full, "x".repeat(8)]);
   });
 
   test("waits for OK and the prompt, then types prov apply and reports PROV OK", () => {
