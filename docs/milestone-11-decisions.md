@@ -191,6 +191,69 @@ RED, each from one mutation of `emulator-core`:
 | The serial test's well-formed rule is `<= 2` | serial: the `heard == well_formed` assertion |
 | The serial bytes are 0 to 6 long | serial: "the fuzz reached the accepting path" |
 
+### The signaling function's cost (Task 9)
+
+**How Upstash bills a script call.** Upstash's "Costs" page for
+`@upstash/ratelimit`
+(https://upstash.com/docs/redis/sdks/ratelimit-ts/costs, fetched
+2026-11-09) counts the script call itself and every Redis command the
+script runs: a fixed-window `limit()` is "EVAL, INCR, PEXPIRE" (3) on a
+key's first count in a window, "EVAL, INCR" (2) after it, "EVAL, INCR"
+(2) when refused on a cache miss, and 0 when refused from the instance's
+cache. The pricing FAQ (https://upstash.com/docs/redis/overall/pricing,
+fetched the same day) charges every command but AUTH, HELLO, SELECT,
+COMMAND, CONFIG, INFO, PING, RESET and QUIT; it says nothing about
+scripts itself.
+
+**Measured.** `upstashDeps` over a `Redis` whose global `fetch` was a
+scratch fake Upstash (SET, GET, DEL, EVALSHA/EVAL with the script's
+INCRBY and first-count PEXPIRE; NOSCRIPT on the first EVALSHA, as a fresh
+database answers), no network. "Billed" is the REST commands plus the
+commands inside the scripts, per the page above:
+
+| Request | Status | REST commands | Inside the scripts | Billed |
+|---|---|---|---|---|
+| `create`, cold (first script use: NOSCRIPT, then EVAL; every window new) | 200 | 6 | INCR ×3, PEXPIRE ×3 | 12 |
+| `create`, warm | 200 | 5 (EVALSHA ×3, SET NX, SET token) | INCR ×3 | 8 |
+| poll answer, pending | 204 | 5 (EVALSHA ×3, GET ×2) | INCR ×3 | 8 |
+| poll answer, answered | 200 | 4 (EVALSHA ×3, GET) | INCR ×3 | 7 |
+| poll offer | 200 | 4 (EVALSHA ×3, GET) | INCR ×3 | 7 |
+| `answer` | 204 | 5 (EVALSHA ×3, GET, SET NX) | INCR ×3 | 8 |
+| `close` | 204 | 5 (EVALSHA ×3, GET, DEL) | INCR ×3 | 8 |
+| a bad request | 400 | 0 | — | 0 |
+| a write over its cap, first refusal | 429 | 2 (EVALSHA ×2) | INCR ×2 | 4 |
+| the same, refused again by the same instance | 429 | 1 (EVALSHA) | INCR | 2 |
+
+A window's first count adds one PEXPIRE (a new room's poll window, a
+client's first request in a window, and so on).
+
+- **Per request**, a served one costs 7 or 8 commands. That is today's
+  cost (three `INCR` + `EXPIRE NX` pipelines, 6, plus the room's
+  command), not the spec's "about 4": a script call bills its `INCR` as
+  well as itself. `create` costs one more than before (the token's SET).
+- **A typical pairing**, warm, with the host polling N times (the last
+  one answered): `create` 8 + (N − 1) × 8 + 7 + the joiner's offer poll
+  7 + `answer` 8 + `close` 8 = 8N + 30, plus a few PEXPIREs. For N = 10
+  to 30 that is about 110 to 275 commands, so the free month (500K)
+  covers about 1,800 to 4,500 pairings. Without `close`, 8N + 22.
+- **At the global cap** (5,000 served requests per 10 min, 7 to 8
+  commands each) the month's quota is spent in 500,000 / 40,000 to
+  500,000 / 35,000 windows: about 2.1 to 2.4 hours. A request refused at
+  the global cap still costs its client's and its room's or writes'
+  script calls (4 commands; the global refusal itself comes from the
+  instance's cache after the first), so a flood past the cap from many
+  clients spends the quota faster still.
+
+**Sizes.** `bun run build`'s client bundle is byte-identical before and
+after (`dist/assets/index-C2eKYMur.js`, 276,964 B, both at `4bd7b06` and
+with this change): the browser takes only the room-code helpers from
+`signal-handler.ts`, `valibot`'s schemas are dropped as unused, and the
+`@upstash` packages live only in `api/signal.ts`. So `valibot` costs the
+client 0 B today. The function, bundled for Node by `bun build
+api/signal.ts --target node --minify` (Vercel bundles it its own way;
+this is an estimate): 4,150 B (1,828 B gzipped) before, 128,188 B
+(32,211 B gzipped) after, almost all of it `@upstash/redis`.
+
 ## What a CPU reset keeps
 
 v392 reboots through `esp_restart()`, which ends in `esp_restart_noos()`
@@ -715,6 +778,22 @@ at exactly that gap and not one step before.
   false, features = ["std"]`: no `fork` or `timeout`, so no `rusty-fork`
   or `tempfile`. A dev-dependency: neither the WASM build nor
   `emulator-wasm`'s dependency tree has it.
+- `@upstash/redis` 1.41.0 (frontend, Task 9): the Upstash REST client, in
+  place of the hand-written `UpstashStore` (spec, Part 5.3, Part 7);
+  `@upstash/ratelimit` needs it. Brings `uncrypto` 0.1.3. Imported only by
+  `api/signal.ts`, never by the browser bundle. Built with
+  `automaticDeserialization: false` (values verbatim), `enableTelemetry:
+  false` and `enableAutoPipelining: false`.
+- `@upstash/ratelimit` 2.2.0 (frontend, Task 9): the four fixed-window
+  limiters (`Ratelimit.fixedWindow`), in place of the hand-written
+  `INCR`/`EXPIRE NX` counters (spec, Part 5.3; the human partner's answer
+  (c) of 2026-11-03). Brings `@upstash/core-analytics` 0.0.10, unused
+  (analytics off). Imported only by `api/signal.ts`.
+- `valibot` 1.5.0 (frontend, Task 9): the request schemas
+  (`v.safeParse`) in `signal-handler.ts`, in place of hand-written type
+  guards (spec, Part 7). A failure is a 400, never a throw. The client
+  bundle does not carry it today (tree-shaken; "The signaling function's
+  cost").
 
 ## Closed in writing
 
@@ -890,6 +969,45 @@ unless another date is given.
   remaining pulse is cut short — cost if wrong: a shake or bump timed
   across a reboot misses its last periods (v392's five apps that open by
   rebooting are entered by a button, and Connect's bump does not reboot).
+- Ruling R-T9-1: the four windows are `Ratelimit.fixedWindow`'s, fixed to
+  the clock (window number `floor(now / window)`), not opened by a key's
+  first request as the old counters were; `memoryLimiter` buckets the
+  same way, and a 429's `Retry-After` is the whole seconds left until the
+  limiter's `reset` (at least 1), no longer the whole window. The caps
+  and windows are unchanged (R-T10-8) — cost if wrong: across a window
+  boundary a key can spend up to twice its cap in a short burst (60
+  writes in a few seconds around a minute boundary; a room's 300 s life
+  can span two poll windows, so up to 400 polls; up to 10,000 global
+  requests around a 10 min boundary, which spends the quota faster). At
+  toy scale this is accepted; a sliding window costs more commands.
+- Ruling R-T9-2: the Upstash limiters run with `timeout: 0`, so a slow
+  or failing store is waited for or fails (a bare 500), never waved
+  through as the library's default 5 s timeout would (it answers
+  `success: true`); analytics, telemetry and the deny list stay off; the
+  library's per-instance cache of refused keys stays on (a key refused
+  in a window is refused again by that instance with no command). Cost
+  if wrong: a hung Upstash holds each request until Vercel's function
+  timeout instead of serving it unlimited after 5 s.
+- Ruling R-T9-3: `clientKey` parses the address strictly: IPv4 whole,
+  IPv6 its /64 (four hextets, expanded, lower case), an IPv4-mapped IPv6
+  address (`::ffff:a.b.c.d`) as its IPv4 address (else every such client
+  would share `0000:0000:0000:0000`), and anything else, a zone index
+  included, `unknown`; the `x-real-ip` fallback stays — cost if wrong: a
+  proxy that forwards non-canonical addresses lumps its clients under
+  `unknown`, which shares one set of client windows.
+- Ruling R-T9-4: `api/signal.ts` checks the credentials `Redis.fromEnv`
+  will read, in its order (`UPSTASH_REDIS_REST_URL` or else
+  `KV_REST_API_URL`, the same for the token), and also answers a bare
+  500 when one has surrounding whitespace or a line break, since
+  `@upstash/redis` would print a console warning for it, and nothing is
+  ever logged — cost if wrong: a deploy whose credential has a trailing
+  newline answers 500 instead of trying Upstash.
+- Ruling R-T9-5: `create` writes the offer (`SET NX`, which claims the
+  code), then the token (`SET`, same TTL); the Upstash adapters live in
+  `api/signal.ts`, not the handler, so the browser bundle cannot carry
+  them — cost if wrong: if the token's `SET` fails after the offer's,
+  the host gets a 500 and the room, which cannot be closed, expires
+  after its 300 s.
 
 ## Milestone 12 backlog
 

@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { SignalError, hostRoom, joinRoom, normalizeRoomCode, type SignalDeps } from "../src/radio/signal-client";
-import { MemoryStore, handleSignal, type SignalStore } from "../src/radio/signal-handler";
+import { MemoryStore, type RoomStore, handleSignal, memoryDeps } from "../src/radio/signal-handler";
 import { FakeNetwork } from "./fake-rtc";
 
 /** Signaling through the real handler over a `MemoryStore`, with a fake clock for the polls. */
-function harness(store: SignalStore = new MemoryStore()) {
+function harness(rooms: RoomStore = new MemoryStore()) {
+  const signal = memoryDeps(undefined, rooms);
   const net = new FakeNetwork();
   let now = 0;
   const urls: string[] = [];
@@ -13,7 +14,7 @@ function harness(store: SignalStore = new MemoryStore()) {
     fetch: async (input, init) => {
       const url = new URL(String(input), "http://localhost");
       urls.push(url.pathname);
-      return handleSignal(new Request(url, init), store);
+      return handleSignal(new Request(url, init), signal);
     },
     // Advance the fake clock, and give the fake network a real moment.
     sleep: async (ms) => {
@@ -86,7 +87,8 @@ describe("signal client", () => {
   });
 
   test("server errors and network failures are SignalErrors, never raw", async () => {
-    const broken: SignalStore = { set: () => Promise.reject(new Error("x")), get: () => Promise.reject(new Error("x")) };
+    const fail = () => Promise.reject(new Error("x"));
+    const broken: RoomStore = { set: fail, get: fail, del: fail };
     const { deps } = harness(broken);
     await expect(hostRoom(deps)).rejects.toBeInstanceOf(SignalError);
     await expect(hostRoom(deps)).rejects.toThrow(/signaling server error \(HTTP 500\)/i);
