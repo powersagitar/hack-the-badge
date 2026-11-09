@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { initSync, add, FirmwareEmulator } from "../src/cpu/wasm-pkg/emulator_wasm.js";
 import { createFirmwareEmulator, initCpuWasmSync } from "../src/cpu/bridge";
-import { createProvisioner, type ProvisionState } from "../src/runtime/provisioner";
+import { createProvisioner, PROMPT, type ProvisionState } from "../src/runtime/provisioner";
 import {
   AFTER_PRESS_STABLE_FOR,
   AFTER_SHAKE_PAGES,
@@ -206,6 +206,40 @@ describe("emulator-wasm firmware-boot boundary", () => {
       emu.free();
     }
   });
+});
+
+describe("emulator-wasm soft reset", () => {
+  // The WASM twin of the native soft-reset rungs: the firmware's own
+  // `reboot` console command, typed at the console prompt, reaches the
+  // emulated software reset, and the count crosses the boundary.
+  test(
+    "softResetCount is 1 after the console's reboot command",
+    () => {
+      initSync({
+        module: readFileSync(new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url)),
+      });
+      const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
+      const emu = new FirmwareEmulator(new Uint8Array(image));
+      try {
+        for (let done = 0; done < FIRST_RUN_MAX_STEPS && !emu.consoleOutput().includes(PROMPT); ) {
+          emu.run(250_000).free();
+          done += 250_000;
+        }
+        expect(emu.consoleOutput()).toContain(PROMPT);
+        expect(emu.softResetCount).toBe(0);
+
+        const command = new TextEncoder().encode("reboot\r\n");
+        expect(emu.serialInput(command)).toBe(command.length);
+        for (let done = 0; done < 10_000_000 && emu.softResetCount === 0; done += 250_000) {
+          emu.run(250_000).free();
+        }
+        expect(emu.softResetCount).toBe(1);
+      } finally {
+        emu.free();
+      }
+    },
+    60_000,
+  );
 });
 
 describe("emulator-wasm provisioned boot", () => {

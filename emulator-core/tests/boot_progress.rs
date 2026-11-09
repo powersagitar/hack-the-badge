@@ -1593,6 +1593,33 @@ fn launcher_responds_to_navigation() {
     assert_no_panic_text(&rt);
 }
 
+/// The gap between two taps of one button in the browser's tap queue:
+/// `RELEASE_GAP_US` in `frontend/src/runtime/firmware-runtime.ts`.
+const RELEASE_GAP_US: u64 = 40_000;
+/// [`two_downs_a_release_gap_apart_move_twice`]'s settling time after the
+/// second release, as [`DOWN_REDRAW`]'s 1.5 s window.
+const TWO_DOWNS_SETTLE_MS: u64 = 1_500;
+/// The launcher after two DOWNs a release gap apart: the cursor on the
+/// third row, first column (title "Mood LEDs"), the same frame as
+/// [`TO_DICE`]'s second DOWN. Not compared with the physical badge.
+const TWO_DOWNS_HASH: u64 = 0xf742_d1dd_3346_b879;
+
+/// Two taps of DOWN, as the browser's tap queue plays them: one
+/// [`PRESS_HOLD_US`] hold, [`RELEASE_GAP_US`] up, another hold. The cursor
+/// moves twice, and neither tap is lost.
+#[test]
+fn two_downs_a_release_gap_apart_move_twice() {
+    let mut rt = launcher_for(OWN_ROLE);
+    press(&mut rt, NAV_SLOT);
+    run_for_us(&mut rt, RELEASE_GAP_US);
+    press(&mut rt, NAV_SLOT);
+    for _ in 0..TWO_DOWNS_SETTLE_MS / 100 {
+        run_for_us(&mut rt, 100_000);
+    }
+    assert_eq!(framebuffer_fnv1a(rt.framebuffer()), TWO_DOWNS_HASH);
+    assert_no_panic_text(&rt);
+}
+
 /// Milestone 5 stretch (Task 9): from the launcher, the navigation to Dice
 /// (bottom row, last column) with each selection's stable frame (role
 /// hacker): three DOWNs, three RIGHTs.
@@ -2602,7 +2629,9 @@ fn no_radio_without_a_radio_app() {
 // organizer (`…10:02`), each on Connect, run in lockstep in one test:
 // both advance to the same emulated time in 1 ms slices, and after each
 // slice each hears the other's advertisement at `LINKED_PEER_RSSI`, as
-// the browser hub (Task 9) passes them between tabs. The exchange is
+// the browser hub (Task 9) passes them between tabs. The bump itself runs
+// one blocking 100 ms slice on each badge (ruling R-T8-3), so nothing
+// crosses until it ends; the 1 ms slices start there. The exchange is
 // connectionless (`docs/milestone-10-decisions.md`, "Connect's pairing
 // exchange"): no connection is made, so the advertisements are all that
 // travels.

@@ -9,7 +9,10 @@
 //! block 1's read registers. Each emulated badge needs its own radio
 //! identity, so the host can give a runtime one
 //! (`crate::runtime::FirmwareRuntime::set_factory_mac`), as a real chip
-//! carries its own.
+//! carries its own. On v392 that read is made by the address builder at
+//! `0x42010344`, which the sync callback calls: it reads the MAC with
+//! `esp_read_mac(buf, 0)` and ORs `0xC0` into byte 5 to make the random
+//! address (`docs/milestone-10-decisions.md`, "hal_radio's init").
 //!
 //! ## Unset: exactly as before
 //!

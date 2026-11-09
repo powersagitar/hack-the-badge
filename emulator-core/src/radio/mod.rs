@@ -33,8 +33,9 @@
 //!   `notify_host_send_available` (the controller took the packet; it
 //!   gives back `esp_nimble_hci.c`'s `vhci_send_sem`, without which the
 //!   next command waits out `NIMBLE_VHCI_TIMEOUT_MS`), then
-//!   `notify_host_recv` with the oldest queued event, normally the
-//!   command's own Command Complete.
+//!   `notify_host_recv` with the command's own Command Complete (the oldest
+//!   queued reply; a report waiting ahead of it stays queued for the idle
+//!   task).
 //!
 //! ## Event injection (ruling R-T6-2)
 //!
@@ -52,7 +53,8 @@
 //! the trampoline saves its context below the frame.
 //!
 //! - **Command replies:** inside the `send_packet` hook, in the NimBLE
-//!   host task that sent the command.
+//!   host task that sent the command, even with a report queued ahead of
+//!   the reply.
 //! - **Asynchronous events** (advertising reports; and any event left when
 //!   one hook delivers one): from the idle task, at
 //!   [`v392::ESP_V_APPLICATION_IDLE_HOOK`]'s entry, one event per idle
@@ -173,6 +175,12 @@ impl Radio {
         &self.hci
     }
 
+    /// The controller model, mutably: tests drive it without a guest.
+    #[cfg(test)]
+    pub(crate) fn controller_mut(&mut self) -> &mut HciController {
+        &mut self.hci
+    }
+
     /// The guest rebooted (software reset): the controller, the callbacks
     /// and the idle hook start over, the MAC and the init count stay.
     pub fn soft_reset(&mut self) {
@@ -254,7 +262,7 @@ impl Radio {
                 self.hci.host_to_controller(&packet);
                 match self.callbacks {
                     Some(cb) => {
-                        let event = self.hci.pop_event();
+                        let event = self.hci.pop_reply();
                         self.call_back(cpu, bus, Some(cb.send_available), event, cb.recv);
                     }
                     None => cpu.hook_return(None),
@@ -454,10 +462,17 @@ mod tests {
         buf
     }
 
+    /// The most steps one idle-hook pass may take, entry to return: the
+    /// hook's own step, the trampoline and the callback (measured at 14).
+    /// A pass that drained the queue or never came back would pass it.
+    const IDLE_PASS_MAX_STEPS: u32 = 20;
+
     struct Guest {
         cpu: Cpu,
         bus: FirmwareBus,
         radio: Radio,
+        /// Steps the last [`Guest::call`] took, entry to return.
+        call_steps: u32,
     }
 
     impl Guest {
@@ -468,7 +483,12 @@ mod tests {
             radio.install(&mut cpu);
             bus.write32(CALLBACKS, SEND_AVAILABLE);
             bus.write32(CALLBACKS + 4, RECV);
-            Self { cpu, bus, radio }
+            Self {
+                cpu,
+                bus,
+                radio,
+                call_steps: 0,
+            }
         }
 
         /// Calls the hooked guest function at `addr` with `a0`, `a1`, as
@@ -480,7 +500,7 @@ mod tests {
             self.cpu.regs.write(rom_stubs::REG_RA, LOOP);
             self.cpu.regs.write(rom_stubs::REG_SP, STACK_TOP);
             self.cpu.regs.pc = addr;
-            for _ in 0..200 {
+            for step in 1..=200 {
                 step_with_interrupts(&mut self.cpu, &mut self.bus);
                 if self.cpu.needs_attention() {
                     self.cpu.clear_attention();
@@ -489,6 +509,7 @@ mod tests {
                     }
                 }
                 if self.cpu.regs.pc == LOOP {
+                    self.call_steps = step;
                     assert_eq!(self.cpu.regs.read(rom_stubs::REG_SP), STACK_TOP);
                     return self.cpu.regs.read(rom_stubs::REG_A0);
                 }
@@ -620,6 +641,74 @@ mod tests {
         assert_eq!(g.reg(T3), sends, "no send credit from the idle task");
         assert_eq!(idle(&g), None, "disarmed once delivered");
         assert!(!g.radio.controller().has_events());
+    }
+
+    /// R-T6-2's ordering risk: a report is already waiting when the host
+    /// sends a command, so the queue holds the report ahead of the reply.
+    /// The host gets its reply inside `send_packet` regardless, in the task
+    /// that sent the command (it is what gives back the command credit);
+    /// the report stays queued, keeps the idle hook armed, and is delivered
+    /// from the idle task afterwards.
+    #[test]
+    fn report_popped_in_send_packet_follows_the_reply() {
+        let mut g = Guest::new();
+        g.bring_up();
+        g.start_scanning();
+        assert!(g.radio.deliver(&mut g.cpu, &peer(), -40));
+        let idle = |g: &Guest| g.cpu.app_hooks().lookup(v392::ESP_V_APPLICATION_IDLE_HOOK);
+        assert_eq!(idle(&g), Some(HOOK_IDLE));
+        let sends = g.reg(T3);
+
+        g.send(SET_EVENT_MASK, &(1u64 << 61).to_le_bytes());
+        assert_eq!(g.reg(T3), sends + 1, "notify_host_send_available");
+        assert_eq!(g.reg(T4), 0x0E, "the reply first: Command Complete");
+        assert_eq!(g.reg(T5), 7, "the reply's length");
+        assert!(g.radio.controller().has_events(), "the report still waits");
+        assert_eq!(idle(&g), Some(HOOK_IDLE), "still armed for the report");
+
+        g.call(v392::ESP_V_APPLICATION_IDLE_HOOK, 0, 0);
+        assert_eq!(g.reg(T4), 0x3E, "then the report: LE Meta");
+        assert_eq!(g.reg(T5), 3 + 26 + 4);
+        assert_eq!(g.reg(T3), sends + 1, "no send credit from the idle task");
+        assert!(!g.radio.controller().has_events());
+        assert_eq!(idle(&g), None, "disarmed once delivered");
+    }
+
+    /// The other half of R-T6-2's risk: the idle task must never block.
+    /// While reports are queued, each idle pass delivers exactly one and
+    /// comes back within a bounded number of steps, leaving the rest for
+    /// later passes (the guest's `notify_host_recv` here returns at once;
+    /// the firmware's own `host_rcv_pkt` queue send is outside this model).
+    #[test]
+    fn host_rcv_pkt_does_not_block_the_idle_task() {
+        const REPORTS: u8 = 3;
+        let mut g = Guest::new();
+        g.bring_up();
+        g.start_scanning();
+        for i in 0..REPORTS {
+            let mut adv = peer();
+            adv.addr[0] = i;
+            assert!(g.radio.deliver(&mut g.cpu, &adv, -40));
+        }
+        for left in (0..REPORTS).rev() {
+            g.cpu.regs.write(T4, 0);
+            g.call(v392::ESP_V_APPLICATION_IDLE_HOOK, 0, 0);
+            assert!(
+                g.call_steps <= IDLE_PASS_MAX_STEPS,
+                "{} steps for one idle pass",
+                g.call_steps
+            );
+            assert_eq!(g.reg(T4), 0x3E, "one report this pass");
+            assert_eq!(
+                g.radio.controller().has_events(),
+                left > 0,
+                "{left} reports still to go"
+            );
+        }
+        assert_eq!(
+            g.cpu.app_hooks().lookup(v392::ESP_V_APPLICATION_IDLE_HOOK),
+            None
+        );
     }
 
     /// Review Focus 2: a soft reset while the radio is up. The guest's

@@ -361,6 +361,15 @@ impl HciController {
         self.events.pop_front().map(|e| e.bytes)
     }
 
+    /// The oldest waiting command reply, H4-framed as [`Self::pop_event`];
+    /// reports queued ahead of it stay queued. The hook that handed a
+    /// command to the model delivers this one (`crate::radio`'s module
+    /// doc), so a report never takes the place of the command's reply.
+    pub fn pop_reply(&mut self) -> Option<Vec<u8>> {
+        let i = self.events.iter().position(|e| !e.report)?;
+        self.events.remove(i).map(|e| e.bytes)
+    }
+
     /// Whether an event is waiting for the host ([`Self::pop_event`]).
     pub fn has_events(&self) -> bool {
         !self.events.is_empty()

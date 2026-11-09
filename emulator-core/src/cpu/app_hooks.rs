@@ -166,7 +166,25 @@ impl AppHookTable {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::TestBus;
+    use super::super::{encode, Cpu};
     use super::*;
+
+    const HOOKED: u32 = 0;
+    const HOOK_ID: u16 = 3;
+
+    /// A core hooked at reset's `pc`, parked on a hit it has not answered:
+    /// the program is `addi x7, x7, 1; j .`.
+    fn hit_cpu() -> (Cpu, TestBus) {
+        let mut cpu = Cpu::new();
+        let mut bus = TestBus::with_program(&[encode::addi(7, 7, 1), encode::jal(0, 0)]);
+        let mut table = AppHookTable::new();
+        table.insert(HOOKED, HOOK_ID);
+        cpu.set_app_hooks(table);
+        assert_eq!(cpu.regs.pc, HOOKED);
+        cpu.step(&mut bus);
+        (cpu, bus)
+    }
 
     #[test]
     fn empty_table_never_hits() {
@@ -244,6 +262,65 @@ mod tests {
         assert_eq!(table.lookup(0x8000_0000), Some(3));
         assert_eq!(table.lookup(0), Some(1));
         assert_eq!(table.lookup(u32::MAX), Some(2));
+    }
+
+    /// Swapping the table drops a pass-through nobody used: the next
+    /// arrival at that address hits again and the guest code does not run.
+    #[test]
+    fn set_app_hooks_drops_a_pending_pass_through() {
+        let (mut cpu, mut bus) = hit_cpu();
+        assert!(cpu.take_hook_hit().is_some());
+        cpu.clear_attention();
+        cpu.hook_pass_through();
+
+        let mut table = AppHookTable::new();
+        table.insert(HOOKED, HOOK_ID);
+        cpu.set_app_hooks(table);
+
+        let info = cpu.step(&mut bus);
+        assert_eq!(info.instr_len, 0, "hit, not fetched");
+        assert_eq!(cpu.regs.read(7), 0, "the guest instruction did not run");
+        assert_eq!(
+            cpu.take_hook_hit(),
+            Some(HookHit {
+                id: HOOK_ID,
+                pc: HOOKED
+            })
+        );
+    }
+
+    /// A clone taken before the driver collects the hit holds the hit and
+    /// the raised flag, and the two are independent afterwards.
+    #[test]
+    fn a_clone_carries_a_pending_hit() {
+        let (mut cpu, _bus) = hit_cpu();
+        let mut clone = cpu.clone();
+        let hit = HookHit {
+            id: HOOK_ID,
+            pc: HOOKED,
+        };
+        assert!(clone.needs_attention());
+        assert_eq!(clone.take_hook_hit(), Some(hit));
+        assert_eq!(clone.take_hook_hit(), None, "taken once");
+        assert_eq!(cpu.take_hook_hit(), Some(hit), "the original keeps its own");
+    }
+
+    /// A clone taken after a pass-through is granted runs the guest code
+    /// at the next arrival, once, like the original.
+    #[test]
+    fn a_clone_carries_a_pass_through() {
+        let (mut cpu, mut bus) = hit_cpu();
+        assert!(cpu.take_hook_hit().is_some());
+        cpu.clear_attention();
+        cpu.hook_pass_through();
+
+        let mut clone = cpu.clone();
+        for c in [&mut clone, &mut cpu] {
+            let info = c.step(&mut bus);
+            assert_eq!(info.instr_len, 4, "fetched and executed");
+            assert_eq!(c.regs.read(7), 1);
+            assert!(!c.needs_attention(), "no second hit");
+        }
     }
 
     #[test]

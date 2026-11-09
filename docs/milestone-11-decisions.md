@@ -672,7 +672,9 @@ at exactly that gap and not one step before.
 
 ## Dependencies added
 
-None yet.
+- `@types/bun` 1.4.4 (dev, frontend, Task 5): the type declarations for
+  `bun:test` and `node:fs`, so `test/cpu-wasm.test.ts` can join
+  `tsconfig.json`'s `include`.
 
 ## Closed in writing
 
@@ -763,6 +765,15 @@ unless another date is given.
   resets it crossed but not which entries came before which reset; a
   diagnosis that needs that split would have to compare the log at the
   reset.
+- Ruling R-T5-1: the `send_packet` hook delivers the command's own reply
+  ahead of any report queued before it (`HciController::pop_reply`), and
+  the report waits for the idle hook, so a reply always reaches the host
+  in the task that sent the command (R-T6-2's ordering risk, fixed
+  rather than only pinned). No pin moved, `two_badges_pair_to_synced`
+  included. — cost if wrong: a report is seen after a command sent later
+  than it, which HCI's event order forbids on a real controller; NimBLE
+  does not depend on the order, and a report was already delayed to the
+  idle pass whenever a reply was in the queue.
 
 ## Milestone 12 backlog
 

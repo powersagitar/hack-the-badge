@@ -184,6 +184,10 @@ pub struct FirmwareRuntime {
     /// software resets replaced, plus [`crate::rom::REBOOT_US`] per reset;
     /// [`FirmwareRuntime::emulated_time_us`] adds the current clock's.
     time_base_us: u64,
+    /// Tests only: answers hook hits in place of the radio
+    /// ([`FirmwareRuntime::set_test_hook_dispatch`]).
+    #[cfg(test)]
+    test_hook_dispatch: Option<fn(HookHit, &mut Cpu)>,
     /// The fake BLE controller and its hooks (`crate::radio`), installed
     /// on every boot.
     radio: Radio,
@@ -206,6 +210,8 @@ impl FirmwareRuntime {
             total_steps: 0,
             soft_reset_count: 0,
             time_base_us: 0,
+            #[cfg(test)]
+            test_hook_dispatch: None,
             radio,
         })
     }
@@ -422,7 +428,20 @@ impl FirmwareRuntime {
     /// is the radio's ([`Radio::install`]), which returns or redirects,
     /// never passes through (`crate::radio`'s module doc).
     fn dispatch_hook(&mut self, hit: HookHit) {
+        #[cfg(test)]
+        if let Some(dispatch) = self.test_hook_dispatch {
+            dispatch(hit, &mut self.cpu);
+            return;
+        }
         self.radio.on_hook(hit, &mut self.cpu, &mut self.bus);
+    }
+
+    /// Tests only: every hook hit goes to `f` instead of the radio, so a
+    /// test can register its own hook ids without reaching the radio's
+    /// `debug_assert` on an id it does not know.
+    #[cfg(test)]
+    fn set_test_hook_dispatch(&mut self, f: fn(HookHit, &mut Cpu)) {
+        self.test_hook_dispatch = Some(f);
     }
 
     /// Shared body for [`FirmwareRuntime::run`],
@@ -1719,11 +1738,20 @@ mod tests {
         buf
     }
 
+    /// A hook id the radio does not know (its ids are small: `crate::radio`'s
+    /// `HOOK_*`), so a hit can only be answered by a test's own dispatch
+    /// ([`FirmwareRuntime::set_test_hook_dispatch`]).
+    const UNKNOWN_HOOK_ID: u16 = 0x7f00;
+
     fn hooked_count_loop() -> FirmwareRuntime {
         let mut rt = FirmwareRuntime::from_image(&count_loop_image()).unwrap();
         let mut table = crate::cpu::AppHookTable::new();
-        table.insert(COUNT_LOOP, 1);
+        table.insert(COUNT_LOOP, UNKNOWN_HOOK_ID);
         rt.cpu.set_app_hooks(table);
+        rt.set_test_hook_dispatch(|hit, cpu| {
+            assert_eq!(hit.id, UNKNOWN_HOOK_ID);
+            cpu.hook_pass_through();
+        });
         rt
     }
 
@@ -1797,20 +1825,55 @@ mod tests {
         assert_eq!(rt.emulated_time_us(), clean.emulated_time_us());
         assert_eq!(rt.cpu.regs.read(7), clean.cpu.regs.read(7));
         assert_eq!(rt.soft_reset_count(), 0);
+        assert_eq!(rt.radio().hook_hits(), 0, "the test's dispatch answered");
     }
 
-    /// Review Focus 4: peer bytes from the network. Too short (under the
-    /// 7-byte address header), oversized (data over 229 bytes), a bad
-    /// Address_Type, and a stream of random lengths and bytes are all
-    /// refused with `false`, without a panic, and nothing is queued for
-    /// the firmware. A well-formed advertisement is refused too here: no
-    /// app is scanning, and nothing is held for later.
+    /// Review Focus 4: peer bytes from the network, heard by a scanning
+    /// guest, so a refusal can only be the bytes' fault. Too short (under
+    /// the 7-byte address header), oversized (data over 229 bytes), a bad
+    /// Address_Type, and a stream of random lengths and bytes are refused
+    /// with `false`, without a panic, and queue nothing; a well-formed
+    /// advertisement in the same state is heard (the positive control).
+    /// Before the guest scans, even a well-formed one is dropped, and
+    /// nothing is held for later.
     #[test]
     fn deliver_rejects_malformed_bytes() {
+        use crate::radio::hci::{
+            LE_SET_EVENT_MASK, LE_SET_EXT_SCAN_ENABLE, LE_SET_EXT_SCAN_PARAMS, SET_EVENT_MASK,
+        };
         use crate::radio::LINKED_PEER_RSSI;
         let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
         let mut ok = vec![0x02, 0x10, 0, 0, 0, 0xC2, 1];
         ok.extend_from_slice(&[0x03, 0xFF, 0xFF, 0xFF]);
+        assert!(
+            !rt.deliver_advertisement_bytes(&ok, LINKED_PEER_RSSI),
+            "not scanning: dropped, not queued"
+        );
+        assert!(!rt.radio().controller().has_events());
+
+        // The guest scans, as `crate::radio`'s tests bring it up.
+        for (opcode, params) in [
+            (SET_EVENT_MASK, &(1u64 << 61).to_le_bytes()[..]),
+            (LE_SET_EVENT_MASK, &(1u64 << 12).to_le_bytes()[..]),
+            (LE_SET_EXT_SCAN_PARAMS, &[0, 0, 1, 0, 0x10, 0, 0x10, 0][..]),
+            (LE_SET_EXT_SCAN_ENABLE, &[1, 0, 0, 0, 0, 0][..]),
+        ] {
+            let mut h4 = vec![0x01, opcode as u8, (opcode >> 8) as u8, params.len() as u8];
+            h4.extend_from_slice(params);
+            assert!(rt.radio.controller_mut().host_to_controller(&h4));
+            assert!(rt.radio.controller_mut().pop_event().is_some(), "reply");
+        }
+        assert!(rt.radio().controller().is_scanning());
+
+        let heard = |rt: &mut FirmwareRuntime, bytes: &[u8], rssi: i8| {
+            let delivered = rt.deliver_advertisement_bytes(bytes, rssi);
+            let queued = rt.radio.controller_mut().pop_event().is_some();
+            assert_eq!(delivered, queued, "{} bytes", bytes.len());
+            assert!(!rt.radio().controller().has_events(), "at most one report");
+            delivered
+        };
+        assert!(heard(&mut rt, &ok, LINKED_PEER_RSSI), "positive control");
+
         let mut oversized = vec![0u8; 7 + 230];
         oversized[6] = 1;
         let mut bad_type = ok.clone();
@@ -1824,12 +1887,14 @@ mod tests {
             &[0xFF; 7][..],
         ] {
             assert!(
-                !rt.deliver_advertisement_bytes(bytes, LINKED_PEER_RSSI),
+                !heard(&mut rt, bytes, LINKED_PEER_RSSI),
                 "{} bytes",
                 bytes.len()
             );
         }
         // xorshift32: deterministic random lengths (0 to 299) and bytes.
+        // Now that the guest scans, what is well-formed by the wire form's
+        // own rules is heard, and only that.
         let mut x: u32 = 0x1234_5678;
         let mut next = || {
             x ^= x << 13;
@@ -1837,17 +1902,17 @@ mod tests {
             x ^= x << 5;
             x
         };
+        let mut well_formed_seen = 0;
         for _ in 0..2_000 {
             let len = (next() % 300) as usize;
             let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
             let rssi = next() as i8;
-            assert!(!rt.deliver_advertisement_bytes(&bytes, rssi));
+            let well_formed = (7..=7 + 229).contains(&len) && bytes[6] <= 3;
+            well_formed_seen += u32::from(well_formed);
+            assert_eq!(heard(&mut rt, &bytes, rssi), well_formed, "{len} bytes");
         }
-        assert!(
-            !rt.deliver_advertisement_bytes(&ok, LINKED_PEER_RSSI),
-            "not scanning: dropped, not queued"
-        );
-        assert!(!rt.radio().controller().has_events());
+        assert!(well_formed_seen > 0, "the fuzz reached the accepting path");
+        assert!(heard(&mut rt, &ok, LINKED_PEER_RSSI), "still scanning");
         assert_eq!(rt.radio_advertisement(), None);
         assert!(rt.radio_advertisement_bytes().is_empty());
         assert_eq!(rt.run(100).steps, 100, "the guest runs on");

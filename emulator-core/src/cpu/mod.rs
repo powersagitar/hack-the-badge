@@ -508,7 +508,9 @@ impl Cpu {
     /// The slow half of the hook check, for a `pc` inside the hook ranges:
     /// `true` if this step is a hit (recorded, attention raised, `pc`
     /// kept), `false` if the step goes on to fetch -- `pc` is not hooked,
-    /// or a pass-through for it is spent here.
+    /// or a pass-through for it is spent here. A WFI-parked core returns
+    /// before the hook check, so a hook on the park's `pc` waits for the
+    /// wake.
     #[cold]
     #[inline(never)]
     fn hook_step(&mut self, pc: u32) -> bool {

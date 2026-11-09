@@ -440,6 +440,42 @@ mod tests {
     }
 
     #[test]
+    fn efuse_range_is_disjoint_from_every_other_range() {
+        assert!(EFUSE_RANGE.contains(&0x6000_8800));
+        assert!(!EFUSE_RANGE.contains(&0x6000_9000)); // exclusive end
+        for (name, other) in [
+            ("DROM", DROM_RANGE),
+            ("IROM", IROM_RANGE),
+            ("DROM mask", DROM_MASK_RANGE),
+            ("DRAM", DRAM_RANGE),
+            ("IRAM", IRAM_RANGE),
+            ("RTC slow memory", RTC_RANGE),
+            ("SYSTIMER", SYSTIMER_RANGE),
+            ("INTERRUPT_CORE0", INTERRUPT_CORE0_RANGE),
+            ("SYSTEM", SYSTEM_RANGE),
+            ("GPIO", GPIO_RANGE),
+            ("SPI2", SPI2_RANGE),
+            ("USB-Serial-JTAG", USB_SERIAL_JTAG_RANGE),
+            ("TIMG0", TIMG0_RANGE),
+            ("TIMG1", TIMG1_RANGE),
+            ("RTC_CNTL", RTC_CNTL_RANGE),
+            ("SPIMEM1", SPIMEM1_RANGE),
+            ("GDMA", GDMA_RANGE),
+            ("I2C0", I2C0_RANGE),
+            ("RMT", RMT_RANGE),
+            ("MMU table", MMU_TABLE_RANGE),
+            ("DBUS cache", DBUS_CACHE_RANGE),
+            ("IBUS cache", IBUS_CACHE_RANGE),
+            ("APB_CTRL", APB_CTRL_RANGE),
+        ] {
+            assert!(
+                EFUSE_RANGE.end <= other.start || other.end <= EFUSE_RANGE.start,
+                "EFUSE_RANGE overlaps {name}"
+            );
+        }
+    }
+
+    #[test]
     fn gdma_range_is_disjoint_from_every_other_peripheral_range_and_xip_iram() {
         assert!(GDMA_RANGE.contains(&0x6003_F000));
         assert!(GDMA_RANGE.contains(&(0x6003_F000 + 0x280))); // OUT_PERI_SEL_CH2
