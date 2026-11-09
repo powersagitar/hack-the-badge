@@ -161,8 +161,9 @@
 //! `esp_reset_reason_set_hint()` writes it before a restart, and
 //! `esp_reset_reason_init()` reads it back on the next boot). Their storage
 //! is the generic word array, as before; [`RtcCntl::store_regs`] and
-//! [`RtcCntl::set_store_regs`] let `crate::runtime`'s software reset carry
-//! the eight words into the rebuilt peripheral. Only `STORE4` is in
+//! [`RtcCntl::set_store_regs`] let `crate::runtime`'s core reset carry the
+//! eight words into the rebuilt peripheral (a CPU reset moves the whole
+//! peripheral instead). Only `STORE4` is in
 //! [`RtcCntl::handles`] (unchanged), so the unmapped-access log stays as it
 //! was.
 //!

@@ -343,6 +343,17 @@ impl Gpio {
         self.start_pressed = pressed;
     }
 
+    /// The 2nd-stage bootloader's `release_default_console_io`: GPIO21
+    /// (U0TXD, `uart_channel.h` :14; [`PIN_HC165_CLK`] on the badge) stops
+    /// being an output, as a `GPIO_ENABLE_W1TC_REG` write of `1 << 21` does
+    /// (`gpio_ll_output_disable`, `gpio_ll.h` :233-236;
+    /// `bootloader_console.c` :28-34, ESP-IDF v5.5.3). It is only reached
+    /// on a console that is not a UART, which v392 is (ruling R-T1-4 in
+    /// `docs/milestone-11-decisions.md`).
+    pub fn release_default_console_io(&mut self) {
+        self.enable &= !Self::pin_bit(PIN_HC165_CLK);
+    }
+
     /// Pad `pin`'s `GPIO_FUNCn_OUT_SEL_CFG_REG` value, or `None` if `pin`
     /// has no such register (`pin >= `[`OUT_SEL_CFG_COUNT`]).
     pub fn func_out_sel_cfg(&self, pin: u32) -> Option<u32> {

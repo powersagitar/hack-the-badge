@@ -924,14 +924,16 @@
 //!     the reset: it re-boots the same image with
 //!     [`esp32c3_rom_stubs_with_reset_reason`] (so `rtc_get_reset_reason`
 //!     returns that reason instead of [`POWERON_RESET`]) and carries over
-//!     what survives a reset on the badge — the flash, the RTC_CNTL
-//!     `STORE0..7` registers (ESP-IDF's reset-reason hint lives in
+//!     what survives that kind of reset on the badge. Each stub's
+//!     [`ResetKind`](crate::cpu::rom_stubs::ResetKind) selects it:
+//!     `software_reset_cpu` is `Cpu` and keeps what the CPU reset keeps,
+//!     per the table in `docs/milestone-11-decisions.md` ("What a CPU reset
+//!     keeps"); `software_reset` is `Core` and keeps only the flash, the
+//!     RTC_CNTL `STORE0..7` registers (ESP-IDF's reset-reason hint lives in
 //!     `STORE6`, `RTC_RESET_CAUSE_REG`, per
-//!     `components/esp_system/port/soc/esp32c3/reset_reason.c`), RTC fast
-//!     memory, the panel's pixels — see `crate::runtime`'s module doc,
-//!     "Software reset".
-//!     Both kinds are modeled as the same full re-boot through the shortcut
-//!     boot; only the reported reason differs.
+//!     `components/esp_system/port/soc/esp32c3/reset_reason.c`), the RTC
+//!     timer, RTC fast memory and the panel's pixels. See `crate::runtime`'s
+//!     module doc, "Software reset".
 //!
 //! 27. **libgcc `__popcountsi2` and `__lesf2`** (`0x4000_0888` and
 //!     `0x4000_082c`, `esp32c3.rom.libgcc.ld` lines 89 and 66;
@@ -1218,8 +1220,9 @@ use crate::cpu::encode::{
     RA, S0, S1, S2, S3, S4, S5, SP, T0, T1, T2, T3, ZERO,
 };
 use crate::cpu::rom_stubs::{
-    BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, RomStub,
-    RomStubTable, SoftDoubleOp, SoftFloatOp, WordSource, WordStore, REG_A0, REG_A1, REG_A2, REG_A3,
+    BusRegisterOp, BusRegisterWrite, CondBits, Int32UnaryOp, Int64Op, Md5Op, RegCond, ResetKind,
+    RomStub, RomStubTable, SoftDoubleOp, SoftFloatOp, WordSource, WordStore, REG_A0, REG_A1,
+    REG_A2, REG_A3,
 };
 use crate::mem::bus::{FirmwareBus, RomCodeBlob, RomDataBlob};
 use crate::mem::image::ImageHeader;
@@ -2334,11 +2337,11 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (ETS_DELAY_US, RomStub::void("ets_delay_us")),
     (
         SOFTWARE_RESET,
-        RomStub::request_reset("software_reset", RESET_REASON_CORE_SW),
+        RomStub::request_reset("software_reset", RESET_REASON_CORE_SW, ResetKind::Core),
     ),
     (
         SOFTWARE_RESET_CPU,
-        RomStub::request_reset("software_reset_cpu", RESET_REASON_CPU0_SW),
+        RomStub::request_reset("software_reset_cpu", RESET_REASON_CPU0_SW, ResetKind::Cpu),
     ),
     (MEMSET, RomStub::memset("memset")),
     (MEMCPY, RomStub::memcpy("memcpy")),
@@ -2692,7 +2695,7 @@ pub fn esp32c3_rom_stubs_with_reset_reason(reason: u32) -> RomStubTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::rom_stubs::RomStubEffect;
+    use crate::cpu::rom_stubs::{ResetKind, RomStubEffect};
 
     #[test]
     fn reset_reason_stub_returns_poweron() {
@@ -2733,13 +2736,19 @@ mod tests {
         assert_eq!(reset.name, "software_reset");
         assert_eq!(
             reset.effect,
-            RomStubEffect::RequestReset(RESET_REASON_CORE_SW)
+            RomStubEffect::RequestReset {
+                reason: RESET_REASON_CORE_SW,
+                kind: ResetKind::Core,
+            }
         );
         let cpu = table.lookup(SOFTWARE_RESET_CPU).expect("registered");
         assert_eq!(cpu.name, "software_reset_cpu");
         assert_eq!(
             cpu.effect,
-            RomStubEffect::RequestReset(RESET_REASON_CPU0_SW)
+            RomStubEffect::RequestReset {
+                reason: RESET_REASON_CPU0_SW,
+                kind: ResetKind::Cpu,
+            }
         );
     }
 

@@ -278,7 +278,7 @@ Field names are `FirmwareBus`'s (`emulator-core/src/mem/bus.rs`).
 | # | Peripheral (`FirmwareBus` field) | CPU reset: kept or reset | Citation | Reproduced how (Task 3) |
 |---|---|---|---|---|
 | 1 | SYSTIMER (`systimer`) | **Reset** | `system_internal.c` :52–54 pulses `SYSTEM_SYSTIMER_RST` (`system_reg.h` :335, bit 29; TRM Table 16.3-2, p. 430) | Fresh `systimer`, and `clock` restarts at 0 (spec, "My calls") |
-| 2 | INTC (`intc`) | **Silent → reset** | MAP half: kept by the TRM (§6.1.3), but the app rewrites the MAP of every source below `ETS_MAX_INTR_SOURCE` before interrupts are on (`cpu_start.c` :782 → :171–195). CPU-line half (enable, type, priority, threshold): part of the "CPU core complex" (§1.1, p. 31); whether a CPU reset clears it, the TRM does not say | Fresh `intc`, as today (ruling R-T1-2) |
+| 2 | INTC (`intc`) | **Silent → reset** | MAP half: an inference from §6.1.3 ("Only resets CPU core"; the MAP registers are outside it), which the TRM does not state about them; the app rewrites the MAP of every source below `ETS_MAX_INTR_SOURCE` before interrupts are on (`cpu_start.c` :782 → :171–195). CPU-line half (enable, type, priority, threshold): part of the "CPU core complex" (§1.1, p. 31); whether a CPU reset clears it, the TRM does not say | Fresh `intc`, as today (ruling R-T1-2) |
 | 3 | SYSTEM (`system`) | **Kept, with `SYSCLK_CONF` and `CPU_PER_CONF` rewritten as the bootloader does** | Kept: §6.1.3. Rewritten: fact 3; `clk_tree_ll.h` :442–447 (`CPUPERIOD_SEL` = 0), :481–485 (`PRE_DIV_CNT` = 0), :398–406 (`SOC_CLK_SEL` = 1) | Move `old.system`; then set `SYSCLK_CONF`'s `SOC_CLK_SEL` [11:10] = 1 and `PRE_DIV_CNT` [9:0] = 0 (`system_reg.h` :803–814), and `CPU_PER_CONF`'s `CPUPERIOD_SEL` [1:0] = 0 (:61–66), fields only. `FROM_CPU_0..3` stay as they were |
 | 4 | APB_CTRL RNG (`apb_ctrl`) | **Kept** | §6.1.3; no reset bit is pulsed (`system_internal.c` :31–61); the app's `periph_module_enable(PERIPH_RNG_MODULE)` (`clk.c` :326) has no reset bit (`clk_gate_ll.h` :87–162, `default: return 0`) | Move `old.apb_ctrl`: the xorshift sequence continues (ruling R-T1-5) |
 | 5 | GPIO (`gpio`, without the 74HC165) | **Kept, with GPIO21's output enable cleared as the bootloader does** | Kept: §6.1.3 (only a core reset resets "digital GPIOs"). `esp_restart_noos` writes `GPIO_FUNC0..5_IN_SEL_CFG` = `0x30` (`system_internal.c` :98–103), which the model does not hold. Rewritten: `bootloader_console.c` :28–34 (`release_default_console_io`, called at :138 for a USB-Serial-JTAG console, :41 for none) → `gpio_ll_output_disable(&GPIO, 21)` = `enable_w1tc = 1 << 21` (`gpio_ll.h` :233–236; `uart_channel.h` :14) | Move `old.gpio`; then clear `ENABLE` bit 21, as a `GPIO_ENABLE_W1TC_REG` write of `1 << 21` does (ruling R-T1-4) |
@@ -296,6 +296,10 @@ Field names are `FirmwareBus`'s (`emulator-core/src/mem/bus.rs`).
 | 17 | Flash MMU (`mmu`) | **Kept, with every entry rewritten as the bootloader does** | Kept: §6.1.3. Rewritten: `mmu_hal_init` (`bootloader_esp32c3.c` :164) → `mmu_hal_unmap_all` (`mmu_hal.c` :18–26, :28–39); `set_cache_and_start_app` (`bootloader_utility.c` :1036) unmaps all again (:1064) and maps the app's DROM, entry 127 and IROM (:1082, :1086, :1105). `esp_restart_noos` disables the ICache (`system_internal.c` :94) | Fresh `mmu`, as today: `FirmwareBus::seed_mmu_like_bootloader` already writes exactly the bootloader's table. Mappings the old app added at run time go, as on the badge |
 | 18 | SPI1 controller (`spimem1`) | **Reset** | `system_internal.c` :52–54 pulses `SYSTEM_SPI01_RST` (`system_reg.h` :497, bit 1; TRM Table 16.3-2, p. 430, "SPI0 / SPI1"). The bootloader then sets it up again (`bootloader_init_spi_flash`, `bootloader_esp32c3.c` :181) | Fresh `spimem1`; the shortcut boot's ROM `.data` seeds stand for the bootloader's flash setup, as at a cold boot (`crate::rom`, `esp32c3_rom_ram_initializers` items 1 and 2) |
 | 19 | Flash chip (`flash_chip`) | **Kept** | External chip | As today: `flash_chip = old.flash_chip` |
+
+The `console` bus field has no row: it is the emulator's own output sink
+(`crate::peripherals::console`), not a chip's state, so it stays as it was
+(kept by both kinds, since Milestone 9).
 
 **Totals:** 8 kept (rows 4, 6, 8, 10, 12, 14, 16, 19), 4 kept with
 registers rewritten (rows 3, 5, 11, 17), 6 reset (rows 1, 7, 9, 13, 15,
@@ -315,7 +319,8 @@ than the TRM are in the Milestone 12 backlog.
    it (§6.1.3). `esp_restart_noos`: resets it (`system_internal.c`
    :52–54). Bootloader: nothing. Choice: reset.
 2. **INTC.** CPU reset: the interrupt-matrix MAP registers are a
-   peripheral (Chapter 8), so kept. The CPU interrupt registers belong to
+   peripheral (Chapter 8), so kept, by inference from §6.1.3; the TRM
+   says nothing about them specifically. The CPU interrupt registers belong to
    the "CPU core complex" (§1.1, p. 31), and §6.1.3 says only that a CPU
    reset "only resets CPU core"; neither the TRM nor ESP-IDF says which
    side of that line they fall on. `esp_restart_noos`: turns interrupts
@@ -432,15 +437,36 @@ stable `LAUNCHER_HASH`: Scanner 11.75M steps, Share 12.25M, Sponsors
 or +466,000 µs.
 
 Three of the five deltas are 1 µs short of `REBOOT_US`, with identical
-step counts. So the new boot's own clock ended up to 1 µs behind, through
-the length of an idle fast-forward. The cause was not traced. No pin
-reads time at that precision after a reboot.
+step counts. The likely cause is that some idle fast-forward in the new
+boot ended up shorter by under a microsecond, once the guest had read the
+RTC timer's new value; this is a hypothesis, not traced. Task 3's
+re-measurement leaves every one of these numbers exactly as they are. No pin reads
+time at that precision after a reboot.
 
 One unit test changed, for the recorded cause (not a pin):
 `emulated_time_is_monotonic_across_a_soft_reset` set a `run_until` target
 50 ms past the reset, which now lies inside the reboot's jump. Its target
 is now `REBOOT_US` + 50 ms past the reset, and it still checks that the
 run stops at the target.
+
+**Task 3: no pin moved.** The CPU reset now keeps SYSTEM, the RNG, GPIO
+and the 74HC165, TIMG0/1, RTC_CNTL, USB-Serial-JTAG and the SC7A20H's
+registers (the table above), and all 87 rungs of the release
+`boot_progress` pass unchanged; no constant or frame hash was re-pinned. A
+scratch probe (deleted before the commit) measured the same end states as
+Task 2's table, first at `559cc57` and then with this change, and every
+value is identical: steps, frame hash, emulated time, the RTC timer's
+offset, and the release-to-stable step counts of the open app and of HOME
+back to the launcher. A temporary log in `soft_reset` confirmed the probe
+exercised the change: all six resets on its walks are `ResetKind::Cpu`, and
+the kept state is live at each (for example GPIO `ENABLE` `0x0030_047e`, the
+RNG mid-sequence, `SYSCLK_CONF` at XTAL before the rewrite). What the new
+boot reads from the kept peripherals changes no step count, time or frame on
+these walks. Sync's HOME is the probe's second reset, and is also unchanged.
+
+One unit test changed, for the recorded cause (not a pin):
+`console_output_survives_a_soft_reset` asserted that a CPU reset dropped
+queued serial input; it now asserts that it stays (row 12).
 
 ## Traces
 
@@ -492,8 +518,8 @@ unless another date is given.
   new boot's drivers would read reset values instead of the old boot's;
   they program every register they use before using it, and none of the
   three is touched between the reset and `cpu_start.c` :775.
-- Ruling R-T1-2: INTC is reset whole (silent → reset). The MAP half the
-  TRM keeps is rewritten by the app's `core_intr_matrix_clear` before
+- Ruling R-T1-2: INTC is reset whole (silent → reset). The MAP half,
+  kept by inference from §6.1.3, is rewritten by the app's `core_intr_matrix_clear` before
   interrupts are enabled, and for the CPU-line half the TRM is silent. —
   cost if wrong: a CPU-line enable, type or priority the old boot left
   would differ from the badge's until the new boot allocates that line.

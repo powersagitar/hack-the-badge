@@ -78,6 +78,11 @@ const CPU_PER_CONF_RESET: u32 = 0x0c;
 const CPU_PER_CONF_RW: u32 = 0xff;
 const SYSCLK_CONF_RESET: u32 = 0x01;
 const SYSCLK_CONF_RW: u32 = 0x0fff;
+/// `SYSTEM_CPUPERIOD_SEL` [1:0] (`system_reg.h` :61-66).
+const CPU_PER_CONF_CPUPERIOD_SEL: u32 = 0b11;
+/// `SYSTEM_SOC_CLK_SEL` [11:10] = 1 (PLL), `SYSTEM_PRE_DIV_CNT` [9:0] = 0
+/// (`system_reg.h` :803-814).
+const SYSCLK_CONF_SOC_CLK_PLL: u32 = 1 << 10;
 
 #[derive(Clone)]
 pub struct System {
@@ -161,6 +166,18 @@ impl System {
         }
         let n = ((offset - CPU_INTR_FROM_CPU_0_REG) / 4) as usize;
         self.from_cpu[n] = val & 1 != 0;
+    }
+
+    /// Leaves the CPU clock as the 2nd-stage bootloader's `rtc_clk_init`
+    /// does: 80 MHz on the PLL (`SOC_CLK_SEL` 1, `PRE_DIV_CNT` 0,
+    /// `CPUPERIOD_SEL` 0; ESP-IDF v5.5.3 `clk_tree_ll.h` :398-406, :442-447,
+    /// :481-485). `SYSCLK_CONF` has no other R/W bits; `CPU_PER_CONF`'s
+    /// others are not written. A CPU reset's part of the bootloader, table
+    /// row 3 in `docs/milestone-11-decisions.md`.
+    pub fn set_bootloader_cpu_clock(&mut self) {
+        self.sysclk_conf = SYSCLK_CONF_SOC_CLK_PLL;
+        self.cpu_per_conf &= !CPU_PER_CONF_CPUPERIOD_SEL;
+        self.selected_hz = self.decode_cpu_hz();
     }
 
     /// The CPU frequency these registers select, in Hz, decoded as ESP-IDF

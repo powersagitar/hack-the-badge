@@ -46,6 +46,8 @@
 //! v392 opens some apps by rebooting into them: `esp_restart()` ends in the
 //! mask-ROM `software_reset_cpu` (`crate::rom`, entry 26), whose stub
 //! requests a reset (`crate::cpu::rom_stubs::RomStubEffect::RequestReset`).
+//! That is a **CPU reset**, [`ResetKind::Cpu`]; ROM `software_reset` is a
+//! **core reset**, [`ResetKind::Core`].
 //! The run loop collects the request after the step that made it
 //! ([`crate::cpu::Cpu::needs_attention`], then
 //! [`crate::cpu::Cpu::take_reset_request`] on a cold path) and re-boots the same image
@@ -53,7 +55,7 @@
 //! [`boot_from_firmware_image_with_rom_stubs`] with
 //! `crate::rom::esp32c3_rom_stubs_with_reset_reason`, so
 //! `rtc_get_reset_reason` reports the reset's reason, plus what a reset
-//! keeps on the badge:
+//! keeps on the badge. Both kinds keep:
 //!
 //! - **the emulated flash, whole** (the identity, `reboot.cfg`);
 //! - **RTC_CNTL `STORE0..7`** (`crate::peripherals::rtc_cntl`; ESP-IDF's
@@ -69,8 +71,7 @@
 //! - **the panel** (`crate::peripherals::spi::St7789`): an external chip
 //!   the MCU reset does not touch, so its pixels stay until the firmware
 //!   redraws (any command byte clears its transient parameter state);
-//! - **the console's output text**; queued host serial input is dropped
-//!   with the old USB-Serial-JTAG, as [`FirmwareRuntime::reset`] does;
+//! - **the console's output text**;
 //! - **held buttons and the host-set acceleration**, re-applied;
 //! - **[`FirmwareRuntime::total_steps`] and host time:**
 //!   [`FirmwareRuntime::emulated_time_us`] is the time accumulated before
@@ -87,6 +88,19 @@
 //!   [`crate::mem::bus::FirmwareBus::unmapped_log_resets`]) and the core's
 //!   [`crate::cpu::Cpu::rom_stub_index_drops`] count (with its last drop).
 //!   They describe the whole run since the last cold power-on.
+//!
+//! A CPU reset also keeps the peripherals the table in
+//! `docs/milestone-11-decisions.md` ("What a CPU reset keeps") marks kept,
+//! each moved by its named field: SYSTEM, APB_CTRL's RNG, GPIO and the
+//! 74HC165, TIMG0 and TIMG1, the whole of RTC_CNTL, USB-Serial-JTAG (queued
+//! host input included, so a provision typed across a reboot reaches the
+//! new boot's console) and the SC7A20H's registers. Then come the
+//! bootloader's writes to them: the CPU clock back at 80 MHz on the PLL
+//! ([`crate::peripherals::system::System::set_bootloader_cpu_clock`]) and
+//! GPIO21's output disabled
+//! ([`crate::peripherals::gpio::Gpio::release_default_console_io`]). A core
+//! reset rebuilds them all, and drops the queued host input with the old
+//! USB-Serial-JTAG, as [`FirmwareRuntime::reset`] does.
 //!
 //! Everything else starts fresh with the new boot.
 //!
@@ -105,6 +119,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::boot::{boot_from_firmware_image_with_rom_stubs, idle_until, step_with_interrupts};
+use crate::cpu::rom_stubs::ResetKind;
 use crate::cpu::{exception_code, Cpu, HookHit};
 use crate::mem::bus::FirmwareBus;
 use crate::mem::image::ImageParseError;
@@ -166,8 +181,8 @@ pub struct FirmwareRuntime {
     /// doc, "Software reset").
     soft_reset_count: u32,
     /// Emulated time, in microseconds, accumulated by the clocks that
-    /// software resets replaced; [`FirmwareRuntime::emulated_time_us`] adds
-    /// the current clock's.
+    /// software resets replaced, plus [`crate::rom::REBOOT_US`] per reset;
+    /// [`FirmwareRuntime::emulated_time_us`] adds the current clock's.
     time_base_us: u64,
     /// The fake BLE controller and its hooks (`crate::radio`), installed
     /// on every boot.
@@ -238,10 +253,10 @@ impl FirmwareRuntime {
 
     /// The software reset a `RequestReset` ROM stub asked for, with
     /// `reason` for the next boot's `rtc_get_reset_reason`. See the module
-    /// doc, "Software reset", for what it keeps. If the image somehow
-    /// stopped parsing, nothing changes: the core stays on the stub, which
-    /// asks again next step.
-    fn soft_reset(&mut self, reason: u32) {
+    /// doc, "Software reset", for what each [`ResetKind`] keeps. If the
+    /// image somehow stopped parsing, nothing changes: the core stays on
+    /// the stub, which asks again next step.
+    fn soft_reset(&mut self, reason: u32, kind: ResetKind) {
         use crate::mem::soc::RTC_RANGE;
         use crate::mem::Bus;
         let Ok((mut cpu, bus)) = boot_from_firmware_image_with_rom_stubs(&self.image) else {
@@ -264,8 +279,28 @@ impl FirmwareRuntime {
 
         self.bus.carry_unmapped_log_from(&mut old);
         self.bus.flash_chip = old.flash_chip;
-        // `STORE4` and `STORE5` as the bootloader rewrites them (module doc).
-        let mut store = old.rtc_cntl.store_regs();
+        match kind {
+            ResetKind::Cpu => {
+                // The table's "kept" rows, by field, then the bootloader's
+                // writes to them (`docs/milestone-11-decisions.md`, "What a
+                // CPU reset keeps"; rows in parentheses).
+                self.bus.system = old.system; // (3)
+                self.bus.system.set_bootloader_cpu_clock();
+                self.bus.apb_ctrl = old.apb_ctrl; // (4)
+                self.bus.gpio = old.gpio; // (5), with the 74HC165 (6)
+                self.bus.gpio.release_default_console_io();
+                self.bus.timg0 = old.timg0; // (10)
+                self.bus.timg1 = old.timg1; // (10)
+                self.bus.rtc_cntl = old.rtc_cntl; // (11), with `STORE4`/`STORE5` below
+                self.bus.usb_serial_jtag = old.usb_serial_jtag; // (12)
+                self.bus.i2c0.accel = old.i2c0.accel; // (14)
+            }
+            ResetKind::Core => self.bus.rtc_cntl.set_store_regs(old.rtc_cntl.store_regs()),
+        }
+        // The bootloader runs after both kinds of reset: `STORE4` and
+        // `STORE5` as it rewrites them (module doc), and the RTC timer's
+        // offset, which restarts with SYSTIMER.
+        let mut store = self.bus.rtc_cntl.store_regs();
         store[4] = crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE;
         store[5] = crate::rom::BOOTLOADER_RTC_APB_FREQ_REG_VALUE;
         self.bus.rtc_cntl.set_store_regs(store);
@@ -376,8 +411,8 @@ impl FirmwareRuntime {
         if let Some(hit) = self.cpu.take_hook_hit() {
             self.dispatch_hook(hit);
         }
-        if let Some(reason) = self.cpu.take_reset_request() {
-            self.soft_reset(reason);
+        if let Some((reason, kind)) = self.cpu.take_reset_request() {
+            self.soft_reset(reason, kind);
             return true;
         }
         false
@@ -1068,7 +1103,7 @@ mod tests {
         rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(b'!'));
         assert!(rt.console_output().starts_with(&before));
         assert_eq!(rt.console_output(), format!("{before}!"));
-        assert_eq!(rt.serial_pending(), 0, "queued host input is dropped");
+        assert_eq!(rt.serial_pending(), 6, "a CPU reset keeps it");
     }
 
     /// The RTC timer as `rtc_cntl_ll_get_rtc_time` reads it: `TIME_UPDATE`
@@ -1275,6 +1310,324 @@ mod tests {
         let floor = start_rtc + 2 * REBOOT_RTC_TICKS;
         assert!(rtc >= floor, "{rtc} < {floor}");
         assert!(rtc <= floor + 1, "{rtc} > {floor} + 1 tick");
+    }
+
+    // What a CPU reset keeps, row by row (`docs/milestone-11-decisions.md`,
+    // "What a CPU reset keeps", the table). A core reset is the rebuild.
+    const SYSTEM_BASE: u32 = crate::mem::soc::SYSTEM_RANGE.start;
+    const FROM_CPU_0: u32 = SYSTEM_BASE + crate::peripherals::system::CPU_INTR_FROM_CPU_0_REG;
+    const CPU_PER_CONF: u32 = SYSTEM_BASE + crate::peripherals::system::CPU_PER_CONF_REG;
+    const SYSCLK_CONF: u32 = SYSTEM_BASE + crate::peripherals::system::SYSCLK_CONF_REG;
+    const RNG_DATA: u32 =
+        crate::mem::soc::APB_CTRL_RANGE.start + crate::peripherals::apb_ctrl::RND_DATA_REG;
+    const GPIO_OUT: u32 = crate::mem::soc::GPIO_RANGE.start + crate::peripherals::gpio::OUT_REG;
+    const GPIO_ENABLE: u32 =
+        crate::mem::soc::GPIO_RANGE.start + crate::peripherals::gpio::ENABLE_REG;
+    const TIMG0_WDT: u32 =
+        crate::mem::soc::TIMG0_RANGE.start + crate::peripherals::timg::WDTCONFIG1_REG;
+    const TIMG1_WDT: u32 =
+        crate::mem::soc::TIMG1_RANGE.start + crate::peripherals::timg::WDTCONFIG1_REG;
+    /// `RTC_CNTL_OPTIONS0_REG`: a word the model only stores.
+    const RTC_OPTIONS0: u32 = crate::mem::soc::RTC_CNTL_RANGE.start;
+    /// An I2C0 register the model only stores, reset value 0x10
+    /// (`TO_REG`, in `crate::peripherals::i2c`'s reset table).
+    const I2C0_TO: u32 = crate::mem::soc::I2C0_RANGE.start + 0x0C;
+    const USB_EP1: u32 =
+        crate::mem::soc::USB_SERIAL_JTAG_RANGE.start + crate::peripherals::usb_serial_jtag::EP1_REG;
+    const USB_EP1_CONF: u32 = crate::mem::soc::USB_SERIAL_JTAG_RANGE.start
+        + crate::peripherals::usb_serial_jtag::EP1_CONF_REG;
+    /// A flash MMU entry nothing in the synthetic image maps.
+    const MMU_PROBE: u32 = crate::mem::soc::MMU_TABLE_RANGE.start + 4 * 100;
+
+    /// Writes `SC7A20H` register `reg`, as `i2c_master_transmit` does.
+    fn write_accel_reg(rt: &mut FirmwareRuntime, reg: u8, val: u8) {
+        let accel = &mut rt.bus.i2c0.accel;
+        accel.start(false);
+        accel.write(reg);
+        accel.write(val);
+        accel.stop();
+    }
+
+    /// Reads `SC7A20H` register `reg`, as `i2c_master_transmit_receive` does.
+    fn read_accel_reg(rt: &mut FirmwareRuntime, reg: u8) -> u8 {
+        let accel = &mut rt.bus.i2c0.accel;
+        accel.start(false);
+        accel.write(reg);
+        accel.start(true);
+        let val = accel.read();
+        accel.stop();
+        val
+    }
+
+    /// Runs and reads the console's OUT endpoint until `count` bytes came
+    /// through it, or nothing more will.
+    fn read_serial(rt: &mut FirmwareRuntime, count: usize) -> Vec<u8> {
+        use crate::mem::Bus;
+        use crate::peripherals::usb_serial_jtag::SERIAL_OUT_EP_DATA_AVAIL as DATA_AVAIL;
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            rt.run(10_000);
+            while got.len() < count && rt.bus.read32(USB_EP1_CONF) & DATA_AVAIL != 0 {
+                got.push(rt.bus.read32(USB_EP1) as u8);
+            }
+        }
+        got
+    }
+
+    /// Review Focus 1, the core half: a provision typed across a reboot.
+    /// The firmware reboots before it has read any of the input, and the
+    /// new boot reads all of it, in order, exactly once.
+    #[test]
+    fn queued_serial_input_survives_a_cpu_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let sent: Vec<u8> = (0..100).collect();
+        assert_eq!(rt.serial_input(&sent), 100);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.serial_pending(), 100);
+        assert_eq!(read_serial(&mut rt, 200), sent);
+        assert_eq!(rt.serial_pending(), 0);
+    }
+
+    /// The firmware read part of a packet, then rebooted: the rest of the
+    /// FIFO and the host queue arrive in order, with no byte twice.
+    #[test]
+    fn serial_input_read_partly_before_a_cpu_reset_arrives_once() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let sent: Vec<u8> = (0..100).collect();
+        rt.serial_input(&sent);
+        let read = read_serial(&mut rt, 10);
+        assert_eq!(read, sent[..10]);
+        assert_ne!(
+            rt.bus.read32(USB_EP1_CONF)
+                & crate::peripherals::usb_serial_jtag::SERIAL_OUT_EP_DATA_AVAIL,
+            0,
+            "the packet is half read"
+        );
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.serial_pending(), 90);
+        assert_eq!(read_serial(&mut rt, 200), sent[10..]);
+    }
+
+    #[test]
+    fn system_survives_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.write32(FROM_CPU_0, 1);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(FROM_CPU_0), 1);
+    }
+
+    /// The bootloader's `rtc_clk_init` leaves the PLL at 80 MHz whatever
+    /// `esp_restart_noos` left (table row 3), and writes only these fields:
+    /// the rest of `CPU_PER_CONF` is the old boot's.
+    #[test]
+    fn system_clock_fields_are_the_bootloaders_after_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        // 160 MHz, with WAITI_DELAY_NUM 0xF and WAIT_MODE_FORCE_ON and
+        // PLL_FREQ_SEL clear.
+        rt.bus.write32(CPU_PER_CONF, 0xF1);
+        // XTAL, divider 3.
+        rt.bus.write32(SYSCLK_CONF, 0x002);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.bus.read32(SYSCLK_CONF), 1 << 10, "PLL, divider 1");
+        assert_eq!(
+            rt.bus.read32(CPU_PER_CONF),
+            0xF0,
+            "CPUPERIOD_SEL 0, the rest kept"
+        );
+        assert_eq!(rt.bus.system.cpu_hz(), Some(80_000_000));
+    }
+
+    /// Ruling R-T1-5: the xorshift sequence continues.
+    #[test]
+    fn apb_ctrl_rng_survives_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.read32(RNG_DATA);
+        let mut no_reset = rt.clone();
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(RNG_DATA), no_reset.bus.read32(RNG_DATA));
+    }
+
+    #[test]
+    fn gpio_survives_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.write32(GPIO_OUT, 0x0000_0005);
+        rt.bus.write32(GPIO_ENABLE, 0x0000_0007);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(GPIO_OUT), 0x0000_0005);
+        assert_eq!(rt.bus.read32(GPIO_ENABLE), 0x0000_0007);
+    }
+
+    /// Ruling R-T1-4: the bootloader's `release_default_console_io` disables
+    /// GPIO21's output (table row 5). Only that bit moves.
+    #[test]
+    fn gpio21_output_enable_is_the_bootloaders_after_a_cpu_reset() {
+        use crate::mem::Bus;
+        use crate::peripherals::gpio::PIN_HC165_CLK;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let clk = 1u32 << PIN_HC165_CLK;
+        rt.bus.write32(GPIO_ENABLE, clk | 0x3);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(rt.bus.read32(GPIO_ENABLE), 0x3);
+    }
+
+    /// The external shift register keeps its latched bits and position, so
+    /// a read in progress when the firmware rebooted still shows its bit.
+    #[test]
+    fn hc165_survives_a_cpu_reset() {
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.set_raw_button(2, true);
+        pulse_load(&mut rt);
+        clk_rising_edge(&mut rt);
+        assert!(!rt.bus.gpio.hc165.data_level(), "slot 2 is shifted out");
+        rt.set_raw_button(2, false);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert!(
+            !rt.bus.gpio.hc165.data_level(),
+            "the snapshot latched before the reset"
+        );
+    }
+
+    #[test]
+    fn timg_survives_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.write32(TIMG0_WDT, 0x0123_4567);
+        rt.bus.write32(TIMG1_WDT, 0x89AB_CDEF);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(TIMG0_WDT), 0x0123_4567);
+        assert_eq!(rt.bus.read32(TIMG1_WDT), 0x89AB_CDEF);
+    }
+
+    /// Every stored word, not only `STORE0..7` (table row 11).
+    #[test]
+    fn rtc_cntl_survives_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        rt.bus.write32(RTC_OPTIONS0, 0x1234_5678);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(RTC_OPTIONS0), 0x1234_5678);
+    }
+
+    /// The accelerometer is outside the SoC and keeps its registers; the
+    /// I2C0 controller around it is reset (table rows 13 and 14).
+    #[test]
+    fn accelerometer_survives_a_cpu_reset_and_i2c0_does_not() {
+        use crate::mem::Bus;
+        use crate::peripherals::sc7a20h::CTRL_REG1;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        write_accel_reg(&mut rt, CTRL_REG1, 0x57);
+        rt.bus.write32(I2C0_TO, 0x1F);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+
+        assert_eq!(read_accel_reg(&mut rt, CTRL_REG1), 0x57);
+        assert_eq!(rt.bus.read32(I2C0_TO), 0x10, "the reset value");
+    }
+
+    /// The bootloader unmaps every entry and maps the app (table row 17),
+    /// so a mapping the old app added at run time goes.
+    #[test]
+    fn mmu_entries_are_the_bootloaders_after_a_cpu_reset() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let seeded = rt.bus.read32(MMU_PROBE);
+        rt.bus.write32(MMU_PROBE, 0x05);
+        assert_eq!(rt.bus.read32(MMU_PROBE), 0x05);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.bus.read32(MMU_PROBE), seeded);
+    }
+
+    /// `software_reset` is the core reset: every peripheral a CPU reset
+    /// keeps goes back to its power-on state (Task 2's path).
+    #[test]
+    fn core_reset_rebuilds_every_peripheral() {
+        use crate::mem::Bus;
+        use crate::peripherals::sc7a20h::CTRL_REG1;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let first_rng = rt.clone().bus.read32(RNG_DATA);
+        rt.serial_input(&[0x41; 100]);
+        rt.bus.write32(FROM_CPU_0, 1);
+        rt.bus.write32(CPU_PER_CONF, 0xF1);
+        rt.bus.read32(RNG_DATA);
+        rt.bus.write32(GPIO_OUT, 0x0000_0005);
+        rt.bus.write32(GPIO_ENABLE, 0x0000_0007);
+        rt.set_raw_button(2, true);
+        pulse_load(&mut rt);
+        clk_rising_edge(&mut rt);
+        rt.set_raw_button(2, false);
+        rt.bus.write32(TIMG0_WDT, 0x0123_4567);
+        rt.bus.write32(TIMG1_WDT, 0x89AB_CDEF);
+        rt.bus.write32(RTC_OPTIONS0, 0x1234_5678);
+        write_accel_reg(&mut rt, CTRL_REG1, 0x57);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.serial_pending(), 0);
+        assert_eq!(rt.bus.read32(FROM_CPU_0), 0);
+        assert_eq!(rt.bus.read32(CPU_PER_CONF), 0x0c, "its reset value");
+        assert_eq!(rt.bus.read32(RNG_DATA), first_rng, "the sequence restarts");
+        assert_eq!(rt.bus.read32(GPIO_OUT), 0);
+        assert_eq!(rt.bus.read32(GPIO_ENABLE), 0);
+        assert!(rt.bus.gpio.hc165.data_level(), "no snapshot");
+        assert_eq!(rt.bus.read32(TIMG0_WDT), 0);
+        assert_eq!(rt.bus.read32(TIMG1_WDT), 0);
+        assert_eq!(rt.bus.read32(RTC_OPTIONS0), 0);
+        assert_eq!(read_accel_reg(&mut rt, CTRL_REG1), 0x07, "its reset value");
+    }
+
+    /// Both kinds of reset run the bootloader, so the core reset also takes
+    /// `REBOOT_US` and the `STORE4`/`STORE5` rewrites.
+    #[test]
+    fn core_reset_takes_reboot_time_and_rewrites_the_stores() {
+        use crate::mem::soc::RTC_CNTL_RANGE;
+        use crate::mem::Bus;
+        use crate::peripherals::rtc_cntl::{STORE4_REG, STORE5_REG};
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        let store4 = RTC_CNTL_RANGE.start + STORE4_REG;
+        let store5 = RTC_CNTL_RANGE.start + STORE5_REG;
+        rt.run(8_000_000);
+        let before_us = rt.emulated_time_us();
+        let before_rtc = latch_rtc_timer(&mut rt);
+        rt.bus.write32(store4, 0xdead_beef);
+        rt.bus.write32(store5, 0x2626_2626);
+        rt.bus.write32(STORE6_ADDR, 0x8003_0003);
+
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET);
+
+        assert_eq!(rt.soft_reset_count(), 1);
+        let us = rt.emulated_time_us();
+        assert!(us >= before_us + crate::rom::REBOOT_US, "{us}");
+        assert!(us <= before_us + crate::rom::REBOOT_US + 1, "{us}");
+        let rtc = latch_rtc_timer(&mut rt);
+        let floor = before_rtc + REBOOT_RTC_TICKS;
+        assert!(rtc >= floor, "{rtc} < {floor}");
+        assert!(rtc <= floor + 1, "{rtc} > {floor} + 1 tick");
+        assert_eq!(
+            rt.bus.read32(store4),
+            crate::rom::BOOTLOADER_RTC_XTAL_FREQ_REG_VALUE
+        );
+        assert_eq!(
+            rt.bus.read32(store5),
+            crate::rom::BOOTLOADER_RTC_APB_FREQ_REG_VALUE
+        );
+        assert_eq!(rt.bus.read32(STORE6_ADDR), 0x8003_0003, "the rest kept");
     }
 
     /// The fake hacker MAC the radio rungs use (common context).
