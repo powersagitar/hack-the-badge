@@ -24,7 +24,10 @@ provisions a fake test identity through its own USB console, walks the
 11-page onboarding app, and reaches the launcher. All 16 of the
 launcher's apps open, each pinned by a rung. v392 enters five apps
 (Scanner, Sync, Share, Sponsors, Workshop Quest) by rebooting, through
-the emulated software reset. Connect and Sync run on a fake BLE
+the emulated software reset, which takes the badge's 466 ms (host time
+and the RTC timer jump by it; the new boot's clocks start at 0, and the
+browser holds the screen for it) and keeps what a CPU reset keeps on
+the badge. A cold power-on still starts at 0 µs. Connect and Sync run on a fake BLE
 controller that replaces the mask-ROM one at bt.c's VHCI seam, through
 app-image hooks at v392's addresses. Two emulated badges pair in Connect
 ("SYNCED" on both after a bump), in a rung and in two browsers linked
@@ -40,15 +43,16 @@ Snake plays at about 1.0x, and every tap of a quick burst registers (a
 per-button tap queue in the browser). On v392, in Bun's WASM bench, a
 launcher move (DOWN) plays at about 0.85x and entering the launcher
 (the HOME redraw) at about 0.63x, because the WASM core does about 41M
-steps/s against the badge's 80M; desktop browsers were not re-measured
-on v392, and mobile Safari runs far slower (about 0.0x to 0.2x). Before
+steps/s against the badge's 80M; the human partner finds the speed
+normal in the prod build, so desktop browsers were not re-measured on
+v392 (the mobile Safari slowness was a dev-build effect). Before
 assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-10-decisions.md`.
+`docs/milestone-3-decisions.md` through `docs/milestone-11-decisions.md`.
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
-the v335 → v392 re-pins. Milestone 10's has the radio's rulings and the
-Milestone 11 backlog.
+the v335 → v392 re-pins. Milestone 10's has the radio's rulings.
+Milestone 11's has the CPU-reset table and the Milestone 12 backlog.
 
 ## Repository layout
 
@@ -74,14 +78,15 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 275 of them, about 11 s. Most of that is the
+- `bun test`: unit tests, 318 of them, about 12 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.
 - `bun run typecheck`: `tsc --noEmit`.
 
-Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` target,
-plus `wasm-pack`.
+Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
+`riscv32imc-unknown-none-elf` targets (the second for
+`tests/riscv_integration.rs`), plus `wasm-pack`.
 
 - `cargo test -p emulator-core`: fast native unit tests, the primary
   iteration loop.
@@ -90,8 +95,8 @@ plus `wasm-pack`.
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 87 rungs plus 1 ignored benchmark, about
-  16 s.
+  real-firmware boot ratchet, 88 rungs plus 1 ignored benchmark, about
+  15 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
@@ -190,14 +195,20 @@ frontend/src/
                         pacing (runUntil by the wall delta, clamped and
                         step-capped; a capped frame drops its debt), the
                         button name -> raw slot table, the per-button tap
-                        queue (press hold, release gap), provision() and
-                        shake() and bump() (one motion schedule). It runs
-                        inside the Worker, which also posts the badge's
-                        advertisement (advOut) and takes peers' (advIn).
+                        queue (press hold, release gap; per-source holds,
+                        key and pad; queued taps survive stop()), the
+                        reboot's pause (a frame reports the jump, wall
+                        time pays it, taps shift past it), provision()
+                        and shake() and bump() (one motion schedule). It
+                        runs inside the Worker, which also posts the
+                        badge's advertisement (advOut) and takes peers'
+                        (advIn).
   runtime/firmware-worker.ts
                         Web Worker that owns the runtime and runs it in
                         capped slices: one frame in flight, a throttled
-                        `status`, and messages applied between slices.
+                        `status` (immediate on a soft reset), advOut
+                        coalesced to 10 Hz, and messages applied between
+                        slices.
   runtime/firmware-worker-client.ts
                         Main-thread proxy with the same API. It queues
                         messages until ready, paints frames on rAF and acks
@@ -207,39 +218,57 @@ frontend/src/
   runtime/provisioner.ts
                         Types `put /littlefs/identity.json` and `prov apply`
                         into the emulated USB console, paced in 64-byte
-                        chunks. Mirrors emulator-core's
-                        tests/common/provision.rs.
+                        chunks. The first prompt is matched from the
+                        current boot's console start (Milestone 11's
+                        R-T13-3). Mirrors
+                        emulator-core's tests/common/provision.rs.
   radio/hub.ts          The radio hub on the main thread: sends the badge's
                         advertisement and bumps to every link, validates
-                        peers' messages, holds the latest per peer while
-                        paused (hidden page).
+                        peers' messages (a valibot schema), holds the
+                        latest per peer while paused (hidden page). A bump
+                        goes out only while the badge runs and the page
+                        is visible (setRunning, the bump gate).
   radio/lock.ts         One badge per browser (Web Lock `htn-badge`,
                         take-over), and the per-browser locally
                         administered MAC in localStorage.
   radio/peer-link.ts    A WebRTC link: one ordered data channel,
-                        iceServers: [], no trickle; the manual copy-paste
-                        codes (deflate-raw, base64url).
+                        iceServers: [], no trickle; `opened` settles on the
+                        channel's open or a close first; the manual
+                        copy-paste codes (deflate-raw, base64url).
   radio/signal-client.ts
                         Hosts or joins a room on /api/signal (1 s polls,
-                        120 s budget).
+                        120 s budget). Its messages: busy N min on a 429,
+                        "Signaling unavailable" on a 5xx, room closed on a
+                        join's 404. A cancel aborts and sends `close` with
+                        the host's token, best effort.
   radio/signal-handler.ts
                         Pure signaling handler (Request in, Response out)
-                        over a SignalStore: offer/answer mailbox, 300 s
-                        TTL, four rate-limit counters. MemoryStore for dev
-                        and tests, UpstashStore (REST) for Vercel.
+                        over `SignalDeps` (a RoomStore and four Limiters):
+                        offer/answer mailbox, 300 s TTL, valibot request
+                        schemas (a failure is a 400), a host-token `close`
+                        op, clientKey (IPv4 whole, IPv6 its /64). memoryDeps
+                        for dev and tests; imports only valibot, so the
+                        Upstash clients stay out of the browser.
   render/canvas.ts      Pure widget-tree painter, testable with a fake 2D
                         context.
   render/framebuffer.ts Blits the firmware's framebuffer.
   cpu/bridge.ts         Loads the wasm-pkg. Only the Worker imports it, and
                         lazily, so Lua-only use never loads the WASM.
   bench/                The WASM redraw benchmark and the dev-only bench page.
-  ui/shell.ts, main.ts  Page chrome, input bindings, the mode toggle, the
-                        provisioning controls, the badge notice and the
-                        link panel; main.ts wires it together.
+  ui/shell.ts, ui/badge-controller.ts, main.ts
+                        shell.ts: page chrome, input bindings, the mode
+                        toggle, the provisioning controls, the badge notice
+                        (showing it clears the canvas) and the link panel.
+                        badge-controller.ts: createBadgeController (mode
+                        switch, lazy Worker boot, the badge lock and notice,
+                        provisioning, the bump gate) and mountLinks (links,
+                        the hosted room's cancel). main.ts is thin wiring.
 frontend/api/signal.ts  The Vercel function for /api/signal: the handler
-                        over Upstash Redis (KV_REST_API_URL/_TOKEN; a
-                        missing one is a bare 500). Vite's dev middleware
-                        serves the same handler.
+                        over @upstash/redis and @upstash/ratelimit
+                        (redisRoomStore, upstashLimiter, upstashDeps;
+                        KV_REST_API_URL/_TOKEN; a missing one is a bare
+                        500). Vite's dev middleware serves the same
+                        handler over memoryDeps.
 frontend/public/
   apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
                         because require() must return synchronously.
@@ -250,7 +279,8 @@ frontend/public/
 emulator-core/src/
   cpu/                  Generic RV32IMC core: CSRs, traps, WFI, the cycle
                         counter. Also rom_stubs.rs (the mechanism that
-                        intercepts ROM-address fetches), encode.rs (a const
+                        intercepts ROM-address fetches; ResetKind, CPU or
+                        core), encode.rs (a const
                         RV32IM encoder for ROM code blobs) and
                         decode_cache.rs (a direct-mapped table validated by
                         the raw bits on every fetch, so it needs no
@@ -263,7 +293,8 @@ emulator-core/src/
   clock.rs              Converts steps to 16 MHz SYSTIMER ticks at the
                         firmware-selected CPU frequency, without drift. Every
                         timer reads it.
-  md5.rs                MD5 shared by the ROM stubs and the partition table.
+  md5.rs                MD5 shared by the ROM stubs and the partition table;
+                        the block compression is the md-5 crate's.
   mem/bus.rs            FirmwareBus, the ESP32-C3 memory map: ordered regions
                         (XIP through the flash MMU, RAM segments, ROM code and
                         data blobs, the peripherals, a catch-all). A word fast
@@ -275,8 +306,9 @@ emulator-core/src/
                         (clock registers, software interrupts), APB_CTRL's
                         RNG (fixed seed), GPIO plus the 74HC165 button shift
                         register, SPI2 plus the ST7789 framebuffer, GDMA,
-                        TIMG, RTC_CNTL (the RTC timer; STORE0..7, kept
-                        across a software reset), USB-Serial-JTAG (the
+                        TIMG, RTC_CNTL (the RTC timer, with an offset so it
+                        counts through a software reset; STORE0..7),
+                        USB-Serial-JTAG (the
                         console, in both directions), I2C0 plus the SC7A20H
                         accelerometer, RMT, efuse.rs (only the factory MAC,
                         opt-in; set it at power-on),
@@ -288,14 +320,16 @@ emulator-core/src/
                         event queue; connectionless). mod.rs: Radio, which
                         hooks bt.c's controller init/enable and VHCI
                         functions and feeds NimBLE through a guest
-                        trampoline in free mask-ROM space (reports from the
-                        idle hook); the peers' wire form and
+                        trampoline in free mask-ROM space (the command's
+                        reply first, reports from the idle hook); the
+                        peers' wire form and
                         LINKED_PEER_RSSI (-40 dBm). v392.rs: the hook
                         addresses, each with its evidence.
   rom.rs                The ESP32-C3 mask-ROM HLE stub table (including
                         the software_reset/software_reset_cpu stubs that
-                        request a reset, and the reset reason
-                        rtc_get_reset_reason reports), the guest-executed
+                        request a core or a CPU reset, the reset reason
+                        rtc_get_reset_reason reports, and REBOOT_US, the
+                        466,000 µs a reboot takes), the guest-executed
                         ROM code blobs (qsort, strdup, the CPU-frequency
                         pair), the ROM data tables and the boot-time RAM
                         initializers.
@@ -306,11 +340,19 @@ emulator-core/src/
   runtime.rs            FirmwareRuntime: the whole emulator as one Clone-able
                         object. Buttons by raw slot; serial input; the
                         acceleration; run_until and emulated_time_us. The
-                        software reset: after a reset stub's step it
-                        re-boots the image, keeping the flash, RTC_CNTL's
-                        STORE registers, RTC memory, the panel, the console
-                        text, held input and host time (soft_reset_count).
-                        reset() stays a cold power-on. attend(), the cold
+                        software reset (soft_reset_count): after a reset
+                        stub's step it re-boots the image. Both ResetKinds
+                        add REBOOT_US to host time and the RTC timer and
+                        keep the flash, RTC_CNTL's STORE registers (STORE4
+                        and STORE5 rewritten as the bootloader does), RTC
+                        memory, the panel, the console text, held input
+                        and the diagnostics. A CPU reset also keeps SYSTEM,
+                        the RNG, GPIO and the 74HC165, TIMG, all of
+                        RTC_CNTL, USB-Serial-JTAG (queued input arrives in
+                        the new boot) and the SC7A20H; the table and its
+                        citations are in docs/milestone-11-decisions.md.
+                        reset() stays a cold power-on at 0 µs.
+                        attend(), the cold
                         path behind the attention flag, takes resets and
                         hook hits. The radio host API: set_factory_mac,
                         radio_advertisement(_bytes),

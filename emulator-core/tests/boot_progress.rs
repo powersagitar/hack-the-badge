@@ -1092,9 +1092,11 @@ fn boot_starts_the_console() {
 /// first-run checkpoint at 15.50M; [`console_rejects_an_empty_identity`]'s
 /// `prov apply` prints `PROV FAIL` at 16.30M (v335: 17.00M), the next
 /// prompt follows at 19.30M (v335: 17.20M; 3.0M busy steps, about 40 ms
-/// of emulated time, after the result line, against 0.2M on v335; what
-/// v392 does there was not traced), and its stable-frame check ends at
-/// 20.30M (50,000-step sampling); that + 25%, rounded up to 1,000,000.
+/// of emulated time, after the result line, against 0.2M on v335; on
+/// v392 that is the firmware's own full-screen LVGL redraw, traced in
+/// `docs/milestone-11-decisions.md`, "Traces"), and its stable-frame check
+/// ends at 20.30M (50,000-step sampling); that + 25%, rounded up to
+/// 1,000,000.
 const CONSOLE_DEADLINE: u64 = 26_000_000;
 
 /// [`put_accepts_a_payload_larger_than_the_rx_ring`]: total-step deadline.

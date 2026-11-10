@@ -488,10 +488,28 @@ work (24,000 still passes; 12,000 does not).
 **The RTC timer.** RTC_CNTL's `TIME_UPDATE` snapshot converts SYSTIMER
 ticks to RC slow-clock cycles at `RC_SLOW_HZ / SYSTIMER_HZ` (136,000
 cycles per emulated second), so `rtc_init()`'s waits on it take their
-real time (Task D-M6-1).
+real time (Task D-M6-1). Since Milestone 11 the snapshot also adds an
+offset in slow-clock ticks (`RtcCntl::rtc_ticks_at`), so the timer keeps
+counting through a software reset: at the reset the offset becomes the
+old timer's value plus `REBOOT_US` in slow-clock ticks (63,376; TRM
+§6.1.3, §9.3.3, §9.4.1). A cold `reset()` clears it.
+
+**A reboot's time (Milestone 11).** `crate::rom::REBOOT_US` = 466,000 µs
+is the mask ROM and 2nd-stage bootloader the shortcut boot skips:
+measured on the badge as 468 ms for v335 and scaled to v392's segments
+(`milestone-11-decisions.md`, "Measurements"). Both reset kinds add it.
+It moves only host time (`emulated_time_us`) and the RTC timer: the new
+boot runs no steps for it, and its cycle counter and SYSTIMER start at
+0. Two resets add it twice. A cold `reset()` still starts at 0 µs (a
+limitation below).
 
 **Emulated time and `run_until`.** `FirmwareRuntime::emulated_time_us`
-is the clock's time since boot or the last reset.
+is the time since power-on or the last cold `reset()`: the clocks that
+software resets replaced, plus `REBOOT_US` per reset, plus the current
+clock's. It never goes backwards. A `run_until` whose target lies inside
+a reboot's jump returns at the reset with time past the target, as an
+idle overshoot would, and the next one runs normally
+(`run_until_target_inside_the_reboot_jump`).
 `FirmwareRuntime::run_until(target_us, max_steps)` runs until emulated
 time reaches the target or the step cap, whichever is first, checking
 before each step; it reports the steps used. When the core waits in
@@ -540,8 +558,9 @@ Task 8 the app runs that runtime inside a dedicated Web Worker
   emulation, so a slice never delays the page's paint or input.
 - The Worker posts at most one frame in flight (the main thread's
   `firmware-worker-client.ts` paints it on its next animation frame and
-  acknowledges it) and a `status` (speed, provisioning state) at most
-  every 250 ms. While the page is hidden the client stops the runtime
+  acknowledges it) and a `status` (speed, provisioning state,
+  `softResets`) at most every 250 ms, or at once when the soft-reset
+  count changes (Milestone 11 Task 8). While the page is hidden the client stops the runtime
   and restarts it when visible (R-T8-10), so the Worker does not run the
   firmware unseen.
 
@@ -569,6 +588,21 @@ shapes; `DEFAULT_STEPS_PER_FRAME` is the in-thread
   50 ms). A tab back from the background adds one near-zero sample.
 - The provisioner's timeout and chunk gap stay in steps (host pacing
   against CPU work); holds and the shake are emulated time.
+- **A reboot's pause (Milestone 11 Task 8).** A frame that runs across a
+  reset reports the jump (`n` resets x `rebootUs()`), and the runtime
+  carries it as wall-clock debt (`rebootDebtUs`): each frame's clamped
+  delta pays the debt first and runs only the rest, so the screen holds
+  for about 466 ms, as the badge's does. In Chrome at Gate 3 the first
+  new frame after A on Scanner came 852 ms after A, against about 0.2 s
+  without the pause. The speed reading counts the paid debt as emulated
+  time and leaves the jump out, so it reads about the core's speed
+  through the pause (Milestone 11's R-T8-2). The tap queue's
+  `downSince`/`upSince` move past the jump, so a tap held across a reboot
+  lasts its full `PRESS_HOLD_US` in wall terms and the release gap counts
+  only non-jump time; a shake or bump is not shifted (Milestone 11's
+  R-T8-3). A
+  backgrounded tab pays 50 ms of the pause per frame like any other
+  delta, and a cold `reset()` drops the debt.
 
 Measured by the human on 2026-10-20: Snake runs at 0.9x to 1.0x and 100
 to 110 fps with a 64 ms INP and feels like the badge. Busy screens cannot
@@ -593,15 +627,23 @@ On v392 (Milestone 9) the same benchmark in Bun's WASM gives HOME
 0.623x, DOWN 0.857x and onboarding 1.110x (v335: 0.614x, 0.977x,
 1.224x), at 39.96M steps/s; the firmware differs, so the columns are not
 a speed comparison. The human partner found the lower speed noticeable
-and accepted it (Task 5 gate). An app that opens by rebooting adds no
-pacing case: the reset happens inside one step, the run continues on the
-new boot, and host time keeps counting (see "Software reset" under
-"Current state"). In Chrome the readout dipped to about 0.8x for about
-0.5 s while Scanner rebooted.
+and accepted it (Task 5 gate). Until Milestone 11 a reboot took no
+emulated time, and the readout dipped to about 0.8x for about 0.5 s while
+Scanner rebooted in Chrome. An app that opens by rebooting now pauses
+for the reboot ("A reboot's pause", above). The human partner has since
+called the speed normal in the prod build and closed the speed items
+(`milestone-11-decisions.md`, "Closed in writing").
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 10)
+### Current state (end of Milestone 11)
+
+**Milestone 11 was a backlog sweep.** A reboot now takes the badge's
+466 ms, the RTC timer counts through it, and a CPU reset keeps what the
+badge keeps ("Software reset" below; the table is in
+[`milestone-11-decisions.md`](milestone-11-decisions.md), "What a CPU
+reset keeps"). No pin moved. The rest of this section is otherwise
+unchanged from Milestone 10.
 
 **Milestone 10 emulates the badge radio.** All 16 launcher apps open:
 Connect, and Sync after its reboot, now run through a fake BLE
@@ -724,12 +766,25 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   asks the runtime to reset, and `FirmwareRuntime` re-boots the image
   through the shortcut boot after that step, with `rtc_get_reset_reason`
   reporting `RESET_REASON_CPU0_SW` (`0x0C`; `software_reset` reports
-  `RESET_REASON_CORE_SW`, `0x03`). It keeps what a reset keeps on the
-  badge: the whole emulated flash, RTC_CNTL `STORE0..7` (ESP-IDF's reset-reason hint is `STORE6`),
-  RTC fast memory (with the image's RTC segment reloaded), the panel and
-  its pixels; it also keeps the console text, held buttons, the
-  acceleration, the step count and host time (`emulated_time_us()` never
-  goes backwards). Scanner opens after exactly one reset
+  `RESET_REASON_CORE_SW`, `0x03`). The two are different resets since
+  Milestone 11 (`ResetKind` in `cpu/rom_stubs.rs`; `runtime.rs`'s module
+  doc; each row cited in `milestone-11-decisions.md`, "What a CPU reset
+  keeps"). Both keep the whole emulated flash, RTC_CNTL `STORE0..7`
+  (ESP-IDF's reset-reason hint is `STORE6`), except `STORE4` and `STORE5`,
+  which get the values the 2nd-stage bootloader leaves there; the RTC
+  timer, which counts through the 466 ms reboot; RTC fast memory (with
+  the image's RTC segment reloaded); the panel and its pixels; and, on
+  the host side, the console text, held buttons, the acceleration, the
+  step count, host time (`emulated_time_us()` never goes backwards) and
+  the diagnostics (the unmapped-access log and the ROM-stub drop count).
+  A CPU reset also keeps SYSTEM (with its clock fields rewritten to the
+  bootloader's 80 MHz), the RNG (so its sequence continues), GPIO and the
+  74HC165 (GPIO21's output enable cleared, as the bootloader does),
+  TIMG0/1, the whole of RTC_CNTL, USB-Serial-JTAG (queued serial input
+  arrives in the new boot, in order, exactly once) and the SC7A20H's
+  registers. SYSTIMER, the interrupt matrix, SPI2, GDMA, I2C0, RMT, the
+  flash MMU and SPI1 are reset. A core reset otherwise rebuilds every
+  peripheral; v392 is not seen to use one. Scanner opens after exactly one reset
   (`scanner_opens_after_one_reboot`, `0x4958_3da5_06ff_ab49`), and HOME
   from Scanner is a direct return to the launcher, with no second reset
   (`scanner_home_returns_to_the_launcher`); so is HOME from Share,
@@ -778,8 +833,13 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   validates what peers send. Links are direct WebRTC data channels with
   `iceServers: []`, set up through the signaling function `/api/signal`
   (an offer/answer mailbox: Upstash Redis on Vercel, an in-memory store
-  under `bun run dev`; rate-limited, R-T10-8) or by copy-paste codes
-  behind "Manual". The human partner's gate (2026-11-03, `bun run dev --
+  under `bun run dev`; rate-limited, R-T10-8, on `@upstash/ratelimit`
+  since Milestone 11; a cancelled host room closes through its `close`
+  op) or by copy-paste codes behind "Manual". Since Milestone 11 a Bump
+  goes to the links only while the local badge runs and the page is
+  visible (Milestone 11's R-T11-1), and a Lua-mode switch frees the
+  badge. The human
+  partner's gate (2026-11-03, `bun run dev --
   --host` on the LAN, two real devices): Connect's and Sync's home
   screens, a room link, a Bump with "SYNCED" on both, and a manual
   pairing all worked. That was also the first time a link reached
@@ -815,6 +875,27 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 11** (details in
+[`milestone-11-decisions.md`](milestone-11-decisions.md) and the history
+below):
+
+- A reboot takes the badge's 466 ms, and the browser holds the screen
+  for it (Milestone 10's limitations 2 and 3; Tasks 2 and 8).
+- A CPU reset keeps what the badge keeps; the bootloader's `STORE4`,
+  `STORE5` and GPIO21; queued serial input survives (Tasks 1 to 3).
+- `PROV FAIL`'s 3.0M busy steps and the two provisioning hosts' step
+  difference are traced (Task 4).
+- The core's review items and the release-gap rung (Tasks 5 and 6).
+  `md-5` and `object` replaced the hand-written rounds and the objcopy
+  step (Task 7).
+- Signaling: `@upstash/redis` and `@upstash/ratelimit`, `valibot`, a
+  `close` op, a /64 key for IPv6, messages for a 429 and a store failure
+  (Tasks 9 and 10).
+- The browser: the bump gate, coalesced advertisements, the badge freed
+  on Lua or a failed start, Provision without the badge, per-source tap
+  holds, taps surviving `stop()`, and a boot-scoped provisioner prompt
+  scan (Tasks 11 to 13).
 
 **Resolved in Milestone 10** (details in
 [`milestone-10-decisions.md`](milestone-10-decisions.md) and the history
@@ -885,7 +966,8 @@ below and [`milestone-6-decisions.md`](milestone-6-decisions.md)):
 - Snake: it used to reach "Game over" with no input; it is now playable
   and compared with the badge (Tasks 4 to 6, stretch Task 8).
 - The browser paces the emulator to wall-clock time, with a speed
-  readout (Task 7), and flushes deferred button releases in `stop()`.
+  readout (Task 7), and flushes deferred button releases in `stop()`
+  (since Milestone 11 it keeps queued taps; see the Milestone 8 section).
 
 **Resolved in Milestone 5** (details in the history below and in
 [`milestone-5-decisions.md`](milestone-5-decisions.md)):
@@ -942,8 +1024,8 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 11 candidates)** (the Milestone 11 backlog
-in `milestone-10-decisions.md` is the complete list):
+**Open limitations (Milestone 12 candidates)** (the Milestone 12 backlog
+in `milestone-11-decisions.md` is the complete list):
 
 1. **The radio is a model, not the controller.** The closed controller
    blob and its mask-ROM half never run. `radio/hci.rs` answers only the
@@ -975,17 +1057,18 @@ in `milestone-10-decisions.md` is the complete list):
    - The signaling function's rate limits (R-T10-8) are sized for a toy
      project with few simultaneous users; about 10 browsers waiting
      behind one NAT lock that NAT out for the rest of the window (at most 10 min).
-2. **The RTC timer restarts at a software reset.** The reset builds a
-   fresh bus, and the RTC timer counts the new SYSTIMER clock, so it
-   starts again at 0. On the badge the RTC domain keeps counting through
-   a CPU reset. Host time (`emulated_time_us()`) does not restart, but
-   anything the firmware derives from the RTC timer across a reboot
-   would read low. Nothing observed depends on it yet.
-3. **A reboot takes no time.** The shortcut boot replaces the mask ROM
-   and the 2nd-stage bootloader, so the new boot starts in the step
-   after `software_reset_cpu`; on the badge the ROM and the bootloader
-   run first (not measured on the badge, and not modeled). Rebooting
-   apps open that much sooner than on hardware.
+2. **A cold power-on takes no time.** The shortcut boot starts the app
+   at 0 µs after a power-on or the reset button; the badge takes about
+   466 ms before `cpu_start`. Adding it would move every pin for no
+   visible gain (spec, "Non-goals"; Milestone 12 backlog). A software
+   reset does take it (Milestone 11).
+3. **The CPU-reset table's silent rows.** Where the TRM and ESP-IDF are
+   both silent, the peripheral is reset and the gap recorded. That is the
+   interrupt matrix's CPU-line half (Milestone 11's R-T1-2); the
+   external chips (74HC165, SC7A20H, ST7789, flash) are kept with no
+   citation beyond "no TRM reset scope reaches them". The SYSTEM clock
+   gates and reset bits are not modeled, and the core reset is narrower
+   than the TRM (`milestone-11-decisions.md`, "Milestone 12 backlog").
 4. **The launcher's HOME redraw runs slower than real time in the
    browser.** The core runs about 40M to 42M steps per second in WASM
    against the badge's 80M cycles per second (Milestone 7's bench on
@@ -1012,8 +1095,9 @@ in `milestone-10-decisions.md` is the complete list):
    (on v335), and no app's deeper screens are tested. Milestone 10's
    per-step hook check costs a further 1.7 to 4.4 % natively and 0.8 to
    3.9 % in Bun's WASM (R-T3-5, accepted). On mobile Safari the emulator
-   runs at about 0.0x to 0.2x (the human partner's remark, 2026-11-03;
-   not measured).
+   ran at about 0.0x to 0.2x under the dev server (the human partner's
+   remark, 2026-11-03; a dev-build effect, closed in Milestone 11's
+   decisions along with the speed items).
 5. **ST7789 `MADCTL` is not modeled.** The firmware sends `MADCTL` `0x20`
    and then `0x60` (row/column exchange, then also column-address
    mirroring). `emulator-core/src/peripherals/spi.rs` ignores `MADCTL` and
@@ -3122,7 +3206,9 @@ held at least `PRESS_HOLD_US`, the next is pressed after
 keep a button the user still holds; `stop()` keeps the last release
 time, so a tap right after a resume still waits the gap. A double tap
 takes 240 ms of emulated time. No emulator-core change; every
-pin holds.
+pin holds. (Since Milestone 11 Task 13, `stop()` keeps the queue and
+only releases a tap already let go; `reset()` still drops it. See that
+milestone's R-T13-2.)
 
 Re-measured at the start (`96fe58c`): the launcher's DOWN redraw runs at
 0.97x in Bun's WASM and 1.44x natively, so moving around the launcher is
@@ -3254,6 +3340,47 @@ are in `docs/milestone-10-decisions.md`.
   Bump to "SYNCED" on both, and a manual pairing all worked. The human
   partner accepted the rate limiter as is: this is a toy project, and
   few simultaneous users are expected.
+
+### Milestone 11: the backlog sweep
+
+The spec (`docs/superpowers/specs/2026-11-03-milestone11-backlog-sweep-design.md`)
+clears the Milestone 10 backlog and its carry-overs, except what the human
+partner closed or saved for Milestone 12. Rulings, measurements, the
+CPU-reset table, the traces and the backlog are in
+`docs/milestone-11-decisions.md`.
+
+- **Task 1** wrote the CPU-reset table, row by row with citations; the
+  human partner approved it (Gate 1).
+- **Task 2** made a reboot take `REBOOT_US` (466 ms) and kept the RTC
+  timer counting, carried the diagnostics across a reset and set the
+  bootloader's `STORE4` and `STORE5` (R-T1-3). **Task 3** split `ResetKind`
+  and made a CPU reset keep what the table keeps. No pin or frame moved
+  (Gate 2).
+- **Task 4** traced `PROV FAIL`'s 3.0M steps (the firmware's own redraw)
+  and the two provisioning hosts' step difference (both valid). No
+  emulator fault.
+- **Tasks 5 and 6** closed Milestone 10's core review items (replies
+  before reports, the HCI parameter rules, `proptest` fuzzing, the
+  release-gap rung, 88 rungs).
+- **Task 7** took the block compression from `md-5` and read the
+  fixtures with `object`, so `llvm-tools-preview` is no longer needed.
+- **Task 8** showed the reboot in the browser ("A reboot's pause" in
+  "Timing model") and posts `status` at once on a reset.
+- **Tasks 9 and 10** moved signaling to `@upstash/redis`,
+  `@upstash/ratelimit` and `valibot`, added a token-gated `close` op,
+  keyed IPv6 clients by /64, gave the client real messages (429, store
+  failure, closed room) and moved `waitOpen` onto `PeerLink.opened`. The
+  command saving the spec expected does not happen: a served request
+  costs 7 or 8 commands, as before ("The signaling function's cost").
+- **Task 11** gated the bump on the running badge and coalesced
+  advertisements to 10 Hz. **Task 12** factored `ui/badge-controller.ts`
+  out of `main.ts`, freed the badge on Lua or a failed start, and put
+  `happy-dom` under the shell tests. **Task 13** gave each button
+  per-source holds, kept queued taps across `stop()` (`stop()` still
+  flushes a release already due; R-M8-6's flush of the queue no longer
+  holds) and scoped the provisioner's first prompt to the current boot.
+- **Gate 3**, the browser (2026-11-09): the controller's Chrome checks
+  and the human partner's two devices and Vercel preview all passed.
 
 ## Emulated flash chip: what it contains
 

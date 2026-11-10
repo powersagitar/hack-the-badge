@@ -244,7 +244,8 @@ client's first request in a window, and so on).
   instance's cache after the first), so a flood past the cap from many
   clients spends the quota faster still.
 
-**Sizes.** `bun run build`'s client bundle is byte-identical before and
+**Sizes (at Task 9; Task 11 later put `valibot` in the client, see
+"Dependencies added").** `bun run build`'s client bundle is byte-identical before and
 after (`dist/assets/index-C2eKYMur.js`, 276,964 B, both at `4bd7b06` and
 with this change): the browser takes only the room-code helpers from
 `signal-handler.ts`, `valibot`'s schemas are dropped as unused, and the
@@ -565,6 +566,11 @@ One unit test changed, for the recorded cause (not a pin):
 `console_output_survives_a_soft_reset` asserted that a CPU reset dropped
 queued serial input; it now asserts that it stays (row 12).
 
+**Tasks 4 to 13: no pin moved.** They added the rung
+`two_downs_a_release_gap_apart_move_twice` (Task 5, 88 rungs since), and
+every other pin holds; the final check list is in "Final suites". No
+frame compared with the badge moved.
+
 ## Traces
 
 Both traces were made on v392 at `fd96f49`, with scratch probes outside
@@ -767,17 +773,70 @@ that prompt. `frontend/test/provisioner.test.ts`'s
 and pins the chunk size (64), the gap (48,000) and the frontend's sending
 at exactly that gap and not one step before.
 
+## Gates
+
+- **Gate 1 (2026-11-05).** The human partner approved the CPU-reset table
+  and rulings R-T1-1, R-T1-3 and R-T1-4.
+- **Gate 2 (2026-11-09).** The human partner: OK. No pin or frame moved.
+  Two caveats: the three 465,999 µs deltas are untraced ("Moved pins"),
+  and the step-exact claims come from probes since deleted.
+- **Gate 4** (a Task 4 fix bigger than a small register model): not
+  triggered. Task 4 found no emulator fault.
+- **Gate 3 (2026-11-09), the browser.** The controller's Chrome checks on
+  the dev server all passed:
+  - Scanner's pause: the first new frame came 852 ms after A, against
+    about 0.2 s without the pause, and the held A did not act as a
+    second press in the new boot;
+  - the 429: the 31st `create` got a 429 with `Retry-After` 56, shown as
+    "Signaling server busy, try again in 1 min.";
+  - a cancelled room: "Room closed or expired.";
+  - Lua mode frees the lock, and a second tab takes it.
+
+  The human partner reported "All pass" for the same checks, plus the
+  bump gate on two devices, and for a Vercel preview with the new
+  bundled dependencies (a 400 on a bad request, a pairing, the 429).
+
 ## Dependencies added
 
 - `@types/bun` 1.4.4 (dev, frontend, Task 5): the type declarations for
   `bun:test` and `node:fs`, so `test/cpu-wasm.test.ts` can join
-  `tsconfig.json`'s `include`.
+  `tsconfig.json`'s `include`. Size: none shipped (types only). Known
+  cost: the file needs `"bun"` in `tsconfig.json`'s `types`, which makes
+  Bun's and Node's globals visible to `src/` and `api/` too, so
+  `bun run typecheck` no longer catches a browser module reaching for
+  one of them.
 - `proptest` =1.12.0 (dev, `emulator-core`, Task 6): generated inputs and
   shrinking for the HCI and serial fuzz tests, in place of the two
   hand-rolled xorshift generators (spec, Part 7). `default-features =
   false, features = ["std"]`: no `fork` or `timeout`, so no `rusty-fork`
   or `tempfile`. A dev-dependency: neither the WASM build nor
-  `emulator-wasm`'s dependency tree has it.
+  `emulator-wasm`'s dependency tree has it. Size: 0 B shipped.
+- `md-5` =0.11.0 (`emulator-core`, Task 7; RustCrypto): `md5.rs`'s
+  block compression is its `block_api::compress`, in place of the
+  hand-written 64 rounds and their two constant tables (spec, Part 7).
+  `default-features = false`: no `alloc` or `oid`. Its tree is `cfg-if`,
+  `digest` 0.11.3, `block-buffer`, `crypto-common`, `hybrid-array` and
+  `typenum`, all pure Rust and `no_std`; on `wasm32-unknown-unknown` the
+  crate takes its `soft` backend (only LoongArch64 has assembly). The
+  Plumb context, its 88-byte guest image and every byte-exact write stay
+  in `md5.rs`; RFC 1321's suite, the ROM-stub tests and
+  `PARTITION_TABLE_MD5` pass unchanged. The WASM grew from 140,003 B to
+  141,861 B (+1,858 B, +1.3%), measured with `ls -l` of
+  `frontend/src/cpu/wasm-pkg/emulator_wasm_bg.wasm` after `bun run
+  build:wasm` at `1c8aeb6` and after the change.
+- `object` =0.40.0 (dev, `emulator-core`, Task 7): `riscv_integration.rs`
+  flattens each fixture ELF by copying its `PT_LOAD` segments' file bytes
+  to their physical addresses, in place of shelling out to
+  `rust-objcopy`/`llvm-objcopy`, so the `llvm-tools-preview` component is
+  no longer needed (spec, Part 7). `default-features = false, features =
+  ["read_core", "elf"]`: no `std`, `compression` or other formats. A
+  dev-dependency: neither the WASM build nor `emulator-wasm`'s tree has
+  it. Checked against the objcopy route at `1c8aeb6`: both fixtures' flat
+  images are byte-identical (`toy_sum` 42 B, `toy_mul` 489 B in two
+  segments), with the same entry points (0 and 2). No segment has
+  `p_memsz` above `p_filesz`. The loader, like `objcopy -O binary`,
+  stops at the last file byte, and `FlatBus` starts zeroed anyway. Size:
+  0 B shipped.
 - `@upstash/redis` 1.41.0 (frontend, Task 9): the Upstash REST client, in
   place of the hand-written `UpstashStore` (spec, Part 5.3, Part 7);
   `@upstash/ratelimit` needs it. Brings `uncrypto` 0.1.3. Imported only by
@@ -788,12 +847,20 @@ at exactly that gap and not one step before.
   limiters (`Ratelimit.fixedWindow`), in place of the hand-written
   `INCR`/`EXPIRE NX` counters (spec, Part 5.3; the human partner's answer
   (c) of 2026-11-03). Brings `@upstash/core-analytics` 0.0.10, unused
-  (analytics off). Imported only by `api/signal.ts`.
+  (analytics off). Imported only by `api/signal.ts`. Size, the two
+  `@upstash` packages together: 0 B in the browser bundle; the function
+  grew from 4,150 B (1,828 B gzipped) to 128,188 B (32,211 B gzipped),
+  almost all `@upstash/redis` (`bun build --target node --minify`, an
+  estimate of Vercel's bundling). They do not cut the command count the
+  spec predicted: "The signaling function's cost".
 - `valibot` 1.5.0 (frontend, Task 9): the request schemas
-  (`v.safeParse`) in `signal-handler.ts`, in place of hand-written type
-  guards (spec, Part 7). A failure is a 400, never a throw. The client
-  bundle does not carry it today (tree-shaken; "The signaling function's
-  cost").
+  (`v.safeParse`) in `signal-handler.ts` and the peer-message parser in
+  `hub.ts` (Task 11), in place of hand-written type guards (spec, Part
+  7). A failure is a 400 or a drop, never a throw. Size: since Task 11
+  the client carries the part `hub.ts` uses, about 4.5 KB minified and
+  1.8 KB gzipped (a scratch `bun build --minify` of the same schema, an
+  estimate; the client bundle's whole growth over the milestone is in
+  "Final suites"). The function's size is counted above.
 - `happy-dom` 21.0.4 (dev, frontend, Task 12): a real DOM for
   `test/shell.test.ts`, in place of its hand-written `FakeElement` (spec,
   Part 7), so the shell and the badge controller are tested through the
@@ -802,7 +869,11 @@ at exactly that gap and not one step before.
   global registrator. Brings `entities` 7.0.1, `whatwg-mimetype` 3.0.0,
   `ws` 8.22.2, `buffer-image-size` 0.6.4 and the types
   `@types/whatwg-mimetype` 3.0.2 and `@types/ws` 8.18.2 (`@types/node` was
-  already there). Tests only: nothing under `src/` imports it.
+  already there). Tests only: nothing under `src/` imports it, and
+  `dist/` has none of it. Size: 0 B shipped.
+
+The swaps the survey decided against, each with its reason, are in the
+spec's Part 7 ("Keep, recorded with the reason").
 
 ## Closed in writing
 
@@ -821,22 +892,55 @@ unless another date is given.
   Milestone 7). Closed (same decision).
 - **Tuning `WORKER_STEPS_PER_SLICE`** (Milestone 7). Closed (same
   decision).
-- **The unverified Vercel build of `frontend/api/signal.ts`** (R-T10-3).
-  Closed: the human partner checked that the Vercel preview deploy works.
-  R-T10-3's "imports nothing" is revisited by Part 5.3, and the new
-  dependencies are re-checked on the next preview deploy (Gate 3).
-- **Upstash's plan limits** (R-T10-8). Checked: the free plan, measured
+- **The unverified Vercel build of `frontend/api/signal.ts`** (Milestone
+  10's R-T10-3). Closed: the human partner checked that the Vercel preview
+  deploy works. That ruling's "imports nothing" is revisited by Part 5.3,
+  and the new dependencies were re-checked on a preview deploy (Gate 3:
+  all pass, "Gates" above).
+- **Upstash's plan limits** (Milestone 10's R-T10-8). Checked: the free plan, measured
   above ("Upstash's free plan").
 - **No v392 frame compared with hardware**, and **v392's early log
   timestamps compared with no badge.** Closed: reflashing the badge to
   v392 is dismissed; the badge stays on v335.
+- **The per-client limits trust the first `x-forwarded-for` entry.** It
+  stays: sound on Vercel, which overwrites it (spec, Part 5.2; Task 9's
+  `clientKey`).
 - **The tap queue's lag on fast bursts (`RELEASE_GAP_US`).** Closed:
   `RELEASE_GAP_US` stays 40 ms (R-M8-4 stands; the human partner called
   the lag tiny; spec Part 4.9).
-- **Hearing real badges.** Stays dropped (ruling R-T11-2, the human
-  partner's no-go of 2026-11-02; spec, "Non-goals").
+- **Hearing real badges.** Stays dropped (Milestone 10's ruling R-T11-2,
+  the human partner's no-go of 2026-11-02; spec, "Non-goals").
+- **Milestone 10's R-T9-2 changed the Shake's timing** (its first
+  acceleration applies at the call, a change to Milestone 6's behaviour;
+  no pin moved). Acknowledged (spec, Part 6). No work.
+
+## Earlier decisions this milestone changed
+
+The past milestones' docs are left as written; each of these is the
+current word.
+
+- **Milestone 8's R-M8-6 ("`stop()` flushes the queue").** Since
+  R-T13-2, `stop()` keeps queued taps and still releases a tap that is
+  down and let go. `reset()` is unchanged. `docs/firmware-emulator-notes.md`
+  says so where it describes the flush.
+- **Milestone 9's R-T3-3 and "both reset stubs are the same full
+  re-boot".** A CPU reset now keeps what a CPU reset keeps, and `STORE4`
+  and `STORE5` get the bootloader's values ("What a CPU reset keeps").
+- **Milestone 10's R-T10-1 (bump ungated).** Revised by R-T11-1 of this
+  doc, by the human partner's choice (spec, Part 4.4).
+- **Milestone 10's R-T10-3 ("imports nothing").** Ended by Part 5.3.
+- **Milestone 10's R-PF-3, "each advertisement change posted at once"**
+  (its R-T8-3 text and backlog). Coalesced to 10 Hz by R-T11-2 of this
+  doc.
+- **Milestone 10's R-T6-2, the report-ahead-of-a-reply risk.** Fixed by
+  R-T5-1 of this doc (`pop_reply`).
 
 ## Rulings
+
+Labels below are this milestone's. Milestones 10's and 11's task numbers
+overlap, so a Milestone 10 ruling is always named as such here
+("Milestone 10's R-T9-3"), and the rulings that share a label most
+closely (R-T5-1, R-T6-2, R-T10-1, R-T10-2) say which numbering they use.
 
 - Ruling R-T1-1: the app's own `esp_perip_clk_init` resets of SPI2, I2C0
   and RMT (`clk.c` :270–287, :306–307) are reproduced at the reset step,
@@ -893,11 +997,13 @@ unless another date is given.
   resets it crossed but not which entries came before which reset; a
   diagnosis that needs that split would have to compare the log at the
   reset.
-- Ruling R-T5-1: the `send_packet` hook delivers the command's own reply
+- Ruling R-T5-1 (Milestone 11's numbering; Milestone 10's doc has its own
+  R-T5-k): the `send_packet` hook delivers the command's own reply
   ahead of any report queued before it (`HciController::pop_reply`), and
   the report waits for the idle hook, so a reply always reaches the host
-  in the task that sent the command (R-T6-2's ordering risk, fixed
-  rather than only pinned). No pin moved, `two_badges_pair_to_synced`
+  in the task that sent the command (Milestone 10's R-T6-2 ordering
+  risk, fixed rather than only pinned; its `host_rcv_pkt` half stays
+  open, see the Milestone 12 backlog). No pin moved, `two_badges_pair_to_synced`
   included. — cost if wrong: a report is seen after a command sent later
   than it, which HCI's event order forbids on a real controller; NimBLE
   does not depend on the order, and a report was already delayed to the
@@ -910,7 +1016,8 @@ unless another date is given.
   set to 0x01", duplicates first, and leaves the precedence otherwise
   open — cost if wrong: an error code for a host that names an unknown
   handle twice; NimBLE on v392 sends one set.
-- Ruling R-T6-2: Filter_Duplicates 2 is refused when Duration or Period
+- Ruling R-T6-2 (Milestone 11's numbering; Milestone 10's R-T6-2 is the
+  event path): Filter_Duplicates 2 is refused when Duration or Period
   is zero, not only Period as the spec says: 7.8.65's one sentence names
   "either Period or Duration". Only when Enable is 1: with Enable 0 "the
   remaining parameters shall be ignored" — cost if wrong: none for
@@ -935,35 +1042,10 @@ unless another date is given.
   `deliver_rejects_malformed_bytes`, the only xorshift in that file (peer
   bytes, in the wire form). Only that loop changed; the rest of the test
   stands — cost if wrong: none.
-- `md-5` =0.11.0 (`emulator-core`, Task 7; RustCrypto): `md5.rs`'s
-  block compression is its `block_api::compress`, in place of the
-  hand-written 64 rounds and their two constant tables (spec, Part 7).
-  `default-features = false`: no `alloc` or `oid`. Its tree is `cfg-if`,
-  `digest` 0.11.3, `block-buffer`, `crypto-common`, `hybrid-array` and
-  `typenum`, all pure Rust and `no_std`; on `wasm32-unknown-unknown` the
-  crate takes its `soft` backend (only LoongArch64 has assembly). The
-  Plumb context, its 88-byte guest image and every byte-exact write stay
-  in `md5.rs`; RFC 1321's suite, the ROM-stub tests and
-  `PARTITION_TABLE_MD5` pass unchanged. The WASM grew from 140,003 B to
-  141,861 B (+1,858 B, +1.3%), measured with `ls -l` of
-  `frontend/src/cpu/wasm-pkg/emulator_wasm_bg.wasm` after `bun run
-  build:wasm` at `1c8aeb6` and after the change.
 - Ruling R-T7-1: the crate's library is named `md5`, like the module
   `emulator_core::md5`. `md5.rs` calls it by the absolute path
   `::md5::block_api::compress`, with no rename in `Cargo.toml` and no
   `use` alias — cost if wrong: none; a build error if it were ambiguous.
-- `object` =0.40.0 (dev, `emulator-core`, Task 7): `riscv_integration.rs`
-  flattens each fixture ELF by copying its `PT_LOAD` segments' file bytes
-  to their physical addresses, in place of shelling out to
-  `rust-objcopy`/`llvm-objcopy`, so the `llvm-tools-preview` component is
-  no longer needed (spec, Part 7). `default-features = false, features =
-  ["read_core", "elf"]`: no `std`, `compression` or other formats. A
-  dev-dependency: neither the WASM build nor `emulator-wasm`'s tree has
-  it. Checked against the objcopy route at `1c8aeb6`: both fixtures' flat
-  images are byte-identical (`toy_sum` 42 B, `toy_mul` 489 B in two
-  segments), with the same entry points (0 and 2). No segment has
-  `p_memsz` above `p_filesz`. The loader, like `objcopy -O binary`,
-  stops at the last file byte, and `FlatBus` starts zeroed anyway.
 - Ruling R-T8-1: the reboot's debt is paid by each frame's *clamped*
   wall delta (at most `MAX_FRAME_DELTA_MS`), as new emulated time is, so
   a tab back from the background pays 50 ms of the pause, not all of it;
@@ -983,7 +1065,7 @@ unless another date is given.
   first request as the old counters were; `memoryLimiter` buckets the
   same way, and a 429's `Retry-After` is the whole seconds left until the
   limiter's `reset` (at least 1), no longer the whole window. The caps
-  and windows are unchanged (R-T10-8) — cost if wrong: across a window
+  and windows are unchanged (Milestone 10's R-T10-8) — cost if wrong: across a window
   boundary a key can spend up to twice its cap in a short burst (60
   writes in a few seconds around a minute boundary; a room's 300 s life
   can span two poll windows, so up to 400 polls; up to 10,000 global
@@ -1049,7 +1131,7 @@ unless another date is given.
   hub's existing pause (`onPausedChange`). The two combine as an AND,
   and neither is remembered: a bump refused while stopped or hidden is
   not sent later. A peer's bump is unchanged (it reaches the local badge,
-  which drops it when stopped or hidden, R-T9-3). So that a `start()`
+  which drops it when stopped or hidden, Milestone 10's R-T9-3). So that a `start()`
   made while the page is hidden also gates it, the Worker client now
   calls `onPausedChange(true)` at that start, not only at a later hide —
   cost if wrong: two people who tap Bump in a tab whose badge is not
@@ -1140,15 +1222,59 @@ unless another date is given.
   boot's prompt and time out; an idle badge's console holds about
   2.3 KB.
 
+## Final suites
+
+At the milestone's last commit (one comment and these docs after
+`99784f1`, which changes no count), from the full check list:
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all` | no changes |
+| `cargo test --workspace` | 751 passed, 0 failed, 1 ignored: `emulator-core` lib 632; debug `boot_progress` 88 + 1 ignored in 22.70 s; the seven other integration binaries 31 |
+| `cargo test -p emulator-core --release --test boot_progress` | 88 passed, 1 ignored, 15.35 s (the 90 s bound holds) |
+| `cargo clippy --workspace --all-targets` | 3 warnings, the known ones (two in `boot.rs`, one in a `console.rs` test) |
+| `bun run build:wasm` | OK |
+| `bun test` | 318 pass, 0 fail, 18,430 `expect()` calls, 20 files, 12.43 s |
+| `bun run typecheck` | clean |
+| `bun run build` | OK |
+
+`bun run build` against the baseline at `5fb5704` ("Baselines"):
+
+| File | Before (B) | After (B) | Vite's gzip, before → after |
+|---|---|---|---|
+| `index.html` | 984 | 984 | 0.46 kB → 0.46 kB |
+| `bridge-*.js` | 5,773 | 5,919 | not printed |
+| `firmware-worker-*.js` | 7,636 | 8,206 | not printed |
+| `emulator_wasm_bg-*.wasm` | 137,533 | 141,973 | 60.61 kB → 62.52 kB |
+| `index-*.css` | 2,962 | 2,962 | 1.01 kB → 1.01 kB |
+| `index-*.js` | 276,964 | 283,869 | 92.23 kB → 94.73 kB |
+
+The client's +6,905 B is every browser change of the milestone, `valibot`
+(about 4.5 KB minified) the largest part. The WASM's +4,440 B is the
+reset model, the HCI checks and `md-5`'s +1,858 B.
+
 ## Milestone 12 backlog
 
-Started by Task 1; later tasks add what they leave open.
+Saved for Milestone 12 by the human partner or the spec:
 
-- **Share's radio transfer** (the human partner, 2026-11-03).
+- **Share's radio transfer** (the human partner, 2026-11-03). Neither
+  traced nor tested; it may need connections, which the HCI model does
+  not have (Milestone 10's R-T5-8).
 - **Sync's empty-room path:** the fake upload credential and the ROM
   `crc32_le` stub (the human partner, 2026-11-03).
-- **A cold power-on's boot time.** The shortcut boot starts the app at
-  0 µs; the badge takes about 466 ms (spec, "Non-goals").
+- **A cold power-on's 466 ms.** The shortcut boot starts the app at
+  0 µs; the badge takes about 466 ms. Adding it would move every pin for
+  no visible gain (spec, "Non-goals").
+- **A joiner who answered before a cancel waits out `waitOpen`.** A
+  joiner who arrives after the cancel gets the 404 at once. Covering the
+  earlier one needs a new poll, which costs commands (spec, Part 4.6).
+
+### The reset model
+
+- **The CPU-reset table's silent rows.** INTC is reset because the TRM
+  says nothing about the CPU-line half (R-T1-2). The external chips
+  (74HC165, SC7A20H, ST7789, flash) are kept with no citation beyond
+  "no TRM reset scope reaches them".
 - **The core reset is narrower than the TRM.** A core reset keeps the
   whole RTC domain (§6.1.3), but `soft_reset`'s core path keeps only
   `STORE0..7` and the timer; and it drops USB-Serial-JTAG, which §30.3.4
@@ -1160,9 +1286,96 @@ Started by Task 1; later tasks add what they leave open.
   stand in for the resets around a reboot only.
 - **DRAM `.noinit` data** is not kept across a reset (the TRM keeps
   internal SRAM).
+- **The RTC and timer-group watchdogs** are inert storage, so the 1 s RTC
+  watchdog `esp_restart_noos` arms is never checked.
+- **Three of the five reboot apps' time deltas are 465,999 µs**, 1 µs
+  short of `REBOOT_US`, with identical step counts. Untraced ("Moved
+  pins"). No pin reads time at that precision.
+- **Why v335 showed 0.2M steps after `PROV FAIL`** is not established;
+  v392's 3.0M is traced, v335 was not re-traced. SPI transfers are
+  instant in this model, so the trace's zero idle time is a claim about
+  the model, not the badge ("Traces").
+
+### The provisioner
+
+- A console at its 256 KiB cap plus a soft reset makes the boot-scoped
+  prompt scan never match, and the provision times out (R-T13-3). An idle
+  badge's console holds about 2.3 KB.
+- A provision already past the first prompt when the badge reboots loses
+  bytes during the new REPL's 500 ms terminal probe, then times out
+  cleanly. It does not hang or double-type (Task 3 keeps the queued
+  input; Task 13's report).
+
+### The radio model
+
+- **`host_rcv_pkt` blocking on the real firmware is not established.**
+  Milestone 10's R-T6-2 risk is half open: Task 5 fixed the report ahead
+  of a reply, and tested only the model's side of this half.
 - **LE Set Extended Scan Enable's other parameter rules** (Core v5.4,
   7.8.65): Duration not less than a non-zero Period is `0x12`, and a
   disable (Enable 0) should ignore an out-of-range Filter_Duplicates, not
   refuse it. Neither is a form NimBLE on v392 sends. (Task 6)
-- **The RTC and timer-group watchdogs** are inert storage, so the 1 s RTC
-  watchdog `esp_restart_noos` arms is never checked.
+
+### The browser
+
+- Provision in a tab whose badge was since freed boots the Worker without
+  starting it, and the notice stays until "Run here" or a mode switch
+  (Task 12).
+- A Provision and a `startFirmware` can race on a claim in flight
+  (Task 12).
+- A refused Bump gives no feedback in the UI: `hub.bump()` returns `false`
+  and the page ignores it (Task 11).
+- An advertisement change just before a Worker stop is never posted
+  (Task 11).
+- The host tab keeps the stale "Room …: enter this code" line after
+  Remove (seen at Gate 3).
+- The speed readout reads about 1x through the reboot's pause (R-T8-2, on
+  purpose; a freeze the readout does not show).
+- A shake or bump playing across a reboot loses its tail (R-T8-3).
+- The Worker client receives `status.softResets` and does not use it.
+- Only `test/cpu-wasm.test.ts` of the test files is in `tsconfig.json`'s
+  `include`; the others, `shell.test.ts` included, are not type-checked.
+
+### Signaling
+
+- `@upstash/redis`'s default retries are on (5, with backoff), so a lost
+  reply's retried `EVALSHA` counts one limiter hit twice (Task 9).
+
+### Carried from Milestone 8's backlog (still open)
+
+No part of this milestone's spec names these (Task 1's report). Word for
+word in `docs/milestone-9-decisions.md`, "Carried from Milestone 8's
+backlog (still open)"; listed by item, minus what this milestone closed
+or fixed:
+
+- **From Milestone 7's final review:** `stepFirmwareFrame` copies the
+  framebuffer on every slice; a Worker error after ready only logs; the
+  shadowed `now` in `serviceTaps`/`pollTaps`; a held button stays held
+  across a mode switch or a hidden tab.
+- **Speed and timing:** Snake's late game-over after an eat; CPI 1
+  calibrated only against timer-paced apps; zero-latency RMT, I2C0 and
+  SPIMEM1; the cycle counter ignores PCER/PCMR;
+  `PROVISION_TIMEOUT_STEPS` counted in steps.
+- **Apps and UI:** no app's deeper screens are tested, beyond Connect's
+  pairing and Sync's "not ready"; a browser-supplied RNG seed; a console
+  pane; motion input beyond the Shake and Bump buttons
+  (`DeviceMotionEvent`); Milestone 5 Task 7's provisioning-fetch minors;
+  small Task 7 cleanups (`speed()`'s 0 sentinel, the literal middle dot,
+  `pollShake`'s double clear); only role hacker's frames compared with
+  hardware.
+- **Peripherals:** RMT not decoded (no LEDs); NFC not modeled; the busy
+  phase after START on the first-run screen; SC7A20H simplifications;
+  I2C0's empty-FIFO `OP_WRITE`; the `put` task's CPU time per packet;
+  `R_M5_3`'s closure follows direct calls only; `strtol`/`atoi` and
+  `errno`, and the untested 8 MiB stub cap; unmapped ASSIST_DEBUG and
+  RTC_CNTL `0x6000_80bc` accesses at idle.
+- **Build and tests:** the release suite's wall time is one chain;
+  Milestone 6's test minors (`snake_eats`,
+  `run_until_a_past_target_runs_nothing`, the `DEFAULT_STEPS_PER_FRAME`
+  test, `snake_moves_on_its_own`'s gap pin).
+- **Carried from Milestones 3 and 4:** ST7789 `MADCTL` unmodeled; GPIO0
+  routing stored only; the eFuse block beyond the factory MAC (chip
+  revision v0.0 against the badge's v0.4); flagged ROM-stub guesses;
+  simplified edge interrupts; GDMA's unmodeled corners;
+  `boot_until_console_contains`' 250,000-step chunks; small
+  duplications in the stub arms and test helpers.
