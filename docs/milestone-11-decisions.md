@@ -1242,17 +1242,17 @@ closely (R-T5-1, R-T6-2, R-T10-1, R-T10-2) say which numbering they use.
 
 ## Final suites
 
-At the milestone's last commit (one comment and these docs after
-`99784f1`, which changes no count), from the full check list:
+At `5593e09`, the final review's fix wave (the commit after it is these
+docs only), from the full check list:
 
 | Check | Result |
 |---|---|
 | `cargo fmt --all` | no changes |
-| `cargo test --workspace` | 751 passed, 0 failed, 1 ignored: `emulator-core` lib 632; debug `boot_progress` 88 + 1 ignored in 22.70 s; the seven other integration binaries 31 |
-| `cargo test -p emulator-core --release --test boot_progress` | 88 passed, 1 ignored, 15.35 s (the 90 s bound holds) |
+| `cargo test --workspace` | 751 passed, 0 failed, 1 ignored: `emulator-core` lib 632; debug `boot_progress` 88 + 1 ignored in 22.36 s; the seven other integration binaries 31 |
+| `cargo test -p emulator-core --release --test boot_progress` | 88 passed, 1 ignored, 15.71 s (the 90 s bound holds) |
 | `cargo clippy --workspace --all-targets` | 3 warnings, the known ones (two in `boot.rs`, one in a `console.rs` test) |
 | `bun run build:wasm` | OK |
-| `bun test` | 318 pass, 0 fail, 18,430 `expect()` calls, 20 files, 12.43 s |
+| `bun test` | 319 pass, 0 fail, 18,437 `expect()` calls, 20 files, 12.50 s |
 | `bun run typecheck` | clean |
 | `bun run build` | OK |
 
@@ -1265,9 +1265,9 @@ At the milestone's last commit (one comment and these docs after
 | `firmware-worker-*.js` | 7,636 | 8,206 | not printed |
 | `emulator_wasm_bg-*.wasm` | 137,533 | 141,973 | 60.61 kB → 62.52 kB |
 | `index-*.css` | 2,962 | 2,962 | 1.01 kB → 1.01 kB |
-| `index-*.js` | 276,964 | 283,869 | 92.23 kB → 94.73 kB |
+| `index-*.js` | 276,964 | 283,902 | 92.23 kB → 94.74 kB |
 
-The client's +6,905 B is every browser change of the milestone, `valibot`
+The client's +6,938 B is every browser change of the milestone, `valibot`
 (about 4.5 KB minified) the largest part. The WASM's +4,440 B is the
 reset model, the HCI checks and `md-5`'s +1,858 B.
 
