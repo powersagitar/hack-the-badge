@@ -149,7 +149,7 @@ function pollAdvertisement(state: WorkerState, handle: FirmwareEmulatorHandle, p
   if (adv.length === 0 && state.lastAdv.length === 0) return;
   state.lastAdv = adv;
   state.lastAdvMs = t;
-  // Not transferred: the Worker keeps it to compare, and it is small.
+  // A copy, not a transfer: `state.lastAdv` keeps it (only its emptiness is read), and it is small.
   post({ kind: "advOut", bytes: adv.slice() });
 }
 

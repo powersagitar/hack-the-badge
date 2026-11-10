@@ -30,7 +30,7 @@
 //! firmware gets no Unknown HCI Command reply. The two parameter rules of
 //! Milestone 11 Task 6 (7.8.56's duplicate handles, 7.8.65's
 //! Filter_Duplicates 2) were read from Core **v5.4**'s HTML text, fetched
-//! 2026-11-09: same section numbers.
+//! 2026-11-09.
 //!
 //! - **Framing.** Vol 4 Part A (UART transport) 2: H4 packet indicators
 //!   `0x01` command, `0x02` ACL, `0x03` SCO, `0x04` event, `0x05` ISO.

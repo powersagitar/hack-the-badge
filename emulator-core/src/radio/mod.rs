@@ -464,7 +464,7 @@ mod tests {
 
     /// The most steps one idle-hook pass may take, entry to return: the
     /// hook's own step, the trampoline and the callback (measured at 14).
-    /// A pass that drained the queue or never came back would pass it.
+    /// A pass that drained the queue or never came back would exceed it.
     const IDLE_PASS_MAX_STEPS: u32 = 20;
 
     struct Guest {

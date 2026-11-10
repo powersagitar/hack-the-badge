@@ -376,6 +376,31 @@ describe("badge controller", () => {
     expect(r.locks.held()).toBe(true); // still the other tab's
   });
 
+  test("a_failed_boot_from_provision_releases_the_badge", async () => {
+    const r = badgeRig({ boot: "error" });
+    // Another tab holds the badge while this one enters firmware mode, then frees it.
+    let free = () => {};
+    void r.locks.request(BADGE_LOCK_NAME, {}, () => new Promise<void>((resolve) => (free = resolve)));
+    await settle();
+    r.pick("Real Firmware");
+    await settle();
+    expect(r.controller.mode()).toBe("firmware");
+    expect(r.workers).toHaveLength(0);
+    free();
+    await settle();
+    expect(r.locks.held()).toBe(false);
+
+    const errors = await quietErrors(async () => {
+      button(r.el("provision-controls"), "Provision test badge").click();
+      await settle();
+    });
+    expect(r.workers).toHaveLength(1); // the claim succeeded and the boot was tried
+    expect(errors.length).toBeGreaterThan(0);
+    expect(r.locks.held()).toBe(false);
+    r.controller.refreshStatus();
+    expect(r.el("provision-controls").textContent).toContain("could not load hacker");
+  });
+
   test("the keyboard's buttons reach the Worker as the key source, the pad's as the pad", async () => {
     const r = badgeRig();
     // mountKeyboard listens on the global window; happy-dom's, for this test.

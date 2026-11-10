@@ -287,7 +287,14 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
           showNotice();
           return;
         }
-        const rt = await ensureFirmwareRuntime();
+        let rt: WorkerFirmwareRuntime;
+        try {
+          rt = await ensureFirmwareRuntime();
+        } catch (e) {
+          // Nothing runs here: let another tab have the badge.
+          releaseBadge();
+          throw e;
+        }
         rt.provision(await deps.fetchIdentity(role));
       } catch (e) {
         console.error(`Could not load test identity ${role}:`, e);

@@ -78,7 +78,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 318 of them, about 12 s. Most of that is the
+- `bun test`: unit tests, 319 of them, about 12 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.

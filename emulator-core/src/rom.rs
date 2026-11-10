@@ -928,12 +928,13 @@
 //!     [`ResetKind`](crate::cpu::rom_stubs::ResetKind) selects it:
 //!     `software_reset_cpu` is `Cpu` and keeps what the CPU reset keeps,
 //!     per the table in `docs/milestone-11-decisions.md` ("What a CPU reset
-//!     keeps"); `software_reset` is `Core` and keeps only the flash, the
+//!     keeps"); `software_reset` is `Core` and keeps the flash, the
 //!     RTC_CNTL `STORE0..7` registers (ESP-IDF's reset-reason hint lives in
 //!     `STORE6`, `RTC_RESET_CAUSE_REG`, per
 //!     `components/esp_system/port/soc/esp32c3/reset_reason.c`), the RTC
-//!     timer, RTC fast memory and the panel's pixels. See `crate::runtime`'s
-//!     module doc, "Software reset".
+//!     timer, RTC fast memory, the panel's pixels, the console text, the
+//!     held buttons, the host-set acceleration, the factory MAC and the
+//!     diagnostics. See `crate::runtime`'s module doc, "Software reset".
 //!
 //! 27. **libgcc `__popcountsi2` and `__lesf2`** (`0x4000_0888` and
 //!     `0x4000_082c`, `esp32c3.rom.libgcc.ld` lines 89 and 66;

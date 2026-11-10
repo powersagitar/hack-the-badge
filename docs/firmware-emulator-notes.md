@@ -833,8 +833,8 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   validates what peers send. Links are direct WebRTC data channels with
   `iceServers: []`, set up through the signaling function `/api/signal`
   (an offer/answer mailbox: Upstash Redis on Vercel, an in-memory store
-  under `bun run dev`; rate-limited, R-T10-8, on `@upstash/ratelimit`
-  since Milestone 11; a cancelled host room closes through its `close`
+  under `bun run dev`; rate-limited, Milestone 10's R-T10-8, on
+  `@upstash/ratelimit` since Milestone 11; a cancelled host room closes through its `close`
   op) or by copy-paste codes behind "Manual". Since Milestone 11 a Bump
   goes to the links only while the local badge runs and the page is
   visible (Milestone 11's R-T11-1), and a Lua-mode switch frees the
@@ -923,7 +923,8 @@ below):
   found again in v392 by its bytes or its function's shape).
 - The software reset (Task 3): `software_reset` and `software_reset_cpu`
   are stubs that request a reset, and `FirmwareRuntime` re-boots while
-  keeping the flash, RTC_CNTL `STORE0..7` and RTC fast memory. Scanner,
+  keeping the flash, RTC_CNTL `STORE0..7` and RTC fast memory
+  (narrowed in Milestone 11). Scanner,
   Share, Sponsors and Workshop Quest now open; Sync gets past its reboot
   and stops at the Bluetooth ROM (limitation 1).
 - Every launcher app has a rung (Task 4); Sponsors is pinned on its
@@ -1054,8 +1055,8 @@ in `milestone-11-decisions.md` is the complete list):
      function addresses in this one image (no symbols; each cited from
      the disassembly). A different `firmware.bin` needs them found
      again, or Connect and Sync fault as in Milestone 9.
-   - The signaling function's rate limits (R-T10-8) are sized for a toy
-     project with few simultaneous users; about 10 browsers waiting
+   - The signaling function's rate limits (Milestone 10's R-T10-8) are
+     sized for a toy project with few simultaneous users; about 10 browsers waiting
      behind one NAT lock that NAT out for the rest of the window (at most 10 min).
 2. **A cold power-on takes no time.** The shortcut boot starts the app
    at 0 µs after a power-on or the reset button; the badge takes about
@@ -3254,8 +3255,9 @@ persisted `/littlefs/config/reboot.cfg`) and the reboot calls mask-ROM
   and re-boots with the reset reason (`reset_reasons.h`: `0x03`,
   `0x0C`), keeping the flash, RTC_CNTL `STORE0..7`
   (`rtc_cntl_reg.h`: `0x50..0x5c` and `0xb8..0xc4`), RTC fast memory and
-  the panel (R-T3-1 to R-T3-3). Scanner opens after one reset; HOME from
-  it is a direct return, measured (R-T3-4). No pin moved.
+  the panel (R-T3-1 to R-T3-3) (narrowed in Milestone 11). Scanner opens
+  after one reset; HOME from it is a direct return, measured (R-T3-4). No
+  pin moved.
 - **Task 4** gave every launcher cell a rung: the 16 selection frames,
   then each app's open frame and soft-reset count. Connect and Sync stop
   at the Bluetooth ROM fault (after it the panic handler's reboot lands

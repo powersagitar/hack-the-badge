@@ -23,8 +23,8 @@
  * - **Bump.** {@link RadioHub.bump} (the page's Bump button) bumps the
  *   local badge and sends `{ t: "bump" }` to every link; a peer's bump
  *   bumps only the local badge. It is gated on the local badge: while it
- *   is not running ({@link RadioHub.setRunning}, which `main.ts` calls at
- *   the runtime's start and stop) or the hub is paused (the page is
+ *   is not running ({@link RadioHub.setRunning}, which
+ *   `ui/badge-controller.ts` calls at the runtime's start and stop) or the hub is paused (the page is
  *   hidden), `bump()` sends nothing, bumps nothing and returns `false`
  *   (Milestone 11's ruling R-T11-1, revising Milestone 10's R-T10-1). A
  *   new hub is not running.
@@ -119,7 +119,7 @@ function parse(msg: unknown): Incoming | null {
 export class RadioHub {
   private readonly links = new Map<string, RadioLink>();
   private paused = false;
-  /** The local badge's runtime is started (`main.ts`); a new hub's is not. */
+  /** The local badge's runtime is started (`ui/badge-controller.ts`); a new hub's is not. */
   private running = false;
   /** While paused: the latest advertisement per peer id, in first-heard order. */
   private readonly held = new Map<string, Uint8Array>();

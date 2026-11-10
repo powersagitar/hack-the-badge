@@ -484,8 +484,9 @@ than the TRM are in the Milestone 12 backlog.
     for this console only switches the ROM's output channel
     (`bootloader_console.c` :133–149). Choice: kept, with its queued host
     input, which closes the provisioner's stale-prompt item one way:
-    a provision typed across a reboot reaches the new console (Part 4.10
-    still scans only text written after the provision started).
+    a provision typed across a reboot reaches the new console (Part 4.10's
+    prompt scan is scoped to the current boot, not to text written after
+    the provision started: R-T13-3).
 13. **I2C0.** As SPI2: the app resets it on every boot (fact 2). Choice:
     reset.
 14. **SC7A20H.** External. Choice: kept.
@@ -708,14 +709,15 @@ Whether v335 lacks this rebuild, or only scheduled it after the prompt
 (as the no-file case above does on v392), is open, and instant SPI could
 bear on the second case.
 
-`boot_progress.rs`'s doc on `CONSOLE_DEADLINE` still says "not traced";
-no constant changes for this.
+`boot_progress.rs`'s doc on `CONSOLE_DEADLINE` said "not traced" before
+this milestone; it now cites this trace. No constant changes for this.
 
 ### The two provisioning hosts' step difference: both valid
 
 **Result.** The first difference is 2,000 steps, at Chunk 1 in the
-table below (the payload's second 64-byte chunk). The bulk of the difference is that the Rust host waits for the
-prompt after `PROV OK` and the frontend does not.
+table below (the payload's second 64-byte chunk). The bulk of the
+difference is that the Rust host waits for the prompt after `PROV OK`
+and the frontend does not.
 
 **How it was measured.** Each input was logged as (total steps, emulated
 µs, event) by wrapping `serial_input` / `serialInput`,
@@ -766,9 +768,10 @@ Milestone 7's 740,001 was measured on v335. On v392 the walks are
   the phase (for example 2,632,588 against 2,642,375 for the first). The
   remaining 9,854 steps were not attributed press by press.
 
-Neither host is wrong against the firmware: every pinned frame matches
-on both. The frontend never types after `PROV OK`, so it does not need
-that prompt. `frontend/test/provisioner.test.ts`'s
+Neither host is wrong against the firmware: every frame pinned on the
+walk both hosts run matches on both. The frontend never types after
+`PROV OK`, so it does not need that prompt.
+`frontend/test/provisioner.test.ts`'s
 `provisioner_pacing_matches_the_rust_host` reads the Rust host's source
 and pins the chunk size (64), the gap (48,000) and the frontend's sending
 at exactly that gap and not one step before.
@@ -1005,9 +1008,12 @@ closely (R-T5-1, R-T6-2, R-T10-1, R-T10-2) say which numbering they use.
   risk, fixed rather than only pinned; its `host_rcv_pkt` half stays
   open, see the Milestone 12 backlog). No pin moved, `two_badges_pair_to_synced`
   included. — cost if wrong: a report is seen after a command sent later
-  than it, which HCI's event order forbids on a real controller; NimBLE
-  does not depend on the order, and a report was already delayed to the
-  idle pass whenever a reply was in the queue.
+  than it, which HCI's event order forbids on a real controller. NimBLE's
+  source was not read, so whether it depends on the order is not
+  established. The evidence held: a scratch probe saw the branch (a reply
+  taken from behind queued reports) reached twice in
+  `two_badges_pair_to_synced`, and that rung still pins; and a report was
+  already delayed to the idle pass whenever a reply was in the queue.
 
 - Ruling R-T6-1: LE Set Extended Advertising Enable's duplicate-handle
   check (Core v5.4, Vol 4 Part E, 7.8.56) runs for disabling too, and
@@ -1052,9 +1058,10 @@ closely (R-T5-1, R-T6-2, R-T10-1, R-T10-2) say which numbering they use.
   a cold `reset()` drops the debt — cost if wrong: a pause up to 466 ms
   longer after a backgrounded reboot.
 - Ruling R-T8-2: the speed reading counts the debt a frame paid as
-  emulated time (and leaves the jump out), so the readout stays at the
-  core's speed through the pause instead of dropping to 0x — cost if
-  wrong: a readout that hides a 466 ms freeze, which is the badge's own.
+  emulated time (and leaves the jump out), so the readout is about 1x
+  through the pause, whatever the core's speed, instead of dropping to
+  0x — cost if wrong: a readout that hides a 466 ms freeze, which is the
+  badge's own.
 - Ruling R-T8-3: only the tap queue's `downSince`/`upSince` move past the
   jump; a shake or bump playing across a reboot is not shifted, so its
   remaining pulse is cut short — cost if wrong: a shake or bump timed
@@ -1221,6 +1228,17 @@ closely (R-T5-1, R-T6-2, R-T10-1, R-T10-2) say which numbering they use.
   provision started after 256 KiB of console output could miss the new
   boot's prompt and time out; an idle badge's console holds about
   2.3 KB.
+- Ruling R-T14-1 (Milestone 11's numbering; the final review's fix
+  wave): `@upstash/ratelimit` stays, although the command saving spec
+  Part 7 expected did not happen: a served request costs 7 to 8 commands
+  against about 7 before ("The signaling function's cost"), and the
+  function grew from 4,150 B to 128,188 B (1,828 B to 32,211 B gzipped,
+  an estimate of Vercel's bundling; 0 B in the browser). Part 7's "If a
+  swap turns out worse ... it is reverted" clause was considered and not
+  applied: the swap is not worse for a user, it replaces hand-written
+  counters with tested code, and Gate 3's Vercel preview passed (a 400
+  on a bad request, a pairing, the 429) — cost if wrong: revert Task 9's
+  limiter half, back to the counters.
 
 ## Final suites
 
@@ -1329,6 +1347,9 @@ Saved for Milestone 12 by the human partner or the spec:
   (Task 11).
 - The host tab keeps the stale "Room …: enter this code" line after
   Remove (seen at Gate 3).
+- `createBadgeController`'s `inject` still feeds a stopped runtime while
+  the "another tab" notice is up, so those taps queue and replay after
+  "Run here" (queued taps survive `stop()` since R-T13-2).
 - The speed readout reads about 1x through the reboot's pause (R-T8-2, on
   purpose; a freeze the readout does not show).
 - A shake or bump playing across a reboot loses its tail (R-T8-3).
@@ -1340,6 +1361,12 @@ Saved for Milestone 12 by the human partner or the spec:
 
 - `@upstash/redis`'s default retries are on (5, with backoff), so a lost
   reply's retried `EVALSHA` counts one limiter hit twice (Task 9).
+- After the host gives up at 120 s, only a cancel sends `close`
+  (`signal-client.ts`, `connected`'s catch), so the room lives up to
+  about 180 s more and a joiner waits out `waitOpen` for a dead host.
+- `signal-client.ts`'s `call` has no fetch timeout, so with R-T9-2's
+  `timeout: 0` a hung Upstash holds a poll past the 120 s budget (a host
+  can cancel, a joiner cannot).
 
 ### Carried from Milestone 8's backlog (still open)
 
