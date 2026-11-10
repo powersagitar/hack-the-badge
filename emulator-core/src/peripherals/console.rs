@@ -59,6 +59,6 @@ mod tests {
             c.push((i % 251) as u8);
         }
         assert_eq!(c.bytes().len(), CONSOLE_CAPACITY);
-        assert_eq!(c.bytes()[0], (10 % 251) as u8, "oldest 10 bytes dropped");
+        assert_eq!(c.bytes()[0], 10u8, "oldest 10 bytes dropped");
     }
 }

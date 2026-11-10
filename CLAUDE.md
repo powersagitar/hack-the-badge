@@ -103,8 +103,7 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
   - `cargo test --workspace` runs the same rungs in debug, about 23 s.
-- `cargo clippy --workspace --all-targets` has 3 known warnings (two in
-  `boot.rs`, one in a `console.rs` test).
+- `cargo clippy --workspace --all-targets` runs clean, with no warnings.
 - Benchmarks are never part of a test run; results go in
   the current milestone's decisions doc (Milestone 7's has the profiles):
   - `cargo test -p emulator-core --release --test boot_progress bench_redraws -- --ignored --nocapture`

@@ -214,8 +214,8 @@ pub fn apply_ram_initializers(bus: &mut FirmwareBus, inits: &[RamInitializer]) {
 /// advances [`FirmwareBus`]'s emulated time and timed peripherals
 /// ([`FirmwareBus::tick_peripherals`]: the clock, SYSTIMER, USB) exactly once.
 ///
-/// This is the interrupt-delivery driving loop (interrupt matrix + SYSTIMER
-/// + SYSTEM software interrupts, see `crate::peripherals`). Callers that
+/// This is the interrupt-delivery driving loop (the interrupt matrix, SYSTIMER
+/// and SYSTEM software interrupts; see `crate::peripherals`). Callers that
 /// want peripherals (and therefore interrupts) to actually work should call
 /// this instead of `cpu.step(&mut bus)` directly.
 ///

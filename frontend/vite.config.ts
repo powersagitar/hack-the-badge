@@ -85,9 +85,35 @@ export function readCapped(req: IncomingMessage): Promise<Buffer | null> {
   });
 }
 
+/**
+ * fengari and its Node-only dependencies (`tmp`, `readline-sync`) import Node
+ * built-ins, but only on paths guarded by `typeof process !== "undefined"`
+ * (`process` stays undefined in the browser; see below), except
+ * liolib.js's top-level `require('fs')`, which is bound and never used at
+ * load. Vite would externalize each with a warning, so resolve them, only
+ * when imported from those packages, to one empty module. The same resolver
+ * serves the dev dependency pre-bundle.
+ */
+const NODE_ONLY_IMPORTERS = /[\\/]node_modules[\\/](?:fengari|tmp|readline-sync)[\\/]/;
+const NODE_ONLY_SPECIFIERS = /^(?:node:)?(?:fs|os|path|child_process|crypto)$|^(?:tmp|readline-sync)$/;
+const EMPTY_ID = "\0htn-node-empty";
+const nodeEmptyResolver = {
+  name: "htn-fengari-node-empty",
+  resolveId(source: string, importer?: string) {
+    if (importer && NODE_ONLY_SPECIFIERS.test(source) && NODE_ONLY_IMPORTERS.test(importer)) return EMPTY_ID;
+    return null;
+  },
+  load(id: string) {
+    return id === EMPTY_ID ? "export default {};" : null;
+  },
+};
+function fengariNodeEmpty(): Plugin {
+  return { enforce: "pre", ...nodeEmptyResolver };
+}
+
 export default defineConfig({
   root: ".",
-  plugins: [devSignal()],
+  plugins: [devSignal(), fengariNodeEmpty()],
   publicDir: "public",
   server: {
     port: 5173,
@@ -112,6 +138,7 @@ export default defineConfig({
   // which would make `typeof process` true and turn on fengari's Node paths.
   optimizeDeps: {
     rolldownOptions: {
+      plugins: [nodeEmptyResolver],
       transform: {
         define: {
           "process.env": "{}",
