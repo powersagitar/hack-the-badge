@@ -4,7 +4,7 @@ Status: scope agreed in conversation with the human partner (2026-11-10).
 main @ `35a6c37` (the Milestone 11 merge), and `origin/main` is the same:
 the human partner had main pushed on 2026-11-10, before this spec.
 Branch `milestone-12`, worktree `.claude/worktrees/milestone-12`.
-**Not yet approved.**
+**Approved by the human partner on 2026-11-11.**
 
 ## Why
 
