@@ -2447,37 +2447,41 @@ static SYNC_OPEN: OnceLock<FirmwareRuntime> = OnceLock::new();
 /// of the [`SYNC_OPEN`] checkpoint.
 fn sync_open() -> FirmwareRuntime {
     SYNC_OPEN
-        .get_or_init(|| {
-            let (mut rt, before) = press_a_on_cell_from(radio_launcher(), 3);
-            let cap = rt.total_steps() + SYNC_RESPONSE_STEPS;
-            let (hash, step) = run_until_stable_frame(
-                &mut rt,
-                cap,
-                AFTER_PRESS_STABLE_FOR,
-                &[LAUNCHER_SELECTED[3]],
-            );
-            assert_eq!(hash, SYNC_HOME_HASH, "Sync's home, stable at step {step}");
-            let console = rt.console_output();
-            let since = &console[before..];
-            let reboot = since
-                .find("app_reboot: reboot into sync")
-                .unwrap_or_else(|| panic!("console since A:\n{since}"));
-            let mut at = reboot;
-            for line in [
-                "hal_radio: init_once",
-                "hal_radio: BLE radio ready",
-                "app_reg: launched Sync",
-            ] {
-                at += since[at..]
-                    .find(line)
-                    .unwrap_or_else(|| panic!("no `{line}` in order; console since A:\n{since}"));
-            }
-            assert_radio_clean(&rt, before);
-            assert_eq!(rt.soft_reset_count(), 1);
-            assert_eq!(rt.radio_init_count(), 1);
-            rt
-        })
+        .get_or_init(|| open_sync_from(radio_launcher()))
         .clone()
+}
+
+/// [`sync_open`]'s walk and assertions, from `rt` on hacker's launcher
+/// (first cell selected).
+fn open_sync_from(rt: FirmwareRuntime) -> FirmwareRuntime {
+    let (mut rt, before) = press_a_on_cell_from(rt, 3);
+    let cap = rt.total_steps() + SYNC_RESPONSE_STEPS;
+    let (hash, step) = run_until_stable_frame(
+        &mut rt,
+        cap,
+        AFTER_PRESS_STABLE_FOR,
+        &[LAUNCHER_SELECTED[3]],
+    );
+    assert_eq!(hash, SYNC_HOME_HASH, "Sync's home, stable at step {step}");
+    let console = rt.console_output();
+    let since = &console[before..];
+    let reboot = since
+        .find("app_reboot: reboot into sync")
+        .unwrap_or_else(|| panic!("console since A:\n{since}"));
+    let mut at = reboot;
+    for line in [
+        "hal_radio: init_once",
+        "hal_radio: BLE radio ready",
+        "app_reg: launched Sync",
+    ] {
+        at += since[at..]
+            .find(line)
+            .unwrap_or_else(|| panic!("no `{line}` in order; console since A:\n{since}"));
+    }
+    assert_radio_clean(&rt, before);
+    assert_eq!(rt.soft_reset_count(), 1);
+    assert_eq!(rt.radio_init_count(), 1);
+    rt
 }
 
 /// Sync opens after its reboot ([`sync_open`]), replacing Milestone 9's
@@ -2553,6 +2557,186 @@ fn sync_now_without_a_credential_is_not_ready() {
     assert!(!tree.contains("No sync station in range"), "{tree}");
     assert_no_panic_text(&rt);
     assert_eq!(rt.radio_init_count(), 1);
+}
+
+// ---------------------------------------------------------------------
+// Milestone 12: Sync with a fake upload credential. The registration desk
+// sets the credential right after `prov apply` (`badge_token set`, then
+// the 64-byte token, `provision::set_upload_token`); the credential is
+// valid only for the identity it was set against, so it is set on the
+// first-run screen, after `PROV OK`, before onboarding. The walk then
+// matches `launcher_with_mac`'s, frame for frame. No sync station exists
+// in the browser and none is emulated, so Sync's A ends on "No sync
+// station in range" (`docs/milestone-12-decisions.md`).
+// ---------------------------------------------------------------------
+
+/// Total steps at [`credential_launcher`] (measured; the spec's probe
+/// measured the same walk at 342,894,540).
+const CREDENTIAL_LAUNCHER_STEPS: u64 = 342_894_540;
+/// Emulated time at [`credential_launcher`], in microseconds (measured;
+/// the spec's probe: 94,521,622).
+const CREDENTIAL_LAUNCHER_US: u64 = 94_521_622;
+
+/// Role hacker's launcher with [`HACKER_MAC`] and the fake upload
+/// credential ([`credential_launcher`]).
+static CREDENTIAL_LAUNCHER: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// From a [`FIRST_RUN`] clone: [`HACKER_MAC`] set, role hacker
+/// provisioned (`PROV OK id=test-`), then
+/// [`provision::FAKE_UPLOAD_TOKEN`] set through the console
+/// (`BADGE_TOKEN OK`), then onboarding page 1 stable on hacker's hash (as
+/// [`provisioned_from`] asserts) and the walk to the launcher with every
+/// hacker frame asserted ([`walk_to_shake_page_from`],
+/// [`walk_to_registered_from`], [`walk_to_launcher_from`]). Pins
+/// [`CREDENTIAL_LAUNCHER_STEPS`] and [`CREDENTIAL_LAUNCHER_US`], and the
+/// radio untouched. A clone of the [`CREDENTIAL_LAUNCHER`] checkpoint.
+fn credential_launcher() -> FirmwareRuntime {
+    CREDENTIAL_LAUNCHER
+        .get_or_init(|| {
+            let mut rt = first_run_screen();
+            assert!(rt.set_factory_mac(&HACKER_MAC));
+            let text = provision::provision(
+                &mut rt,
+                &provision::identity_fixture(OWN_ROLE),
+                PROVISION_DEADLINE,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            assert!(text.contains("PROV OK id=test-"), "{text}");
+            let text = provision::set_upload_token(
+                &mut rt,
+                provision::FAKE_UPLOAD_TOKEN,
+                PROVISION_DEADLINE,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            assert!(text.contains(provision::TOKEN_OK), "{text}");
+            let (page1, _) = role_row(OWN_ROLE);
+            let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+            let (hash, step) =
+                run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[FIRST_RUN_HASH]);
+            assert_eq!(hash, page1, "onboarding page 1, stable at step {step}");
+            let (rt, previous) = walk_to_shake_page_from(rt, OWN_ROLE);
+            let rt = walk_to_registered_from(rt, previous, OWN_ROLE);
+            let rt = walk_to_launcher_from(rt, OWN_ROLE);
+            assert_eq!(rt.total_steps(), CREDENTIAL_LAUNCHER_STEPS);
+            assert_eq!(rt.emulated_time_us(), CREDENTIAL_LAUNCHER_US);
+            assert_eq!(rt.radio_init_count(), 0);
+            assert_eq!(rt.radio().hook_hits(), 0);
+            rt
+        })
+        .clone()
+}
+
+/// The fake upload credential, set right after provisioning, changes no
+/// frame on the walk: onboarding, the registered screen and the launcher
+/// are the same hashes as [`launcher_with_mac`]'s
+/// ([`credential_launcher`]).
+#[test]
+fn launcher_with_a_credential_keeps_every_walk_frame() {
+    credential_launcher();
+}
+
+/// Sync opened from [`credential_launcher`] ([`sync_open_with_credential`]).
+static SYNC_OPEN_WITH_CREDENTIAL: OnceLock<FirmwareRuntime> = OnceLock::new();
+
+/// A on cell 3 of [`credential_launcher`]: Sync reboots into itself and
+/// settles on [`SYNC_HOME_HASH`], with [`sync_open`]'s console order,
+/// [`assert_radio_clean`], one soft reset and the radio initialized once
+/// ([`open_sync_from`]). A clone of the [`SYNC_OPEN_WITH_CREDENTIAL`]
+/// checkpoint.
+fn sync_open_with_credential() -> FirmwareRuntime {
+    SYNC_OPEN_WITH_CREDENTIAL
+        .get_or_init(|| open_sync_from(credential_launcher()))
+        .clone()
+}
+
+/// The console line Sync prints once "Packing your badge..." has staged
+/// the snapshot and checksummed it with the ROM's `crc32_le` (seed 0), up
+/// to its run time, which is left out (measured on v392 with
+/// [`provision::FAKE_UPLOAD_TOKEN`] and hacker's fake identity:
+/// `sync: snapshot 1026 bytes, crc ec2f90df, 37ms, complete=1`). The
+/// packing frame itself (`0xb882_9410_38c1_75a2`, saved as
+/// `local/m12-frames/sync-packing.png`) is finished 1,188,996 steps after
+/// A's press and holds about 4,200,000 steps, under
+/// [`AFTER_PRESS_STABLE_FOR`], so the rung pins this line instead.
+const SYNC_SNAPSHOT_LINE: &str = "sync: snapshot 1026 bytes, crc ec2f90df,";
+/// A's press to [`SYNC_SNAPSHOT_LINE`] (and `complete=1`): measured at
+/// 4,394,418 steps (first seen in 1 ms slices, at 82 ms of the 100 ms
+/// hold; A's release is 4,914,783 steps after the press); + 25 %, rounded
+/// up to 1,000,000.
+const SYNC_PACKING_STEPS: u64 = 6_000_000;
+/// How long "No sync station in range" must hold to count as stable:
+/// above the "Asking the station..." border's pulse, whose two frames
+/// alternate every 6,000,000 to 7,000,000 steps (measured; one is saved
+/// as `local/m12-frames/sync-asking.png`), so the pulse never counts as
+/// stable.
+const SYNC_NO_STATION_STABLE_FOR: u64 = 30_000_000;
+/// "No sync station in range", "Move closer to the sync desk", footer
+/// "A: try again   -   HOME: home" (measured on v392; the spec's probes
+/// found the same hash). Saved as `local/m12-frames/sync-no-station.png`.
+const SYNC_NO_STATION_HASH: u64 = 0xa465_e4c0_e16e_ede6;
+/// A's press to the stable [`SYNC_NO_STATION_HASH`]: first sampled
+/// 414,064,783 steps after the press (about 20 s of emulated time, the
+/// firmware's open retries running out), then
+/// [`SYNC_NO_STATION_STABLE_FOR`] more; + 25 %, rounded up to 1,000,000.
+const SYNC_NO_STATION_STEPS: u64 = 556_000_000;
+
+/// Milestone 12's finish line. From [`sync_open_with_credential`], the
+/// credential has survived Sync's reboot into itself (`badge_token get`
+/// reports one). A ("A: sync now") packs the badge ("Packing your
+/// badge...", too brief to hold for [`AFTER_PRESS_STABLE_FOR`], so pinned
+/// by [`SYNC_SNAPSHOT_LINE`] instead), then asks for a station ("Asking
+/// the station...", "B: cancel", by `uitree`; its border pulses), and with
+/// no station in range (none is emulated) gives up on the stable
+/// [`SYNC_NO_STATION_HASH`] frame, whose `uitree` holds "No sync station
+/// in range", "Move closer to the sync desk" and "A: try again   -
+/// HOME: home". No fault, no panic text, nothing from
+/// [`assert_radio_clean`], the radio initialized once and one soft reset.
+#[test]
+fn sync_with_a_credential_finds_no_station() {
+    let mut rt = sync_open_with_credential();
+    let get = console_command(&mut rt, "badge_token get");
+    assert!(
+        get.contains("BADGE_TOKEN ") && !get.contains("MISSING"),
+        "no credential after Sync's reboot"
+    );
+    let before = rt.console_output().len();
+    let pressed = rt.total_steps();
+    press(&mut rt, A_SLOT);
+    let (_, seen) = provision::wait_for_any(
+        &mut rt,
+        before,
+        &[SYNC_SNAPSHOT_LINE],
+        pressed + SYNC_PACKING_STEPS,
+    )
+    .unwrap_or_else(|| panic!("console since A:\n{}", &rt.console_output()[before..]));
+    let line = &seen[seen.find(SYNC_SNAPSHOT_LINE).unwrap()..];
+    let line = line.lines().next().unwrap_or(line);
+    assert!(line.contains("complete=1"), "{line}");
+    let asking = console_command(&mut rt, "uitree");
+    assert!(
+        asking.contains("text=\"Asking the station...\""),
+        "{asking}"
+    );
+    assert!(asking.contains("text=\"B: cancel\""), "{asking}");
+    let (hash, step) = run_until_stable_frame(
+        &mut rt,
+        pressed + SYNC_NO_STATION_STEPS,
+        SYNC_NO_STATION_STABLE_FOR,
+        &[],
+    );
+    assert_eq!(hash, SYNC_NO_STATION_HASH, "stable at step {step}");
+    let tree = console_command(&mut rt, "uitree");
+    for text in [
+        "No sync station in range",
+        "Move closer to the sync desk",
+        "A: try again   -   HOME: home",
+    ] {
+        assert!(tree.contains(&format!("text=\"{text}\"")), "{tree}");
+    }
+    assert!(!tree.contains("Badge not ready"), "{tree}");
+    assert_radio_clean(&rt, before);
+    assert_eq!(rt.radio_init_count(), 1);
+    assert_eq!(rt.soft_reset_count(), 1);
 }
 
 /// Review Focus 2 on the firmware: a soft reset while the radio is up.

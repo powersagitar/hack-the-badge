@@ -81,6 +81,45 @@ starting from `!a0` and returning the inverse, `len` capped at
 `MAX_STUB_MEMORY_BYTES`. `esp32c3_rom_stubs().len()` goes from 127 to
 128.
 
+### Sync with the fake credential (Task 2)
+
+Measured in release with the rungs exactly as committed
+(`launcher_with_a_credential_keeps_every_walk_frame`,
+`sync_with_a_credential_finds_no_station`), plus one scratch probe for the
+packing frame's timing and the frames (deleted before the commit):
+
+- `credential_launcher()` (hacker, `HACKER_MAC`, `provision`, then
+  `set_upload_token(FAKE_UPLOAD_TOKEN)`, then the walk with every hacker
+  frame asserted): 342,894,540 steps and 94,521,622 µs, the spec's probe
+  values exactly (`CREDENTIAL_LAUNCHER_STEPS`, `CREDENTIAL_LAUNCHER_US`).
+  `RADIO_LAUNCHER` is 342,600,681 and 94,521,615; the token adds 293,859
+  steps and 7 µs. Every walk frame is `launcher_with_mac`'s.
+- Sync opens from it to `SYNC_HOME_HASH` (405,422,627 steps), and
+  `badge_token get` there reports the credential (it survived Sync's
+  reboot into itself).
+- A's press to the console line
+  `sync: snapshot 1026 bytes, crc ec2f90df, 37ms, complete=1`:
+  4,394,418 steps (1 ms slices; 82 ms into the 100 ms hold; the release is
+  at +4,914,783). `SYNC_PACKING_STEPS` = 6,000,000 (+25 %, rounded up).
+- "Packing your badge..." (`0xb882_9410_38c1_75a2`) is finished at
+  +1,188,996 and holds until about 500,000 steps after the release, about
+  4.2M steps: under `AFTER_PRESS_STABLE_FOR` (8M). It is pinned by the
+  console line (R-T2-1).
+- "Asking the station..." pulses between `0xa8ea_6aac_fa65_1423` and
+  `0x6c55_722c_2b58_aa1b`, each held 6.0M to 7.0M steps.
+  `SYNC_NO_STATION_STABLE_FOR` = 30,000,000.
+- `SYNC_NO_STATION_HASH` `0xa465_e4c0_e16e_ede6` (the spec's hash), first
+  sampled 414,064,783 steps after A's press, with the rung's mid-wait
+  `uitree`. `SYNC_NO_STATION_STEPS` = (414,064,783 + 30,000,000) × 1.25,
+  rounded up: 556,000,000.
+- Frames for the human partner's eye (Gate 3), gitignored:
+  `local/m12-frames/sync-packing.png`, `sync-asking.png`,
+  `sync-no-station.png` (in the milestone-12 worktree's `local/`).
+- Suites at Task 2: release `boot_progress` 90 pass, 1 ignored, 18.6 s
+  (was 88 and about 15 s); `cargo test --workspace` 757 pass, 1 ignored,
+  29.4 s; `bun test` 319 pass, 12.4 s; clippy and `bun run build` 0
+  warnings.
+
 ## Traces
 
 (Filled by later tasks.)
@@ -95,6 +134,14 @@ chose over a direct `crc32fast` dependency.
 Ruling R-T1-1: `crc32_le_stub_wild_buffer_does_not_panic` asserts the exact result (the CRC of `MAX_STUB_MEMORY_BYTES` zero bytes from seed 0, computed by an independent bitwise loop in the test), not only "some value", so it also pins the cap and the unmapped reads as zeros — cost if wrong: the test costs about 0.1 s in debug; if the cap ever changes, the test follows it through the shared constant.
 
 Ruling R-T1-2: the stub's citations add ESP-IDF v5.5.3's `esp32c3.rom.api.ld:4` (a third fetched file) to the two the brief named, because `esp_rom_crc.h` documents `esp_rom_crc32_le`, and that alias is what ties the header's semantics to the ROM's `crc32_le` — cost if wrong: one extra citation line.
+
+Ruling R-T2-1: the packing frame ("Packing your badge...", `0xb882_9410_38c1_75a2`) holds about 4.2M steps, under `AFTER_PRESS_STABLE_FOR`, so the rung pins the console line `sync: snapshot 1026 bytes, crc ec2f90df,` (with `complete=1`; the `37ms` run time left out) instead of a hash, and the frame is kept only as a PNG for the eye check — cost if wrong: a change that redraws the packing frame wrongly but still prints the line would pass; the stable no-station hash and the `uitree` texts still bound it.
+
+Ruling R-T2-2: `SYNC_PACKING_STEPS` and `SYNC_NO_STATION_STEPS` count from A's press, not its release, because the snapshot line is printed inside the 100 ms hold (the release-relative measurement would be 0) — cost if wrong: none to behaviour; a reader comparing with `SYNC_RESPONSE_STEPS` (from the release) must note the different origin, which each constant's doc states.
+
+Ruling R-T2-3: `sync_open`'s body moved, unchanged, into `open_sync_from(rt)`, which `sync_open_with_credential` shares, rather than copying the walk and its console-order assertions — cost if wrong: none to behaviour (every Milestone 11 pin and `sync_open`'s rungs pass unchanged); one more helper name.
+
+Ruling R-T2-4: `credential_launcher` also asserts `radio().hook_hits() == 0`, as `launcher_with_mac` does, besides the brief's `radio_init_count() == 0` — cost if wrong: one extra assertion.
 
 ## Final suites
 

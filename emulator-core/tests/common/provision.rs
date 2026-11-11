@@ -167,6 +167,81 @@ pub fn provision(
     }
 }
 
+/// The fake upload credential the new Sync rungs set with
+/// [`set_upload_token`]: 64 lowercase hex characters, obviously fake
+/// (`0123456789abcdef` four times), one constant for every role. Committed
+/// with the organizers' permission (2026-11-10), like the fake identities;
+/// it never goes into the identity files. Mirrored as `FAKE_UPLOAD_TOKEN`
+/// in `frontend/src/runtime/provisioner.ts`; keep the two equal.
+pub const FAKE_UPLOAD_TOKEN: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// What `badge_token set` prints before it reads the token's 64 bytes
+/// from stdin (v392's console; the token is sent only after this).
+pub const TOKEN_READY: &str = "BADGE_TOKEN READY";
+/// What `badge_token set` prints once the credential is stored.
+pub const TOKEN_OK: &str = "BADGE_TOKEN OK";
+/// What `badge_token set` prints when it refuses the token or cannot
+/// store it.
+pub const TOKEN_FAIL: &str = "BADGE_TOKEN FAIL";
+/// The REPL's answer to a malformed `badge_token` command.
+pub const TOKEN_USAGE: &str = "usage:";
+
+/// The registration desk's second step: `badge_token set`, wait for
+/// [`TOKEN_READY`], send `token`'s bytes in one `serial_input` (64 bytes,
+/// one USB packet, under the 256-byte RX ring), wait for [`TOKEN_OK`] and
+/// then the REPL's next prompt after it. Call it only at an idle prompt
+/// (the caller has just seen one, e.g. right after [`provision`]).
+/// [`TOKEN_USAGE`] or [`TOKEN_FAIL`] is an `Err` with the console text.
+/// Returns the console text from the command on.
+pub fn set_upload_token(
+    rt: &mut FirmwareRuntime,
+    token: &str,
+    deadline: u64,
+) -> Result<String, String> {
+    let marker = rt.console_output().len();
+    let command = format!("badge_token set{LINE_END}");
+    if rt.serial_input(command.as_bytes()) != command.len() {
+        return Err("serial queue refused badge_token set".into());
+    }
+    match wait_for_any(
+        rt,
+        marker,
+        &[TOKEN_READY, TOKEN_USAGE, TOKEN_FAIL],
+        deadline,
+    ) {
+        Some((0, _)) => {}
+        Some((_, text)) => return Err(format!("badge_token set refused:\n{text}")),
+        None => {
+            return Err(format!(
+                "no `{TOKEN_READY}`:\n{}",
+                console_since(rt, marker)
+            ))
+        }
+    }
+    if rt.serial_input(token.as_bytes()) != token.len() {
+        return Err("serial queue refused the token".into());
+    }
+    let seen = match wait_for_any(rt, marker, &[TOKEN_OK, TOKEN_FAIL], deadline) {
+        Some((0, seen)) => seen,
+        Some((_, text)) => return Err(format!("token refused:\n{text}")),
+        None => {
+            return Err(format!(
+                "badge_token set timed out:\n{}",
+                console_since(rt, marker)
+            ))
+        }
+    };
+    // Look for the prompt only after the result line.
+    let found = seen.find(TOKEN_OK).unwrap_or(0);
+    if wait_for_any(rt, marker + found, &[PROMPT], deadline).is_none() {
+        return Err(format!(
+            "no prompt after `{TOKEN_OK}`:\n{}",
+            console_since(rt, marker)
+        ));
+    }
+    Ok(console_since(rt, marker))
+}
+
 /// A committed test identity
 /// (`frontend/public/firmware/test-identities/<role>.json`: obviously fake,
 /// one per role, committed with the organizers' permission, R-M5-2). When
