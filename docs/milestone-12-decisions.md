@@ -131,6 +131,31 @@ Task 3: release `boot_progress` 90 pass, 1 ignored, 18.5 s;
 debug `boot_progress` 27.0 s); `bun test` 330 pass, 12.4 s; clippy and `bun run build` 0
 warnings.
 
+### Type-checking the test files (Task 4)
+
+`frontend/tsconfig.json`'s `include` widened from
+`["src", "api", "test/cpu-wasm.test.ts"]` to `["src", "api", "test"]`.
+`bun run typecheck` then reported 58 errors (at `b0040ec`, after Task 3):
+`firmware-worker.test.ts` 29, `firmware-runtime.test.ts` 19,
+`shell.test.ts` 3, and one each in `manifest.test.ts`,
+`provisioner.test.ts`, `radio-lock.test.ts`, `redraw-bench.test.ts`,
+`signal-client.test.ts`, `signal-handler.test.ts` and `vite.config.ts`
+(which `signal-handler.test.ts` imports). 50 were `.at()` (ES2022) and
+one `.replaceAll()` (ES2021), all cleared by the `lib` bump (R-T4-1).
+The other seven were fixed in place, with `strict` unchanged and no
+`any`, `@ts-nocheck` or `@ts-ignore` (R-T4-2).
+
+`bun run build`'s output before and after the `lib` bump (and after the
+whole task): every file in `frontend/dist/` has the same byte size and
+the same SHA-1 (`index.html` 984, `assets/bridge-Ctgh-ak7.js` 5,919,
+`assets/firmware-worker-BYvDG9ar.js` 8,946,
+`assets/emulator_wasm_bg-DjWHtz-t.wasm` 142,270,
+`assets/index-XRjmGPO9.css` 2,962, `assets/index-BNNDwprf.js` 261,491;
+the hashed names are unchanged too). Suites at Task 4: release
+`boot_progress` 90 pass, 1 ignored, 18.9 s; `cargo test --workspace` 757
+pass, 1 ignored, 29.0 s wall; `bun test` 330 pass, 12.6 s;
+`bun run typecheck` 0 errors; clippy and `bun run build` 0 warnings.
+
 ## Traces
 
 ### Re-provisioning a registered badge (Task 3)
@@ -197,6 +222,10 @@ Ruling R-T3-1: the probe found no reboot on `prov apply` (first-run or re-provis
 Ruling R-T3-2: beyond the brief's tests, `provisioner.test.ts` adds `provisioner_fails_on_badge_token_fail_before_ready` (a FAIL instead of READY never sends the token), `provisioner_sends_a_given_upload_token` (the option's non-default value) and a constants test; the old test "waits for OK and the prompt, then types prov apply and reports PROV OK" now ends in `typing` at the `PROV OK` line (the default sets the token; the skip test keeps the old `ok`-at-`PROV OK` path) — cost if wrong: three small tests; the renamed test no longer pins `ok` on its own.
 
 Ruling R-T3-3: `redraw-bench.ts` passes `() => 0` for `bootConsoleStart` (the default's value; the bench never reboots while provisioning) to reach the options argument — cost if wrong: none to behaviour.
+
+Ruling R-T4-1: `lib` goes from `ES2020` to `ES2022` (the `target` stays `ES2020`) rather than rewriting 50 `.at()` calls and one `.replaceAll()` in the tests, because `bun run build`'s output is byte-identical with it (same files, sizes and SHA-1s) — cost if wrong: `src/` may now type-check an ES2021/ES2022 library call (`.at()`, `.replaceAll()`, `Object.hasOwn`, …) that `target` does not down-level; Vite's default build target (widely available browsers) already ships those, and a browser without them would fail at that call.
+
+Ruling R-T4-2: the seven non-`lib` errors are fixed by typing, not loosening: `manifest.test.ts` reads the absent key with `Reflect.get` (no cast); `signal-client.test.ts` and `signal-handler.test.ts` name their case arrays `Record<string, string>[]`; `redraw-bench.test.ts`'s fake gains `softResetCount: () => 0` and `rebootUs: () => 466_000` (`REBOOT_US`, as `firmware-runtime.test.ts`'s fake); `vite.config.ts`'s `readCapped` is typed `Promise<Buffer<ArrayBuffer> | null>`, what `Buffer.concat` already returns (type-only; the build is unchanged); and `shell.test.ts` takes one commented `as unknown as MouseEvent` cast in a `mouse()` helper, since happy-dom's `MouseEvent` typings lack only `isTrusted`, `returnValue` and `srcElement` — cost if wrong: the cast would hide a real happy-dom/DOM event mismatch in that one keyboard-and-pad test; its assertions on the Worker's messages still run.
 
 ## Final suites
 

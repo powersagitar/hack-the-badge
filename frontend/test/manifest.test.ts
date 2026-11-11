@@ -72,7 +72,7 @@ describe("parseManifest", () => {
   test("unknown keys are silently ignored (not surfaced on the manifest)", () => {
     const m = parseManifest(["slug=unk", "name=Unknown Key App", "totally_unknown_key=some value"].join("\n"));
     expect(m.slug).toBe("unk");
-    expect((m as Record<string, unknown>).totally_unknown_key).toBeUndefined();
+    expect(Reflect.get(m, "totally_unknown_key")).toBeUndefined();
   });
 
   test("boolean parsing accepts 1/true/yes case-insensitively, else false", () => {

@@ -352,13 +352,14 @@ describe("the Vercel entry", () => {
     const logged: unknown[] = [];
     console.warn = console.log = console.error = (...a: unknown[]) => void logged.push(a);
     try {
-      for (const env of [
+      const envs: Record<string, string>[] = [
         {},
         { KV_REST_API_URL: "https://example.upstash.io" },
         { KV_REST_API_TOKEN: "tok" },
         { KV_REST_API_URL: "https://example.upstash.io", KV_REST_API_TOKEN: "tok\n" },
         { KV_REST_API_URL: " https://example.upstash.io", KV_REST_API_TOKEN: "tok" },
-      ]) {
+      ];
+      for (const env of envs) {
         await withEnv(env, async () => {
           const res = await entry.fetch(post({ op: "create", offer: SDP }));
           expect(res.status).toBe(500);

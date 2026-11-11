@@ -176,12 +176,13 @@ describe("signal client", () => {
       await expect(joinRoom("ABCDEFGH", busy.deps)).rejects.toThrow(text);
     }
     // A missing or malformed Retry-After still gives a busy message (ruling R-T10-1, Milestone 11).
-    for (const headers of [
+    const malformed: Record<string, string>[] = [
       {},
       { "Retry-After": "soon" },
       { "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT" },
       { "Retry-After": "-5" },
-    ]) {
+    ];
+    for (const headers of malformed) {
       const busy = harness();
       busy.deps.fetch = always(429, headers).fetch;
       await expect(hostRoom(busy.deps)).rejects.toThrow("Signaling server busy, try again later.");

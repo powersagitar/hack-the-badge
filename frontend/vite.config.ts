@@ -52,7 +52,7 @@ function devSignal(): Plugin {
  * reading stops (the stream is paused, its listeners removed), and the
  * caller answers and destroys the request.
  */
-export function readCapped(req: IncomingMessage): Promise<Buffer | null> {
+export function readCapped(req: IncomingMessage): Promise<Buffer<ArrayBuffer> | null> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;

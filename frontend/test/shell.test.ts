@@ -43,6 +43,12 @@ const settle = (ms = 0) => new Promise<void>((r) => setTimeout(r, ms));
 const buttons = (root: ParentNode) => [...root.querySelectorAll("button")];
 const button = (root: ParentNode, label: string) => buttons(root).find((b) => b.textContent === label)!;
 const container = () => doc().createElement("div");
+/**
+ * A happy-dom mouse event, typed as the DOM lib's for `dispatchEvent` on a
+ * DOM-typed element: happy-dom's typings lack only the legacy `isTrusted`,
+ * `returnValue` and `srcElement` fields, which no listener here reads.
+ */
+const mouse = (type: string) => new win.MouseEvent(type) as unknown as MouseEvent;
 
 /** A 2D context that records its fills: the colour and the rectangle. */
 function fakeCtx() {
@@ -413,8 +419,8 @@ describe("badge controller", () => {
       await settle();
       const sent = r.workers[0]!.sent;
       win.dispatchEvent(new win.KeyboardEvent("keydown", { code: "KeyZ" }));
-      button(r.el("button-pad"), "A").dispatchEvent(new win.MouseEvent("mousedown"));
-      button(r.el("button-pad"), "A").dispatchEvent(new win.MouseEvent("mouseup"));
+      button(r.el("button-pad"), "A").dispatchEvent(mouse("mousedown"));
+      button(r.el("button-pad"), "A").dispatchEvent(mouse("mouseup"));
       win.dispatchEvent(new win.KeyboardEvent("keyup", { code: "KeyZ" }));
       expect(sent.filter((m) => m.kind === "button")).toEqual([
         { kind: "button", button: "A", pressed: true, source: "key" },
