@@ -120,9 +120,58 @@ packing frame's timing and the frames (deleted before the commit):
   29.4 s; `bun test` 319 pass, 12.4 s; clippy and `bun run build` 0
   warnings.
 
+### The browser provisioner's token (Task 3)
+
+`createProvisioner` types `badge_token set` and `FAKE_UPLOAD_TOKEN` after
+`PROV OK` and its prompt by default (`uploadToken: null` skips it; the
+WASM redraw benchmark does). The WASM twin (`test/cpu-wasm.test.ts`)
+takes the default, and every frame pin it holds is unchanged. Suites at
+Task 3: release `boot_progress` 90 pass, 1 ignored, 18.5 s;
+`cargo test --workspace` 757 pass, 1 ignored, about 28 s wall (its
+debug `boot_progress` 27.0 s); `bun test` 330 pass, 12.4 s; clippy and `bun run build` 0
+warnings.
+
 ## Traces
 
-(Filled by later tasks.)
+### Re-provisioning a registered badge (Task 3)
+
+A scratch `#[ignore]` probe at the end of `boot_progress.rs` (release,
+deleted before the commit), from a clone of `credential_launcher()`
+(hacker, `HACKER_MAC`, `FAKE_UPLOAD_TOKEN` set, on the launcher at
+342,894,540 steps). It ran `put_file` with organizer's fixture, typed
+`prov apply`, and stepped in 50,000-step slices, watching
+`soft_reset_count()` and the console after each slice as the browser's
+runtime does when it records `bootConsoleStart`.
+
+1. **`prov apply` on a registered badge does not reboot.**
+   `soft_reset_count()` stays 0 through `prov apply` and for 20M steps
+   after it; nothing moves the boot console start. The console after the
+   command, in order: the echo `prov apply`, `hal_identity`'s
+   `identity: Test Organizer (Organizer) id=test-fake-badge-0002` log
+   line, `PROV OK id=test-fake-badge-0002 mac=…`,
+   `name=Test Organizer role=Organizer attendee=2 tutorial=reset`, then
+   `badge> `. `PROV OK` printed about 3.5M steps after the launcher
+   checkpoint (put included), and its prompt 1.35M steps after
+   `PROV OK`, 117 console bytes after the `PROV OK` line's start.
+2. **The old credential does not carry over.** `badge_token get` right
+   after organizer's `PROV OK` prints `BADGE_TOKEN MISSING` (and the
+   REPL's `Command returned non-zero error code: 0x1`), as the spec
+   expected: the stored credential belonged to hacker's `badge_id`.
+3. **`set_upload_token` then succeeds:** `badge_token set`,
+   `BADGE_TOKEN READY`, `BADGE_TOKEN OK`, a prompt; `badge_token get`
+   then prints the token. No fault.
+4. **Twice:** the same run after first re-provisioning hacker from the
+   launcher (`PROV OK id=test-fake-badge-0001`, again no reboot) and
+   setting the token again (`BADGE_TOKEN OK`) gives the same four
+   findings for the organizer that follows.
+
+So on v392 every provision, first-run or re-provision, prints `PROV OK`
+and its prompt in the boot that took `prov apply`. The stale prompts
+already in the console when the token phase starts are the launcher's
+idle one and `put`'s, and the old `BADGE_TOKEN READY`/`OK` lines of an
+earlier provision; the provisioner's token phase looks only past the
+`PROV OK` line (and past `bootConsoleStart()`), and its `READY`/`OK`
+matching only past its own `badge_token set`.
 
 ## Dependencies added
 
@@ -142,6 +191,12 @@ Ruling R-T2-2: `SYNC_PACKING_STEPS` and `SYNC_NO_STATION_STEPS` count from A's p
 Ruling R-T2-3: `sync_open`'s body moved, unchanged, into `open_sync_from(rt)`, which `sync_open_with_credential` shares, rather than copying the walk and its console-order assertions — cost if wrong: none to behaviour (every Milestone 11 pin and `sync_open`'s rungs pass unchanged); one more helper name.
 
 Ruling R-T2-4: `credential_launcher` also asserts `radio().hook_hits() == 0`, as `launcher_with_mac` does, besides the brief's `radio_init_count() == 0` — cost if wrong: one extra assertion.
+
+Ruling R-T3-1: the probe found no reboot on `prov apply` (first-run or re-provision), so the pinned re-provision test is `provisioner_sets_the_token_after_prov_ok_without_a_reboot`; the token phase still applies the boot-console-start rule (the later of the `PROV OK` line's end and `bootConsoleStart()`), pinned by a second test, `provisioner_waits_for_the_current_boots_prompt_after_prov_ok` — cost if wrong: one rule and one test for a case v392 does not show; if a later firmware reboots on `prov apply`, the prompt rule already holds.
+
+Ruling R-T3-2: beyond the brief's tests, `provisioner.test.ts` adds `provisioner_fails_on_badge_token_fail_before_ready` (a FAIL instead of READY never sends the token), `provisioner_sends_a_given_upload_token` (the option's non-default value) and a constants test; the old test "waits for OK and the prompt, then types prov apply and reports PROV OK" now ends in `typing` at the `PROV OK` line (the default sets the token; the skip test keeps the old `ok`-at-`PROV OK` path) — cost if wrong: three small tests; the renamed test no longer pins `ok` on its own.
+
+Ruling R-T3-3: `redraw-bench.ts` passes `() => 0` for `bootConsoleStart` (the default's value; the bench never reboots while provisioning) to reach the options argument — cost if wrong: none to behaviour.
 
 ## Final suites
 

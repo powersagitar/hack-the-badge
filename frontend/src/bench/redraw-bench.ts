@@ -246,7 +246,9 @@ export function runRedrawBench(
   );
   log(`booted to the first-run screen at step ${handle.totalSteps()}`);
 
-  const p = createProvisioner(handle, identityJson);
+  // No upload token: the rows stay like-for-like with Milestones 7, 9 and
+  // 11, whose runs provisioned without one.
+  const p = createProvisioner(handle, identityJson, () => 0, { uploadToken: null });
   let state: ProvisionState = p.poll();
   while (
     (state.kind === "waiting" || state.kind === "typing") &&

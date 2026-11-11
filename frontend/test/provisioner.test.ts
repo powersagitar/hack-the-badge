@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
+  BADGE_TOKEN_FAIL,
+  BADGE_TOKEN_OK,
+  BADGE_TOKEN_READY,
   createProvisioner,
+  FAKE_UPLOAD_TOKEN,
   PUT_CHUNK_BYTES,
   PUT_CHUNK_GAP_STEPS,
+  type ProvisionOptions,
 } from "../src/runtime/provisioner";
 import type { FirmwareEmulatorHandle } from "../src/cpu/bridge";
 
@@ -45,6 +50,39 @@ function toFirstChunk(json: string) {
   p.poll();
   f.print("READY\r\n");
   p.poll();
+  return { f, p };
+}
+
+const PROV_OK_LINE = "PROV OK id=test-fake-badge-0001 mac=02:00:00:00:10:01";
+
+/**
+ * Drives a fake through `put` and `prov apply` to a complete `PROV OK`
+ * line (no prompt after it yet). With `expectTyping`, checks the state is
+ * still `typing` (the token phase is pending).
+ */
+function toProvOk(options?: ProvisionOptions, expectTyping = true) {
+  const f = fakeHandle();
+  const p = createProvisioner(f.handle, "{}", () => 0, options);
+  f.print("badge> ");
+  p.poll();
+  f.print("READY\r\n");
+  p.poll();
+  f.print("OK 2\r\nbadge> ");
+  p.poll();
+  f.print("prov apply\r\n");
+  f.print(`${PROV_OK_LINE}\r\n`);
+  if (expectTyping) expect(p.poll().kind).toBe("typing");
+  return { f, p };
+}
+
+/** [`toProvOk`], then the prompt and `BADGE_TOKEN READY`, so the token is sent. */
+function toTokenReady() {
+  const { f, p } = toProvOk();
+  f.print("badge> ");
+  p.poll();
+  f.print("badge_token set\r\nBADGE_TOKEN READY\r\n");
+  p.poll();
+  expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
   return { f, p };
 }
 
@@ -129,7 +167,7 @@ describe("provisioner", () => {
     expect(f.typed.slice(1)).toEqual([full, full, "x".repeat(8)]);
   });
 
-  test("waits for OK and the prompt, then types prov apply and reports PROV OK", () => {
+  test("waits for OK and the prompt, then types prov apply and waits for PROV OK", () => {
     const { f, p } = toFirstChunk('{"a":1}');
     f.print("OK 7\r\n");
     p.poll();
@@ -140,8 +178,8 @@ describe("provisioner", () => {
     f.print("PROV OK id=test-fake");
     expect(p.poll().kind).toBe("typing");
     f.print("-badge-0001\r\n");
-    expect(p.poll()).toEqual({ kind: "ok", line: "PROV OK id=test-fake-badge-0001" });
-    expect(p.poll()).toEqual({ kind: "ok", line: "PROV OK id=test-fake-badge-0001" });
+    // By default the token phase follows, so `ok` waits for it.
+    expect(p.poll().kind).toBe("typing");
     expect(f.typed.length).toBe(3);
   });
 
@@ -212,4 +250,177 @@ describe("provisioner", () => {
     expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
   });
 
+  // ------------------------------------------------------------------
+  // Milestone 12: the fake upload credential (`badge_token set`), typed
+  // after `PROV OK` and its prompt. The fake console answers as v392 does
+  // (docs/milestone-12-decisions.md, "Traces"): the REPL echoes the
+  // command, prints `BADGE_TOKEN READY`, reads 64 bytes (not echoed),
+  // then prints `BADGE_TOKEN OK` and a prompt.
+
+  test("the fake upload token is 64 lowercase hex characters", () => {
+    expect(FAKE_UPLOAD_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+    expect(BADGE_TOKEN_READY).toBe("BADGE_TOKEN READY");
+    expect(BADGE_TOKEN_OK).toBe("BADGE_TOKEN OK");
+    expect(BADGE_TOKEN_FAIL).toBe("BADGE_TOKEN FAIL");
+  });
+
+  test("provisioner_sets_the_token_after_prov_ok", () => {
+    const { f, p } = toProvOk();
+    // The PROV OK line alone does not start the token: its prompt follows.
+    expect(f.typed.length).toBe(3);
+    f.print("name=Test Hacker role=Hacker attendee=1 tutorial=reset\r\nbadge> ");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed[3]).toBe("badge_token set\n");
+    f.print("badge_token set\r\n");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed.length).toBe(4);
+    f.print("BADGE_TOKEN READY\r\n");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
+    expect(new TextEncoder().encode(f.typed[4]).length).toBe(64);
+    expect(f.typed.length).toBe(5);
+    f.print("BADGE_TOKEN OK\r\n");
+    // OK alone is not enough: the REPL prompts again after it.
+    expect(p.poll().kind).toBe("typing");
+    f.print("badge> ");
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+    expect(f.typed.length).toBe(5);
+  });
+
+  test("provisioner_fails_on_badge_token_fail", () => {
+    const { f, p } = toTokenReady();
+    f.print("BADGE_TOKEN FAIL\r\n");
+    expect(p.poll()).toEqual({ kind: "failed", reason: "BADGE_TOKEN FAIL" });
+    f.print("badge> ");
+    expect(p.poll()).toEqual({ kind: "failed", reason: "BADGE_TOKEN FAIL" });
+    expect(f.typed.length).toBe(5);
+  });
+
+  test("provisioner_fails_on_badge_token_fail_before_ready", () => {
+    const { f, p } = toProvOk();
+    f.print("badge> ");
+    p.poll();
+    f.print("badge_token set\r\nBADGE_TOKEN FAIL\r\n");
+    expect(p.poll()).toEqual({ kind: "failed", reason: "BADGE_TOKEN FAIL" });
+    // The token is never sent.
+    expect(f.typed.length).toBe(4);
+  });
+
+  test("provisioner_fails_on_badge_token_usage", () => {
+    const { f, p } = toProvOk();
+    f.print("badge> ");
+    p.poll();
+    f.print("badge_token set\r\nusage: badge_token <set|get>");
+    // The line is reported only once it is complete.
+    expect(p.poll().kind).toBe("typing");
+    f.print("\r\nbadge> ");
+    expect(p.poll()).toEqual({ kind: "failed", reason: "usage: badge_token <set|get>" });
+    expect(f.typed.length).toBe(4);
+  });
+
+  test("provisioner_skips_the_token_when_asked", () => {
+    const { f, p } = toProvOk({ uploadToken: null }, false);
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+    f.print("badge> ");
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+    expect(f.typed.length).toBe(3);
+    expect(f.typed.some((t) => t.includes("badge_token"))).toBe(false);
+  });
+
+  test("provisioner_sends_a_given_upload_token", () => {
+    const token = "f".repeat(64);
+    const { f, p } = toProvOk({ uploadToken: token });
+    f.print("badge> ");
+    p.poll();
+    f.print("badge_token set\r\nBADGE_TOKEN READY\r\n");
+    p.poll();
+    expect(f.typed[4]).toBe(token);
+  });
+
+  // Review Focus 1, re-provisioning. The probe (decisions file, "Traces")
+  // found that `prov apply` on a registered badge does not reboot: its
+  // REPL prints `PROV OK`, the identity line and a prompt in the same
+  // boot. The old prompts (the launcher's idle one, `put`'s) are already
+  // in the console and must not start the token phase.
+  test("provisioner_sets_the_token_after_prov_ok_without_a_reboot", () => {
+    const f = fakeHandle();
+    // A registered badge idle at its prompt, from an earlier provision.
+    f.print("PROV OK id=test-fake-badge-0001\r\nbadge> badge_token set\r\n");
+    f.print("BADGE_TOKEN READY\r\nBADGE_TOKEN OK\r\nbadge> ");
+    const p = createProvisioner(f.handle, "{}", () => 0);
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+    f.print("put /littlefs/identity.json 2\r\nREADY\r\n");
+    p.poll();
+    f.print("OK 2\r\nbadge> ");
+    p.poll();
+    expect(f.typed[2]).toBe("prov apply\n");
+    f.print("prov apply\r\nI (94586) hal_identity: identity: Test Organizer\r\n");
+    expect(p.poll().kind).toBe("typing");
+    f.print("PROV OK id=test-fake-badge-0002 mac=02:00:00:00:10:02\r\n");
+    // Neither the old boot's text nor put's prompt counts.
+    expect(p.poll().kind).toBe("typing");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed.length).toBe(3);
+    f.print("name=Test Organizer role=Organizer attendee=2 tutorial=reset\r\nbadge> ");
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+    // The old `BADGE_TOKEN READY`/`OK` lines do not count either.
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed.length).toBe(4);
+    f.print("badge_token set\r\nBADGE_TOKEN READY\r\n");
+    p.poll();
+    expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
+    expect(p.poll().kind).toBe("typing");
+    f.print("BADGE_TOKEN OK\r\nbadge> ");
+    expect(p.poll()).toEqual({
+      kind: "ok",
+      line: "PROV OK id=test-fake-badge-0002 mac=02:00:00:00:10:02",
+    });
+  });
+
+  test("provisioner_waits_for_the_current_boots_prompt_after_prov_ok", () => {
+    // Not seen on v392 (the probe found no reboot), but the token phase
+    // follows the first prompt's rule (R-T13-3): a prompt counts only at
+    // or after the current boot's console start.
+    const f = fakeHandle();
+    let bootStart = 0;
+    const p = createProvisioner(f.handle, "{}", () => bootStart);
+    f.print("badge> ");
+    p.poll();
+    f.print("READY\r\n");
+    p.poll();
+    f.print("OK 2\r\nbadge> ");
+    p.poll();
+    f.print(`${PROV_OK_LINE}\r\n`);
+    // The old boot prompts, then the firmware reboots in the same frame;
+    // the runtime records the new boot's start after both.
+    f.print("badge> ");
+    bootStart = f.handle.consoleOutput().length;
+    f.print("I (5) boot: ESP-IDF\r\n");
+    expect(p.poll().kind).toBe("typing");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed.length).toBe(3);
+    f.print("badge> ");
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+  });
+
+  test("provisioner_never_types_a_token_into_a_prompt_before_prov_ok", () => {
+    const { f, p } = toFirstChunk("{}");
+    f.print("OK 2\r\nbadge> ");
+    p.poll();
+    expect(f.typed[2]).toBe("prov apply\n");
+    // A stray prompt after `prov apply` but before its result.
+    f.print("prov apply\r\nbadge> ");
+    expect(p.poll().kind).toBe("typing");
+    f.print(`${PROV_OK_LINE}\r\n`);
+    expect(p.poll().kind).toBe("typing");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed.length).toBe(3);
+    f.print("badge> ");
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+  });
 });

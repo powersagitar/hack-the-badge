@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
+import { FAKE_UPLOAD_TOKEN } from "../src/runtime/provisioner";
 import { TEST_IDENTITY_ROLES, testIdentityUrl } from "../src/runtime/test-identities";
 
 const DIR = new URL("../public/firmware/test-identities/", import.meta.url);
@@ -37,6 +38,23 @@ describe("committed test identities", () => {
   test("one file per role, and nothing else", () => {
     const files = readdirSync(DIR).sort();
     expect(files).toEqual([...TEST_IDENTITY_ROLES].map((r) => `${r}.json`).sort());
+  });
+
+  // Milestone 12: the fake upload credential is one constant, mirrored
+  // from the Rust helper (`tests/common/provision.rs`), and stays out of
+  // the identity files.
+  test("fake_upload_token_matches_the_rust_helper", () => {
+    const rust = readFileSync(
+      new URL("../../emulator-core/tests/common/provision.rs", import.meta.url),
+      "utf8",
+    );
+    const literal = /pub const FAKE_UPLOAD_TOKEN: &str =\s*"([^"]*)";/.exec(rust)?.[1];
+    expect(literal).toBe(FAKE_UPLOAD_TOKEN);
+    expect(FAKE_UPLOAD_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+    for (const role of TEST_IDENTITY_ROLES) {
+      const text = readFileSync(new URL(`${role}.json`, DIR), "utf8");
+      expect(text.includes(FAKE_UPLOAD_TOKEN)).toBe(false);
+    }
   });
 
   test("testIdentityUrl points into public/firmware/test-identities", () => {
