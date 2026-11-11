@@ -60,8 +60,8 @@
 //!    [`RomStubEffect::Memcpy`], [`RomStubEffect::BusRegisterWrite`],
 //!    [`RomStubEffect::BusRegisterWrites`] and [`RomStubEffect::StoreWords`]
 //!    (plus the read-only libc effects `Strlen`/`Memcmp`/`Strncmp`/`Strcmp`/`Strspn`/`Strcspn`/`Strchr`/`DivT`, the writing
-//!    `Strncpy`/`Strlcat`/`Strlcpy`/`Strcpy`, and [`RomStubEffect::Md5`], an MD5 whose context lives in guest
-//!    memory).
+//!    `Strncpy`/`Strlcat`/`Strlcpy`/`Strcpy`, [`RomStubEffect::Md5`], an MD5 whose context lives in guest
+//!    memory, and [`RomStubEffect::Crc32Le`], a read-only CRC-32).
 //! 2. `pc` is set to `ra`/`x1` — the return address the caller's own
 //!    `jal`/`jalr` already deposited there before transferring control.
 //!    From the caller's point of view the callee has run and returned.
@@ -269,6 +269,20 @@ pub enum RomStubEffect {
     /// only skips equal words, so gives the same answer). `n` is capped at
     /// [`MAX_STUB_MEMORY_BYTES`]. Real: the caller branches on the result.
     Memcmp,
+    /// `uint32_t crc32_le(uint32_t crc, const uint8_t *buf, uint32_t len)`:
+    /// the little-endian (reflected) CRC-32 of `len = a2` bytes at
+    /// `buf = a1`, read through the bus, chained from `crc = a0`; the result
+    /// goes to `a0`. ESP-IDF v5.5.3's `components/esp_rom/include/esp_rom_crc.h`
+    /// documents it (`:62`..`:70`, `esp_rom_crc32_le`, which
+    /// `esp32c3.rom.api.ld:4` aliases to the ROM's `crc32_le`): polynomial
+    /// `0x04c11db7` (`:29`), reflected `0xEDB8_8320`, with a `~` added "at
+    /// the beginning and the end" (`:32`), and the seed is "result of last
+    /// calculation or 0 for the first time" (`:65`). So the running value
+    /// starts from `!a0` and the result is inverted back: a seed of 0 gives
+    /// zlib's `crc32(0, buf, len)` (`"123456789"` gives `0xCBF4_3926`), and
+    /// the result chains as the next call's seed. `len` is capped at
+    /// [`MAX_STUB_MEMORY_BYTES`]. Real: NVS checksums every entry with it.
+    Crc32Le,
     /// `int strncmp(const char *s1, const char *s2, size_t n)`: compares at
     /// most `n = a2` bytes of `s1 = a0`/`s2 = a1` as `unsigned char`,
     /// stopping after a differing pair or a shared NUL, and returns
@@ -1542,6 +1556,14 @@ impl RomStub {
         Self {
             name,
             effect: RomStubEffect::Memcmp,
+        }
+    }
+
+    /// A real high-level-emulated `crc32_le` -- see [`RomStubEffect::Crc32Le`].
+    pub const fn crc32_le(name: &'static str) -> Self {
+        Self {
+            name,
+            effect: RomStubEffect::Crc32Le,
         }
     }
 

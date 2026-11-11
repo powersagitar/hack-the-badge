@@ -779,6 +779,21 @@ impl Cpu {
                 }
                 self.regs.write(rom_stubs::REG_A0, diff as u32);
             }
+            RomStubEffect::Crc32Le => {
+                let buf = self.regs.read(rom_stubs::REG_A1);
+                let len = self
+                    .regs
+                    .read(rom_stubs::REG_A2)
+                    .min(rom_stubs::MAX_STUB_MEMORY_BYTES);
+                let mut crc = !self.regs.read(rom_stubs::REG_A0);
+                for i in 0..len {
+                    crc ^= u32::from(bus.read8(buf.wrapping_add(i)));
+                    for _ in 0..8 {
+                        crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+                    }
+                }
+                self.regs.write(rom_stubs::REG_A0, !crc);
+            }
             RomStubEffect::Strncmp => {
                 let s1 = self.regs.read(rom_stubs::REG_A0);
                 let s2 = self.regs.read(rom_stubs::REG_A1);

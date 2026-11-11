@@ -951,6 +951,22 @@
 //!     libgcc builds `__lesf2` from the same soft-fp source as `__ltsf2`
 //!     (`FP_CMP_S(r, A, B, 2, 2)`), so it is [`SoftFloatOp::Lt`].
 //!
+//! 28. **ROM `crc32_le`** ([`CRC32_LE`], `0x4000_0628`, `esp32c3.rom.ld:415`)
+//!     — Milestone 12 Task 1. First reached when NVS writes Sync's upload
+//!     credential (the console's `badge_token set`): NVS checksums every
+//!     entry it writes through `esp_rom_crc32_le`, which
+//!     `esp32c3.rom.api.ld:4` aliases to this ROM function. Observed
+//!     faulting there (an instruction access fault at `0x40000628`, right
+//!     after the 64 token bytes; the Milestone 12 spec's probe 1), and
+//!     reached again by Sync's snapshot CRC (`sync: snapshot ... crc ...`).
+//!     Nothing reached it before, so adding it moves no earlier pin. A real
+//!     [`RomStubEffect::Crc32Le`](crate::cpu::rom_stubs::RomStubEffect::Crc32Le)
+//!     with the semantics of ESP-IDF's `esp_rom_crc.h`: zlib's CRC-32
+//!     (reflected polynomial `0xEDB8_8320`), inverted in and out, so the
+//!     result chains as the next call's seed. Its neighbours (`crc32_be`,
+//!     `crc16_le`, `crc16_be`, `crc8_le`, `crc8_be`, `esp_crc8`,
+//!     `esp32c3.rom.ld:416`..`:421`) are not reached and stay unstubbed.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -970,8 +986,11 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 10 Task 6**: 127 stubs (`esp32c3_rom_stubs().len()`),
-//! with `__popcountsi2` and `__lesf2` (entry 27).
+//! **As of Milestone 12 Task 1**: 128 stubs (`esp32c3_rom_stubs().len()`),
+//! with `crc32_le` (entry 28).
+//!
+//! **As of Milestone 10 Task 6** (history): 127 stubs, with `__popcountsi2`
+//! and `__lesf2` (entry 27).
 //!
 //! **As of Milestone 9 Task 3** (history): 125 stubs:
 //! Milestone 6 Task 2 turned the two CPU-frequency stubs into guest code
@@ -1530,6 +1549,14 @@ pub const STRLEN: u32 = 0x4000_0374;
 /// 0x40000360;`; the ROM ELF shows a `j 0x40058772 <memcmp>` trampoline). Real
 /// HLE ([`crate::cpu::rom_stubs::RomStubEffect::Memcmp`]); module doc entry 17.
 pub const MEMCMP: u32 = 0x4000_0360;
+
+/// ROM `crc32_le`'s fixed address (ESP-IDF v5.5.3,
+/// `components/esp_rom/esp32c3/ld/esp32c3.rom.ld:415`: `crc32_le =
+/// 0x40000628;`; `esp32c3.rom.api.ld:4` aliases `esp_rom_crc32_le` to it).
+/// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Crc32Le`]), with the
+/// semantics of `components/esp_rom/include/esp_rom_crc.h` (`:23`..`:70`):
+/// zlib's CRC-32, inverted in and out, chainable. Module doc entry 28.
+pub const CRC32_LE: u32 = 0x4000_0628;
 
 /// ROM libc `strncmp`'s fixed address (`esp32c3.rom.libc.ld`: `strncmp =
 /// 0x40000370;`; trampoline to `0x40058fa6 <strncmp>`). Real HLE
@@ -2466,6 +2493,7 @@ const NAMED_STUBS: &[(u32, RomStub)] = &[
     (STRCAT, RomStub::strcat("strcat")),
     (STRLEN, RomStub::strlen("strlen")),
     (MEMCMP, RomStub::memcmp("memcmp")),
+    (CRC32_LE, RomStub::crc32_le("crc32_le")),
     (STRNCMP, RomStub::strncmp("strncmp")),
     (STRNCPY, RomStub::strncpy("strncpy")),
     (STRCMP, RomStub::strcmp("strcmp")),
@@ -2920,6 +2948,7 @@ mod tests {
             (STRCPY, RomStubEffect::Strcpy),
             (MEMCHR, RomStubEffect::Memchr),
             (MEMMOVE, RomStubEffect::Memmove),
+            (CRC32_LE, RomStubEffect::Crc32Le),
         ] {
             assert_eq!(table.lookup(addr).unwrap().effect, effect);
         }
@@ -3938,6 +3967,85 @@ mod tests {
         bus.write8(a + 2, 0x10);
         bus.write8(b + 2, 0x90);
         assert_eq!(call(&mut cpu, &mut bus, 4) as i32, -0x80);
+    }
+
+    // ---- Milestone 12 Task 1: ROM `crc32_le` ----
+
+    /// Calls the `crc32_le` stub once (`a0` = crc, `a1` = buf, `a2` = len)
+    /// and returns `a0`, asserting it ran as a stub and returned to `ra`.
+    fn crc32_le_call(cpu: &mut Cpu, bus: &mut FirmwareBus, crc: u32, buf: u32, len: u32) -> u32 {
+        cpu.regs.write(REG_RA, 0x4000_1000);
+        cpu.regs.write(REG_A0, crc);
+        cpu.regs.write(REG_A1, buf);
+        cpu.regs.write(REG_A2, len);
+        cpu.regs.pc = CRC32_LE;
+        let info = cpu.step(bus);
+        assert!(!info.trap_taken);
+        assert_eq!(info.rom_stub, Some(CRC32_LE));
+        assert_eq!(cpu.regs.pc, 0x4000_1000);
+        cpu.regs.read(REG_A0)
+    }
+
+    /// A CPU with the real table and a bus holding `data` at `buf`.
+    fn crc32_le_fixture(buf: u32, data: &[u8]) -> (Cpu, FirmwareBus) {
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        bus.add_scratch_ram(buf, 64);
+        for (i, x) in data.iter().enumerate() {
+            bus.write8(buf + i as u32, *x);
+        }
+        (cpu, bus)
+    }
+
+    #[test]
+    fn crc32_le_stub_matches_the_check_value() {
+        // CRC-32's catalogue check value: zlib's crc32(0, "123456789", 9).
+        let buf = 0x3fc9_0500;
+        let (mut cpu, mut bus) = crc32_le_fixture(buf, b"123456789");
+        assert_eq!(crc32_le_call(&mut cpu, &mut bus, 0, buf, 9), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn crc32_le_stub_zero_length_returns_the_seed() {
+        let buf = 0x3fc9_0500;
+        let (mut cpu, mut bus) = crc32_le_fixture(buf, b"123456789");
+        assert_eq!(
+            crc32_le_call(&mut cpu, &mut bus, 0xDEAD_BEEF, buf, 0),
+            0xDEAD_BEEF
+        );
+        assert_eq!(crc32_le_call(&mut cpu, &mut bus, 0, buf, 0), 0);
+    }
+
+    #[test]
+    fn crc32_le_stub_chains() {
+        // esp_rom_crc.h: the seed is "result of last calculation or 0 for
+        // the first time", so two calls equal one over the whole buffer.
+        let buf = 0x3fc9_0500;
+        let (mut cpu, mut bus) = crc32_le_fixture(buf, b"123456789");
+        let first = crc32_le_call(&mut cpu, &mut bus, 0, buf, 4);
+        assert_eq!(
+            crc32_le_call(&mut cpu, &mut bus, first, buf + 4, 5),
+            0xCBF4_3926
+        );
+    }
+
+    #[test]
+    fn crc32_le_stub_wild_buffer_does_not_panic() {
+        // An unmapped buffer reads 0s, and a huge length is capped at
+        // MAX_STUB_MEMORY_BYTES: the result is the CRC of that many zero
+        // bytes, computed here by an independent bitwise reference.
+        let mut cpu = Cpu::new();
+        cpu.set_rom_stubs(esp32c3_rom_stubs());
+        let mut bus = empty_firmware_bus();
+        let got = crc32_le_call(&mut cpu, &mut bus, 0, 0x1000_0000, u32::MAX);
+        let mut crc = !0u32;
+        for _ in 0..crate::cpu::rom_stubs::MAX_STUB_MEMORY_BYTES {
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        assert_eq!(got, !crc);
     }
 
     #[test]
