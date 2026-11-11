@@ -156,6 +156,29 @@ the hashed names are unchanged too). Suites at Task 4: release
 pass, 1 ignored, 29.0 s wall; `bun test` 330 pass, 12.6 s;
 `bun run typecheck` 0 errors; clippy and `bun run build` 0 warnings.
 
+### The three signaling fixes (Task 5)
+
+- **A fetch timeout.** Every request the browser makes to `/api/signal`
+  aborts after `SIGNAL_FETCH_TIMEOUT_MS` (10 s; `SignalDeps.fetchTimeoutMs`
+  injects a smaller one in tests) and maps to "Could not reach the
+  signaling server; check the connection.". So a joiner, which has no
+  cancel, ends a hung request within its 120 s budget plus one
+  timeout. The host's answer polls also abort on its cancel (R-T5-1).
+- **No Upstash retries.** `REDIS_OPTIONS.retry` is `{ retries: 0 }`: one
+  REST request per command, so a lost `EVALSHA` reply is never re-sent
+  and counted twice. A store error stays the bare 500 (R-T5-2).
+- **`close` when the host gives up.** `connected`'s failure (no joiner
+  in 120 s, a 404/429/5xx poll, an unusable answer, no direct path, a
+  fetch timeout) now sends `close` with the room's token, as `cancel()`
+  already did. A `closeSent` flag shared by the two sends it exactly once,
+  in either order. A host that pairs sends none. `client_stops_on_500`
+  no longer counts that `close` as a request after the failure (R-T5-3).
+
+Suites at Task 5: release `boot_progress` 90 pass, 1 ignored, 18.8 s;
+`cargo test --workspace` 757 pass, 1 ignored, 28.3 s wall; `bun test` 339
+pass, 13.0 s; `bun run typecheck` 0 errors; clippy and `bun run build` 0
+warnings.
+
 ## Traces
 
 ### Re-provisioning a registered badge (Task 3)
@@ -226,6 +249,12 @@ Ruling R-T3-3: `redraw-bench.ts` passes `() => 0` for `bootConsoleStart` (the de
 Ruling R-T4-1: `lib` goes from `ES2020` to `ES2022` (the `target` stays `ES2020`) rather than rewriting 50 `.at()` calls and one `.replaceAll()` in the tests, because `bun run build`'s output is byte-identical with it (same files, sizes and SHA-1s) — cost if wrong: `src/` may now type-check an ES2021/ES2022 library call (`.at()`, `.replaceAll()`, `Object.hasOwn`, …) that `target` does not down-level; Vite's default build target (widely available browsers) already ships those, and a browser without them would fail at that call.
 
 Ruling R-T4-2: the seven non-`lib` errors are fixed by typing, not loosening: `manifest.test.ts` reads the absent key with `Reflect.get` (no cast); `signal-client.test.ts` and `signal-handler.test.ts` name their case arrays `Record<string, string>[]`; `redraw-bench.test.ts`'s fake gains `softResetCount: () => 0` and `rebootUs: () => 466_000` (`REBOOT_US`, as `firmware-runtime.test.ts`'s fake); `vite.config.ts`'s `readCapped` is typed `Promise<Buffer<ArrayBuffer> | null>`, what `Buffer.concat` already returns (type-only; the build is unchanged); and `shell.test.ts` takes one commented `as unknown as MouseEvent` cast in a `mouse()` helper, since happy-dom's `MouseEvent` typings lack only `isTrusted`, `returnValue` and `srcElement` — cost if wrong: the cast would hide a real happy-dom/DOM event mismatch in that one keyboard-and-pad test; its assertions on the Worker's messages still run.
+
+Ruling R-T5-1: `call` combines the caller's signal and the timeout through a hand-made `AbortController` and `setTimeout`, cleared (and the listener removed) once the fetch settles, not `AbortSignal.any`/`AbortSignal.timeout`, though both are in the DOM lib types: `AbortSignal.any` is missing before Safari 17.4 and Chrome 116, and there `call` would throw on every request, while `AbortSignal.timeout`'s timer cannot be cleared — cost if wrong: about eight lines where two would do; the timer still covers only the fetch up to its headers, not the small JSON body read after it.
+
+Ruling R-T5-2: `REDIS_OPTIONS.retry` is `{ retries: 0 }`, not the brief's `false`, because @upstash/redis 1.41.0 reads `retry: false` as `attempts: 1` and its request loop runs `i <= attempts`, so `false` still re-sends a request after a network error, with no backoff (`node_modules/@upstash/redis/chunk-*.mjs`, `HttpClient`'s constructor and `request`); `redis_options_disable_retries` pins one fetch per command with `{ retries: 0 }` and two with `false`, so a library upgrade that changes either shows up — cost if wrong: none to behaviour; the option's value differs from the plan's interface line (`REDIS_OPTIONS.retry === false`).
+
+Ruling R-T5-3: `client_stops_on_500`'s count of requests after the failing one leaves out the host's `close`, which a failed host now sends by design; every other request still counts, and `host_sends_close_on_a_server_error` pins the one `close` — cost if wrong: a stray second `close` would not show in that test, but the four `host_*_close*` tests count closes exactly.
 
 ## Final suites
 

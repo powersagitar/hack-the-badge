@@ -9,13 +9,18 @@
  *   the room code at once; its `connected` promise polls for the answer
  *   every {@link POLL_INTERVAL_MS}, applies it and waits for the channel
  *   to open, all within {@link SIGNAL_TIMEOUT_MS} of the start. It keeps
- *   the room's token from `create` to itself; its `cancel` sends `close`
- *   with it, best effort (Milestone 11 Task 10).
+ *   the room's token from `create` to itself, and sends `close` with it,
+ *   best effort, exactly once: on its `cancel` (Milestone 11 Task 10) or
+ *   when `connected` fails, a timeout included (Milestone 12 Task 5).
  * - {@link joinRoom} fetches the room's offer, answers it, and waits for
  *   the channel to open within the same budget.
  *
  * Waiting for the channel is event-driven: {@link PeerLink.opened} raced
  * against the deadline and the cancel, with no polling.
+ *
+ * Every request aborts after {@link SIGNAL_FETCH_TIMEOUT_MS} (and a host's
+ * polls also on its cancel), so a hung fetch ends as "Could not reach the
+ * signaling server" rather than holding the side forever.
  *
  * Every failure is a {@link SignalError} with a message meant for the
  * page's status line, and ends that side's requests; a link that fails is
@@ -29,6 +34,8 @@ import { CROCKFORD_ALPHABET, ROOM_CODE_LENGTH, TOKEN_LENGTH, isRoomCode } from "
 export const SIGNAL_URL = "/api/signal";
 export const POLL_INTERVAL_MS = 1000;
 export const SIGNAL_TIMEOUT_MS = 120_000;
+/** How long one request to the signaling server may take before it is aborted. */
+export const SIGNAL_FETCH_TIMEOUT_MS = 10_000;
 
 export const SIGNALING_UNAVAILABLE = "Signaling unavailable.";
 export const ROOM_CLOSED = "Room closed or expired.";
@@ -44,6 +51,8 @@ export interface SignalDeps {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
   factory?: PeerConnectionFactory;
+  /** Aborts each request after this many ms; default {@link SIGNAL_FETCH_TIMEOUT_MS}. */
+  fetchTimeoutMs?: number;
 }
 
 export interface HostedRoom {
@@ -85,15 +94,30 @@ function resolveDeps(deps: SignalDeps) {
     sleep: deps.sleep ?? timerSleep,
     now: deps.now ?? (() => Date.now()),
     factory: deps.factory,
+    fetchTimeoutMs: deps.fetchTimeoutMs ?? SIGNAL_FETCH_TIMEOUT_MS,
   };
 }
 type Deps = ReturnType<typeof resolveDeps>;
 
-async function call(d: Deps, init: RequestInit, query = ""): Promise<Response> {
+/**
+ * One request to the server. It aborts on `signal` or after
+ * `d.fetchTimeoutMs`, whichever comes first (a hand-made controller and
+ * timer, cleared once the fetch settles: ruling R-T5-1); an abort or any
+ * throw is a {@link SignalError}.
+ */
+async function call(d: Deps, init: RequestInit, query = "", signal?: AbortSignal): Promise<Response> {
+  const abort = new AbortController();
+  const onAbort = () => abort.abort();
+  if (signal?.aborted) abort.abort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const timer = setTimeout(onAbort, d.fetchTimeoutMs);
   try {
-    return await d.fetch(SIGNAL_URL + query, { cache: "no-store", ...init });
+    return await d.fetch(SIGNAL_URL + query, { cache: "no-store", ...init, signal: abort.signal });
   } catch {
     throw new SignalError("Could not reach the signaling server; check the connection.");
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -227,11 +251,19 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
 
   const cancel = new AbortController();
   const cancelled = whenAborted(cancel.signal);
+  // Shared by `cancel()` and `connected`'s failure, whichever comes first: one `close`.
+  let closeSent = false;
+  const closeOnce = () => {
+    if (closeSent) return;
+    closeSent = true;
+    sendClose(d, room, token);
+  };
   const connected = (async () => {
     try {
       for (;;) {
         if (cancel.signal.aborted) throw new SignalError(CANCELLED);
-        const res = await Promise.race([call(d, { method: "GET" }, `?room=${room}&want=answer`), cancelled]);
+        const poll = call(d, { method: "GET" }, `?room=${room}&want=answer`, cancel.signal);
+        const res = await Promise.race([poll, cancelled]);
         if (res.status === 200) {
           const answer = await field(res, "answer");
           try {
@@ -249,6 +281,8 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
       await waitOpen(d, link, deadline, cancel.signal);
     } catch (e) {
       link.close();
+      // The room is of no use to anyone now: free it rather than leave it to its TTL.
+      closeOnce();
       throw e instanceof SignalError ? e : new SignalError("Linking failed.");
     }
   })();
@@ -262,7 +296,7 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
       if (cancel.signal.aborted) return;
       cancel.abort();
       link.close();
-      sendClose(d, room, token);
+      closeOnce();
     },
   };
 }

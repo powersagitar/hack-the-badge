@@ -463,6 +463,32 @@ describe("the Upstash adapters", () => {
     }
   });
 
+  test("redis_options_disable_retries", async () => {
+    // A retried EVALSHA after a lost reply would count one limiter hit twice.
+    expect(REDIS_OPTIONS.retry).toEqual({ retries: 0 });
+    // And it reaches the client: a network failure is tried once, not retried.
+    const original = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches++;
+      throw new TypeError("Failed to fetch");
+    }) as unknown as typeof fetch;
+    try {
+      const redis = new Redis({ url: "https://example.upstash.io", token: "tok", ...REDIS_OPTIONS });
+      await expect(redisRoomStore(redis).get("k")).rejects.toThrow();
+      expect(fetches).toBe(1);
+      await expect(upstashLimiter(redis, 2, 60, "rl:z").limit("a")).rejects.toThrow();
+      expect(fetches).toBe(2);
+      // Why not `retry: false`: this library version reads it as one retry (ruling R-T5-2).
+      fetches = 0;
+      const once = new Redis({ url: "https://example.upstash.io", token: "tok", ...REDIS_OPTIONS, retry: false });
+      await expect(redisRoomStore(once).get("k")).rejects.toThrow();
+      expect(fetches).toBe(2);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   test("a failing Upstash rejects; the handler answers a bare 500", async () => {
     const original = globalThis.fetch;
     globalThis.fetch = (async () => Response.json({ error: "ERR max requests limit exceeded" }, { status: 400 })) as unknown as typeof fetch;

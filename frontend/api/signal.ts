@@ -110,9 +110,18 @@ const usable = (s: string | undefined): s is string => !!s && s.trim() === s && 
 /**
  * Values verbatim (no JSON parsing of what `GET` returns), no telemetry
  * headers, and one REST request per command: the handler's calls are
- * sequential, so auto-pipelining would batch nothing.
+ * sequential, so auto-pipelining would batch nothing. No retries: a
+ * retried `EVALSHA` after a lost reply would count one limiter hit twice;
+ * a store error stays the bare 500. `{ retries: 0 }`, not `false`:
+ * @upstash/redis 1.41.0 reads `retry: false` as one retry with no
+ * backoff (its loop runs `attempts + 1` times; ruling R-T5-2).
  */
-export const REDIS_OPTIONS = { automaticDeserialization: false, enableTelemetry: false, enableAutoPipelining: false };
+export const REDIS_OPTIONS = {
+  automaticDeserialization: false,
+  enableTelemetry: false,
+  enableAutoPipelining: false,
+  retry: { retries: 0 },
+};
 
 let deps: SignalDeps | null = null;
 

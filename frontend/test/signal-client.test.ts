@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  SIGNAL_FETCH_TIMEOUT_MS,
   SIGNAL_TIMEOUT_MS,
   SignalError,
   hostRoom,
@@ -85,6 +86,38 @@ function always(status: number, headers: Record<string, string> = {}) {
   };
   return { fetch, fetched };
 }
+
+/**
+ * A fetch that settles only when its signal aborts (rejecting as a browser's does), recording
+ * each request's signal. A request without one fails at once, so a missing signal fails the
+ * test instead of hanging it.
+ */
+function hungFetch() {
+  const signals: (AbortSignal | null | undefined)[] = [];
+  const fetch = (_input: string, init?: RequestInit) =>
+    new Promise<Response>((_, reject) => {
+      const signal = init?.signal;
+      signals.push(signal);
+      if (!signal) return reject(new TypeError("no signal"));
+      signal.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")), {
+        once: true,
+      });
+    });
+  return { fetch, signals };
+}
+
+/** Makes the host's answer polls in `h` answer `status`. */
+function failPolls(h: ReturnType<typeof harness>, status: number) {
+  const real = h.deps.fetch!;
+  h.deps.fetch = async (input, init) =>
+    input.includes("want=answer") ? new Response(null, { status }) : real(input, init);
+}
+
+/** The bodies of the `close` requests in `calls`. */
+const closesOf = (calls: Call[]) => calls.filter((c) => c.body?.op === "close").map((c) => c.body);
+
+/** The token `create` returned. */
+const tokenOf = (calls: Call[]) => calls.find((c) => c.body?.op === "create")!.reply!.token as string;
 
 describe("signal client", () => {
   test("host and join a room, and the link opens on both sides", async () => {
@@ -218,9 +251,10 @@ describe("signal client", () => {
       const h = harness();
       const real = h.deps.fetch!;
       // The failing side's requests after its 500 (the host's, or for a join's ops the joiner's).
+      // A host's `close` after its own failure is expected (Task 5, Milestone 12), and not counted.
       let after = -1;
       const failingFetch: SignalDeps["fetch"] = async (input, init) => {
-        if (after >= 0) after++;
+        if (after >= 0 && opOf(input, init) !== "close") after++;
         else if (opOf(input, init) === failing) {
           after = 0;
           return new Response(null, { status: 500 });
@@ -333,5 +367,119 @@ describe("signal client", () => {
     // No polling: at most the one deadline timer, never a poll interval.
     expect(sleeps.every((ms) => ms === SIGNAL_TIMEOUT_MS)).toBe(true);
     expect(sleeps.length).toBeLessThanOrEqual(1);
+  });
+
+  test("the fetch timeout is 10 s", () => {
+    expect(SIGNAL_FETCH_TIMEOUT_MS).toBe(10_000);
+  });
+
+  test(
+    "call_aborts_a_hung_fetch",
+    async () => {
+      // Review Focus 4: a joiner has no cancel, so only the fetch timeout ends a hung request.
+      const hung = hungFetch();
+      await noUnhandledRejections(async () => {
+        await expect(joinRoom("ABCDEFGH", { fetch: hung.fetch, fetchTimeoutMs: 20 })).rejects.toThrow(
+          "Could not reach the signaling server; check the connection.",
+        );
+      });
+      expect(hung.signals.length).toBe(1);
+      expect(hung.signals[0]?.aborted).toBe(true);
+    },
+    2000,
+  );
+
+  test(
+    "host_cancel_still_aborts_an_in_flight_fetch",
+    async () => {
+      // The cancel aborts a hung poll long before the (default, 10 s) fetch timeout.
+      const h = harness();
+      const real = h.deps.fetch!;
+      const hung = hungFetch();
+      h.deps.fetch = (input, init) => (input.includes("want=answer") ? hung.fetch(input, init) : real(input, init));
+      await noUnhandledRejections(async () => {
+        const hosted = await hostRoom(h.deps);
+        await tick();
+        expect(hung.signals.length).toBe(1);
+        expect(hung.signals[0]?.aborted).toBe(false);
+        hosted.cancel();
+        await expect(hosted.connected).rejects.toThrow(/cancelled/i);
+        expect(hung.signals[0]?.aborted).toBe(true);
+      });
+      // And the same poll's signal still carries the timeout: without a cancel it ends the poll.
+      const t = harness();
+      const realT = t.deps.fetch!;
+      const hungT = hungFetch();
+      t.deps.fetch = (input, init) => (input.includes("want=answer") ? hungT.fetch(input, init) : realT(input, init));
+      await noUnhandledRejections(async () => {
+        const hosted = await hostRoom({ ...t.deps, fetchTimeoutMs: 20 });
+        await expect(hosted.connected).rejects.toThrow("Could not reach the signaling server; check the connection.");
+        expect(hungT.signals[0]?.aborted).toBe(true);
+      });
+    },
+    2000,
+  );
+
+  test("host_gives_up_and_sends_close", async () => {
+    const h = harness();
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      await expect(hosted.connected).rejects.toThrow(`No one joined room ${hosted.room}`);
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+      // The room is gone: a join gets "Room closed or expired." at once.
+      await expect(joinRoom(hosted.room, h.deps)).rejects.toThrow("Room closed or expired.");
+    });
+  });
+
+  test("host_sends_close_on_a_server_error", async () => {
+    const h = harness();
+    failPolls(h, 500);
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      await expect(hosted.connected).rejects.toThrow("Signaling unavailable.");
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+    });
+  });
+
+  test("host_failure_then_cancel_sends_close_once", async () => {
+    const h = harness();
+    failPolls(h, 500);
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      await expect(hosted.connected).rejects.toThrow("Signaling unavailable.");
+      hosted.cancel();
+      hosted.cancel();
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+    });
+  });
+
+  test("host_cancel_then_failure_sends_close_once", async () => {
+    // The poll ignores its abort signal and answers 500 only after the cancel.
+    const h = harness();
+    const real = h.deps.fetch!;
+    let release: (res: Response) => void = () => {};
+    h.deps.fetch = (input, init) =>
+      input.includes("want=answer") ? new Promise<Response>((r) => (release = r)) : real(input, init);
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      await tick();
+      hosted.cancel();
+      release(new Response(null, { status: 500 }));
+      await expect(hosted.connected).rejects.toThrow(/cancelled/i);
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+    });
+  });
+
+  test("host_success_sends_no_close", async () => {
+    const h = harness();
+    const hosted = await hostRoom(h.deps);
+    await joinRoom(hosted.room, h.deps);
+    await hosted.connected;
+    await tick();
+    expect(closesOf(h.calls)).toEqual([]);
   });
 });
