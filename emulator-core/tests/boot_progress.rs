@@ -1538,6 +1538,123 @@ provisions_role!(
 );
 provisions_role!(provisions_visitor_through_the_console, "visitor");
 
+/// [`provision::skip_setup`]'s deadline, from the stable Setup page 1
+/// (role hacker, v392): `config`, its `OK` and prompt, then `reboot`, and
+/// the reset seen 1,850,000 steps on (sampled every 50,000); + 25%,
+/// rounded up to 1,000,000. It also bounds `reboot` alone in
+/// [`setup_logs_its_launch_after_a_reboot`] (reset seen within 250,000).
+const SKIP_SETUP_DEADLINE_STEPS: u64 = 3_000_000;
+/// The skip's reset to the registered screen: first stable 38,000,000
+/// steps after the reset was seen (through the boot splash), then
+/// [`AFTER_PRESS_STABLE_FOR`] more to confirm, 46,000,000; + 25%, rounded
+/// up to 1,000,000.
+const SKIP_REGISTERED_STEPS: u64 = 58_000_000;
+/// Total steps once the skipped badge's registered screen is confirmed
+/// stable (exact pin, v392, role hacker: page 1 stable and returned at
+/// 36,542,000, reset seen at 38,392,000, registered first stable at
+/// 76,392,000).
+const SKIP_REGISTERED_AT_STEPS: u64 = 84_392_000;
+/// Emulated time at [`SKIP_REGISTERED_AT_STEPS`] (exact pin; it counts
+/// through the reset, including its 466 ms).
+const SKIP_REGISTERED_AT_US: u64 = 8_855_536;
+/// A mid-Setup `reboot`'s reset to Setup page 1 again: `launched Setup`
+/// by 10,850,000 steps after the reset was seen, page 1 first stable at
+/// 14,850,000, confirmed at 22,850,000; + 25%, rounded up to 1,000,000.
+const SETUP_AFTER_REBOOT_STEPS: u64 = 29_000_000;
+
+/// The byte offset where the boot after the skip's reset starts: just
+/// past [`provision::REBOOTING`] in the console text from `marker` on.
+fn boot_start_after(rt: &FirmwareRuntime, marker: usize) -> usize {
+    let since = &rt.console_output()[marker..];
+    let at = since
+        .find(provision::REBOOTING)
+        .unwrap_or_else(|| panic!("no `{}`:\n{since}", provision::REBOOTING));
+    marker + at + provision::REBOOTING.len()
+}
+
+/// Milestone 13's gate: from Setup page 1, `config system onboard_build
+/// 2147483647` then `reboot` in the USB console skips Setup. The badge
+/// reboots once (the emulated software reset), the new boot launches My
+/// Badge and not Setup, and lands on the same registered screen the
+/// 11-page walk reaches; HOME then opens the launcher.
+#[test]
+fn skipping_setup_lands_on_the_registered_screen() {
+    let (page1, registered_hash) = role_row(OWN_ROLE);
+    let mut rt = provisioned(OWN_ROLE);
+    assert!(rt.console_output().contains(provision::SETUP_LAUNCHED));
+    let resets = rt.soft_reset_count();
+    let marker = rt.console_output().len();
+    let deadline = rt.total_steps() + SKIP_SETUP_DEADLINE_STEPS;
+    let text = provision::skip_setup(&mut rt, deadline).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        text.contains(provision::SKIP_SETUP_CONFIG_OK) && text.contains(provision::REBOOTING),
+        "{text}"
+    );
+    assert_eq!(rt.soft_reset_count(), resets + 1);
+    let boot_start = boot_start_after(&rt, marker);
+    let cap = rt.total_steps() + SKIP_REGISTERED_STEPS;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[page1, SPLASH_HASH]);
+    assert_eq!(hash, registered_hash, "registered after skip, step {step}");
+    let new_boot = &rt.console_output()[boot_start..];
+    assert!(
+        new_boot.contains("app_reg: launched My Badge")
+            && !new_boot.contains(provision::SETUP_LAUNCHED),
+        "new boot:\n{new_boot}"
+    );
+    assert_eq!(
+        (rt.total_steps(), rt.emulated_time_us()),
+        (SKIP_REGISTERED_AT_STEPS, SKIP_REGISTERED_AT_US)
+    );
+    press(&mut rt, TO_LAUNCHER_SLOT);
+    let cap = rt.total_steps() + LAUNCHER_RESPONSE_STEPS;
+    let (hash, step) =
+        run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[registered_hash]);
+    assert_eq!(hash, LAUNCHER_HASH, "launcher, stable at step {step}");
+    assert_no_panic_text(&rt);
+}
+
+/// The boot-time path into Setup (`app_registry_start`, a badge that boots
+/// provisioned but not onboarded) logs [`provision::SETUP_LAUNCHED`] on
+/// v392, as My Badge's hand-off after `prov apply` does: `reboot` alone on
+/// Setup page 1 reboots into Setup, which logs its launch and draws page 1
+/// again (measured, v392, role hacker), so Milestone 13's Setup watcher
+/// needs only the one needle.
+#[test]
+fn setup_logs_its_launch_after_a_reboot() {
+    let mut rt = provisioned(OWN_ROLE);
+    let resets = rt.soft_reset_count();
+    let marker = rt.console_output().len();
+    let input = format!("{}{}", provision::REBOOT, provision::LINE_END);
+    assert_eq!(rt.serial_input(input.as_bytes()), input.len());
+    let deadline = rt.total_steps() + SKIP_SETUP_DEADLINE_STEPS;
+    while rt.soft_reset_count() == resets {
+        assert!(
+            rt.total_steps() < deadline,
+            "no reset:\n{}",
+            &rt.console_output()[marker..]
+        );
+        let s = rt.run(FRAME_CHUNK);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+    }
+    let boot_start = boot_start_after(&rt, marker);
+    let reset_at = rt.total_steps();
+    let cap = reset_at + SETUP_AFTER_REBOOT_STEPS;
+    let launched = provision::wait_for_any(&mut rt, boot_start, &[provision::SETUP_LAUNCHED], cap);
+    assert!(
+        launched.is_some(),
+        "new boot:\n{}",
+        &rt.console_output()[boot_start..]
+    );
+    let (hash, step) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[SPLASH_HASH]);
+    assert_eq!(
+        hash,
+        role_row(OWN_ROLE).0,
+        "Setup page 1 after the reboot, step {step}"
+    );
+    assert_no_panic_text(&rt);
+}
+
 /// [`registered`], then HOME to the stable launcher.
 fn walk_to_launcher(role: &str) -> FirmwareRuntime {
     walk_to_launcher_from(registered(role), role)

@@ -256,3 +256,53 @@ pub fn identity_fixture(role: &str) -> Vec<u8> {
     std::fs::read(dir.join(format!("{role}.json")))
         .unwrap_or_else(|e| panic!("fixture {role} in {}: {e}", dir.display()))
 }
+
+/// The console line that marks the badge onboarded (Milestone 13): Setup
+/// shows only while `system.onboard_build` is below the firmware's build
+/// number, and INT32_MAX is at or above any build number. Setup itself
+/// never re-reads it, so [`REBOOT`] must follow.
+pub const SKIP_SETUP_CONFIG: &str = "config system onboard_build 2147483647";
+/// `cmd_config`'s reply once the setting is stored.
+pub const SKIP_SETUP_CONFIG_OK: &str = "OK system.onboard_build=2147483647";
+/// The REPL's reboot command (`cmd_reboot`, then `esp_restart()`).
+pub const REBOOT: &str = "reboot";
+/// What `reboot` prints before it restarts.
+pub const REBOOTING: &str = "rebooting...";
+/// The registry's line when Setup launches (`app_registry_launch`).
+pub const SETUP_LAUNCHED: &str = "app_reg: launched Setup";
+/// The REPL's answer to a malformed command.
+pub const USAGE: &str = "usage:";
+
+/// Skips Setup as Milestone 13's button does: types [`SKIP_SETUP_CONFIG`]
+/// (waiting for the prompt after it), checks for [`SKIP_SETUP_CONFIG_OK`],
+/// then types [`REBOOT`] and runs in `CHUNK`-step chunks, asserting no
+/// fault, until [`FirmwareRuntime::soft_reset_count`] has risen by one. A
+/// missing reply, [`USAGE`], or no reset by `deadline` (total steps) is an
+/// `Err` with the console text. Call it at an idle prompt. Returns the
+/// console text from the `config` line on.
+pub fn skip_setup(rt: &mut FirmwareRuntime, deadline: u64) -> Result<String, String> {
+    let marker = rt.console_output().len();
+    let text = match type_line(rt, SKIP_SETUP_CONFIG, deadline) {
+        Outcome::Done(text) => text,
+        Outcome::Timeout(text) => return Err(format!("config timed out:\n{text}")),
+    };
+    if text.contains(USAGE) || !text.contains(SKIP_SETUP_CONFIG_OK) {
+        return Err(format!("config refused:\n{text}"));
+    }
+    let resets = rt.soft_reset_count();
+    let input = format!("{REBOOT}{LINE_END}");
+    if rt.serial_input(input.as_bytes()) != input.len() {
+        return Err("serial queue refused reboot".into());
+    }
+    while rt.soft_reset_count() == resets {
+        if rt.total_steps() >= deadline {
+            return Err(format!(
+                "no reset after reboot:\n{}",
+                console_since(rt, marker)
+            ));
+        }
+        let s = rt.run(CHUNK);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+    }
+    Ok(console_since(rt, marker))
+}
