@@ -12,11 +12,32 @@ import { FakeNetwork } from "./fake-rtc";
 
 /**
  * The shell's tests run on a real DOM: a happy-dom `Window` per test, with
- * `index.html`'s body (its script dropped) and `shell.css` inline, set as
+ * the old page's body ({@link LEGACY_BODY}) and `shell.css` inline, set as
  * `globalThis.document` for the test and the previous value restored after.
  * No global registrator: other test files see no DOM.
  */
-const INDEX_HTML = readFileSync(new URL("../index.html", import.meta.url), "utf8");
+/**
+ * The body `index.html` had before the React page (Milestone 14 Task 7),
+ * which `shell.ts` builds into. `index.html` now mounts the React app;
+ * Task 12 deletes `shell.ts`, `shell.css` and these tests.
+ */
+const LEGACY_BODY = `
+    <div id="app">
+      <h1>Hack the North 2026 &mdash; Badge Emulator</h1>
+      <div id="provision-controls" style="display: none"></div>
+      <div id="badge-notice" style="display: none"></div>
+      <div id="link-panel" style="display: none"></div>
+      <div id="badge-frame">
+        <canvas id="badge-screen" width="320" height="240"></canvas>
+        <div id="led-row"></div>
+      </div>
+      <div id="button-pad"></div>
+      <div id="log-panel">
+        <div id="log-header">console.log</div>
+        <pre id="log-output"></pre>
+      </div>
+    </div>
+`;
 const SHELL_CSS = readFileSync(new URL("../src/ui/shell.css", import.meta.url), "utf8");
 /** `shell.css`'s `--bg`: the page's background. */
 const PAGE_BG = /--bg:\s*([^;]+);/.exec(SHELL_CSS)![1]!.trim();
@@ -27,7 +48,7 @@ let savedDocument: PropertyDescriptor | undefined;
 beforeEach(() => {
   savedDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
   win = new Window({ url: "http://localhost:5173/" });
-  const body = /<body>([\s\S]*)<\/body>/.exec(INDEX_HTML)![1]!.replace(/<script[\s\S]*?<\/script>/g, "");
+  const body = LEGACY_BODY;
   win.document.write(`<!doctype html><html><head><style>${SHELL_CSS}</style></head><body>${body}</body></html>`);
   Object.defineProperty(globalThis, "document", { value: win.document, configurable: true, writable: true });
 });

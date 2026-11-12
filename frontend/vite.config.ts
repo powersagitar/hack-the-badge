@@ -1,4 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { fileURLToPath } from "node:url";
+import tailwindcss from "@tailwindcss/vite";
+import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 import { MAX_BODY_BYTES, handleSignal, memoryDeps } from "./src/radio/signal-handler.ts";
 
@@ -87,7 +90,10 @@ export function readCapped(req: IncomingMessage): Promise<Buffer<ArrayBuffer> | 
 
 export default defineConfig({
   root: ".",
-  plugins: [devSignal()],
+  plugins: [react(), tailwindcss(), devSignal()],
+  resolve: {
+    alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
+  },
   publicDir: "public",
   server: {
     port: 5173,

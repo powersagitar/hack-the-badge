@@ -1,0 +1,108 @@
+/*
+ * The page's theme (Milestone 14): the design's values
+ * (local/m14-design/Main.dc.html and Mobile.dc.html) as shadcn CSS
+ * variables, mapped onto Tailwind v4 theme tokens below. Dark only: the
+ * design has no light theme, so there is no `.dark` variant and no
+ * light palette. Components use the tokens (`bg-card`, `text-accent-text`,
+ * `rounded-panel`, ...), never inline colours.
+ *
+ * shadcn's own `--accent` is a hover/selected *background* (Select items
+ * use it), so the design's accent text colours are separate tokens:
+ * `--accent-text` (#c9a7dc) and `--accent-strong` (#b07ccb).
+ */
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+
+  --background: #050505;
+  --foreground: #ececec;
+  --card: #0a0a0a;
+  --card-foreground: #ececec;
+  --popover: #0a0a0a;
+  --popover-foreground: #ececec;
+  --border: #1c1c1c;
+  --muted: #141414;
+  --muted-foreground: #8c8c8c;
+
+  /* The design's accents. */
+  --accent-text: #c9a7dc;
+  --accent-strong: #b07ccb;
+  --link-hover: #ead7f5;
+
+  /* The active fill (`.pill.on`), and shadcn's hover/selected background (`.ghost.on`). */
+  --primary: #6b4a7d;
+  --primary-foreground: #ffffff;
+  --accent: #2a1d33;
+  --accent-foreground: #ffffff;
+
+  /* Fields and ghost buttons (`.field`, `.ghost`). */
+  --secondary: #0d0d0d;
+  --secondary-foreground: #d6d6d6;
+  --field: #0d0d0d;
+  --input: #2a2a2a;
+  --field-hover-border: #555555;
+  --placeholder: #6f6f6f;
+  --ring: #b07ccb;
+
+  /* Not in the design; shadcn's components reference it. */
+  --destructive: #e5484d;
+
+  --radius: 6px;
+}
+
+@theme inline {
+  --font-sans: "Space Grotesk", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-border: var(--border);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent-text: var(--accent-text);
+  --color-accent-strong: var(--accent-strong);
+  --color-link-hover: var(--link-hover);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-field: var(--field);
+  --color-input: var(--input);
+  --color-field-hover-border: var(--field-hover-border);
+  --color-placeholder: var(--placeholder);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+
+  /* 6 px controls; 12 px desktop panels; 14 px mobile panels. */
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-control: var(--radius);
+  --radius-panel: 12px;
+  --radius-panel-mobile: 14px;
+}
+
+/* The stage's dotted grid (the design's `.stage`). */
+@utility stage-grid {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply m-0 bg-background font-sans text-foreground;
+  }
+  a {
+    @apply text-accent-text hover:text-link-hover;
+  }
+}

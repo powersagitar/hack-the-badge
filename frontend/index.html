@@ -4,24 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Hack the Badge Emulator</title>
-    <link rel="stylesheet" href="/src/ui/shell.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;600&amp;display=swap">
   </head>
   <body>
-    <div id="app">
-      <h1>Hack the North 2026 &mdash; Badge Emulator</h1>
-      <div id="provision-controls" style="display: none"></div>
-      <div id="badge-notice" style="display: none"></div>
-      <div id="link-panel" style="display: none"></div>
-      <div id="badge-frame">
-        <canvas id="badge-screen" width="320" height="240"></canvas>
-        <div id="led-row"></div>
-      </div>
-      <div id="button-pad"></div>
-      <div id="log-panel">
-        <div id="log-header">console.log</div>
-        <pre id="log-output"></pre>
-      </div>
-    </div>
-    <script type="module" src="/src/main.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
