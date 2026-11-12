@@ -451,9 +451,14 @@ to its home ("Find a sync station", `SYNC_HOME_HASH`) without input:
 - Measured: `0x42043b02` at +20.070 s after A, the stable no-station
   frame at +20.117 s, `SYNC_HOME_HASH` back at +30.137 s: 10.07 s of
   emulated time (400 ticks, the same 20/30 ms mix).
-- The browser (Task 3, the orchestrator's stopwatch at about 1.0x) saw
-  about 22 s from A and about 12 s of hold. The emulated values are 20.1
-  s and 10.1 s, so the browser ran at about 0.85x to 0.9x there.
+- The browser (Task 3, the orchestrator's wall-clock stopwatch; the
+  page displayed about 1.0x) showed it for both roles: hacker, then the
+  same badge re-provisioned as organizer. "No sync station in range"
+  came about 22.4 s (hacker) and 22.2 s (organizer) after A. The
+  auto-return, measured on the hacker run, came after about 12 s of
+  hold. The emulated values are 20.1 s and 10.1 s, so against the wall
+  clock the emulator ran at about 0.85x to 0.9x there, below the
+  displayed speed.
 
 ## Dependencies added
 
