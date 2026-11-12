@@ -124,6 +124,11 @@
  * reads the current boot's console from `bootConsoleStart` and is false
  * while a skip runs; it copies that text, so it belongs in a status, not
  * in a per-step path.
+ *
+ * The other way round, `provision()` is refused while a skip is in flight
+ * (ruling T4-2: its `put` could land between `config` and `reboot`):
+ * nothing is typed, no provisioner starts, and the provision state is
+ * failed with {@link SKIP_IN_PROGRESS_REASON}.
  */
 import type { ButtonName, ButtonSource } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
@@ -192,6 +197,9 @@ export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
  * a slow browser does not time out early.
  */
 export const PROVISION_TIMEOUT_STEPS = 60_000_000;
+
+/** Why `provision()` fails at once while a setup skip is in flight (ruling T4-2). */
+export const SKIP_IN_PROGRESS_REASON = "a setup skip is in progress";
 
 /**
  * Minimum emulated time a button stays pressed: 100 ms (same value as
@@ -346,7 +354,11 @@ export interface FirmwareRuntime {
    * (default `"pad"`): see "Tap sources and taps across `stop()`".
    */
   injectButton(button: ButtonName, kind: "pressed" | "released", source?: ButtonSource): void;
-  /** Starts typing the provisioning flow for `identityJson`, replacing any in flight. */
+  /**
+   * Starts typing the provisioning flow for `identityJson`, replacing any in
+   * flight; refused (failed with {@link SKIP_IN_PROGRESS_REASON}, nothing
+   * typed) while a setup skip is in flight.
+   */
   provision(identityJson: string): void;
   /** The current provisioning state, or `null` if none was started since the last reset. */
   provisionState(): ProvisionState | null;
@@ -686,6 +698,11 @@ export function createFirmwareRuntime(
   }
 
   function provision(identityJson: string): void {
+    if (skipper !== null) {
+      // Ruling T4-2: never type between the skip's `config` and `reboot`.
+      lastState = { kind: "failed", reason: SKIP_IN_PROGRESS_REASON };
+      return;
+    }
     provisioner = createProvisioner(handle, identityJson, () => bootConsoleStart);
     lastState = { kind: "waiting" };
     provisionStartedAt = handle.totalSteps();

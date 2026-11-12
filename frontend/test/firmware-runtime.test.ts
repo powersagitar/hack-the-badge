@@ -781,6 +781,34 @@ describe("FirmwareRuntime skip setup", () => {
     expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
   });
 
+  // Ruling T4-2: a provision could otherwise type `put` between `config` and `reboot`.
+  test("provision refuses while a skip is in flight", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.start();
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.skipSetup()).toBe(true);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED]);
+    rt.provision('{"a":1}');
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: "a setup skip is in progress" });
+    print("OK system.onboard_build=2147483647\r\nbadge> ");
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED]);
+    armReboot();
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "done" });
+    // Nothing of the refused provision was typed, and it stays failed.
+    print("badge> ");
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED]);
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: "a setup skip is in progress" });
+    // Once the skip is over, a provision starts normally.
+    rt.provision('{"a":1}');
+    expect(rt.provisionState()).toEqual({ kind: "waiting" });
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED, "put /littlefs/identity.json 7\n"]);
+  });
+
   // Review Focus 2: exactly one config and one reboot.
   test("a second skipSetup while one runs is refused", () => {
     const { rt, typed, frame, print, armReboot } = rig();
