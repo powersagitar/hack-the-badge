@@ -124,6 +124,7 @@ about 1 kB smaller), so it was reverted (R-T8-3).
 | Task 6 (`b60e4ed`) | — | 384, 14.72 s |
 | Task 7 (`3867f6f`) | — | 385, 14.8 s |
 | Task 8 (`c2bdfaf`) | 92 + 1 ignored, 18.23 s | 392, 15.5 s |
+| Final review (`689911e`) | — (no Rust change) | 395, 15.39 s |
 
 Clippy and `bun run typecheck` were clean after every task.
 
@@ -144,8 +145,8 @@ appears at Setup's launch, not at `PROV OK` (Review Focus 4; Task 4's
 - **Gate 1** (Task 1, the go/no-go): passed. v392 agrees with the public
   source: `config` writes the setting, `reboot` takes the normal path,
   and the skipped boot lands on the walked registered screen.
-- **Gate 2** (Task 6): no scope surprise; ride-alongs 4, 6 and 7 were
-  each small and already diagnosed.
+- **Gate 2** (Task 6): no scope surprise; ride-alongs 4, 6 and 7 went
+  in.
 - **Gate 3, the human partner's browser check: pending.** To be run on
   the prod build (`bun run build && bun run preview`): provision hacker,
   then the Skip setup button appears with Setup; press it, then
@@ -174,7 +175,7 @@ Ruling R-T1-3: `setup_logs_its_launch_after_a_reboot` bounds its reset wait with
 
 Ruling R-T2-1: the console slice is byte-exact in the core: `Console::text_since(at)` (lossy UTF-8 of the ring's bytes from absolute offset `at`; the whole ring if `at` is older than the ring, "" at or past `written`), `FirmwareRuntime::console_since`, the wasm one-line passthrough `consoleSince(at: f64)` (`at as u64`, saturating, as `run_until` does) and `FirmwareEmulatorHandle.consoleSince`; `console-io.ts`'s `consoleSince(handle, at)` is a thin call to it — why: v392's console is not ASCII (Task 2's em dash), so a slice can be exact only where the bytes are; it also copies only the current boot instead of the whole 256 KiB ring — cost if wrong: one more passthrough to remove; a slice that starts mid-character or at a wrapped ring's start begins with one U+FFFD, harmless for needle scans.
 
-Ruling R-T3-1: ride-along 3(b), decided in the plan: a provision **fails** with `the badge rebooted during provisioning` (`REBOOTED_REASON`) when `softResetCount()` changes after it left its `prompt` phase, and types nothing more; a reboot while it still waits for the first prompt stays fine — why: the new REPL's 500 ms terminal probe eats bytes, so a retry would have to restart from `put` after re-reading the new boot, while a clear failure ends at once and the user presses Provision again; the old behaviour waited out the 60M-step timeout — cost if wrong: an interrupted provision needs a second click instead of resuming by itself. The check is `!==`, not "a rise": a cold `reset()` zeroes the count but drops the provisioner anyway, so `!==` is the safe superset.
+Ruling R-T3-1: ride-along 3(b), decided in the plan: a provision **fails** with `the badge rebooted during provisioning` (`REBOOTED_REASON`) when `softResetCount()` changes after it left its `prompt` phase, and types nothing more; a reboot while it still waits for the first prompt stays fine — why (inferred: the plan says only "decided"; this reason is ours): the new REPL's 500 ms terminal probe eats bytes, so a retry would have to restart from `put` after re-reading the new boot, while a clear failure ends at once and the user presses Provision again; the old behaviour waited out the 60M-step timeout — cost if wrong: an interrupted provision needs a second click instead of resuming by itself. The check is `!==`, not "a rise": a cold `reset()` zeroes the count but drops the provisioner anyway, so `!==` is the safe superset.
 
 Ruling R-T3-2: ride-along 3(a): the provisioner's markers (`marker`, `provOkEnd`, `bootConsoleStart()`) are absolute byte offsets read through `consoleSince`, and `firmware-runtime.ts` sets `bootConsoleStart` to `consoleWritten()` at a soft reset (was `consoleOutput().length`) — why: an index into `consoleOutput()` shifts once the 256 KiB ring is full, which made Milestone 11's R-T13-3 boot-scoped prompt scan never match after a reset in a full console; an absolute offset does not shift — cost if wrong: none found; the WASM twin's provisioned walk is unchanged.
 
@@ -218,6 +219,28 @@ Ruling R-T8-6: `wait_for_any` (`tests/common/provision.rs`) returns the needle p
 
 Ruling R-T8-7: Milestone 12's R-T1-1 wording was corrected in `docs/milestone-12-decisions.md` itself, with a Milestone 13 history note (the old reference repeated the stub's loop; Task 8 made it table-driven and checked it against `0xCBF43926`), rather than only here — why: the ruling's text overstated what the test checked, and a reader finds it there — cost if wrong: a later milestone's note inside Milestone 12's record; the ruling itself is unchanged.
 
+## Final review
+
+A whole-branch review approved the branch with fixes; the controller's
+final fixer made them (`ce01928`, `689911e` and these docs). No Rust
+changed.
+
+Ruling R-FR-1: Skip setup hides on a stopped badge: `badge-controller.ts` keeps a `running` flag, set beside each `hub.setRunning(true/false)` (the start, a switch to Lua mode, and `onBadgeLost()`, which now also refreshes the status), the button shows only while it is set, and the click handler returns at once unless it is — why: the spec hides the button "on a stopped badge", but a badge lost to another tab only stopped the runtime, which posts no more statuses, so the button stayed up from the last one, and a click left the page on `skipping setup…` with Provision disabled until Run here — cost if wrong: none found; the button comes back with the next status after the badge runs again (`Skip setup hides on a badge lost to another tab, and a click sends nothing`).
+
+Ruling R-FR-2: the provisioning hint's Skip setup sentence follows the setup's sentence and names its object: "…on “Shake it!” press Shake. Press Skip setup to jump past the setup. In Connect, press Bump." — why: after "In Connect, press Bump.", "jump past it" read as skipping Connect (a plan defect) — cost if wrong: text only (`shell.test.ts` pins the order).
+
+Ruling R-FR-3: `lastStarted = "skip"` is set only for a skip that was sent: the handler returns before it unless the badge runs and the client's `setupOnScreen()` is true (the client's own guard) — why: a refused click set it anyway, which could bring back an old `skip failed: …` line over a newer provision's status — cost if wrong: display only (`a refused Skip setup click keeps the newer provision's status`).
+
+The review's test minors went in with them: the mid-character
+`consoleOffsetOf` test is renamed to what it pins (it rules out a
+forward count, not a char-count tail); the Worker's extra-fields
+`skipSetup` is now the first skip and types exactly one `config`;
+the hung-body bound is 500 ms; and a new test covers the `whenAborted`
+arm of `call`'s race (a `json()` that never settles and ignores the
+signal still rejects with the "Could not reach the signaling server"
+`SignalError` by the timeout). `bun test`: 392 → 395 (three new
+tests), 15.39 s.
+
 ## Final suites
 
 At `9e4f886` (the `cargo fmt` commit, after Task 8's `c2bdfaf`; the
@@ -237,7 +260,8 @@ commit after it is these docs only), run in Task 9:
 Against Milestone 12's final suites: release `boot_progress` 90 → 92
 (Task 1's two rungs); `cargo test --workspace` 757 → 764 (the two rungs
 and Task 2's five console tests: lib 636 → 641); `bun test` 339 → 392
-(Tasks 2 to 8).
+(Tasks 2 to 8), then 395 after the final review (395 pass, 0 fail,
+19,231 `expect()` calls, 21 files, 15.39 s; see "Final review").
 
 `bun run build`'s output (bytes, `ls -l`): `index.html` 984,
 `bridge-DKQjtxhY.js` 6,241, `firmware-worker-B3_rqCz3.js` 10,837,
@@ -268,17 +292,13 @@ review may close some of these; what it closes comes off this list.
   (~:390) compares JS string length, not bytes (use `consoleWritten()`);
   `text_since` silently returns the whole ring for an `at` older than
   the ring (documented; a caller can detect `written - at >
-  CONSOLE_CAPACITY`); the first `cpu-wasm` case had no RED stage.
+  CONSOLE_CAPACITY`).
 - **Task 3 (the provisioner):** `!==` against the doc's "a rise" for the
-  reboot check (a safe superset, R-T3-1); the mid-character
-  `consoleOffsetOf` test's name overstates what it pins (it guards the
-  forward formula, not a char-count mutation).
+  reboot check (a safe superset, R-T3-1).
 - **Task 4 (the skipper):** `setup-skip.ts`'s `usage:` match is not
   anchored to a line start or to before the OK (the firmware's help text
   has "Heap usage: …").
-- **Task 5 (the Worker):** `firmware-worker.test.ts`'s "extra fields
-  ignored" check sends junk while a skip is in flight, which is refused
-  anyway, so it proves only no throw; no test pins `setupOnScreen` being
+- **Task 5 (the Worker):** no test pins `setupOnScreen` being
   computed only when a status is built (verified by reading
   `firmware-worker.ts`); a refused provision overwrites an earlier
   `done` state with `failed` (R-T4-2).
@@ -288,14 +308,13 @@ review may close some of these; what it closes comes off this list.
   or `reset()` (display only); Remove leaves a linked room's
   `Room X: linked.` line (R-T6-3); a refused Bump always says "the badge
   isn't running" (R-T6-4).
-- **Task 7 (signaling):** `signal-client.test.ts`'s `< 100` ms bound
-  (~:422) leaves 50 ms of slack (a flake risk); `call`'s `whenAborted`
-  arm of the race is untested (the test's stream errors on abort
-  itself).
 - **Task 8 (the minors):** `manifest.test.ts` (~:88-90) repeats the
   assertion at ~:85; `signal-client.test.ts` (~:318-329) restores the
   `warn` spy through a catch-rethrow and an after-loop, where
   `try`/`finally` is simpler.
+- **The final review:** `setupOnScreen` decodes the whole boot's
+  console, up to 256 KiB, four times a second (once per status); it
+  could scan only from the last `app_reg: launched` offset.
 
 ### Carried from Milestone 12's backlog (still open)
 

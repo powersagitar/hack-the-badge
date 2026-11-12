@@ -65,7 +65,8 @@ limitations" sections in particular. Design decisions are in
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
 the v335 → v392 re-pins. Milestone 10's has the radio's rulings.
 Milestone 11's has the CPU-reset table. Milestone 12's has Sync's and
-Share's traces and the Milestone 13 backlog.
+Share's traces. Milestone 13's has Skip setup's pins and rulings and the
+Milestone 14 backlog.
 
 ## Repository layout
 
@@ -91,7 +92,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 392 of them, about 16 s. Most of that is the
+- `bun test`: unit tests, 395 of them, about 16 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.
