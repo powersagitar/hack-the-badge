@@ -158,6 +158,12 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   // this tab holds the badge.
   let badgeHold: BadgeHold | null = null;
   let claiming: Promise<boolean> | null = null;
+  /**
+   * Whether the firmware runs in this tab, set beside each
+   * `hub.setRunning`. A stopped badge posts no status, so Skip setup hides
+   * on it (Milestone 13's final review, R-FR-1).
+   */
+  let running = false;
   const badgeNotice = shell.mountBadgeNotice(() => {
     void runHere();
   });
@@ -166,7 +172,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   function onBadgeLost(): void {
     badgeHold = null;
     firmwareRuntime?.stop();
+    running = false;
     hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
+    refreshStatus();
     showNotice();
   }
 
@@ -220,6 +228,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     // The user switched away, or another tab took the badge, while it booted.
     if (mode !== "firmware" || !badgeHold) return;
     rt.start();
+    running = true;
     hub.setRunning(true); // the bump gate (Milestone 11 Task 11)
   }
 
@@ -256,6 +265,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       lua.stopPaint();
     } else {
       firmwareRuntime?.stop();
+      running = false;
       hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
     }
 
@@ -330,8 +340,12 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       refreshStatus();
     },
     () => {
+      // A stopped badge types nothing, and a refused click keeps the last
+      // status line (Milestone 13's final review, R-FR-1 and R-FR-3).
+      const rt = firmwareRuntime;
+      if (!running || !rt?.setupOnScreen()) return;
       lastStarted = "skip";
-      firmwareRuntime?.skipSetup();
+      rt.skipSetup();
       refreshStatus();
     },
   );
@@ -339,8 +353,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   /**
    * The provisioning controls from the runtime's last status. Skip setup
    * shows only while the firmware's Setup app is on screen, no skip is
-   * typing and no provision is in flight (the provision's token phase runs
-   * after Setup appears; Milestone 13's ruling T4-1). Provision is
+   * typing, no provision is in flight (the provision's token phase runs
+   * after Setup appears; Milestone 13's ruling T4-1) and the badge runs in
+   * this tab (a stopped badge posts no status; R-FR-1). Provision is
    * disabled while a skip types (ruling T5-1). The speed reads
    * `rebooting…` through the reboot's pause, not a speed (ride-along 4).
    */
@@ -352,7 +367,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     const provisionInFlight = st?.kind === "waiting" || st?.kind === "typing";
     const skipTyping = skip?.kind === "typing";
     provisionControls.setSkipVisible(
-      mode === "firmware" && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
+      mode === "firmware" && running && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
     );
     provisionControls.setProvisionEnabled(!skipTyping);
     let text = fetchError;

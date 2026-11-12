@@ -154,7 +154,7 @@ export function buildProvisionControls(
   const hint = doc.createElement("p");
   hint.className = "provision-hint";
   hint.textContent =
-    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. In Connect, press Bump. Press Skip setup to jump past it.";
+    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. Press Skip setup to jump past the setup. In Connect, press Bump.";
   container.append(select, provisionBtn, skipBtn, shakeBtn, bumpBtn, status, hint);
   return {
     setStatus: (text) => {

@@ -128,7 +128,10 @@ describe("provision controls", () => {
     expect(provision.disabled).toBe(true);
     controls.setProvisionEnabled(true);
     expect(provision.disabled).toBe(false);
-    expect(root.querySelector(".provision-hint")!.textContent).toContain("Press Skip setup to jump past it.");
+    // Right after the setup's sentence, so "the setup" is what it skips, not Connect.
+    expect(root.querySelector(".provision-hint")!.textContent).toContain(
+      "press Shake. Press Skip setup to jump past the setup. In Connect",
+    );
   });
 });
 
@@ -621,6 +624,47 @@ describe("badge controller", () => {
     r.skipButton().click();
     r.status({ setupOnScreen: true, provision: { kind: "ok", line: "PROV OK id=x" }, skip: { kind: "typing" } });
     expect(r.statusText()).toContain("skipping setup…");
+  });
+
+  test("Skip setup hides on a badge lost to another tab, and a click sends nothing", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ setupOnScreen: true });
+    expect(r.skipShown()).toBe(true);
+    // Another tab takes the badge over: this one stops and posts no more statuses.
+    void r.locks.request(BADGE_LOCK_NAME, { steal: true }, () => new Promise(() => {}));
+    await settle();
+    expect(r.noticeShown()).toBe(true);
+    expect(r.running).toEqual([true, false]);
+    expect(r.skipShown()).toBe(false);
+    r.controller.refreshStatus();
+    expect(r.skipShown()).toBe(false);
+    r.skipButton().click(); // a click on the hidden button all the same
+    r.controller.refreshStatus();
+    expect(r.workers[0]!.sent.filter((m) => m.kind === "skipSetup")).toHaveLength(0);
+    expect(r.statusText()).not.toContain("skipping setup");
+    expect(button(r.controls(), "Provision test badge").disabled).toBe(false);
+  });
+
+  test("a refused Skip setup click keeps the newer provision's status", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ setupOnScreen: true });
+    r.skipButton().click();
+    const failed = { kind: "failed", reason: "timed out" } as const;
+    r.status({ setupOnScreen: true, skip: failed });
+    button(r.controls(), "Provision test badge").click();
+    await settle();
+    r.status({ setupOnScreen: false, provision: { kind: "ok", line: "PROV OK id=x" }, skip: failed });
+    expect(r.statusText()).toContain("PROV OK id=x");
+    // Setup is off screen: the client refuses the click, and the old skip failure stays hidden.
+    r.skipButton().click();
+    r.controller.refreshStatus();
+    expect(r.statusText()).toContain("PROV OK id=x");
+    expect(r.statusText()).not.toContain("skip failed");
+    expect(r.workers[0]!.sent.filter((m) => m.kind === "skipSetup")).toHaveLength(1);
   });
 
   test("the speed reads rebooting… during the reboot's pause", async () => {
