@@ -21,6 +21,26 @@ const MAX_LEN: Record<string, number> = {
   net_instagram: 31,
   net_x: 31,
 };
+/**
+ * Each role's [display_name, account_email]: the spec's "Friendly
+ * identities" table (Milestone 14; historical figures only, no living
+ * person, all on example.com). It replaces Milestone 5's "Test <Role>"
+ * names, overridden by the human partner on 2026-11-12
+ * (docs/milestone-14-decisions.md).
+ */
+const FRIENDLY: Record<string, [string, string]> = {
+  hacker: ["Ada Lovelace", "ada.lovelace@example.com"],
+  organizer: ["Grace Hopper", "grace.hopper@example.com"],
+  sponsor: ["Andrew Carnegie", "andrew.carnegie@example.com"],
+  judge: ["Alan Turing", "alan.turing@example.com"],
+  mentor: ["Charles Babbage", "charles.babbage@example.com"],
+  volunteer: ["Annie Easley", "annie.easley@example.com"],
+  media: ["Hedy Lamarr", "hedy.lamarr@example.com"],
+  staff: ["Katherine Johnson", "katherine.johnson@example.com"],
+  general: ["Jane Doe", "jane.doe@example.com"],
+  workshop_lead: ["Dennis Ritchie", "dennis.ritchie@example.com"],
+  visitor: ["Nikola Tesla", "nikola.tesla@example.com"],
+};
 /** The registered-record key set (Trace facts; `role_color` is optional and left out). */
 const KEYS = [
   "version",
@@ -75,7 +95,7 @@ describe("committed test identities", () => {
       expect(id.attendee_id).toBe(index + 1);
       expect(id.provisioned_unix).toBe(1_767_225_600); // 2026-01-01T00:00:00Z
       expect(id.claim_id).toBe("100001");
-      expect(id.display_name.startsWith("Test ")).toBe(true);
+      expect([id.display_name, id.account_email]).toEqual(FRIENDLY[role]);
       expect(id.badge_id.startsWith("test-")).toBe(true);
       expect(id.account_email.endsWith("@example.com")).toBe(true);
       for (const k of ["net_email", "net_phone", "net_linkedin", "net_discord", "net_instagram", "net_x"]) {

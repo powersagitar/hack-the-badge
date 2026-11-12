@@ -316,7 +316,7 @@ describe("provisioner", () => {
     const { f, p } = toProvOk();
     // The PROV OK line alone does not start the token: its prompt follows.
     expect(f.typed.length).toBe(3);
-    f.print("name=Test Hacker role=Hacker attendee=1 tutorial=reset\r\nbadge> ");
+    f.print("name=Ada Lovelace role=Hacker attendee=1 tutorial=reset\r\nbadge> ");
     expect(p.poll().kind).toBe("typing");
     expect(f.typed[3]).toBe("badge_token set\n");
     f.print("badge_token set\r\n");
@@ -404,14 +404,14 @@ describe("provisioner", () => {
     f.print("OK 2\r\nbadge> ");
     p.poll();
     expect(f.typed[2]).toBe("prov apply\n");
-    f.print("prov apply\r\nI (94586) hal_identity: identity: Test Organizer\r\n");
+    f.print("prov apply\r\nI (94586) hal_identity: identity: Grace Hopper\r\n");
     expect(p.poll().kind).toBe("typing");
     f.print("PROV OK id=test-fake-badge-0002 mac=02:00:00:00:10:02\r\n");
     // Neither the old boot's text nor put's prompt counts.
     expect(p.poll().kind).toBe("typing");
     expect(p.poll().kind).toBe("typing");
     expect(f.typed.length).toBe(3);
-    f.print("name=Test Organizer role=Organizer attendee=2 tutorial=reset\r\nbadge> ");
+    f.print("name=Grace Hopper role=Organizer attendee=2 tutorial=reset\r\nbadge> ");
     p.poll();
     expect(f.typed[3]).toBe("badge_token set\n");
     // The old `BADGE_TOKEN READY`/`OK` lines do not count either.
