@@ -15,9 +15,10 @@
  *   the substeps of one step() call, through sensorMg with
  *   GAIN_MG_PER_PX_S2. The sink gets one sample per step() that ran a
  *   substep.
- * - Impacts: a badge-wall contact whose contact point approaches the
- *   wall faster than IMPACT_PX_S fires onImpact, at most once per
- *   IMPACT_COOLDOWN_MS of simulated time (the design's `detect()`).
+ * - Impacts: a new contact (a bounds edge reaching its wall after
+ *   WALL_REARM_MS away) whose edge approached faster than IMPACT_PX_S
+ *   fires onImpact, at most once per IMPACT_COOLDOWN_MS of simulated
+ *   time (the design's `detect()`; see wallCheck).
  *
  * Constants and their tuning: docs/milestone-14-decisions.md, "Lanyard
  * physics and the sensor (Task 9)".
@@ -27,7 +28,7 @@ import { BOARD_AXES, type AxisMap } from "./axes";
 import { sensorMg } from "./sensor";
 import type { Mg, MotionSource } from "./source";
 
-const { Bodies, Body, Composite, Constraint, Engine, Events, Vertices } = Matter;
+const { Bodies, Body, Composite, Constraint, Engine, Vertices } = Matter;
 
 /** The photo's size (local/m14-design/front.webp), for the aspect ratio. */
 export const IMG_W = 974;
@@ -44,7 +45,7 @@ export const MAX_SUBSTEPS = 12;
  * mg per px/s² of simulated motion (Step 6's tuning against the real
  * firmware's "Shake it!" page; see the decisions doc).
  */
-export const GAIN_MG_PER_PX_S2 = 0.1;
+export const GAIN_MG_PER_PX_S2 = 0.2;
 /** Normal speed at a wall that counts as an impact (design: 7 px/step at 120 Hz). */
 export const IMPACT_PX_S = 840;
 export const IMPACT_COOLDOWN_MS = 800;
@@ -60,6 +61,8 @@ interface Push {
   from: number;
   to: number;
   ax: number;
+  /** Part of impulse("shake")'s train (a new shake replaces only these). */
+  shake?: boolean;
 }
 
 const SHAKE_HALF_MS = 80;
@@ -73,6 +76,17 @@ const PEER_BUMP_PX_S2 = 30_000;
 const PEER_BUMP_QUIET_MS = 1000;
 /** A runaway (or NaN) body speed; the world is rebuilt at rest past it. */
 const RUNAWAY_PX_S = 50_000;
+/**
+ * How far past a wall (and past the rope's reach) the grip may pull: the
+ * wall collider, not the grip, stops a fling, so it arrives at speed.
+ */
+const GRIP_OVERREACH_PX = 40;
+/** Silent substeps at (re)build, so the world starts at rest (2 s). */
+const SETTLE_SUBSTEPS = 240;
+/** An edge this close to its wall touches it. */
+const TOUCH_EPS_PX = 1;
+/** Time away from a wall before touching it again starts a new contact. */
+const WALL_REARM_MS = 50;
 /** Speed caps, as the design's Verlet (60 px per 1/120 s step). */
 const MAX_SPEED_PX_S = 7200;
 const MAX_SPIN_RAD_S = 40;
@@ -140,6 +154,9 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
   let engine: Matter.Engine;
   let badge: Matter.Body;
   let nodes: Matter.Body[];
+  /** The rope's links, the first one anchored; and the two wall bodies. */
+  let links: Matter.Constraint[];
+  let wallBodies: Matter.Body[];
   let grip: Matter.Constraint | null = null;
   let pointer: Point = { x: 0, y: 0 };
 
@@ -153,6 +170,9 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
 
   // The chip spot's last position and velocity (px, px/s), for the
   // acceleration's finite differences; null right after a (re)build.
+  /** The badge's x velocity (px/s) and spin (rad/s) over the last substep. */
+  /** Per wall: when the badge last touched it, and its edge's last speed toward it. */
+  let walls = { left: { lastTouch: -Infinity, lastV: 0 }, right: { lastTouch: -Infinity, lastV: 0 } };
   let qPrev: Point | null = null;
   let vPrev: Point | null = null;
   let current: Mg = sensorMg(0, { x: 0, y: 0 }, gain, axes);
@@ -171,6 +191,7 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     });
     const seg = ropeLen / ROPE_SEGMENTS;
     nodes = [];
+    links = [];
     const parts: Array<Matter.Body | Matter.Constraint> = [];
     for (let i = 1; i <= ROPE_SEGMENTS; i++) {
       const n = Bodies.circle(anchor.x, anchor.y + i * seg, 3, {
@@ -180,13 +201,13 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       Body.setMass(n, 0.04);
       nodes.push(n);
       parts.push(n);
-      parts.push(
-        Constraint.create(
-          i === 1
-            ? { pointA: { ...anchor }, bodyB: n, length: seg, stiffness: 1, damping: 0.05 }
-            : { bodyA: nodes[i - 2], bodyB: n, length: seg, stiffness: 1, damping: 0.05 },
-        ),
+      const link = Constraint.create(
+        i === 1
+          ? { pointA: { ...anchor }, bodyB: n, length: seg, stiffness: 1, damping: 0.05 }
+          : { bodyA: nodes[i - 2], bodyB: n, length: seg, stiffness: 1, damping: 0.05 },
       );
+      links.push(link);
+      parts.push(link);
     }
     const ring = nodes[nodes.length - 1].position;
     const dPC = clip + bh / 2;
@@ -208,6 +229,27 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
         damping: 0.05,
       }),
     );
+    wallBodies = makeWalls(W, H);
+    parts.push(...wallBodies);
+    Composite.add(engine.world, parts);
+    // Settle silently: the rope stretches as it takes the badge's weight,
+    // which would otherwise read as a ±180 mg bounce at the start.
+    for (let i = 0; i < SETTLE_SUBSTEPS; i++) Engine.update(engine, STEP_MS);
+    for (const b of [badge, ...nodes]) {
+      Body.setVelocity(b, { x: 0, y: 0 });
+      Body.setAngularVelocity(b, 0);
+    }
+    grip = null;
+    pushes = [];
+    knockUntil = -1;
+    qPrev = null;
+    vPrev = null;
+    walls = { left: { lastTouch: -Infinity, lastV: 0 }, right: { lastTouch: -Infinity, lastV: 0 } };
+    debtMs = 0;
+  }
+
+  /** The stage's side walls: static colliders just outside 0 and W. */
+  function makeWalls(W: number, H: number): Matter.Body[] {
     const T = 400;
     const wallOpts = {
       isStatic: true,
@@ -218,17 +260,37 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     };
     const left = Bodies.rectangle(-T / 2, H / 2, T, H * 6, wallOpts);
     const right = Bodies.rectangle(W + T / 2, H / 2, T, H * 6, wallOpts);
-    left.label = "wall-left";
-    right.label = "wall-right";
-    parts.push(left, right);
-    Composite.add(engine.world, parts);
-    Events.on(engine, "collisionStart", onCollision);
-    grip = null;
-    pushes = [];
-    knockUntil = -1;
+    return [left, right];
+  }
+
+  /**
+   * The design's relayout: a new badge size rebuilds the world at rest;
+   * the same size (within 0.5 px) keeps the swing, moving the rope, the
+   * badge and any grip with the anchor and re-placing the walls.
+   */
+  function relayout(width: number, height: number): void {
+    const next = lanyardGeometry(width, height, layout);
+    if (Math.abs(next.bh - geo.bh) > 0.5) {
+      build(width, height);
+      current = sensorMg(0, { x: 0, y: 0 }, gain, axes);
+      return;
+    }
+    const shift = { x: next.anchor.x - geo.anchor.x, y: next.anchor.y - geo.anchor.y };
+    geo = next;
+    for (const b of [badge, ...nodes]) Body.translate(b, shift);
+    if (grip) {
+      grip.pointA = { x: grip.pointA.x + shift.x, y: grip.pointA.y + shift.y };
+      pointer = { x: pointer.x + shift.x, y: pointer.y + shift.y };
+    }
+    links[0].pointA = { ...geo.anchor };
+    for (const link of links) link.length = geo.ropeLen / ROPE_SEGMENTS;
+    Composite.remove(engine.world, wallBodies);
+    wallBodies = makeWalls(geo.W, geo.H);
+    Composite.add(engine.world, wallBodies);
+    // The shift is not motion: restart the finite differences.
     qPrev = null;
     vPrev = null;
-    debtMs = 0;
+    keepInside();
   }
 
   function chipSpot(): Point {
@@ -239,29 +301,50 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     return { x: badge.position.x + lx * c - ly * s, y: badge.position.y + lx * s + ly * c };
   }
 
-  function onCollision(ev: Matter.IEventCollision<Matter.Engine>): void {
-    for (const pair of ev.pairs) {
-      const wall = pair.bodyA === badge ? pair.bodyB : pair.bodyB === badge ? pair.bodyA : null;
-      if (!wall || !wall.label.startsWith("wall")) continue;
-      const leftWall = wall.label === "wall-left";
-      // The contact point's velocity: linear plus the rotation's ω × r.
-      const vx = Body.getVelocity(badge).x * PER_SECOND;
-      const w = Body.getAngularVelocity(badge) * PER_SECOND;
-      let speed = 0;
-      for (const sup of pair.collision.supports) {
-        if (!sup) continue;
-        const ry = sup.y - badge.position.y;
-        const pvx = vx - w * ry;
-        speed = Math.max(speed, leftWall ? -pvx : pvx);
+  /**
+   * Wall impacts, measured on the badge's bounds (so the leading corner's
+   * rotation counts) from its actual motion, which includes the grip's
+   * position corrections. A contact episode starts when an edge reaches
+   * its wall after WALL_REARM_MS away from it; it is an impact if the
+   * edge approached faster than IMPACT_PX_S over the substep before or
+   * the substep of contact. A badge held against the wall stays in one
+   * episode, however the solver jitters, and never re-fires.
+   */
+  function wallCheck(prevMin: number, prevMax: number): void {
+    const { min, max } = badge.bounds;
+    const sides = [
+      { touching: min.x <= TOUCH_EPS_PX, v: (prevMin - min.x) / STEP_S, wall: walls.left },
+      { touching: max.x >= geo.W - TOUCH_EPS_PX, v: (max.x - prevMax) / STEP_S, wall: walls.right },
+    ];
+    for (const side of sides) {
+      const w = side.wall;
+      if (side.touching) {
+        if (simMs - w.lastTouch > WALL_REARM_MS) {
+          if (knockUntil >= 0) knockUntil = -1; // the knock's push ends at the wall
+          if (Math.max(side.v, w.lastV) > IMPACT_PX_S) fireImpact();
+        }
+        w.lastTouch = simMs;
       }
-      if (knockUntil >= 0) knockUntil = -1; // the knock's push ends at the wall
-      if (
-        speed > IMPACT_PX_S &&
-        simMs - lastImpact > IMPACT_COOLDOWN_MS &&
-        simMs >= quietUntil
-      ) {
-        lastImpact = simMs;
-        for (const cb of [...impactListeners]) cb();
+      w.lastV = side.v;
+    }
+  }
+
+  /** The design's hard clamp: the badge's bounds never leave the walls. */
+  function keepInside(): void {
+    const { min, max } = badge.bounds;
+    const dx = min.x < 0 ? -min.x : max.x > geo.W ? geo.W - max.x : 0;
+    if (dx !== 0) Body.translate(badge, { x: dx, y: 0 });
+  }
+
+  function fireImpact(): void {
+    if (simMs - lastImpact <= IMPACT_COOLDOWN_MS || simMs < quietUntil) return;
+    lastImpact = simMs;
+    for (const cb of [...impactListeners]) {
+      try {
+        cb();
+      } catch (err) {
+        // A listener's failure never aborts the simulation step.
+        console.error("lanyard: onImpact listener threw", err);
       }
     }
   }
@@ -301,8 +384,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     let x = Math.max(-40, Math.min(geo.W + 40, pointer.x));
     let y = Math.max(-40, Math.min(geo.H + 40, pointer.y));
     const hw = geo.bw / 2;
-    x = Math.max(off.x + hw, Math.min(geo.W - hw + off.x, x));
-    const reach = geo.ropeLen + geo.clip + geo.bh / 2 + Math.hypot(off.x, off.y);
+    x = Math.max(off.x + hw - GRIP_OVERREACH_PX, Math.min(geo.W - hw + off.x + GRIP_OVERREACH_PX, x));
+    const reach = geo.ropeLen + geo.clip + geo.bh / 2 + Math.hypot(off.x, off.y) + GRIP_OVERREACH_PX;
     const dx = x - geo.anchor.x;
     const dy = y - geo.anchor.y;
     const d = Math.hypot(dx, dy);
@@ -331,6 +414,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
   function substep(): Point {
     applyPushes();
     if (grip) grip.pointA = gripTarget();
+    const prevMin = badge.bounds.min.x;
+    const prevMax = badge.bounds.max.x;
     Engine.update(engine, STEP_MS);
     simMs += STEP_MS;
     capSpeeds();
@@ -338,6 +423,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       build(geo.W, geo.H);
       return { x: 0, y: 0 };
     }
+    wallCheck(prevMin, prevMax);
+    keepInside();
     const q = chipSpot();
     let a = { x: 0, y: 0 };
     if (qPrev) {
@@ -373,8 +460,7 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       sink?.(current);
     },
     relayout(width, height) {
-      build(width, height);
-      current = sensorMg(0, { x: 0, y: 0 }, gain, axes);
+      relayout(width, height);
     },
     pose() {
       return {
@@ -415,12 +501,13 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     impulse(kind) {
       if (kind === "shake") {
         const dir = badge.position.x < geo.W / 2 ? 1 : -1;
-        pushes = [];
+        pushes = pushes.filter((p) => !p.shake); // a peer bump's push survives
         for (let k = 0; k < SHAKE_HALVES; k++) {
           pushes.push({
             from: simMs + k * SHAKE_HALF_MS,
             to: simMs + (k + 1) * SHAKE_HALF_MS,
             ax: (k % 2 === 0 ? dir : -dir) * SHAKE_PX_S2,
+            shake: true,
           });
         }
       } else {

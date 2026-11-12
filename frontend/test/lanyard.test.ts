@@ -124,6 +124,133 @@ describe("lanyard", () => {
     expect(impacts).toBe(1);
   });
 
+  /** The largest vector change between readings 40–70 ms apart (Connect's bump). */
+  function bumpDelta(rs: Mg[]): number {
+    let best = 0;
+    for (let i = 0; i < rs.length; i++) {
+      for (let j = i + 3; j < rs.length && (j - i) * FRAME_MS <= 70; j++) {
+        if ((j - i) * FRAME_MS >= 40) best = Math.max(best, dist(rs[i], rs[j]));
+      }
+    }
+    return best;
+  }
+
+  for (const [W, H, layout] of [
+    [1000, 780, "desktop"],
+    [820, 780, "desktop"],
+    [390, 640, "mobile"],
+    [430, 800, "mobile"],
+  ] as const) {
+    for (const ms of [100, 250]) {
+      test(`a fast drag into the wall fires onImpact once and reads >400 mg 40–70 ms apart (${W}×${H}, ${ms} ms)`, () => {
+        const { l, readings, run } = rig(W, H, layout);
+        run(2000);
+        let impacts = 0;
+        l.onImpact(() => impacts++);
+        const from = readings.length;
+        const c = centre(l);
+        expect(l.grab(c)).toBe(true);
+        const frames = Math.round(ms / FRAME_MS);
+        for (let i = 1; i <= frames; i++) {
+          l.drag({ x: c.x + ((W + 40 - c.x) * i) / frames, y: c.y });
+          run(FRAME_MS);
+        }
+        run(150); // still holding past the wall
+        l.release();
+        run(800 - ms - 150);
+        expect(impacts).toBe(1);
+        expect(bumpDelta(readings.slice(from))).toBeGreaterThan(400);
+      });
+    }
+  }
+
+  test("relayout at the same badge size keeps the swing", () => {
+    // 1000×780 and 1100×780 both give bh = 550: the design moves the
+    // anchor and walls instead of resetting.
+    const { l, readings, run } = rig();
+    run(300);
+    const c = centre(l);
+    l.grab(c);
+    for (let i = 1; i <= 20; i++) {
+      l.drag({ x: c.x + 8 * i, y: c.y });
+      run(FRAME_MS);
+    }
+    l.release();
+    run(100);
+    const before = l.pose().badge;
+    expect(Math.abs(before.angle)).toBeGreaterThan(0.02);
+    l.relayout(1100, 780);
+    const after = l.pose();
+    expect(after.rope[0]).toEqual({ x: 550, y: -10 });
+    expect(after.badge.h).toBeCloseTo(550, 5);
+    expect(after.badge.angle).toBeCloseTo(before.angle, 6);
+    expect(after.badge.x).toBeCloseTo(before.x + 50, 6);
+    const from = readings.length;
+    run(2000);
+    for (const mg of readings.slice(from)) {
+      for (const v of mg) {
+        expect(Number.isFinite(v)).toBe(true);
+        expect(Math.abs(v)).toBeLessThanOrEqual(CLAMP_MG);
+      }
+    }
+  });
+
+  test("a shake does not cancel a peer bump in flight", () => {
+    // Both rigs hold the badge 60 px left of centre, then let go: the
+    // bump and the shake's first half both push right (away from the
+    // nearer wall). A small gain keeps the readings off the ±2000 clamp.
+    const make = () => {
+      const l = createLanyard({ width: 1000, height: 780, layout: "desktop", gain: 0.005 });
+      const rs: Mg[] = [];
+      l.start((mg) => rs.push(mg));
+      const run = (ms: number) => {
+        for (let t = 0; t < ms; t += FRAME_MS) l.step(FRAME_MS);
+      };
+      run(1000);
+      const c = centre(l);
+      l.grab(c);
+      l.drag({ x: c.x - 60, y: c.y });
+      run(2000);
+      l.release();
+      return { l, rs, run };
+    };
+    const both = make();
+    const shakeOnly = make();
+    both.l.peerBump();
+    for (const r of [both, shakeOnly]) r.run(2 * FRAME_MS);
+    for (const r of [both, shakeOnly]) {
+      r.l.impulse("shake");
+      r.run(3 * FRAME_MS);
+    }
+    const [axis, sign] = BOARD_AXES.right;
+    const withBump = both.rs.at(-1)![axis] * sign;
+    const alone = shakeOnly.rs.at(-1)![axis] * sign;
+    expect(withBump).toBeLessThan(CLAMP_MG);
+    // The bump's 30,000 px/s² on top of the shake's 40,000: about 150 mg more.
+    expect(withBump - alone).toBeGreaterThan(100);
+  });
+
+  test("a throwing onImpact listener never aborts step()", () => {
+    const { l, readings, run } = rig();
+    run(1000);
+    let after = 0;
+    l.onImpact(() => {
+      throw new Error("listener bug");
+    });
+    l.onImpact(() => after++);
+    const errors = console.error;
+    console.error = () => {};
+    try {
+      l.impulse("knock");
+      const n = readings.length;
+      expect(() => run(800)).not.toThrow();
+      expect(readings.length - n).toBeGreaterThan(40);
+    } finally {
+      console.error = errors;
+    }
+    expect(after).toBe(1);
+  });
+
   test("knock fires onImpact on the mobile stage too", () => {
     const { l, run } = rig(390, 640, "mobile");
     run(1000);

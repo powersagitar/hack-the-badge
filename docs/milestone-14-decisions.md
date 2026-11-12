@@ -242,55 +242,113 @@ Traced in v392's disassembly (`firmware.bin`'s IROM segment at
 
 `frontend/src/motion/`: `source.ts` (the `MotionSource` seam),
 `axes.ts`, `sensor.ts` (pure) and `lanyard.ts` (matter.js, headless).
+Review fix round 1 changed the impact detector, the grip clamps,
+relayout, the start-up settle and the gain; this section describes the
+result.
 
-- **World.** A 10-segment rope of point masses (0.04 each, frictionAir
-  0.03, no collisions) from the anchor at (W/2, −10) to the badge's
-  ring, pinned `clip + bh/2` above the badge's centre (the design's
-  `dPC`). The badge is a rigid body of mass 1, with frictionAir 0.022
-  and restitution 0.35. The side walls are static colliders at the
-  stage edges. Gravity is 2400 px/s², and every substep is a fixed
-  1/120 s, at most 12 per `step()` (any further debt is dropped). The
-  layout clamps are the design's `layout()`, as the brief gives them.
-  `relayout` rebuilds the world at rest, which also ends a drag.
+- **World.**
+  - **Rope.** 10 point-mass segments (0.04 each, frictionAir 0.03, no
+    collisions) from the anchor at (W/2, −10) to the badge's ring. The
+    ring is pinned `clip + bh/2` above the badge's centre (the design's
+    `dPC`).
+  - **Badge and walls.** The badge is a rigid body of mass 1,
+    frictionAir 0.022, restitution 0.35. The side walls are static
+    colliders at the stage edges. As the design's `detect()` clamps C,
+    the badge's bounds are also clamped inside the walls after every
+    substep.
+  - **Time.** Gravity is 2400 px/s². Every substep is a fixed 1/120 s,
+    at most 12 per `step()`; any further debt is dropped.
+  - **Layout.** The clamps are the design's `layout()`, as the brief
+    gives them.
+- **Start-up settle.** A (re)build runs 240 silent substeps (2 s), then
+  zeroes every velocity. The rope stretches as it takes the badge's
+  weight. Without the settle, the first 0.6 s bounced about ±180 mg at
+  a gain of 0.1. That is enough to trip Connect's 400 mg detector at
+  higher gains, on page load or on any relayout.
+- **Relayout.** As the design does, a badge height that changes by more
+  than 0.5 px rebuilds the world at rest, which ends a drag. The same
+  height keeps the swing: the rope, the badge and any grip move with
+  the anchor, the walls are re-made, and the rope links take the new
+  length.
 - **Damping.** With the badge's frictionAir at 0.014 (the design's
   0.993 per step), a drag-and-release was still 36 mg from rest after
   5 s, against the test's limit of 30. At 0.022 it is about 12 mg.
 - **Drag.** `grab` pins the badge at the grabbed point with a
   stiffness-0.6 constraint. The grip's target is the pointer, clamped
-  three ways: to the stage ±40 px (as the design does), to within the
-  rope's reach of the anchor, and so that the badge's centre stays
-  between the walls. Speeds are capped at 7200 px/s (the design's 60 px
-  per step) and the spin at 40 rad/s.
-  - Without the reach and wall clamps, a slow push dragged the badge
-    through the right wall. On release the rope whipped it above the
-    anchor, flipped (y = −467, angle −2.36).
-  - A NaN or runaway body rebuilds the world at rest.
+  three ways:
+  - to the stage ±40 px (as the design does);
+  - to within the rope's reach of the anchor, plus 40 px;
+  - so that the badge's centre stays at most 40 px past where it would
+    touch a wall.
+
+  The 40 px overreach lets a fling arrive at the wall at speed. The
+  wall collider and the bounds clamp stop it, not the grip.
+  - Round 1 clamped exactly at the wall and the reach. That braked a
+    fling to a stop at the wall: on 1000 px the centre never passed
+    754, with the wall at 823. Fast flings at 820, 600, 430 and 360 px
+    then missed their impact.
+  - With no clamp at all, a slow push dragged the badge through the
+    wall, and on release the rope whipped it above the anchor, flipped
+    over (y = −467, angle −2.36).
+  - Speeds are capped at 7200 px/s (the design's 60 px per step) and
+    the spin at 40 rad/s. A NaN or runaway body rebuilds the world at
+    rest.
 - **Sensor.** The chip spot's acceleration comes from second
   differences of its position across substeps, so the rotational terms
-  are included. It is averaged over one `step()` call's substeps and
-  passed to `sensorMg`. Gravity is a true 1 g through the badge's tilt.
-  Each axis is clamped to ±2000 mg and rounded, and a non-finite input
-  reads as rest.
-- **Impacts.** On a badge–wall `collisionStart`, the contact point's
-  approach speed (linear plus ω × r) is compared with `IMPACT_PX_S` =
-  **840 px/s**, the design's `detect()` threshold of 7 px per 1/120 s
-  step, unchanged. At most one impact fires per 800 ms of simulated
-  time.
-  - Measured on the design's stage sizes (1000×780 and 820×780 desktop,
-    390×640 mobile): pushing the pointer from the centre past the wall
-    in 80–400 ms fires one impact, and the same push over 700 ms or
-    1500 ms fires none.
-  - A ±20 px, 1 Hz drag fires none.
-  - `impulse("knock")` (a 30,000 px/s² push toward the nearer wall, at
-    most 400 ms, ending at contact) fires exactly one, on both layouts.
+  are included. Gravity is a true 1 g through the badge's tilt. Each
+  axis is clamped to ±2000 mg and rounded, and a non-finite input reads
+  as rest.
+  - The reading is the average of the substeps' accelerations within
+    one `step()` call. After a stall, up to the 12-substep cap, a short
+    spike such as a wall hit is diluted across that call's substeps.
+- **Impacts.** One geometric detector on the badge's bounds, so the
+  leading corner's rotation counts. It works from the badge's actual
+  displacement, which includes the grip's position corrections.
+  - **The rule.** A contact episode starts when a bounds edge reaches
+    its wall (within 1 px) after at least 50 ms away from it. It is an
+    impact if that edge approached faster than `IMPACT_PX_S` =
+    **840 px/s**, over the substep before contact or the substep of
+    contact. 840 px/s is the design's `detect()` threshold of 7 px per
+    1/120 s step, unchanged. At most one impact fires per 800 ms of
+    simulated time. A listener that throws is caught and logged, and
+    never aborts `step()`.
+  - **Why not matter's collision events.** Round 1 used
+    `collisionStart`, which reads matter's velocity at contact. That
+    missed flings where the grip moved the badge by position
+    correction: a 3-frame fling on 600 px jumped the badge 39 px into
+    the wall within one substep while its velocity stayed small.
+    Adding `collisionActive` fired repeatedly while a held badge rested
+    against the wall. matter's velocity there is pre-resolution, a
+    steady ~1400 px/s, plus a 7 rad/s angle flicker as the grip and the
+    wall fight.
+  - **Measured (the reviewer's probe).** Grabbed at the centre, the
+    pointer was dragged past the wall over 50, 100, 150, 250 and
+    400 ms, either released at 60% of the way or held. On 1000×780,
+    820×780, 600×780, 390×640, 430×800 and 360×600 every case fires
+    exactly one impact.
+    - A push over 1000 ms or 1500 ms fires none on any stage while it
+      is held.
+    - On the narrow stages (600 px and the phones) the released badge
+      then swings into the opposite wall fast enough to count once.
+      That is a real hit.
+    - ±20 px and ±40 px drags at 1 Hz fire none on any stage.
+    - ±60 px at 2 Hz fires 1–2 on the stages narrower than 820 px,
+      where the badge has 50–120 px of room.
+  - `impulse("knock")` is a 30,000 px/s² push toward the nearer wall,
+    for at most 400 ms, ending at contact. It fires exactly one, on both
+    layouts.
 - **Peer bump.** `peerBump()` pushes the badge at 30,000 px/s² for
   100 ms, away from the nearer wall. That reads about 2000 mg (clamped),
   far above Connect's 400 mg, for longer than its 40–70 ms sample gap.
   For 1000 ms afterwards no outgoing impact fires, so a peer's bump is
-  never echoed back.
+  never echoed back. A shake started during a peer bump replaces only an
+  earlier shake's pushes, never the bump's.
 - **Shake key.** `impulse("shake")` is six alternating 80 ms pushes at
-  40,000 px/s². Against the WASM twin on "Shake it!" it passed the page
-  (a scratch probe; not a committed test).
+  40,000 px/s².
+  - At gain 0.1 it passed "Shake it!" on the WASM twin (a scratch
+    probe, not a committed test).
+  - At gain 0.2 the detector replica (below) passes it at 100% of
+    sampling phases on 1000×780 and 96% on 390×640.
 - **The firmware's sample rate.** With the acceleration changed every
   1 ms on page 6, the frame changed every **~80 ms** (12.5 Hz; gaps 76
   to 81 ms over 1 s). The page's tick runs the detector and then prints
@@ -300,31 +358,36 @@ Traced in v392's disassembly (`firmware.bin`'s IROM segment at
   4–5× faster than either detector needs. Delivery (Task 12) should
   keep about that rate.
 
-### GAIN_MG_PER_PX_S2 = 0.1
+### GAIN_MG_PER_PX_S2 = 0.2
 
-Measured with `frontend/test/physics-shake.test.ts`'s method: the WASM
-twin walked to Setup page 6. The lanyard runs on a 1000×780 desktop
-stage, and the badge is grabbed at its centre. Every 1/60 s the
-lanyard's reading goes to `setAcceleration` and the emulator runs to
-that emulated time. Each drag is 0.5 s at rest, 2 s of drag and 1 s
-after release. The verdict is A: once the page is shaken, A opens page
-7. The page prints the live `G-force` and `Peak`, so the frame changes
-with any motion and "leaves page 6's hash" cannot tell the two cases
-apart.
+Measured with `frontend/test/physics-shake.test.ts`'s method:
+- The WASM twin is walked to Setup page 6.
+- The lanyard runs on a 1000×780 desktop stage, with the badge grabbed
+  at its centre.
+- Every 1/60 s the lanyard's reading goes to `setAcceleration`, and the
+  emulator runs to that emulated time.
+- Each drag is 0.5 s at rest, 2 s of drag and 1 s after release.
 
-| gain | gentle (±20 px, 1 Hz): peak \|a\| | gentle: page | vigorous (±120 px, 3 Hz): peak \|a\| | vigorous: page |
-|---|---|---|---|---|
-| 0.01 | 1018 | stayed | 2547 | stayed |
-| 0.02 | 1037 | stayed | 2828 | stayed |
-| 0.025 | 1046 | stayed | 2828 | stayed |
-| 0.03 | 1055 | stayed | 2828 | stayed |
-| 0.04 | 1074 | stayed | 2828 | **passed** |
-| 0.05 | 1092 | stayed | 2828 | passed |
-| 0.08 | 1147 | stayed | 2828 | passed |
-| **0.1** | **1184** | **stayed** | **2828** | **passed** |
-| 0.12 | 1221 | stayed | 2828 | passed |
-| 0.2 | 1368 | stayed | 2828 | passed |
-| 0.3 | 1552 | stayed | 2828 | passed |
+The verdict is A: once the page is shaken, A opens page 7. The page
+prints the live `G-force` and `Peak`, so the frame changes with any
+motion, and "leaves page 6's hash" cannot tell the two cases apart.
+
+The table is the final physics, after fix round 1. "Phase pass" comes
+from the detector replica described below the table.
+
+| gain | gentle (±20 px, 1 Hz) peak \|a\| | gentle: page | vigorous (±120 px, 3 Hz) peak \|a\| | vigorous: page | vigorous phase pass | gentle phase pass |
+|---|---|---|---|---|---|---|
+| 0.02 | 1018 | stayed | 2728 | stayed | – | – |
+| 0.03 | 1026 | stayed | 2828 | passed | 0.42 | 0 |
+| 0.04 | 1035 | stayed | 2828 | passed | 0.42 | 0 |
+| 0.05 | 1044 | stayed | 2828 | passed | 0.50 | 0 |
+| 0.08 | 1071 | stayed | 2828 | **stayed** | 0.18 | 0 |
+| 0.1 | 1088 | stayed | 2828 | **stayed** | 0.20 | 0 |
+| 0.12 | 1106 | stayed | 2828 | passed | 0.81 | 0 |
+| 0.15 | 1132 | stayed | 2828 | passed | 0.97 | 0 |
+| **0.2** | **1177** | **stayed** | **2828** | **passed** | **1.00** | **0** |
+| 0.25 | 1222 | stayed | 2828 | passed | – | – |
+| 0.3 | 1267 | stayed | 2828 | passed | 1.00 | 0 |
 
 Peak |a| is the largest magnitude in mg. 2828 is both in-plane axes at
 the ±2000 clamp.
@@ -332,17 +395,32 @@ the ±2000 clamp.
 - **The headroom check.** The face-normal axis reads 0, so a shake
   needs both in-plane axes high at once (the ~1304 mg trigger above a
   1000 mg baseline). The vigorous drag reaches 2828 mg, both axes
-  clamped, at every gain from 0.02 up. Below 0.04 the page still
-  stays: the firmware samples about every 80 ms and needs |m − b| past
-  the trigger at one of those samples.
-- **Why 0.1.** It is 2.5× the last failing gain (0.03). The gentle drag
-  then peaks at 1184 mg, a deviation of about 165 mg in the detector's
-  terms, far below "Shake it!"'s 1304 mg and Connect's 400 mg, so
-  ordinary handling doesn't trip either detector. The gentle drag stays
-  even at 0.3, so the upper side has wide margin. The first pick, 0.05,
-  passed before the speed caps and the stage change (where 0.03
-  passed). After them the boundary moved to between 0.03 and 0.04, so
-  0.05 kept too little margin.
-- `physics-shake.test.ts` takes about 8–10 s: one walk to page 6
-  serves both tests, gentle first. The default `bun test` grew from
-  about 16 s to about 24 s.
+  clamped, at every gain from 0.03 up.
+- **Sampling phase decides the pass, not the gain alone.**
+  - The firmware's detector samples about every 80 ms.
+  - Its EMA b then has to sit far enough from a sampled m. At 3 Hz a
+    sample lands on a dip or a peak only at some phases.
+  - So the firmware outcome is not monotonic in the gain: 0.08 and 0.1
+    stay, while 0.03–0.05 and 0.12 pass.
+- **The replica.** A replica of the detector (`b = 0.92 b + 0.08 m`,
+  trigger `|m − b| > 1200`) holds each frame's reading. It samples at
+  70, 80 and 90 ms periods, every phase in 2 ms steps (135 runs). The
+  fraction of runs that pass matches the firmware: about 20% at 0.08
+  and 0.1, where the twin stayed; about 45% at 0.03–0.05, where the
+  twin happened to pass.
+- **Why 0.2.** It is the lowest gain measured where the vigorous drag
+  passes at every sampled phase and period. The gentle drag passes at
+  none, even at 0.3.
+  - **Peaks.** The gentle drag peaks at 1177 mg; the vigorous one reads
+    2–3 g (2828 mg at the clamp), as the spec's tuning rule asks.
+  - **Connect's bump.** The largest change between readings 50–67 ms
+    apart is 299 mg for the ±20 px, 1 Hz drag, below Connect's 400 mg.
+    A ±40 px, 1 Hz drag reads 548 mg, so it can trip Connect's local
+    detector. The spec accepts that: Connect's own detector may fire on
+    midair motion, and only wall impacts are sent to peers.
+- **Superseded picks.** Round 1 picked 0.1, which passed the twin then
+  only by phase. Fix round 1's physics changes moved it to "stayed",
+  which exposed the sensitivity.
+- `physics-shake.test.ts` takes about 7–10 s: one walk to page 6 serves
+  both tests, gentle first. The default `bun test` grew from about 16 s
+  to about 23 s.
