@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseManifest } from "../src/runtime/lifecycle";
 
 describe("parseManifest", () => {
@@ -81,6 +83,17 @@ describe("parseManifest", () => {
     expect(parseManifest("slug=b3\nname=B\nwake_lock=yes").wake_lock).toBe(true);
     expect(parseManifest("slug=b4\nname=B\nwake_lock=no").wake_lock).toBe(false);
     expect(parseManifest("slug=b5\nname=B\nwake_lock=0").wake_lock).toBe(false);
+  });
+
+  test("wake_lock=0 parses to false", () => {
+    expect(parseManifest("slug=w0\nname=W\nwake_lock=0").wake_lock).toBe(false);
+  });
+
+  test("the real smoke-test manifest uses values within v392's loader rules", () => {
+    const path = join(import.meta.dir, "..", "public", "apps", "smoke-test", "manifest.cfg");
+    const m = parseManifest(readFileSync(path, "utf8"));
+    expect(m.heap_kb).toBe(96);
+    expect(m.wake_lock).toBe(false);
   });
 
   test("heap_kb parses to an integer, empty value stays undefined", () => {
