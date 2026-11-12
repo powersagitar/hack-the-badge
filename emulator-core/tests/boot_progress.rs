@@ -3575,8 +3575,9 @@ fn run_until_ends_idle_frames_at_the_target() {
 const FIRST_RUN_LED_FRAMES: u32 = 3;
 /// The first-run screen's LEDs: all six a dim white.
 const FIRST_RUN_LEDS: [u8; 3] = [0x42, 0x42, 0x42];
-/// `prov apply` sends 12 frames: three dim green flashes, each followed
-/// by dark frames, then the role colour.
+/// `prov apply` sends 12 frames: 2 dark (before `PROV OK` prints), then
+/// three times a dim green flash followed by 2 dark, then the role
+/// colour (2 + 3 × 3 + 1).
 const PROV_APPLY_LED_FRAMES: u32 = 12;
 /// The flash colour (`prov apply`, every role).
 const PROV_FLASH_LED: [u8; 3] = [0x00, 0x06, 0x00];

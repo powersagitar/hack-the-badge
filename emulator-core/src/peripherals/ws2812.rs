@@ -19,19 +19,25 @@
 //!   (`rmt_tx_mark_eof`). This is the `led_strip` component's RMT encoder
 //!   shape (a bytes encoder for the GRB bytes, then a copy of the reset
 //!   symbol).
-//! - The LED: the WS2812B datasheet (Worldsemi): a 0 is T0H 0.4 µs high,
-//!   T0L 0.85 µs low; a 1 is T1H 0.8 µs high, T1L 0.45 µs low (each
-//!   ±150 ns); 24 bits per LED, G7..G0, R7..R0, B7..B0, MSB first; a low
-//!   longer than the reset time (RES, above 50 µs) latches the frame.
+//! - The LED: the firmware names the part WS2812B-2020 ("Six
+//!   WS2812B-2020 RGB LEDs ring the board"), and its 280 µs reset fits
+//!   the WS2812B-2020 / V5 datasheets (Worldsemi). From those sheets,
+//!   **recalled, not re-read (unverified)**: T0H 220–380 ns, T1H
+//!   580 ns–1 µs, T0L and T1L about 580 ns–1 µs, RES at least 280 µs;
+//!   24 bits per LED, G7..G0, R7..R0, B7..B0, MSB first.
 //!
 //! ## Decoding
 //!
 //! - **Bits by relative timing.** A symbol with `level0 = 1` and both
 //!   durations non-zero is a bit: 1 when `duration0 > duration1`, else 0.
-//!   For any encoder that keeps to the datasheet (T1H > T1L and
-//!   T0H < T0L) this is the same answer as comparing the high time with
-//!   a threshold in the RMT clock, and it needs no clock divider
-//!   (`docs/milestone-14-decisions.md`, ruling R1).
+//!   This rests on the firmware's own encoder, not on the datasheet in
+//!   general: its 1 is 0.9 µs high then 0.3 µs low, and its 0 is 0.3 µs
+//!   high then 0.9 µs low, so the longer half always names the bit. For
+//!   those symbols it is the same answer as comparing the high time with
+//!   a threshold in the RMT clock, and it needs no clock divider. (The
+//!   2020/V5 ranges above do not by themselves guarantee T1H > T1L, so
+//!   an encoder with other timing could need the absolute threshold;
+//!   `docs/milestone-14-decisions.md`, ruling R1.)
 //! - **Bytes.** Every 24 bits is one LED, in G, R, B order, stored as RGB
 //!   in chain order.
 //! - **Frame end.** Any other symbol (the reset code's long low, an

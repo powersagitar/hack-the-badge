@@ -73,7 +73,8 @@
 //!   redraws (any command byte clears its transient parameter state);
 //! - **the LED chain** (`crate::peripherals::ws2812`): external chips too,
 //!   which hold their last frame until the firmware sends another, so
-//!   [`FirmwareRuntime::led_colors`] and the frame count carry on;
+//!   [`FirmwareRuntime::led_colors`] and the frame count carry on (a
+//!   frame the reset cut off is ended first);
 //! - **the console's output text**;
 //! - **held buttons and the host-set acceleration**, re-applied;
 //! - **[`FirmwareRuntime::total_steps`] and host time:**
@@ -331,7 +332,9 @@ impl FirmwareRuntime {
             }
         }
         self.bus.spi.st7789 = old.spi.st7789;
-        self.bus.rmt.ws2812 = old.rmt.ws2812;
+        let mut leds = old.rmt.ws2812;
+        leds.end_of_transmission();
+        self.bus.rmt.ws2812 = leds;
         self.bus.console = old.console;
         self.reapply_host_input(accel, old.efuse.factory_mac());
         self.radio.soft_reset();
@@ -1073,6 +1076,19 @@ mod tests {
         assert_eq!(rt.soft_reset_count(), 2);
         assert_eq!(rt.led_colors(), vec![[0xFF; 3]]);
         assert_eq!(rt.led_frame_count(), 1);
+        // A frame cut off by a reset: its whole LED is published, and the
+        // partial bits do not leak into the next boot's first frame.
+        for _ in 0..30 {
+            rt.bus.rmt.ws2812.symbol(0x0009_8003); // a 0 bit
+        }
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET);
+        assert_eq!(rt.led_colors(), vec![[0; 3]]);
+        assert_eq!(rt.led_frame_count(), 2);
+        for _ in 0..24 {
+            rt.bus.rmt.ws2812.symbol(0x0003_8009);
+        }
+        rt.bus.rmt.ws2812.end_of_transmission();
+        assert_eq!(rt.led_colors(), vec![[0xFF; 3]]);
         rt.reset().unwrap();
         assert!(rt.led_colors().is_empty());
         assert_eq!(rt.led_frame_count(), 0);

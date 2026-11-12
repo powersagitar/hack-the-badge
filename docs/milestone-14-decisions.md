@@ -176,14 +176,27 @@ the commit.
 The decoder reads a bit as 1 when `duration0 > duration1`, and as 0
 otherwise. It does not compare the high time with a threshold in the
 RMT clock and divider, as the spec first said; the controller ruled for
-relative timing. The two give the same answer for any encoder that keeps
-to the WS2812B datasheet:
+relative timing.
 
-- T0H 0.4 µs < T0L 0.85 µs;
-- T1H 0.8 µs > T1L 0.45 µs (each ±150 ns).
+**The justification is the firmware's observed encoder**, not the
+datasheet in general. A 1 is 9 ticks high, then 3 low (0.9 µs, then
+0.3 µs). A 0 is 3 high, then 9 low (0.3 µs, then 0.9 µs). The longer
+half always names the bit, so for these symbols relative timing gives
+the same answer as an absolute high-time threshold.
 
-The firmware's observed symbols confirm it: a 1 is 9 high > 3 low, and
-a 0 is 3 high < 9 low. A symbol is a bit only when `level0` = 1 and both
+The part is the WS2812B-2020: the firmware's string names it, and its
+280 µs reset fits the 2020/V5 sheets. Those sheets give these ranges,
+**recalled and not re-read, so unverified**:
+
+- T0H 220–380 ns;
+- T1H 580 ns–1 µs;
+- T0L and T1L about 580 ns–1 µs;
+- RES at least 280 µs.
+
+Under those ranges T1H > T1L is not guaranteed. An encoder with other
+timing, such as a long T1L, could need the absolute threshold instead.
+The badge's encoder is fixed, and its symbols are pinned through the
+rungs. A symbol is a bit only when `level0` = 1 and both
 durations are non-zero. Any other symbol, the reset code (`level0` 0)
 or an end-marker, ends the frame. The symbol layout is
 `rmt_symbol_word_t`, from ESP-IDF v5.5.3
@@ -194,7 +207,9 @@ was reused, not re-read.
 ### Ruling R2: the chain survives a software reset
 
 The LEDs are external chips, like the panel. A soft reset of either kind
-carries `rmt.ws2812`, so the colours and the frame count go on.
+carries `rmt.ws2812`, so the colours and the frame count go on. A frame
+the reset cut off mid-way is ended first: its whole LEDs are published,
+and its partial bits are dropped.
 `FirmwareRuntime::reset()`, the cold power-on, clears them. This is
 observation only.
 
@@ -203,7 +218,7 @@ observation only.
 | When | Frames (cumulative) | Colours |
 |---|---|---|
 | Boot to the first-run screen | 3 | two dark, then all six `42 42 42` (dim white) |
-| `prov apply` (hacker) | +12 → 15 | three flashes of all six at `00 06 00`, each followed by two dark frames, then the role colour `06 1F 06` on all six, held on onboarding page 1 |
+| `prov apply` (hacker) | +12 → 15 | frames 4–5 dark (sent before `PROV OK` prints); then three times a flash of all six at `00 06 00` followed by two dark frames (6–14); then the role colour `06 1F 06` on all six (15), held on onboarding page 1. 2 + 3 × 3 + 1 = 12 |
 | Setup (hacker) | → 101 at the shake page | role colour `07 25 08` on all six; a fill 0→5 at `03 11 03`; `07 25 08`, `0C 42 0E`; then a single LED at `0C 42 0E` chasing 0→5, six laps and two more steps; then indices 3 and 4 together, blinking 7 times (before and on page 6) |
 | After the shake, to the registered screen | 102 → 116 | all six at `0C 42 0E`, then dark; **the registered screen is dark** |
 | Mood LEDs open | 227 | all six breathing green (default mood): `00 02 01` at the stable open frame, peaking at `00 21 0E` 1.7M steps later; one breath, dark pause included, is about 7.8M steps |
@@ -218,8 +233,9 @@ patterns in another colour. After `prov apply`, organizer shows
 
 - `leds_flash_during_prov_apply`: from the first-run screen (3 frames,
   `42 42 42` × 6), the rung types `prov apply` and samples every 1,000
-  steps up to the prompt after PROV OK. It checks 12 more frames, 3
-  flashes of `00 06 00` × 6, and the role colour `06 1F 06` × 6.
+  steps up to the prompt after PROV OK. It checks 12 more frames (2
+  dark, 3 × a flash and 2 dark, then the role colour), 3 flashes of
+  `00 06 00` × 6, and the role colour `06 1F 06` × 6.
 - `leds_go_dark_on_the_registered_screen`: 116 frames, all six off.
   **Deviation from the brief's
   `leds_show_the_role_colour_when_registered`:** at hacker's registered
