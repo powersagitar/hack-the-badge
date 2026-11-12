@@ -70,6 +70,35 @@ describe("emulator-wasm firmware-boot boundary", () => {
     }
   });
 
+  // consoleWritten is the console's absolute offset, in bytes: with a
+  // console that has not wrapped its 256 KiB ring, it equals the text's
+  // UTF-8 length. That is not the JS string length: v392's boot prints an
+  // em dash (U+2014, three bytes) by 5.5M steps. reset() builds a new
+  // console, so it starts at 0 again.
+  test("consoleWritten counts the console's bytes and reset() zeroes it", () => {
+    const wasmBytes = readFileSync(
+      new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url),
+    );
+    initCpuWasmSync(wasmBytes);
+    const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
+    const handle = createFirmwareEmulator(new Uint8Array(image));
+    try {
+      expect(handle.consoleWritten()).toBe(0);
+      handle.run(5_500_000);
+      const text = handle.consoleOutput();
+      expect(text.length).toBeGreaterThan(0);
+      expect(text.length).toBeLessThan(256 * 1024);
+      // Valid UTF-8 (no U+FFFD from the lossy decode), so re-encoding gives
+      // back the bytes the firmware printed.
+      expect(text).not.toContain("�");
+      expect(handle.consoleWritten()).toBe(new TextEncoder().encode(text).length);
+      handle.reset();
+      expect(handle.consoleWritten()).toBe(0);
+    } finally {
+      handle.dispose();
+    }
+  }, 30_000);
+
   // The WASM-path twin of emulator-core/tests/boot_progress.rs's
   // boots_to_first_real_frame: same 250,000-step chunks to the same
   // 5,500,000-step horizon, same FNV-1a hash over each pixel's

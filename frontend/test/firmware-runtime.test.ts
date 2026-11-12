@@ -120,6 +120,7 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
     serialInput: () => 0,
     serialPending: () => 0,
     consoleOutput: () => "",
+    consoleWritten: () => 0,
     setAcceleration: () => {},
     setFactoryMac: () => true,
     radioAdvertisement: () => new Uint8Array(0),

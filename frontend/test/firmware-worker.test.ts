@@ -89,6 +89,7 @@ function makeFakeHandle(usPerStep = 1) {
     },
     serialPending: () => 0,
     consoleOutput: () => consoleText,
+    consoleWritten: () => new TextEncoder().encode(consoleText).length,
     setAcceleration: (x, y, z) => {
       accel.push([x, y, z]);
     },

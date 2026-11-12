@@ -12,6 +12,8 @@ pub const CONSOLE_CAPACITY: usize = 256 * 1024;
 #[derive(Clone, Default)]
 pub struct Console {
     buf: VecDeque<u8>,
+    /// Bytes ever pushed, including those the cap has since dropped.
+    written: u64,
 }
 
 impl Console {
@@ -24,6 +26,16 @@ impl Console {
             self.buf.pop_front();
         }
         self.buf.push_back(b);
+        self.written += 1;
+    }
+
+    /// Bytes ever pushed since construction: an absolute offset into the
+    /// console's output that the ring's cap never resets. The ring holds
+    /// the bytes from `written() - bytes().len()` up to `written()`. It
+    /// survives a software reset with the console; a cold reset builds a
+    /// new console, so it starts at 0 again.
+    pub fn written(&self) -> u64 {
+        self.written
     }
 
     /// Owned copy (the ring may be non-contiguous); diagnostic use only.
@@ -60,5 +72,16 @@ mod tests {
         }
         assert_eq!(c.bytes().len(), CONSOLE_CAPACITY);
         assert_eq!(c.bytes()[0], 10u8, "oldest 10 bytes dropped");
+    }
+
+    #[test]
+    fn written_counts_past_the_cap() {
+        let mut c = Console::new();
+        assert_eq!(c.written(), 0);
+        for i in 0..(CONSOLE_CAPACITY + 10) {
+            c.push((i % 251) as u8);
+        }
+        assert_eq!(c.written(), CONSOLE_CAPACITY as u64 + 10);
+        assert_eq!(c.bytes().len(), CONSOLE_CAPACITY);
     }
 }

@@ -96,6 +96,12 @@ export interface FirmwareEmulatorHandle {
   /** Everything the firmware has printed to its console. */
   consoleOutput(): string;
   /**
+   * Bytes the firmware has ever printed to its console: an absolute offset
+   * the 256 KiB console ring's cap never resets. A soft reset keeps it;
+   * `reset()` starts it at 0 again.
+   */
+  consoleWritten(): number;
+  /**
    * Sets the acceleration the badge's SC7A20H reports, in mg per axis
    * (default: lying face up, `(0, 0, 1000)`); survives `reset()`.
    */
@@ -243,6 +249,10 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     consoleOutput(): string {
       assertLive();
       return wasm.consoleOutput();
+    },
+    consoleWritten(): number {
+      assertLive();
+      return wasm.consoleWritten;
     },
     setAcceleration(xMg: number, yMg: number, zMg: number): void {
       assertLive();

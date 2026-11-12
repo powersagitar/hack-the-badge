@@ -561,6 +561,14 @@ impl FirmwareRuntime {
         self.bus.console.text()
     }
 
+    /// Bytes the firmware has ever printed to its console, an absolute
+    /// offset the console ring's cap never resets. A software reset keeps
+    /// it; [`FirmwareRuntime::reset`] starts it at 0 again. See
+    /// `crate::peripherals::console::Console::written`.
+    pub fn console_written(&self) -> u64 {
+        self.bus.console.written()
+    }
+
     /// Bytes a USB host sends to the badge's console (USB-Serial-JTAG OUT).
     /// Returns how many were accepted; see
     /// `crate::peripherals::usb_serial_jtag::HOST_QUEUE_CAPACITY`.
@@ -1123,6 +1131,26 @@ mod tests {
         assert!(rt.console_output().starts_with(&before));
         assert_eq!(rt.console_output(), format!("{before}!"));
         assert_eq!(rt.serial_pending(), 6, "a CPU reset keeps it");
+    }
+
+    #[test]
+    fn console_written_keeps_its_count_across_a_soft_reset() {
+        use crate::mem::soc::USB_SERIAL_JTAG_RANGE;
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert_eq!(rt.console_written(), 0);
+        let line = b"reboot into scanner\n";
+        for b in line {
+            rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(*b));
+        }
+        assert_eq!(rt.console_written(), line.len() as u64);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        assert_eq!(rt.console_written(), line.len() as u64, "the reset keeps it");
+        rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(b'!'));
+        assert_eq!(rt.console_written(), line.len() as u64 + 1);
+        rt.reset().unwrap();
+        assert_eq!(rt.console_written(), 0, "a cold reset makes a new console");
     }
 
     /// The RTC timer as `rtc_cntl_ll_get_rtc_time` reads it: `TIME_UPDATE`

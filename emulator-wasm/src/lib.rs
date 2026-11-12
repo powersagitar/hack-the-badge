@@ -196,6 +196,15 @@ impl FirmwareEmulator {
         self.inner.console_output()
     }
 
+    /// Bytes the firmware has ever printed to its console (see
+    /// `FirmwareRuntime::console_written`): an absolute offset the console
+    /// ring's cap never resets. `f64` for a plain JS `number`, as
+    /// [`FirmwareEmulator::total_steps`].
+    #[wasm_bindgen(getter, js_name = consoleWritten)]
+    pub fn console_written(&self) -> f64 {
+        self.inner.console_written() as f64
+    }
+
     /// Bytes a USB host sends to the badge's console; returns how many
     /// were accepted (see `FirmwareRuntime::serial_input`).
     #[wasm_bindgen(js_name = serialInput)]
