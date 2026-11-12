@@ -179,3 +179,27 @@ Task 4 with the Lua sandbox. Task 1 added none.
 Until Task 12 wires the controller, the page does not reference the
 firmware Worker, so the worker, bridge and wasm chunks are absent from
 the build; they return then.
+
+## CONSOLE.LOG (Task 8)
+
+- **Line cap: 2,000 entries** (`DEFAULT_MAX_LINES` in
+  `frontend/src/ui/console-log.ts`), the builder's call within the spec's
+  "thousands". The newest are kept. A held partial line longer than
+  4,096 characters (`MAX_LINE_CHARS`) is flushed as a line, so a flood
+  with no newline stays bounded too.
+- **Flood handling.** The model notifies once per append call, however
+  many lines it adds, and none for a call that only extends the held
+  partial line. `getSnapshot()` rebuilds one frozen copy per change, at
+  most, and React batches a task's notifications into one render. Rows
+  are memoised on their (immutable) entry, so a render creates only the
+  new rows.
+- **Partial lines are held**, as the brief says: a prompt with no newline
+  (`hack> `) shows once more output follows it. A reboot flushes the old
+  boot's held tail as its own line before the `— badge rebooted —`
+  marker.
+- **Text is passed through.** Only `\n` splits and `\r` is dropped; U+FFFD,
+  lone surrogates and escape bytes (ANSI colour codes included) are
+  shown as they came.
+- **Mounting** is left to Task 12 (controller ruling R5): the panel takes
+  a `log: ConsoleLog` prop, and the log and its `onConsole` wiring belong
+  to the controller.
