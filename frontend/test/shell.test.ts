@@ -80,24 +80,13 @@ describe("roleLabel", () => {
 });
 
 describe("provision controls", () => {
-  test("a Bump button sits next to Shake, and each calls its own handler", () => {
+  test("has no Shake or Bump button (Milestone 14: motion comes from the badge)", () => {
     const root = container();
-    const calls: string[] = [];
-    buildProvisionControls(
-      root,
-      doc(),
-      ["hacker"],
-      (role) => calls.push(`provision ${role}`),
-      () => calls.push("shake"),
-      () => calls.push("bump"),
-      () => calls.push("skip"),
-    );
+    buildProvisionControls(root, doc(), ["hacker"], () => {}, () => {});
     const labels = buttons(root).map((b) => b.textContent);
-    expect(labels).toContain("Shake");
-    expect(labels.indexOf("Bump")).toBe(labels.indexOf("Shake") + 1);
-    button(root, "Bump").click();
-    button(root, "Shake").click();
-    expect(calls).toEqual(["bump", "shake"]);
+    expect(labels).toEqual(["Provision test badge", "Skip setup"]);
+    expect(root.textContent).not.toContain("Shake");
+    expect(root.textContent).not.toContain("Bump");
   });
 
   test("Skip setup sits after Provision test badge, hidden until shown, and calls its handler", () => {
@@ -108,8 +97,6 @@ describe("provision controls", () => {
       doc(),
       ["hacker"],
       () => calls.push("provision"),
-      () => {},
-      () => {},
       () => calls.push("skip"),
     );
     const labels = buttons(root).map((b) => b.textContent);
@@ -128,9 +115,8 @@ describe("provision controls", () => {
     expect(provision.disabled).toBe(true);
     controls.setProvisionEnabled(true);
     expect(provision.disabled).toBe(false);
-    // Right after the setup's sentence, so "the setup" is what it skips, not Connect.
     expect(root.querySelector(".provision-hint")!.textContent).toContain(
-      "press Shake. Press Skip setup to jump past the setup. In Connect",
+      "or press Skip setup to jump past the setup.",
     );
   });
 });
@@ -161,18 +147,17 @@ describe("link panel", () => {
     const panel = buildLinkPanel(root, doc(), {
       onHost: () => calls.push("host"),
       onJoin: (code) => calls.push(`join ${code}`),
-      onManualCreate: () => calls.push("manual create"),
-      onManualUse: (code) => calls.push(`manual use ${code}`),
-      onRemove: (id) => calls.push(`remove ${id}`),
     });
     const byClass = <T extends HTMLElement = HTMLElement>(cls: string) => root.querySelector<T>(`.${cls}`)!;
     return { root, calls, panel, byClass };
   }
 
-  test("Host link, then the join code input and Join link, then Manual, in that order", () => {
+  test("Host link, then the join code input and Join link, and nothing else", () => {
     const { root, calls, byClass } = build();
     const labels = buttons(root).map((b) => b.textContent);
-    expect(labels.slice(0, 3)).toEqual(["Host link", "Join link", "Manual"]);
+    // No copy-paste codes and no link list with Remove (Milestone 14).
+    expect(labels).toEqual(["Host link", "Join link"]);
+    expect(root.querySelector("textarea, ul")).toBeNull();
     button(root, "Host link").click();
     const input = byClass<HTMLInputElement>("link-code");
     expect(input.tagName).toBe("INPUT");
@@ -207,7 +192,6 @@ describe("link panel", () => {
     expect(rooms).toHaveLength(1);
     const status = panelEl.querySelector(".link-status")!.textContent!;
     expect(status).toContain(`Room ${rooms[0]}`);
-    expect(panelEl.querySelector(".link-list")!.textContent).toContain(`room ${rooms[0]}`);
     links.closeAll();
   });
 
@@ -238,69 +222,9 @@ describe("link panel", () => {
     expect(ops).toContain(`close ${rooms[0]}`);
     expect(ops).not.toContain(`close ${rooms[1]}`);
     expect(panelEl.querySelector(".link-status")!.textContent).toContain(`Room ${rooms[1]}`);
-    expect(panelEl.querySelector(".link-list")!.children.length).toBe(1);
     links.closeAll();
     await settle(5);
     expect(ops).toContain(`close ${rooms[1]}`);
-  });
-
-  test("removing the hosted room clears its code line", async () => {
-    const signal = memoryDeps(undefined, new MemoryStore());
-    const net = new FakeNetwork();
-    const deps: SignalDeps = {
-      factory: net.factory,
-      fetch: (input, init) => handleSignal(new Request(new URL(String(input), "http://localhost"), init), signal),
-      // Nobody joins: the host waits.
-      sleep: () => new Promise<void>(() => {}),
-    };
-    const links = mountLinks(pageShell().shell, { addLink() {}, removeLink() {} }, deps);
-    const panelEl = doc().getElementById("link-panel")!;
-    button(panelEl, "Host link").click();
-    await settle(5);
-    const statusEl = panelEl.querySelector(".link-status")!;
-    expect(statusEl.textContent).toContain("enter this code");
-    button(panelEl.querySelector(".link-list")!, "Remove").click();
-    await settle(5);
-    expect(panelEl.querySelector(".link-list")!.children.length).toBe(0);
-    expect(statusEl.textContent).toBe("");
-    links.closeAll();
-  });
-
-  test("the Manual toggle shows the copy-paste codes", () => {
-    const { root, calls, panel, byClass } = build();
-    const manual = byClass("link-manual");
-    expect(manual.style.display).toBe("none");
-    const toggle = button(root, "Manual");
-    toggle.click();
-    expect(manual.style.display).toBe("");
-    expect(toggle.className).toContain("active");
-    button(root, "Create code").click();
-    panel.setManualOutput("offer:abc");
-    expect(byClass<HTMLTextAreaElement>("link-manual-out").value).toBe("offer:abc");
-    byClass<HTMLTextAreaElement>("link-manual-in").value = "answer:xyz";
-    button(root, "Use code").click();
-    expect(calls).toEqual(["manual create", "manual use answer:xyz"]);
-    toggle.click();
-    expect(manual.style.display).toBe("none");
-    expect(toggle.className).not.toContain("active");
-  });
-
-  test("the link list shows each link's state, with Remove", () => {
-    const { root, calls, panel, byClass } = build();
-    panel.setLinks([
-      { id: "link-1", label: "Link 1 (room ABCDEFGH)", state: "open" },
-      { id: "link-2", label: "Link 2 (manual)", state: "connecting" },
-    ]);
-    const list = byClass("link-list");
-    expect(list.children.length).toBe(2);
-    expect(list.children[0]!.textContent).toContain("Link 1 (room ABCDEFGH)");
-    expect(list.children[0]!.textContent).toContain("connected");
-    expect(list.children[1]!.textContent).toContain("connecting");
-    button(list.children[1]!, "Remove").click();
-    expect(calls).toEqual(["remove link-2"]);
-    panel.setLinks([]);
-    expect(list.children.length).toBe(0);
-    expect(root.textContent).not.toContain("Link 1");
   });
 
   test("hides with the provisioning controls", () => {
@@ -340,8 +264,6 @@ function badgeRig(
     otherTab?: boolean;
     /** Each Worker's boot outcome, in creation order (`"ready"` past the end), or one for all. */
     boot?: "ready" | "error" | ReadonlyArray<"ready" | "error">;
-    bump?: () => boolean;
-    bumpNoteMs?: number;
   } = {},
 ) {
   const { shell, canvas, fills } = pageShell();
@@ -358,7 +280,6 @@ function badgeRig(
       fromLocal() {},
       setPaused() {},
       setRunning: (r) => void running.push(r),
-      bump: opts.bump ?? (() => false),
     },
     roles: ["hacker"],
     loadImages: async () => ({ wasm: new ArrayBuffer(8), image: new ArrayBuffer(8) }),
@@ -371,7 +292,6 @@ function badgeRig(
     mac: () => new Uint8Array([0x02, 0, 0, 0, 0x10, 0x01]),
     fetchIdentity: async () => "{}",
     locks,
-    bumpNoteMs: opts.bumpNoteMs,
   });
   const el = (id: string) => doc().getElementById(id)!;
   const noticeShown = () => el("badge-notice").style.display !== "none";
@@ -685,23 +605,6 @@ describe("badge controller", () => {
     r.status({ speed: 1, rebooting: false });
     expect(r.statusText()).toContain("1.0x");
     expect(r.statusText()).not.toContain("rebooting");
-  });
-
-  test("a refused bump says why", async () => {
-    let gate = false;
-    // A 0 ms note: the click shows it synchronously, and the next timer turn clears it.
-    const r = badgeRig({ bump: () => gate, bumpNoteMs: 0 });
-    await settle();
-    button(r.controls(), "Bump").click();
-    expect(r.statusText()).toContain("bump: the badge isn't running");
-    await settle(1);
-    r.controller.refreshStatus();
-    expect(r.statusText()).not.toContain("bump:");
-    // An accepted bump says nothing.
-    gate = true;
-    button(r.controls(), "Bump").click();
-    r.controller.refreshStatus();
-    expect(r.statusText()).not.toContain("bump:");
   });
 
   test("notice_clears_the_canvas", async () => {

@@ -12,8 +12,7 @@
  * (extend KEY_TO_BUTTON as needed.)
  *
  * The radio link panel ({@link buildLinkPanel}, Milestone 10 Task 10)
- * hosts or joins a WebRTC link, or swaps codes by hand; `main.ts` does the
- * linking.
+ * hosts or joins a WebRTC link; `main.ts` does the linking.
  *
  * `shell.ts` has no notion of the runtime: `src/main.ts` passes it a
  * single `ButtonInjector`, the badge controller's.
@@ -62,15 +61,13 @@ export interface ShellHandles {
   renderLeds(colors: Rgb[]): void;
   /**
    * Mounts the role picker, "Provision test badge", "Skip setup" (hidden
-   * until shown), "Shake" and "Bump" buttons, a status span and a hint
-   * into `#provision-controls` (no-op handles if the element is missing).
+   * until shown), a status span and a hint into `#provision-controls`
+   * (no-op handles if the element is missing).
    * `onProvision` gets the selected role string.
    */
   mountProvisionControls(
     roles: readonly string[],
     onProvision: (role: string) => void,
-    onShake: () => void,
-    onBump: () => void,
     onSkipSetup: () => void,
   ): ProvisionControls;
   /**
@@ -96,8 +93,6 @@ export function buildProvisionControls(
   doc: Pick<Document, "createElement">,
   roles: readonly string[],
   onProvision: (role: string) => void,
-  onShake: () => void,
-  onBump: () => void,
   onSkipSetup: () => void,
 ): ProvisionControls {
   container.innerHTML = "";
@@ -121,16 +116,13 @@ export function buildProvisionControls(
   // Milestone 13: ends the on-badge Setup app; shown only while it is on screen.
   const skipBtn = button("Skip setup", onSkipSetup);
   skipBtn.hidden = true;
-  const shakeBtn = button("Shake", onShake);
-  // Connect's bump: pairs with every linked badge that is bumped too.
-  const bumpBtn = button("Bump", onBump);
   const status = doc.createElement("span");
   status.className = "provision-status";
   const hint = doc.createElement("p");
   hint.className = "provision-hint";
   hint.textContent =
-    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. Press Skip setup to jump past the setup. In Connect, press Bump.";
-  container.append(select, provisionBtn, skipBtn, shakeBtn, bumpBtn, status, hint);
+    "After PROV OK, follow the on-badge setup with the button pad, or press Skip setup to jump past the setup.";
+  container.append(select, provisionBtn, skipBtn, status, hint);
   return {
     setStatus: (text) => {
       status.textContent = text;
@@ -174,47 +166,22 @@ export function buildBadgeNotice(
   return { setVisible };
 }
 
-/** One row of the link list: a radio link and its state. */
-export interface LinkRow {
-  id: string;
-  label: string;
-  state: "connecting" | "open" | "closed";
-}
-
 export interface LinkPanelHandlers {
   /** "Host link": create a room. */
   onHost(): void;
   /** "Join link", with the code input's text as typed. */
   onJoin(code: string): void;
-  /** Manual "Create code": an offer code to copy to the peer. */
-  onManualCreate(): void;
-  /** Manual "Use code", with the pasted code (an offer or an answer). */
-  onManualUse(code: string): void;
-  /** A row's "Remove". */
-  onRemove(id: string): void;
 }
 
 /** The radio link panel (Milestone 10 Task 10). */
 export interface LinkPanel {
   setStatus(text: string): void;
-  /** Shows a code for the user to copy, in the manual section. */
-  setManualOutput(code: string): void;
-  setLinks(links: readonly LinkRow[]): void;
   setVisible(visible: boolean): void;
 }
 
-const LINK_STATE_LABEL: Record<LinkRow["state"], string> = {
-  connecting: "connecting…",
-  open: "connected",
-  closed: "disconnected",
-};
-
 /**
  * Builds the radio link panel into `container`, in this order: "Host link",
- * the room code input, "Join link", the "Manual" toggle, a status line,
- * the manual section (hidden until "Manual" is on: "Create code", a
- * read-only code to copy, a code to paste, "Use code"), and the link list,
- * each row with "Remove".
+ * the room code input, "Join link", and a status line.
  */
 export function buildLinkPanel(
   container: HTMLElement,
@@ -242,57 +209,15 @@ export function buildLinkPanel(
   code.spellcheck = false;
   const host = button("Host link", () => handlers.onHost());
   const join = button("Join link", () => handlers.onJoin(code.value));
-  let manualOn = false;
-  const manualToggle = button("Manual", () => {
-    manualOn = !manualOn;
-    manualToggle.className = "mode-btn" + (manualOn ? " active" : "");
-    manual.style.display = manualOn ? "" : "none";
-  });
-  row.append(host, code, join, manualToggle);
+  row.append(host, code, join);
 
   const status = doc.createElement("span");
   status.className = "link-status";
 
-  const manual = doc.createElement("div");
-  manual.className = "link-manual";
-  manual.style.display = "none";
-  const out = doc.createElement("textarea");
-  out.className = "link-manual-out";
-  out.readOnly = true;
-  out.rows = 3;
-  out.placeholder = "your code appears here: copy it to the other browser";
-  const paste = doc.createElement("textarea");
-  paste.className = "link-manual-in";
-  paste.rows = 3;
-  paste.placeholder = "paste the other browser's code here";
-  manual.append(
-    button("Create code", () => handlers.onManualCreate()),
-    out,
-    paste,
-    button("Use code", () => handlers.onManualUse(paste.value)),
-  );
-
-  const list = doc.createElement("ul");
-  list.className = "link-list";
-
-  container.append(row, status, manual, list);
+  container.append(row, status);
   return {
     setStatus: (text) => {
       status.textContent = text;
-    },
-    setManualOutput: (text) => {
-      out.value = text;
-    },
-    setLinks: (links) => {
-      list.innerHTML = "";
-      for (const link of links) {
-        const item = doc.createElement("li");
-        item.className = `link-item link-${link.state}`;
-        const label = doc.createElement("span");
-        label.textContent = `${link.label} — ${LINK_STATE_LABEL[link.state]} `;
-        item.append(label, button("Remove", () => handlers.onRemove(link.id)));
-        list.appendChild(item);
-      }
     },
     setVisible: (visible) => {
       container.style.display = visible ? "" : "none";
@@ -368,15 +293,13 @@ export function mountShell(): ShellHandles {
   function mountProvisionControls(
     roles: readonly string[],
     onProvision: (role: string) => void,
-    onShake: () => void,
-    onBump: () => void,
     onSkipSetup: () => void,
   ): ProvisionControls {
     const container = document.getElementById("provision-controls");
     if (!container) {
       return { setStatus: () => {}, setVisible: () => {}, setSkipVisible: () => {}, setProvisionEnabled: () => {} };
     }
-    return buildProvisionControls(container, document, roles, onProvision, onShake, onBump, onSkipSetup);
+    return buildProvisionControls(container, document, roles, onProvision, onSkipSetup);
   }
 
   /**
@@ -409,7 +332,7 @@ export function mountShell(): ShellHandles {
 
   function mountLinkPanel(handlers: LinkPanelHandlers): LinkPanel {
     const container = document.getElementById("link-panel");
-    if (!container) return { setStatus() {}, setManualOutput() {}, setLinks() {}, setVisible() {} };
+    if (!container) return { setStatus() {}, setVisible() {} };
     return buildLinkPanel(container, document, handlers);
   }
 

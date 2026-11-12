@@ -4,8 +4,6 @@ import {
   MAX_PEER_MESSAGE_CHARS,
   acceptOffer,
   createOffer,
-  decodeManualCode,
-  encodeManualCode,
   type PeerLink,
 } from "../src/radio/peer-link";
 import { MAX_SDP_CHARS } from "../src/radio/signal-handler";
@@ -167,54 +165,5 @@ describe("peer link", () => {
     await expect(link.complete("garbage")).rejects.toThrow();
     await expect(acceptOffer("garbage", { factory: net.factory })).rejects.toThrow();
     await expect(acceptOffer("x".repeat(MAX_SDP_CHARS + 1), { factory: net.factory })).rejects.toThrow();
-  });
-});
-
-describe("manual codes", () => {
-  const SDP = "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n".repeat(8);
-
-  test("round-trip, in both directions", async () => {
-    for (const kind of ["offer", "answer"] as const) {
-      const code = await encodeManualCode(kind, SDP);
-      expect(code.startsWith(`${kind}:`)).toBe(true);
-      expect(/^[a-z]+:[A-Za-z0-9_-]+$/.test(code)).toBe(true);
-      // Compressed: shorter than the SDP.
-      expect(code.length).toBeLessThan(SDP.length);
-      const decoded = await decodeManualCode(code);
-      expect(decoded).toEqual({ kind, sdp: SDP });
-      expect(await encodeManualCode(decoded!.kind, decoded!.sdp)).toBe(code);
-      // Pasting adds whitespace and line breaks; they are ignored.
-      expect(await decodeManualCode(`  ${code.slice(0, 20)}\n${code.slice(20)}  \n`)).toEqual({ kind, sdp: SDP });
-    }
-  });
-
-  test("garbage is rejected without throwing", async () => {
-    const valid = await encodeManualCode("offer", SDP);
-    const bomb = new Uint8Array(
-      await new Response(
-        new Blob([new Uint8Array(1 << 20)]).stream().pipeThrough(new CompressionStream("deflate-raw")),
-      ).arrayBuffer(),
-    );
-    let bin = "";
-    for (const b of bomb) bin += String.fromCharCode(b);
-    const bombCode = "offer:" + btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
-    const garbage = [
-      "",
-      "offer:",
-      "offer",
-      "hello world",
-      "offer:!!!!",
-      "offer:AAAA",
-      "answer:" + "A".repeat(100),
-      "bogus:" + valid.slice("offer:".length),
-      valid.slice(0, valid.length - 7),
-      "offer:" + "A".repeat(200_000),
-      bombCode,
-      "offer:" + valid.slice("offer:".length) + "%",
-    ];
-    for (const g of garbage) expect(await decodeManualCode(g)).toBeNull();
-    // Not a string at all (a hostile caller).
-    expect(await decodeManualCode(42 as unknown as string)).toBeNull();
   });
 });

@@ -17,31 +17,29 @@
  * (`src/radio/lock.ts`); another tab shows "Badge running in another tab —
  * Run here", whose button takes the badge over (the old tab stops). The
  * badge's factory MAC is this browser's, sent to the Worker before its
- * first start. The Bump button bumps this badge and every linked one, only
- * while the badge runs here and the page is visible: each `rt.start()` and
- * `firmwareRuntime?.stop()` below is paired with `hub.setRunning`, and the
- * hidden-page pause pauses the hub (`onPausedChange`), Milestone 11 Task 11.
+ * first start. The hub's bump gate is open only while the badge runs here
+ * and the page is visible: each `rt.start()` and `firmwareRuntime?.stop()`
+ * below is paired with `hub.setRunning`, and the hidden-page pause pauses
+ * the hub (`onPausedChange`), Milestone 11 Task 11.
  *
  * **Links (Milestone 10 Task 10).** The link panel ({@link mountLinks})
  * makes WebRTC links (`src/radio/peer-link.ts`) to other browsers: "Host
- * link" creates a room on `/api/signal` and shows its code, "Join link"
- * joins one, and "Manual" swaps the same offer and answer as copy-paste
- * codes instead. Each link joins the hub as soon as it exists; it carries
+ * link" creates a room on `/api/signal` and shows its code, and "Join
+ * link" joins one. Each link joins the hub as soon as it exists; it carries
  * nothing until its channel opens, and leaves the hub when it closes.
  * Cancelling a hosted room ({@link mountLinks}'s `cancelHosting`: hosting
- * again, removing its link, unload) also closes the room on the server,
- * best effort (Milestone 11 Task 10).
+ * again, unload) also closes the room on the server, best effort
+ * (Milestone 11 Task 10).
  */
 import type { RadioHub } from "../radio/hub";
 import { acquireBadge, type BadgeHold, type LockManagerLike, takeOver } from "../radio/lock";
-import { acceptOffer, createOffer, decodeManualCode, encodeManualCode, type PeerLink } from "../radio/peer-link";
+import type { PeerLink } from "../radio/peer-link";
 import {
   type HostedRoom,
   SignalError,
   type SignalDeps,
   hostRoom,
   joinRoom,
-  normalizeRoomCode,
 } from "../radio/signal-client";
 import {
   createWorkerFirmwareRuntime,
@@ -57,7 +55,7 @@ export interface BadgeWorker extends WorkerLike {
 
 export interface BadgeControllerDeps {
   shell: Pick<ShellHandles, "ctx" | "renderLeds" | "mountBadgeNotice" | "mountProvisionControls">;
-  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning" | "bump">;
+  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning">;
   /** The firmware roles the provisioning controls offer. */
   roles: readonly string[];
   /** Fetches the WASM module and `firmware.bin`. */
@@ -70,14 +68,8 @@ export interface BadgeControllerDeps {
   fetchIdentity(role: string): Promise<string>;
   /** The Web Locks to hold the badge with; the browser's when omitted. */
   locks?: LockManagerLike | null;
-  /** How long a refused Bump's reason stays in the status (ms); {@link BUMP_NOTE_MS} when omitted. */
-  bumpNoteMs?: number;
 }
 
-/** A refused Bump's reason in the status line: the hub's bump gate is closed. */
-export const BUMP_REFUSED_NOTE = "bump: the badge isn't running";
-/** How long {@link BUMP_REFUSED_NOTE} stays in the status (ms). */
-export const BUMP_NOTE_MS = 3000;
 /** The status line after the firmware failed to boot. */
 export const START_FAILED_NOTE = "could not start the badge";
 
@@ -243,9 +235,6 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   };
 
   let fetchError = "";
-  /** A refused Bump's reason ({@link BUMP_REFUSED_NOTE}), cleared by `bumpNoteTimer`. */
-  let bumpNote = "";
-  let bumpNoteTimer: ReturnType<typeof setTimeout> | undefined;
   /**
    * Which of the two the user started last: its state is the status text.
    * The runtime keeps a finished skip's state through later provisions.
@@ -268,18 +257,6 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
         console.error(`Could not load test identity ${role}:`, e);
         fetchError = `could not load ${role}`;
       }
-    },
-    () => firmwareRuntime?.shake(),
-    () => {
-      // Ride-along 7: the bump gate closed (stopped or hidden badge) says so for a moment.
-      if (hub.bump()) return;
-      bumpNote = BUMP_REFUSED_NOTE;
-      clearTimeout(bumpNoteTimer);
-      bumpNoteTimer = setTimeout(() => {
-        bumpNote = "";
-        bumpNoteTimer = undefined;
-      }, deps.bumpNoteMs ?? BUMP_NOTE_MS);
-      refreshStatus();
     },
     () => {
       // A stopped badge types nothing, and a refused click keeps the last
@@ -329,9 +306,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       // The emulated/wall ratio: below 1x the step cap binds (slow motion).
       const speed = rt.speed();
       const prefix = rt.rebooting() ? "rebooting…" : speed > 0 ? `${speed.toFixed(1)}x` : "";
-      provisionControls.setStatus([prefix, text, bumpNote].filter(Boolean).join(" · "));
+      provisionControls.setStatus([prefix, text].filter(Boolean).join(" · "));
     } else {
-      provisionControls.setStatus([text, bumpNote].filter(Boolean).join(" · "));
+      provisionControls.setStatus(text);
     }
   }
 
@@ -343,7 +320,6 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     inject,
     refreshStatus,
     dispose() {
-      clearTimeout(bumpNoteTimer);
       firmwareRuntime?.dispose();
       releaseBadge();
     },
@@ -356,40 +332,32 @@ function errorText(e: unknown, fallback: string): string {
 
 /**
  * Mounts the link panel and runs its links into `hub`: one hosted room at
- * a time (hosting again cancels a room no one has joined yet), any number
- * of links, and the manual codes. Returns the panel and a function that
- * closes every link (for unload). `signal` reaches `/api/signal` and
- * WebRTC; the browser's when omitted.
+ * a time (hosting again cancels a room no one has joined yet) and any
+ * number of links; a link leaves the hub when it closes. Returns the panel
+ * and a function that closes every link (for unload). `signal` reaches
+ * `/api/signal` and WebRTC; the browser's when omitted.
  */
 export function mountLinks(
   shell: Pick<ShellHandles, "mountLinkPanel">,
   hub: Pick<RadioHub, "addLink" | "removeLink">,
   signal: SignalDeps = {},
 ): { panel: LinkPanel; closeAll(): void } {
-  const links = new Map<string, { link: PeerLink; label: string }>();
-  let made = 0;
+  const links = new Map<string, PeerLink>();
   let hosting: HostedRoom | null = null;
   /**
    * Counts host presses and cancels: a room whose `hostRoom` returns after
    * a later press or a cancel is closed at once, not orphaned.
    */
   let hostSeq = 0;
-  /** This browser's manual offer, waiting for the peer's answer code. */
-  let manualOffer: PeerLink | null = null;
-  // The manual codes' WebRTC: `signal`'s factory, or the browser's.
-  const rtc = { factory: signal.factory };
 
-  const refresh = () =>
-    panel.setLinks([...links.values()].map(({ link, label }) => ({ id: link.id, label, state: link.state })));
-
-  function track(link: PeerLink, how: string): void {
-    links.set(link.id, { link, label: `Link ${++made} (${how})` });
+  function track(link: PeerLink): void {
+    links.set(link.id, link);
     hub.addLink(link);
     link.onStateChange((state) => {
-      if (state === "closed") hub.removeLink(link.id);
-      refresh();
+      if (state !== "closed") return;
+      links.delete(link.id);
+      hub.removeLink(link.id);
     });
-    refresh();
   }
 
   /**
@@ -417,7 +385,7 @@ export function mountLinks(
         return;
       }
       hosting = h;
-      track(h.link, `room ${h.room}`);
+      track(h.link);
       panel.setStatus(`Room ${h.room}: enter this code in the other browser\u2019s Join link, within 2 minutes.`);
       h.connected.then(
         () => {
@@ -439,80 +407,22 @@ export function mountLinks(
     panel.setStatus(`Joining ${code.trim()}\u2026`);
     try {
       const link = await joinRoom(code, signal);
-      track(link, `room ${normalizeRoomCode(code) ?? code.trim()}`);
+      track(link);
       panel.setStatus("Linked.");
     } catch (e) {
       panel.setStatus(errorText(e, "Could not join the room."));
     }
   }
 
-  async function manualCreate(): Promise<void> {
-    try {
-      if (manualOffer && manualOffer.state === "connecting") remove(manualOffer.id);
-      const { link, offer } = await createOffer(rtc);
-      manualOffer = link;
-      track(link, "manual");
-      panel.setManualOutput(await encodeManualCode("offer", offer));
-      panel.setStatus("Copy this offer code to the other browser, then paste its answer code here and press Use code.");
-    } catch {
-      panel.setStatus("This browser could not start a WebRTC link.");
-    }
-  }
-
-  async function manualUse(code: string): Promise<void> {
-    const decoded = await decodeManualCode(code);
-    if (!decoded) {
-      panel.setStatus("That is not a link code.");
-      return;
-    }
-    try {
-      if (decoded.kind === "offer") {
-        const { link, answer } = await acceptOffer(decoded.sdp, rtc);
-        track(link, "manual");
-        panel.setManualOutput(await encodeManualCode("answer", answer));
-        panel.setStatus("Copy this answer code back to the other browser.");
-        return;
-      }
-      const offerer = manualOffer;
-      if (!offerer || offerer.state !== "connecting") {
-        panel.setStatus("An answer code completes this browser\u2019s offer: press Create code first.");
-        return;
-      }
-      await offerer.complete(decoded.sdp);
-      manualOffer = null;
-      panel.setStatus("Answer applied: connecting\u2026");
-    } catch {
-      panel.setStatus("That code could not be used.");
-    }
-  }
-
-  function remove(id: string): void {
-    const entry = links.get(id);
-    if (!entry) return;
-    if (hosting?.link === entry.link) {
-      cancelHosting();
-      // Its "Room …: enter this code" line is stale now (ride-along 6).
-      panel.setStatus("");
-    }
-    if (manualOffer === entry.link) manualOffer = null;
-    links.delete(id);
-    hub.removeLink(id);
-    entry.link.close();
-    refresh();
-  }
-
   const panel = shell.mountLinkPanel({
     onHost: () => void host(),
     onJoin: (code) => void join(code),
-    onManualCreate: () => void manualCreate(),
-    onManualUse: (code) => void manualUse(code),
-    onRemove: remove,
   });
   return {
     panel,
     closeAll() {
       cancelHosting();
-      for (const { link } of links.values()) link.close();
+      for (const link of links.values()) link.close();
     },
   };
 }

@@ -10,8 +10,7 @@
  * - **No trickle.** {@link createOffer} and {@link acceptOffer} return the
  *   SDP only once `iceGatheringState` is `"complete"`, so one offer and
  *   one answer carry every candidate. They are swapped through the
- *   signaling function (`./signal-client.ts`) or by hand, as the manual
- *   codes ({@link encodeManualCode}).
+ *   signaling function (`./signal-client.ts`).
  * - **Nothing before open.** {@link PeerLink.send} drops a message unless
  *   the channel is open. {@link PeerLink.opened} settles on the channel's
  *   own events (Milestone 11 Task 10), so a waiter needs no polling.
@@ -248,96 +247,5 @@ export async function acceptOffer(
   } catch (e) {
     link.close();
     throw e;
-  }
-}
-
-// ---- The copy-paste fallback --------------------------------------------
-
-export type ManualCodeKind = "offer" | "answer";
-
-/** The longest manual code accepted for decoding. */
-const MAX_MANUAL_CODE_CHARS = 2 * MAX_SDP_CHARS;
-const MANUAL_CODE = /^(offer|answer):([A-Za-z0-9_-]+)$/;
-
-function toBase64Url(bytes: Uint8Array): string {
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromBase64Url(s: string): Uint8Array | null {
-  // 4n+1 characters cannot come from whole bytes.
-  if (s.length % 4 === 1) return null;
-  try {
-    const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-async function deflate(text: string): Promise<Uint8Array> {
-  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("deflate-raw"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-/** Inflates `bytes`, giving up past `limit` output bytes; `null` on any error. Never rejects. */
-async function inflate(bytes: Uint8Array, limit: number): Promise<Uint8Array | null> {
-  try {
-    const ds = new DecompressionStream("deflate-raw");
-    const writer = ds.writable.getWriter();
-    // Rejections surface through the reader; these must not go unhandled.
-    writer.write(bytes as Uint8Array<ArrayBuffer>).catch(() => {});
-    writer.close().catch(() => {});
-    const reader = ds.readable.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > limit) {
-        reader.cancel().catch(() => {});
-        return null;
-      }
-      chunks.push(value);
-    }
-    const out = new Uint8Array(total);
-    let at = 0;
-    for (const c of chunks) {
-      out.set(c, at);
-      at += c.byteLength;
-    }
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-/** An SDP as a manual code: `<kind>:` and the SDP, deflate-raw compressed, base64url. */
-export async function encodeManualCode(kind: ManualCodeKind, sdp: string): Promise<string> {
-  return `${kind}:${toBase64Url(await deflate(sdp))}`;
-}
-
-/**
- * A manual code back to its kind and SDP; whitespace (from pasting) is
- * ignored. `null` for anything that is not a code this page made. Never
- * rejects.
- */
-export async function decodeManualCode(code: string): Promise<{ kind: ManualCodeKind; sdp: string } | null> {
-  try {
-    if (typeof code !== "string" || code.length > MAX_MANUAL_CODE_CHARS + 64) return null;
-    const m = MANUAL_CODE.exec(code.replace(/\s+/g, ""));
-    if (!m) return null;
-    const bytes = fromBase64Url(m[2]!);
-    if (!bytes) return null;
-    const raw = await inflate(bytes, MAX_SDP_CHARS);
-    if (!raw || raw.length === 0) return null;
-    const sdp = new TextDecoder("utf-8", { fatal: true }).decode(raw);
-    return { kind: m[1] as ManualCodeKind, sdp };
-  } catch {
-    return null;
   }
 }

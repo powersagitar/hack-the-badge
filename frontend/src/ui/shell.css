@@ -185,16 +185,14 @@ h1 {
   color: var(--muted);
 }
 
-.link-row,
-.link-manual {
+.link-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.link-code,
-.link-manual textarea {
+.link-code {
   padding: 5px 8px;
   border-radius: 8px;
   border: 1px solid #333a44;
@@ -202,28 +200,6 @@ h1 {
   color: var(--text);
   font-size: 12px;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.link-code {
   width: 8.5em;
   text-transform: uppercase;
-}
-
-.link-manual textarea {
-  flex-basis: 100%;
-  resize: vertical;
-  word-break: break-all;
-}
-
-.link-list {
-  margin: 0;
-  padding-left: 18px;
-}
-
-.link-item {
-  margin: 2px 0;
-}
-
-.link-open {
-  color: var(--text);
 }
