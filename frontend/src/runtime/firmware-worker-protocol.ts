@@ -9,9 +9,16 @@
  *   a transferred buffer. At most one is in flight: the Worker posts the
  *   next only after the client's `frameAck`, which the client sends after
  *   painting (or after dropping a frame while stopped).
- * - `status` carries the speed reading, the provisioning state and the
- *   software reset count, at most every 250 ms (`STATUS_INTERVAL_MS`),
- *   and at once when the reset count changes (Milestone 11 Task 8).
+ * - `status` carries the speed reading, whether the reboot's pause is
+ *   still being paid (`rebooting`), the provisioning state, the setup
+ *   skip's state and whether Setup is on screen (Milestone 13 Task 5; the
+ *   software reset count it carried before is the Worker's own now), at
+ *   most every 250 ms (`STATUS_INTERVAL_MS`), and at once when the badge
+ *   soft-resets (Milestone 11 Task 8). `setupOnScreen` copies the current
+ *   boot's console, so it is computed only when a `status` is built.
+ * - `skipSetup` starts the setup skip (`./setup-skip.ts`). It has no
+ *   fields; the runtime refuses it unless Setup is on screen and nothing
+ *   is typing.
  *
  * The radio (Milestone 10 Task 9):
  *
@@ -30,6 +37,7 @@
  */
 import type { ButtonName, ButtonSource } from "../badge/input";
 import type { ProvisionState } from "./provisioner";
+import type { SkipState } from "./setup-skip";
 
 export type ToWorker =
   | { kind: "init"; wasm: ArrayBuffer; image: ArrayBuffer }
@@ -38,6 +46,7 @@ export type ToWorker =
   /** `source` is optional: a message without one (or with an unknown one) is the pad's. */
   | { kind: "button"; button: ButtonName; pressed: boolean; source?: ButtonSource }
   | { kind: "provision"; identityJson: string }
+  | { kind: "skipSetup" }
   | { kind: "shake" }
   | { kind: "bump" }
   | { kind: "setMac"; mac: Uint8Array }
@@ -49,7 +58,14 @@ export type ToWorker =
 export type FromWorker =
   | { kind: "ready" }
   | { kind: "frame"; pixels: ArrayBuffer; width: number; height: number }
-  | { kind: "status"; speed: number; provision: ProvisionState | null; softResets: number }
+  | {
+      kind: "status";
+      speed: number;
+      rebooting: boolean;
+      provision: ProvisionState | null;
+      skip: SkipState | null;
+      setupOnScreen: boolean;
+    }
   | { kind: "advOut"; bytes: Uint8Array }
   | { kind: "error"; message: string };
 

@@ -176,6 +176,22 @@ async function bootedRig(usPerStep = 1) {
 
 const framesOf = (posted: FromWorker[]) => posted.filter((m) => m.kind === "frame");
 
+/** A `status` with nothing in flight: no provision, no skip, Setup not on screen, not rebooting. */
+const idleStatus = (speed: number): Extract<FromWorker, { kind: "status" }> => ({
+  kind: "status",
+  speed,
+  rebooting: false,
+  provision: null,
+  skip: null,
+  setupOnScreen: false,
+});
+
+const statusesOf = (posted: FromWorker[]) =>
+  posted.filter((m): m is Extract<FromWorker, { kind: "status" }> => m.kind === "status");
+
+const SETUP_LINE = "I (20) app_reg: launched Setup\r\n";
+const CONFIG_TYPED = "config system onboard_build 2147483647\n";
+
 describe("firmware worker", () => {
   test("worker slice clamps the wall delta", async () => {
     const { fake, send, sliceAt } = await bootedRig();
@@ -238,7 +254,7 @@ describe("firmware worker", () => {
     const statuses = posted.filter((m) => m.kind === "status");
     // At 0, 250, 500, 750 and 1,000 ms.
     expect(statuses).toHaveLength(5);
-    expect(statuses.at(-1)).toEqual({ kind: "status", speed: expect.closeTo(1, 5), provision: null, softResets: 0 });
+    expect(statuses.at(-1)).toEqual(idleStatus(expect.closeTo(1, 5)));
   });
 
   test("status_is_posted_at_once_on_a_soft_reset", async () => {
@@ -252,12 +268,57 @@ describe("firmware worker", () => {
     sliceAt(20);
     const statuses = posted.filter((m) => m.kind === "status");
     expect(statuses).toHaveLength(2);
-    expect(statuses.at(-1)).toEqual({ kind: "status", speed: expect.closeTo(1, 5), provision: null, softResets: 1 });
+    expect(statuses.at(-1)).toEqual({ ...idleStatus(expect.closeTo(1, 5)), rebooting: true });
     // No reset since: back to the throttle.
     sliceAt(30);
     expect(posted.filter((m) => m.kind === "status")).toHaveLength(2);
     sliceAt(270);
     expect(posted.filter((m) => m.kind === "status")).toHaveLength(3);
+  });
+
+  test("skipSetup reaches the runtime", async () => {
+    const { fake, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    fake.print(`${SETUP_LINE}badge> `);
+    send({ kind: "skipSetup" });
+    // A second one is refused by the runtime: one config, never two.
+    send({ kind: "skipSetup" });
+    sliceAt(10);
+    expect(fake.typed).toEqual([CONFIG_TYPED]);
+    // Extra fields are ignored; only the kind is read.
+    expect(() => send({ kind: "skipSetup", junk: 1 } as unknown as ToWorker)).not.toThrow();
+    sliceAt(20);
+    expect(fake.typed).toEqual([CONFIG_TYPED]);
+  });
+
+  test("status carries rebooting, skip and setupOnScreen, and no softResets", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    expect(statusesOf(posted).at(-1)).toEqual(idleStatus(0));
+    expect("softResets" in statusesOf(posted).at(-1)!).toBe(false);
+    fake.print(`${SETUP_LINE}badge> `);
+    sliceAt(250);
+    expect(statusesOf(posted).at(-1)).toEqual({ ...idleStatus(expect.any(Number)), setupOnScreen: true });
+    send({ kind: "skipSetup" });
+    sliceAt(500);
+    expect(statusesOf(posted).at(-1)).toEqual({ ...idleStatus(expect.any(Number)), skip: { kind: "typing" } });
+    fake.print("OK system.onboard_build=2147483647\r\nbadge> ");
+    sliceAt(510);
+    // The skip's reboot: posted at once, rebooting, the skip done.
+    fake.armReboot();
+    sliceAt(520);
+    expect(statusesOf(posted)).toHaveLength(4);
+    expect(statusesOf(posted).at(-1)).toEqual({
+      ...idleStatus(expect.any(Number)),
+      rebooting: true,
+      skip: { kind: "done" },
+    });
+    // The reboot's 466 ms paid, one status interval later: no longer rebooting.
+    for (let t = 570; t <= 1_020; t += 50) sliceAt(t);
+    expect(statusesOf(posted).at(-1)).toEqual({ ...idleStatus(expect.any(Number)), skip: { kind: "done" } });
+    for (const s of statusesOf(posted)) expect("softResets" in s).toBe(false);
   });
 
   test("a button message for an unknown name is ignored without throwing", async () => {
@@ -336,12 +397,7 @@ describe("firmware worker", () => {
     sliceAt(310);
     expect(fake.typed).toHaveLength(1);
     expect(fake.accel).toHaveLength(nAccel);
-    expect(posted.filter((m) => m.kind === "status").at(-1)).toEqual({
-      kind: "status",
-      speed: expect.any(Number),
-      provision: null,
-      softResets: 0,
-    });
+    expect(posted.filter((m) => m.kind === "status").at(-1)).toEqual(idleStatus(expect.any(Number)));
   });
 
   test("a failing slice posts an error and stops the loop", async () => {
@@ -699,13 +755,40 @@ describe("firmware worker client", () => {
     reply({ kind: "ready" });
     rt.provision("{}");
     expect(rt.provisionState()).toEqual({ kind: "waiting" });
-    reply({ kind: "status", speed: 0.75, provision: { kind: "typing" } as never, softResets: 0 });
+    reply({ ...idleStatus(0.75), provision: { kind: "typing" } as never });
     expect(rt.speed()).toBe(0.75);
     expect(rt.provisionState()).toEqual({ kind: "typing" } as never);
     rt.reset();
     expect(rt.speed()).toBe(0);
     expect(rt.provisionState()).toBeNull();
     expect(rt.isExitRequested()).toBe(false);
+  });
+
+  test("skipSetup hides the skip until the next status", () => {
+    const { rt, sent, reply } = clientRig();
+    expect([rt.skipState(), rt.setupOnScreen(), rt.rebooting()]).toEqual([null, false, false]);
+    reply({ kind: "ready" });
+    // Setup not on screen yet: nothing sent.
+    rt.skipSetup();
+    expect(sent.filter((m) => m.kind === "skipSetup")).toHaveLength(0);
+    reply({ ...idleStatus(1), setupOnScreen: true });
+    expect(rt.setupOnScreen()).toBe(true);
+    rt.skipSetup();
+    expect(sent.at(-1)).toEqual({ kind: "skipSetup" });
+    expect(rt.skipState()).toEqual({ kind: "typing" });
+    expect(rt.setupOnScreen()).toBe(false);
+    // A double click sends once.
+    rt.skipSetup();
+    expect(sent.filter((m) => m.kind === "skipSetup")).toHaveLength(1);
+    // The next status replaces the optimistic state.
+    reply({ ...idleStatus(1), rebooting: true, skip: { kind: "done" } });
+    expect([rt.skipState(), rt.setupOnScreen(), rt.rebooting()]).toEqual([{ kind: "done" }, false, true]);
+    // Setup again (a failed skip, or a re-provision): a fresh skip is sent.
+    reply({ ...idleStatus(1), skip: { kind: "failed", reason: "timed out" }, setupOnScreen: true });
+    rt.skipSetup();
+    expect(sent.filter((m) => m.kind === "skipSetup")).toHaveLength(2);
+    rt.reset();
+    expect([rt.skipState(), rt.setupOnScreen(), rt.rebooting()]).toEqual([null, false, false]);
   });
 
   test("ready rejects on a boot error, and dispose terminates the worker", async () => {

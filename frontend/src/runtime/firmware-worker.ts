@@ -28,11 +28,14 @@
  *
  * A slice with no frame in flight posts the current framebuffer, its
  * buffer transferred; the next frame waits for the client's `frameAck`.
- * `status` (speed, provisioning state and the software reset count) goes
- * out at most every `STATUS_INTERVAL_MS`, and at once, outside that
- * throttle, when the reset count changed since the last `status`
- * (Milestone 11 Task 8), so the status line never shows the old boot's
- * state for up to 250 ms.
+ * `status` (speed, `rebooting`, the provisioning and skip states, and
+ * `setupOnScreen`) goes out at most every `STATUS_INTERVAL_MS`, and at
+ * once, outside that throttle, when the software reset count changed
+ * since the last `status` (Milestone 11 Task 8), so the status line never
+ * shows the old boot's state for up to 250 ms. The Worker keeps that count
+ * itself; the message does not carry it (Milestone 13 Task 5).
+ * `setupOnScreen` decodes the current boot's console, so it is read only
+ * when a `status` is built, never per slice.
  *
  * ## The radio (Milestone 10 Task 9)
  *
@@ -94,7 +97,7 @@ export interface WorkerState {
   lastCapped: boolean;
   /** `host.now()` of the last `status`, or `null` (none yet). */
   lastStatusMs: number | null;
-  /** The `softResets` the last `status` carried. */
+  /** `softResetCount()` when the last `status` was posted (the message no longer carries it). */
   lastStatusSoftResets: number;
   /** The token of the one live scheduled slice; `0` when none. */
   liveSlice: number;
@@ -190,7 +193,15 @@ function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: 
         ) {
           state.lastStatusMs = t;
           state.lastStatusSoftResets = softResets;
-          post({ kind: "status", speed: rt.speed(), provision: rt.provisionState(), softResets });
+          post({
+            kind: "status",
+            speed: rt.speed(),
+            rebooting: rt.rebooting(),
+            provision: rt.provisionState(),
+            skip: rt.skipState(),
+            // Copies the boot's console: read only here, never per slice.
+            setupOnScreen: rt.setupOnScreen(),
+          });
         }
       },
       scheduleFrame: (cb) => {
@@ -274,6 +285,10 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
         break;
       case "provision":
         if (typeof msg.identityJson === "string") rt.provision(msg.identityJson);
+        break;
+      case "skipSetup":
+        // No fields: the kind is the whole message. The runtime refuses a skip it can't start.
+        rt.skipSetup();
         break;
       case "shake":
         rt.shake();

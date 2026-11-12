@@ -41,12 +41,21 @@
  *   `reset()` the speed) at once, as the in-thread runtime did; the next
  *   `status` replaces them. A `status` the Worker posted before it handled
  *   the message can show the old state for up to one status interval.
+ * - Skip setup (Milestone 13 Task 5): `skipState()`, `setupOnScreen()` and
+ *   `rebooting()` read the last `status`. `skipSetup()` posts `skipSetup`
+ *   only while that status shows Setup on screen, and then shows the skip
+ *   as typing and Setup hidden until the next status. A status the Worker
+ *   built before it handled the message can show Setup again for one
+ *   interval; a click then sends a second `skipSetup`, which the Worker's
+ *   runtime refuses (a skip is in flight), so one `config` and one
+ *   `reboot` are still typed. `reset()` clears all three.
  */
 import type { ButtonName, ButtonSource } from "../badge/input";
 import { blitFramebuffer } from "../render/framebuffer";
 import type { FirmwareRuntime, FrameCanceler, FrameScheduler } from "./firmware-runtime";
 import type { FromWorker, ToWorker } from "./firmware-worker-protocol";
 import type { ProvisionState } from "./provisioner";
+import type { SkipState } from "./setup-skip";
 
 export interface WorkerLike {
   postMessage(m: ToWorker, transfer?: Transferable[]): void;
@@ -86,16 +95,20 @@ export interface WorkerClientOptions {
   onPausedChange?: (paused: boolean) => void;
 }
 
-/** The client runtime, plus a promise that settles when the Worker has booted the emulator (or failed to). */
 /**
- * The Worker-side runtime's Skip-setup calls (Milestone 13 Task 4). They
- * run in the Worker; carrying them across the message boundary is the
- * client's to add (Task 5), so the client's API leaves them out until then.
+ * The client runtime, plus a promise that settles when the Worker has
+ * booted the emulator (or failed to). `skipSetup()` returns nothing here:
+ * whether the Worker's runtime started the skip is known only from the
+ * next `status`.
  */
-type WorkerOnlyCalls = "skipSetup" | "skipState" | "setupOnScreen" | "rebooting";
-
-export interface WorkerFirmwareRuntime extends Omit<FirmwareRuntime, WorkerOnlyCalls> {
+export interface WorkerFirmwareRuntime extends Omit<FirmwareRuntime, "skipSetup"> {
   readonly ready: Promise<void>;
+  /**
+   * Sends `skipSetup` if the last status showed Setup on screen, then
+   * shows the skip as typing (and Setup hidden) until the next status, so
+   * a second click sends nothing.
+   */
+  skipSetup(): void;
   /** Gives the badge its factory MAC; send it before the first `start()`. */
   setMac(mac: Uint8Array): void;
   /** A linked peer's advertisement, heard at `rssi` dBm; dropped unless running and visible. */
@@ -133,6 +146,9 @@ export function createWorkerFirmwareRuntime(
   const queue: ToWorker[] = [];
   let lastSpeed = 0;
   let lastProvision: ProvisionState | null = null;
+  let lastRebooting = false;
+  let lastSkip: SkipState | null = null;
+  let lastSetupOnScreen = false;
   let pendingFrame: Extract<FromWorker, { kind: "frame" }> | null = null;
   let paintHandle: number | null = null;
 
@@ -193,6 +209,9 @@ export function createWorkerFirmwareRuntime(
       case "status":
         lastSpeed = msg.speed;
         lastProvision = msg.provision;
+        lastRebooting = msg.rebooting === true;
+        lastSkip = msg.skip;
+        lastSetupOnScreen = msg.setupOnScreen === true;
         break;
       case "advOut":
         if (msg.bytes instanceof Uint8Array) notify(onAdvertisement, msg.bytes);
@@ -252,6 +271,16 @@ export function createWorkerFirmwareRuntime(
       send({ kind: "provision", identityJson });
     },
     provisionState: () => lastProvision,
+    skipSetup(): void {
+      // Hidden until the next status: a double click sends once.
+      if (!lastSetupOnScreen) return;
+      lastSkip = { kind: "typing" };
+      lastSetupOnScreen = false;
+      send({ kind: "skipSetup" });
+    },
+    skipState: () => lastSkip,
+    setupOnScreen: () => lastSetupOnScreen,
+    rebooting: () => lastRebooting,
     shake(): void {
       send({ kind: "shake" });
     },
@@ -270,6 +299,9 @@ export function createWorkerFirmwareRuntime(
     reset(): void {
       lastProvision = null;
       lastSpeed = 0;
+      lastRebooting = false;
+      lastSkip = null;
+      lastSetupOnScreen = false;
       send({ kind: "reset" });
     },
     speed: () => lastSpeed,

@@ -558,9 +558,10 @@ Task 8 the app runs that runtime inside a dedicated Web Worker
   emulation, so a slice never delays the page's paint or input.
 - The Worker posts at most one frame in flight (the main thread's
   `firmware-worker-client.ts` paints it on its next animation frame and
-  acknowledges it) and a `status` (speed, provisioning state,
-  `softResets`) at most every 250 ms, or at once when the soft-reset
-  count changes (Milestone 11 Task 8). While the page is hidden the client stops the runtime
+  acknowledges it) and a `status` (speed, `rebooting`, the provisioning
+  and setup-skip states, `setupOnScreen`; Milestone 13 Task 5 dropped
+  `softResets`) at most every 250 ms, or at once when the Worker's
+  soft-reset count changes (Milestone 11 Task 8). While the page is hidden the client stops the runtime
   and restarts it when visible (R-T8-10), so the Worker does not run the
   firmware unseen.
 
