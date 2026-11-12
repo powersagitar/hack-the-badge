@@ -569,6 +569,13 @@ impl FirmwareRuntime {
         self.bus.console.written()
     }
 
+    /// The console's output from absolute byte offset `at` (a
+    /// [`FirmwareRuntime::console_written`] value) on, lossily decoded. See
+    /// `crate::peripherals::console::Console::text_since`.
+    pub fn console_since(&self, at: u64) -> String {
+        self.bus.console.text_since(at)
+    }
+
     /// Bytes a USB host sends to the badge's console (USB-Serial-JTAG OUT).
     /// Returns how many were accepted; see
     /// `crate::peripherals::usb_serial_jtag::HOST_QUEUE_CAPACITY`.
@@ -1151,6 +1158,24 @@ mod tests {
         assert_eq!(rt.console_written(), line.len() as u64 + 1);
         rt.reset().unwrap();
         assert_eq!(rt.console_written(), 0, "a cold reset makes a new console");
+    }
+
+    #[test]
+    fn console_since_holds_only_the_new_boots_output() {
+        use crate::mem::soc::USB_SERIAL_JTAG_RANGE;
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        for b in b"old boot\n" {
+            rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(*b));
+        }
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        assert_eq!(rt.soft_reset_count(), 1);
+        let at = rt.console_written();
+        for b in b"new boot\n" {
+            rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(*b));
+        }
+        assert_eq!(rt.console_since(at), "new boot\n");
+        assert_eq!(rt.console_since(0), rt.console_output());
     }
 
     /// The RTC timer as `rtc_cntl_ll_get_rtc_time` reads it: `TIME_UPDATE`

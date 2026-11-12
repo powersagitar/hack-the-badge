@@ -91,7 +91,18 @@ describe("emulator-wasm firmware-boot boundary", () => {
       // Valid UTF-8 (no U+FFFD from the lossy decode), so re-encoding gives
       // back the bytes the firmware printed.
       expect(text).not.toContain("�");
-      expect(handle.consoleWritten()).toBe(new TextEncoder().encode(text).length);
+      const bytes = new TextEncoder().encode(text);
+      expect(handle.consoleWritten()).toBe(bytes.length);
+      // consoleSince slices by bytes: the last n bytes, decoded (lossily, as
+      // the core does, should n cut a character).
+      const written = handle.consoleWritten();
+      for (const n of [1, 5, 40, 200]) {
+        expect(handle.consoleSince(written - n)).toBe(
+          new TextDecoder().decode(bytes.subarray(bytes.length - n)),
+        );
+      }
+      expect(handle.consoleSince(0)).toBe(text);
+      expect(handle.consoleSince(written)).toBe("");
       handle.reset();
       expect(handle.consoleWritten()).toBe(0);
     } finally {

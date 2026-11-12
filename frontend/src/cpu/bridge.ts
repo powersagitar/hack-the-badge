@@ -102,6 +102,12 @@ export interface FirmwareEmulatorHandle {
    */
   consoleWritten(): number;
   /**
+   * The console's output from absolute byte offset `at` (a `consoleWritten()`
+   * value) on, sliced by bytes before decoding. An `at` older than the ring
+   * gives the whole ring; one at or past `consoleWritten()` gives "".
+   */
+  consoleSince(at: number): string;
+  /**
    * Sets the acceleration the badge's SC7A20H reports, in mg per axis
    * (default: lying face up, `(0, 0, 1000)`); survives `reset()`.
    */
@@ -253,6 +259,10 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     consoleWritten(): number {
       assertLive();
       return wasm.consoleWritten;
+    },
+    consoleSince(at: number): string {
+      assertLive();
+      return wasm.consoleSince(at);
     },
     setAcceleration(xMg: number, yMg: number, zMg: number): void {
       assertLive();

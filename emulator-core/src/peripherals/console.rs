@@ -49,6 +49,22 @@ impl Console {
     pub fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes()).into_owned()
     }
+
+    /// Lossy UTF-8 decode of the ring's bytes from absolute offset `at`
+    /// (see [`Console::written`]) on. An `at` older than the ring's start
+    /// gives the whole ring, and an `at` at or past `written()` gives "".
+    /// Slicing by bytes before decoding keeps a multi-byte character whole
+    /// when `at` is at its start.
+    pub fn text_since(&self, at: u64) -> String {
+        if at >= self.written {
+            return String::new();
+        }
+        let start = self.written - self.buf.len() as u64;
+        // `at - start` < `buf.len()` here, so it fits in a usize.
+        let skip = at.saturating_sub(start) as usize;
+        let bytes: Vec<u8> = self.buf.range(skip..).copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -83,5 +99,35 @@ mod tests {
         }
         assert_eq!(c.written(), CONSOLE_CAPACITY as u64 + 10);
         assert_eq!(c.bytes().len(), CONSOLE_CAPACITY);
+    }
+
+    #[test]
+    fn text_since_slices_by_absolute_offset_past_a_wrap() {
+        let mut c = Console::new();
+        for i in 0..(CONSOLE_CAPACITY + 10) {
+            c.push(b'a' + (i % 26) as u8);
+        }
+        let ring = c.bytes();
+        let tail = String::from_utf8(ring[ring.len() - 5..].to_vec()).unwrap();
+        assert_eq!(c.text_since(c.written() - 5), tail);
+        assert_eq!(c.text_since(0), c.text(), "older than the ring: the whole ring");
+        assert_eq!(c.text_since(10), c.text(), "exactly the ring's start");
+        assert_eq!(c.text_since(c.written()), "");
+        assert_eq!(c.text_since(c.written() + 100), "");
+    }
+
+    #[test]
+    fn text_since_decodes_a_multibyte_char_whole_at_its_start() {
+        let mut c = Console::new();
+        for b in "ab".bytes() {
+            c.push(b);
+        }
+        let at = c.written();
+        for b in "\u{2014}x".bytes() {
+            c.push(b);
+        }
+        assert_eq!(c.text_since(at), "\u{2014}x");
+        assert_eq!(c.text_since(at + 3), "x");
+        assert_eq!(c.text_since(0), "ab\u{2014}x");
     }
 }

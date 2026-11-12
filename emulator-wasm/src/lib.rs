@@ -205,6 +205,15 @@ impl FirmwareEmulator {
         self.inner.console_written() as f64
     }
 
+    /// The console's output from absolute byte offset `at` (a
+    /// [`FirmwareEmulator::console_written`] value) on (see
+    /// `FirmwareRuntime::console_since`). `at` converts as `run_until`'s
+    /// `target_us` does (a saturating cast: NaN or negative is 0).
+    #[wasm_bindgen(js_name = consoleSince)]
+    pub fn console_since(&self, at: f64) -> String {
+        self.inner.console_since(at as u64)
+    }
+
     /// Bytes a USB host sends to the badge's console; returns how many
     /// were accepted (see `FirmwareRuntime::serial_input`).
     #[wasm_bindgen(js_name = serialInput)]

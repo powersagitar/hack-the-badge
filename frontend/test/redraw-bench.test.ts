@@ -56,6 +56,7 @@ function makeFake(after: Uint16Array) {
     serialPending: () => 0,
     consoleOutput: () => "",
     consoleWritten: () => 0,
+    consoleSince: () => "",
     setAcceleration() {},
     setFactoryMac: () => true,
     radioAdvertisement: () => new Uint8Array(0),
