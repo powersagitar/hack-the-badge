@@ -48,6 +48,8 @@ fn console_since(rt: &FirmwareRuntime, marker: usize) -> String {
 
 /// Runs until the console text after byte `marker` contains one of
 /// `needles` (returns its index and that text), or `deadline` total steps.
+/// When one chunk brings several needles, the index is the one printed
+/// first (console order, not list order; a tie goes to the earlier entry).
 pub fn wait_for_any(
     rt: &mut FirmwareRuntime,
     marker: usize,
@@ -56,7 +58,12 @@ pub fn wait_for_any(
 ) -> Option<(usize, String)> {
     loop {
         let since = console_since(rt, marker);
-        if let Some(i) = needles.iter().position(|n| since.contains(n)) {
+        let first = needles
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| since.find(n).map(|at| (at, i)))
+            .min();
+        if let Some((_, i)) = first {
             return Some((i, since));
         }
         if rt.total_steps() >= deadline {

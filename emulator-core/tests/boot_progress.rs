@@ -1211,7 +1211,10 @@ fn console_rejects_an_empty_identity() {
 /// Total-step deadline for provisioning from the first-run screen: the
 /// slowest role (workshop_lead) prints `PROV OK` at 28.74M on v392 (all
 /// roles 28.54M..28.74M, host-paced `put`, 50,000-step sampling; v335:
-/// 28.39M); + 25%, rounded up to 1,000,000.
+/// 28.39M); + 25%, rounded up to 1,000,000. It is a total-step deadline,
+/// so [`credential_launcher`] reuses it for the token phase that follows
+/// (`badge_token set` to its prompt, about 0.29M steps more), which ends
+/// near 29.0M, still well inside it.
 const PROVISION_DEADLINE: u64 = 36_000_000;
 /// How long after a press (or the shake) a response may take to start:
 /// page 7 settled about 9M steps after A under the pre-Milestone-6 clock
@@ -2719,13 +2722,9 @@ fn credential_launcher() -> FirmwareRuntime {
             )
             .unwrap_or_else(|e| panic!("{e}"));
             assert!(text.contains("PROV OK id=test-"), "{text}");
-            let text = provision::set_upload_token(
-                &mut rt,
-                provision::FAKE_UPLOAD_TOKEN,
-                PROVISION_DEADLINE,
-            )
-            .unwrap_or_else(|e| panic!("{e}"));
-            assert!(text.contains(provision::TOKEN_OK), "{text}");
+            // Its Ok means TOKEN_OK and the prompt after it were seen.
+            provision::set_upload_token(&mut rt, provision::FAKE_UPLOAD_TOKEN, PROVISION_DEADLINE)
+                .unwrap_or_else(|e| panic!("{e}"));
             let (page1, _) = role_row(OWN_ROLE);
             let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
             let (hash, step) =
@@ -2826,8 +2825,13 @@ fn sync_with_a_credential_finds_no_station() {
         pressed + SYNC_PACKING_STEPS,
     )
     .unwrap_or_else(|| panic!("console since A:\n{}", &rt.console_output()[before..]));
-    let line = &seen[seen.find(SYNC_SNAPSHOT_LINE).unwrap()..];
-    let line = line.lines().next().unwrap_or(line);
+    // Read the line only once it has ended (its newline is in the console;
+    // when it already is, this runs nothing), so a line still being
+    // printed is never read short.
+    let at = before + seen.find(SYNC_SNAPSHOT_LINE).unwrap();
+    let (_, line) = provision::wait_for_any(&mut rt, at, &["\n"], pressed + SYNC_PACKING_STEPS)
+        .unwrap_or_else(|| panic!("unended line:\n{}", &rt.console_output()[at..]));
+    let line = line.lines().next().unwrap_or(&line);
     assert!(line.contains("complete=1"), "{line}");
     let asking = console_command(&mut rt, "uitree");
     assert!(
