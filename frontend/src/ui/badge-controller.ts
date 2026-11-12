@@ -287,10 +287,16 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   /** A refused Bump's reason ({@link BUMP_REFUSED_NOTE}), cleared by `bumpNoteTimer`. */
   let bumpNote = "";
   let bumpNoteTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * Which of the two the user started last: its state is the status text.
+   * The runtime keeps a finished skip's state through later provisions.
+   */
+  let lastStarted: "provision" | "skip" | null = null;
   const provisionControls: ProvisionControls = shell.mountProvisionControls(
     deps.roles,
     async (role) => {
       fetchError = "";
+      lastStarted = "provision";
       try {
         // Without the badge, boot nothing: another tab runs it.
         if (!(await claimBadge())) {
@@ -324,6 +330,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       refreshStatus();
     },
     () => {
+      lastStarted = "skip";
       firmwareRuntime?.skipSetup();
       refreshStatus();
     },
@@ -355,9 +362,12 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       else if ("line" in st) text = st.line;
       else if ("reason" in st) text = `failed: ${st.reason}`;
     }
-    // A skip's state is newer than the provision's; `done` adds nothing (the screen shows it).
-    if (skip?.kind === "typing") text = "skipping setup…";
-    else if (skip?.kind === "failed") text = `skip failed: ${skip.reason}`;
+    // The skip's state shows only while it is the newer of the two (`lastStarted`);
+    // `done` adds nothing (the screen shows it).
+    if (lastStarted === "skip") {
+      if (skip?.kind === "typing") text = "skipping setup…";
+      else if (skip?.kind === "failed") text = `skip failed: ${skip.reason}`;
+    }
     if (mode === "firmware" && rt) {
       // The emulated/wall ratio: below 1x the step cap binds (slow motion).
       const speed = rt.speed();

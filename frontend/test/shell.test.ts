@@ -595,6 +595,34 @@ describe("badge controller", () => {
     expect(provisionBtn.disabled).toBe(false);
   });
 
+  test("a provision started after a failed skip shows its own status", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ setupOnScreen: true });
+    r.skipButton().click();
+    const failed = { kind: "failed", reason: "timed out" } as const;
+    r.status({ setupOnScreen: true, skip: failed });
+    expect(r.statusText()).toContain("skip failed: timed out");
+    // The user provisions again; the Worker still reports the old skip failure.
+    button(r.controls(), "Provision test badge").click();
+    await settle();
+    r.status({ setupOnScreen: true, provision: { kind: "typing" }, skip: failed });
+    expect(r.statusText()).toContain("provisioning…");
+    expect(r.statusText()).not.toContain("skip failed");
+    // It finishes: its own result shows, not the old skip failure.
+    r.status({ setupOnScreen: true, provision: { kind: "ok", line: "PROV OK id=x" }, skip: failed });
+    expect(r.statusText()).toContain("PROV OK id=x");
+    expect(r.statusText()).not.toContain("skip failed");
+    r.status({ setupOnScreen: true, provision: { kind: "failed", reason: "no prompt" }, skip: failed });
+    expect(r.statusText()).toContain("failed: no prompt");
+    expect(r.statusText()).not.toContain("skip failed");
+    // A skip started after that provision wins again.
+    r.skipButton().click();
+    r.status({ setupOnScreen: true, provision: { kind: "ok", line: "PROV OK id=x" }, skip: { kind: "typing" } });
+    expect(r.statusText()).toContain("skipping setup…");
+  });
+
   test("the speed reads rebooting… during the reboot's pause", async () => {
     const r = badgeRig();
     r.pick("Real Firmware");
@@ -609,13 +637,13 @@ describe("badge controller", () => {
 
   test("a refused bump says why", async () => {
     let gate = false;
-    const r = badgeRig({ bump: () => gate, bumpNoteMs: 20 });
+    // A 0 ms note: the click shows it synchronously, and the next timer turn clears it.
+    const r = badgeRig({ bump: () => gate, bumpNoteMs: 0 });
     r.pick("Real Firmware");
     await settle();
     button(r.controls(), "Bump").click();
-    r.controller.refreshStatus();
     expect(r.statusText()).toContain("bump: the badge isn't running");
-    await settle(40);
+    await settle(1);
     r.controller.refreshStatus();
     expect(r.statusText()).not.toContain("bump:");
     // An accepted bump says nothing.
