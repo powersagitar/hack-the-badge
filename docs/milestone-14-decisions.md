@@ -346,3 +346,27 @@ the build; they return then.
 - **Mounting** is left to Task 12 (controller ruling R5): the panel takes
   a `log: ConsoleLog` prop, and the log and its `onConsole` wiring belong
   to the controller.
+
+## Power cycle (Task 3)
+
+`FirmwareRuntime::power_cycle()` (WASM `power_cycle()`) is the page's
+power switch: `reset()`'s cold power-on, sharing its body, except that
+the emulated flash is kept, as on the physical badge, so the identity,
+NVS and `reboot.cfg` survive. Everything else is lost as in `reset()`:
+RAM, RTC memory and the RTC_CNTL `STORE` registers, every peripheral,
+the panel, the console, queued serial input and the diagnostics.
+Emulated time, the step count and the soft-reset count restart at 0, and
+`rtc_get_reset_reason` reports `POWERON_RESET`. **The LEDs are cleared**,
+as `reset()` clears them (Ruling R2's cold case): `led_colors()` is empty
+and `led_frame_count()` is 0 until the new boot's first frame. Held
+buttons, the host-set acceleration and the factory MAC are host input
+and are re-applied, as `reset()` does. `reset()`'s behaviour is
+unchanged; `power_cycle` is a new entry point, and no pre-existing pin
+moved.
+
+Observed (v392, role hacker): from the registered checkpoint, a power
+cycle boots through the splash straight to My Badge's registered screen,
+the same hash as the walk's (`0x83ca_0950_da3c_55da`), with no reboot and
+no Setup. First stable at 38,500,000 steps, confirmed at 46,500,000 steps
+and 1,554,210 µs. Rung: `power_cycle_boots_to_the_registered_screen`
+(budget 59,000,000 steps, the confirmed step + 25%, rounded up).

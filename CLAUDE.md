@@ -416,7 +416,9 @@ emulator-core/src/
                         RTC_CNTL, USB-Serial-JTAG (queued input arrives in
                         the new boot) and the SC7A20H; the table and its
                         citations are in docs/milestone-11-decisions.md.
-                        reset() stays a cold power-on at 0 µs.
+                        reset() stays a cold power-on at 0 µs;
+                        power_cycle() is the same power-on but keeps
+                        the flash (the page's power switch).
                         attend(), the cold
                         path behind the attention flag, takes resets and
                         hook hits. The radio host API: set_factory_mac,
