@@ -32,9 +32,15 @@ controller that replaces the mask-ROM one at bt.c's VHCI seam, through
 app-image hooks at v392's addresses. Two emulated badges pair in Connect
 ("SYNCED" on both after a bump), in a rung and in two browsers linked
 by WebRTC on the same network (checked by the human partner on two
-devices). Sync shows "Badge not ready to sync": the fake identities have
-no upload credential. No browser can advertise BLE, so emulated badges
-hear only each other. Every frame
+devices). Sync, with the fake upload credential the provisioner sets,
+packs the badge, asks for a station for about 20 s of emulated time and
+ends on "No sync station in range" (no station exists in the browser,
+and none is emulated), then returns to its home by itself about 10 s
+later. No browser can advertise BLE, so emulated badges hear only each
+other, and two badges provisioned with the same identity never pair
+(Connect drops a card with its own badge ID). Share's transfer works
+between two emulated badges in a scratch probe; it is neither pinned
+nor reachable in the browser yet. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
@@ -49,10 +55,11 @@ v392 (the mobile Safari slowness was a dev-build effect). Before
 assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-11-decisions.md`.
+`docs/milestone-3-decisions.md` through `docs/milestone-12-decisions.md`.
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
 the v335 → v392 re-pins. Milestone 10's has the radio's rulings.
-Milestone 11's has the CPU-reset table and the Milestone 12 backlog.
+Milestone 11's has the CPU-reset table. Milestone 12's has Sync's and
+Share's traces and the Milestone 13 backlog.
 
 ## Repository layout
 
@@ -78,7 +85,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 319 of them, about 12 s. Most of that is the
+- `bun test`: unit tests, 339 of them, about 13 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.
@@ -95,14 +102,14 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 88 rungs plus 1 ignored benchmark, about
-  15 s.
+  real-firmware boot ratchet, 90 rungs plus 1 ignored benchmark, about
+  19 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
-  - `cargo test --workspace` runs the same rungs in debug, about 23 s.
+  - `cargo test --workspace` runs the same rungs in debug, about 30 s.
 - `cargo clippy --workspace --all-targets` runs clean, with no warnings.
 - Benchmarks are never part of a test run; results go in
   the current milestone's decisions doc (Milestone 7's has the profiles):
@@ -168,8 +175,11 @@ The rules for this data:
   Code that needs the full dump reads `BADGE_FULL_DUMP` and skips when it is
   unset.
 - The only committed identity data is the eleven obviously fake identities
-  in `frontend/public/firmware/test-identities/`, committed with the
-  organizers' permission. A real attendee's identity never goes there.
+  in `frontend/public/firmware/test-identities/` and the fake upload token
+  `FAKE_UPLOAD_TOKEN` (in `tests/common/provision.rs` and
+  `runtime/provisioner.ts`, never in the identity files), committed with
+  the organizers' permission (the token's, 2026-11-10). A real attendee's
+  identity or credential never goes there.
 - Never add a full flash dump to `public/firmware/`.
 
 See the notes' "Data-handling note".
@@ -217,10 +227,13 @@ frontend/src/
   runtime/provisioner.ts
                         Types `put /littlefs/identity.json` and `prov apply`
                         into the emulated USB console, paced in 64-byte
-                        chunks. The first prompt is matched from the
-                        current boot's console start (Milestone 11's
-                        R-T13-3). Mirrors
-                        emulator-core's tests/common/provision.rs.
+                        chunks, then by default `badge_token set` and
+                        FAKE_UPLOAD_TOKEN after PROV OK and its prompt
+                        (`uploadToken: null` skips the token; the redraw
+                        benchmark does). The first prompt is matched from
+                        the current boot's console start (Milestone 11's
+                        R-T13-3), the token's past the PROV OK line.
+                        Mirrors emulator-core's tests/common/provision.rs.
   radio/hub.ts          The radio hub on the main thread: sends the badge's
                         advertisement and bumps to every link, validates
                         peers' messages (a valibot schema), holds the
@@ -238,8 +251,10 @@ frontend/src/
                         Hosts or joins a room on /api/signal (1 s polls,
                         120 s budget). Its messages: busy N min on a 429,
                         "Signaling unavailable" on a 5xx, room closed on a
-                        join's 404. A cancel aborts and sends `close` with
-                        the host's token, best effort.
+                        join's 404. Each request aborts after a 10 s fetch
+                        timeout (SIGNAL_FETCH_TIMEOUT_MS). The host sends
+                        `close` with its token once, best effort, on a
+                        cancel or when `connected` fails.
   radio/signal-handler.ts
                         Pure signaling handler (Request in, Response out)
                         over `SignalDeps` (a RoomStore and four Limiters):
@@ -266,8 +281,9 @@ frontend/api/signal.ts  The Vercel function for /api/signal: the handler
                         over @upstash/redis and @upstash/ratelimit
                         (redisRoomStore, upstashLimiter, upstashDeps;
                         KV_REST_API_URL/_TOKEN; a missing one is a bare
-                        500). Vite's dev middleware serves the same
-                        handler over memoryDeps.
+                        500; REDIS_OPTIONS' retry { retries: 0 }, one
+                        REST request per command). Vite's dev middleware
+                        serves the same handler over memoryDeps.
 frontend/public/
   apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
                         because require() must return synchronously.
@@ -327,11 +343,12 @@ emulator-core/src/
   rom.rs                The ESP32-C3 mask-ROM HLE stub table (including
                         the software_reset/software_reset_cpu stubs that
                         request a core or a CPU reset, the reset reason
-                        rtc_get_reset_reason reports, and REBOOT_US, the
-                        466,000 µs a reboot takes), the guest-executed
-                        ROM code blobs (qsort, strdup, the CPU-frequency
-                        pair), the ROM data tables and the boot-time RAM
-                        initializers.
+                        rtc_get_reset_reason reports, REBOOT_US, the
+                        466,000 µs a reboot takes, and crc32_le, the
+                        CRC-32 NVS checks its entries with), the
+                        guest-executed ROM code blobs (qsort, strdup, the
+                        CPU-frequency pair), the ROM data tables and the
+                        boot-time RAM initializers.
   boot.rs               "Shortcut boot": loads firmware.bin straight from its
                         header, skipping ROM and bootloader emulation.
                         step_with_interrupts runs one step, with WFI

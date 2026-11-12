@@ -256,7 +256,7 @@
 - Produces:
   - `export const SIGNAL_FETCH_TIMEOUT_MS = 10_000`;
   - `SignalDeps.fetchTimeoutMs?: number`, defaulting to `SIGNAL_FETCH_TIMEOUT_MS` (tests inject a small value);
-  - `REDIS_OPTIONS.retry === false`.
+  - `REDIS_OPTIONS.retry` is `{ retries: 0 }` (not `false`, which still re-sends once; R-T5-2).
 
 - [ ] **Step 1: Write the failing tests.**
   - `call_aborts_a_hung_fetch`: a fake `fetch` that settles only when its `init.signal` aborts. With `fetchTimeoutMs: 20`, joining a room rejects with "Could not reach the signaling server; check the connection.", and the fetch's signal was aborted.
@@ -265,7 +265,7 @@
   - `host_sends_close_on_a_server_error`: a poll answers 500, `connected` rejects, and one `close` is sent.
   - `host_failure_then_cancel_sends_close_once` and `host_cancel_then_failure_sends_close_once`: both orders send exactly one `close`.
   - `host_success_sends_no_close`: today's behaviour holds.
-  - In `signal-handler.test.ts`, `redis_options_disable_retries`: `REDIS_OPTIONS.retry` is `false`.
+  - In `signal-handler.test.ts`, `redis_options_disable_retries`: `REDIS_OPTIONS.retry` is `{ retries: 0 }` (R-T5-2).
 
 - [ ] **Step 2: Run the tests and see them fail.**
   Run: `bun test test/signal-client.test.ts test/signal-handler.test.ts`
@@ -275,7 +275,7 @@
   - `call` takes an optional `signal`. It aborts on that signal or after `d.fetchTimeoutMs`, whichever comes first, and maps any abort or throw to the existing `SignalError`. If `AbortSignal.any` or `AbortSignal.timeout` are missing from the types, use a hand-made `AbortController` and timer. Clear the timer once the fetch settles.
   - The host's polls pass `cancel.signal`.
   - A `closeSent` flag, shared by `cancel()` and `connected`'s catch, ensures exactly one `close`.
-  - In `REDIS_OPTIONS`, add `retry: false`, with a comment: a retried `EVALSHA` after a lost reply would count one limiter hit twice; a store error stays the bare 500.
+  - In `REDIS_OPTIONS`, add `retry: { retries: 0 }` (R-T5-2), with a comment: a retried `EVALSHA` after a lost reply would count one limiter hit twice; a store error stays the bare 500.
 
 - [ ] **Step 4: Run the tests and see them pass**, then run the full check list.
 

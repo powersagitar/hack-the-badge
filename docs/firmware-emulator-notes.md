@@ -636,7 +636,17 @@ called the speed normal in the prod build and closed the speed items
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 11)
+### Current state (end of Milestone 12)
+
+**Milestone 12 takes Sync to "No sync station in range".** A ROM
+`crc32_le` stub lets NVS store an upload credential, both provisioning
+hosts set the fake `FAKE_UPLOAD_TOKEN` after `PROV OK`, and Sync then
+asks for a station for about 20 s of emulated time, gives up, and
+returns to its home by itself ("Milestone 12" below; the traces are in
+[`milestone-12-decisions.md`](milestone-12-decisions.md)). No
+Milestone 11 pin moved. The signaling client gained a fetch timeout and
+a `close` when the host gives up, and the function no Upstash retries.
+The rest of this section is otherwise unchanged from Milestone 11.
 
 **Milestone 11 was a backlog sweep.** A reboot now takes the badge's
 466 ms, the RTC timer counts through it, and a CPU reset keeps what the
@@ -811,9 +821,11 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   home and reopens after HOME without a second init
   (`connect_opens_with_the_radio_up`, `connect_reopens_after_home`);
   Sync reboots, opens, and answers "sync now" with "Badge not ready to
-  sync", because the fake identities carry no upload credential
-  (`sync_now_without_a_credential_is_not_ready`, R-T6-5, the human
-  partner's amendment). A soft reset resets the controller with the
+  sync" when the badge has no upload credential
+  (`sync_now_without_a_credential_is_not_ready`, Milestone 10's R-T6-5).
+  With the fake credential (Milestone 12) it ends on "No sync station in
+  range" instead (`sync_with_a_credential_finds_no_station`). A soft
+  reset resets the controller with the
   guest, and the radio initializes again cleanly
   (`sync_after_connect_initializes_the_radio_again`). Each badge needs its
   own factory MAC, an opt-in eFuse value set at power-on
@@ -875,6 +887,18 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 12** (details in
+[`milestone-12-decisions.md`](milestone-12-decisions.md) and
+"Milestone 12" below):
+
+- Sync's empty-room path: the ROM `crc32_le` stub and the fake upload
+  credential, so Sync reaches "No sync station in range" (Tasks 1 to 3).
+- Every frontend test file is type-checked (Task 4).
+- Signaling: a fetch timeout, no Upstash retries, and `close` when the
+  host gives up (Task 5).
+- Share's radio transfer is traced: advertisements only, and it works
+  between two emulated badges with no core change (Task 6).
 
 **Resolved in Milestone 11** (details in
 [`milestone-11-decisions.md`](milestone-11-decisions.md) and the history
@@ -1025,8 +1049,8 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 12 candidates)** (the Milestone 12 backlog
-in `milestone-11-decisions.md` is the complete list):
+**Open limitations (Milestone 13 candidates)** (the Milestone 13 backlog
+in `milestone-12-decisions.md` is the complete list):
 
 1. **The radio is a model, not the controller.** The closed controller
    blob and its mask-ROM half never run. `radio/hci.rs` answers only the
@@ -1043,8 +1067,15 @@ in `milestone-11-decisions.md` is the complete list):
      emulator. Hearing real badges through Chrome's Web Bluetooth scan
      (Part 5) was dropped on the human partner's no-go (R-T11-2): its
      only visible effect would be a lopsided bump. Sync therefore never
-     finds a station; with the fake identities it stops earlier anyway,
-     at "Badge not ready to sync" (no upload credential, R-T6-5).
+     finds a station: with the fake credential it ends on "No sync
+     station in range" (Milestone 12), and there is no fake station.
+     Without the credential (a provision that skips the token) it stops
+     at "Badge not ready to sync" (Milestone 10's R-T6-5).
+   - **Two badges with the same identity never pair.** Connect drops a
+     card that carries its own badge ID (`0x4201ee96`, Milestone 10
+     Task 11), so two browsers provisioned with the same role both end
+     on "No badge found, try again". Firmware behaviour; provision each
+     badge with a different role (Milestone 12's Gate 4).
    - **Links are same-network only.** `iceServers: []` (no STUN, TURN or
      relay), so two browsers must reach each other by host or mDNS
      candidates; a network or OS setting that blocks mDNS (macOS Local
@@ -1061,7 +1092,8 @@ in `milestone-11-decisions.md` is the complete list):
 2. **A cold power-on takes no time.** The shortcut boot starts the app
    at 0 µs after a power-on or the reset button; the badge takes about
    466 ms before `cpu_start`. Adding it would move every pin for no
-   visible gain (spec, "Non-goals"; Milestone 12 backlog). A software
+   visible gain (Milestone 11's spec, "Non-goals"; Milestone 13
+   backlog). A software
    reset does take it (Milestone 11).
 3. **The CPU-reset table's silent rows.** Where the TRM and ESP-IDF are
    both silent, the peripheral is reset and the gap recorded. That is the
@@ -1069,7 +1101,7 @@ in `milestone-11-decisions.md` is the complete list):
    external chips (74HC165, SC7A20H, ST7789, flash) are kept with no
    citation beyond "no TRM reset scope reaches them". The SYSTEM clock
    gates and reset bits are not modeled, and the core reset is narrower
-   than the TRM (`milestone-11-decisions.md`, "Milestone 12 backlog").
+   than the TRM (`milestone-12-decisions.md`, "Milestone 13 backlog").
 4. **The launcher's HOME redraw runs slower than real time in the
    browser.** The core runs about 40M to 42M steps per second in WASM
    against the badge's 80M cycles per second (Milestone 7's bench on
@@ -1144,6 +1176,25 @@ in `milestone-11-decisions.md` is the complete list):
     an eat (`snake_eats`), 50 to 134 ms after it. Not explained (a
     high-score save is a guess, not verified), and not compared with the
     badge.
+11. **Re-provisioning a registered badge** (Provision again, for the
+    same role or another) is the firmware's behaviour, not changed:
+    `prov apply` does not reboot, and `badge_token get` reads
+    `BADGE_TOKEN MISSING` for the new identity until the token is set
+    again (the stored credential belonged to the old badge ID; the
+    provisioner always sets it). The firmware prints `tutorial=reset`:
+    the launcher stays on screen until the next button press, which
+    drops into onboarding. The human partner did not rule on whether
+    this is acceptable (Milestone 12, Gate 3).
+12. **Sync's 20 s is not checked on hardware.** The emulated "Asking the
+    station..." lasts 19.98 s: 750 ticks of a 20 ms LVGL timer that the
+    firmware's 10 ms sleep rounding runs every 20 or 30 ms (Milestone
+    12's R-T6-1). The public source's comments say 15 s. A stopwatch on a
+    v392 badge settles it.
+13. **Share is not reachable in the browser.** It works between two
+    emulated badges (a scratch probe, Milestone 12 Task 6), but firmware
+    mode has no way to install a custom app, so the sender stops at "No
+    custom apps yet"; nothing pins the transfer, and v392's loader
+    refuses the committed `smoke-test/manifest.cfg` (R-T6-2).
 
 ### Ground truth from the physical badge
 
@@ -3383,6 +3434,81 @@ CPU-reset table, the traces and the backlog are in
   holds) and scoped the provisioner's first prompt to the current boot.
 - **Gate 3**, the browser (2026-11-09): the controller's Chrome checks
   and the human partner's two devices and Vercel preview all passed.
+
+### Milestone 12: Sync to "No sync station in range"
+
+The spec (`docs/superpowers/specs/2026-11-10-milestone12-sync-no-station-design.md`)
+takes Sync as far as the firmware goes without a sync station, which
+the browser cannot supply and the human partner chose not to emulate
+(2026-11-10). It carries three ride-alongs: three signaling faults,
+type-checking the test files, and a trace of Share's radio transfer.
+Rulings, measurements and traces are in
+`docs/milestone-12-decisions.md`. No Milestone 11 pin moved.
+
+- **Task 1: the stub.** `badge_token set` faulted at `0x4000_0628`, the
+  mask-ROM `crc32_le` (ESP-IDF v5.5.3's `esp32c3.rom.ld:415`), because
+  NVS checksums every entry it writes. `rom.rs`'s `CRC32_LE` is an HLE
+  stub: the zlib CRC-32 (reflected, `0xEDB8_8320`), inverted in and
+  out, chainable, its length capped at `MAX_STUB_MEMORY_BYTES` and its
+  buffer read through the bus (a wild buffer reads 0s). Nothing reached
+  that address before, so no pin could move. 128 stubs.
+- **Task 2: the credential.** `tests/common/provision.rs` gains
+  `FAKE_UPLOAD_TOKEN` (64 hex characters, one for every role, never in
+  the identity files; the organizers' OK, 2026-11-10) and
+  `set_upload_token`, which types `badge_token set` and the token and
+  waits for `BADGE_TOKEN READY`, then `BADGE_TOKEN OK`. `provision`
+  itself is unchanged. `credential_launcher()` reaches the launcher
+  through every hacker walk frame at 342,894,540 steps and 94,521,622 µs
+  (the token adds 293,859 steps and 7 µs). Two rungs:
+  `launcher_with_a_credential_keeps_every_walk_frame` and
+  `sync_with_a_credential_finds_no_station`.
+- **Sync's path** (Task 2's rung, Task 6's trace). From the open Sync
+  with the credential, A packs the badge ("Packing your badge...", then
+  the console's `sync: snapshot 1026 bytes, crc ec2f90df, …,
+  complete=1`, about 4.4M steps after the press), then NimBLE's
+  `extended advertise` and `extended discovery`. "Asking the
+  station..." pulses for 19.98 s of emulated time: v392's timeout is
+  the source's 750 ticks (3 OPEN attempts × 250), and its 20 ms LVGL
+  timer runs every 20 or 30 ms because the LVGL task sleeps in whole
+  10 ms FreeRTOS ticks (R-T6-1; the idle launcher's ticks are exactly
+  20 ms, and Snake's 170 ms matches the filmed badge). The final frame,
+  `0xa465_e4c0_e16e_ede6`, is "No sync station in range" / "Move closer
+  to the sync desk" / "A: try again   -   HOME: home", first sampled
+  414,064,783 steps after the press.
+- **The no-station screen returns by itself.** It holds for
+  `error_ticks_ = 400` (`0x42043b4e`, the source's `kErrorHoldTicks`),
+  10.07 s of emulated time, then Sync goes back to its home
+  (`SYNC_HOME_HASH`) with no input. In the browser (Task 3's check,
+  wall clock) "No sync station in range" came about 22 s after A for
+  both roles (hacker 22.4 s, the same badge re-provisioned as organizer
+  22.2 s), and the home came back about 12 s later; the emulator ran at
+  about 0.85x to 0.9x of real time there.
+- **Task 3: the browser provisioner** types `badge_token set` and
+  `FAKE_UPLOAD_TOKEN` after `PROV OK` and its prompt by default, and
+  matches `READY`/`OK` only past its own command (`uploadToken: null`
+  skips it; the WASM redraw benchmark does). A `BADGE_TOKEN FAIL`, a
+  `usage:` line or no `READY` fails the provision or times it out; it
+  never reports `ok`. The WASM twin takes the default, and its frame
+  pins hold. Re-provisioning is limitation 11 above.
+- **Task 4** widened `tsconfig.json`'s `include` to all of `test/` and
+  fixed its 58 errors: `lib` ES2022 (R-T4-1; the build output is
+  byte-identical) and seven typing fixes (R-T4-2).
+- **Task 5** fixed three signaling faults: every request aborts after a
+  10 s fetch timeout (`SIGNAL_FETCH_TIMEOUT_MS`), `REDIS_OPTIONS.retry`
+  is `{ retries: 0 }` (R-T5-2: `false` still re-sends once in
+  `@upstash/redis` 1.41.0), and the host sends `close` once, on a cancel
+  or when `connected` fails.
+- **Task 6** traced Share: advertisements only (an `APP1` header of 12
+  bytes and a body of at most 213; a full DATA frame is exactly the
+  model's 229-byte limit), and two emulated badges move an app end to
+  end on today's controller model. What is missing is in the browser
+  (limitation 13).
+- **Gate 3** (2026-11-11): the human partner says Sync's frames look
+  right. **Gate 4**, the Vercel preview of `6df703a`: a host's timeout
+  (the room gone) and a WebRTC link worked. Pairing first seemed to fail
+  ("No badge found, try again" on both), but both badges had the same
+  hacker identity, which Connect never pairs (limitation 1); with
+  distinct identities it pairs.
 
 ## Emulated flash chip: what it contains
 

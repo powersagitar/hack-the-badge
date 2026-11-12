@@ -315,10 +315,11 @@ Answers, in `docs/milestone-12-decisions.md`, "Traces":
    abort maps to the existing "Could not reach the signaling server"
    error. A joiner, who has no cancel, can then never wait past its 120 s
    budget by more than one timeout.
-2. **Upstash retries off:** `retry: false` in `api/signal.ts`'s Redis
-   options (`@upstash/redis` 1.41.0's `RetryConfig = false | {…}`), so a
-   lost reply's retried `EVALSHA` cannot count one limiter hit twice. A
-   store error stays the bare 500 it is today.
+2. **Upstash retries off:** `retry: { retries: 0 }` in `api/signal.ts`'s
+   Redis options (`@upstash/redis` 1.41.0's `RetryConfig = false | {…}`;
+   `false` still re-sends once, so the decisions doc's R-T5-2 chose
+   `{ retries: 0 }`), so a lost reply's retried `EVALSHA` cannot count
+   one limiter hit twice. A store error stays the bare 500 it is today.
 3. **`close` when the host gives up:** every way the host's `connected`
    ends in failure (no joiner by the deadline, `waitOpen`'s deadline, a
    bad answer, a server error) sends `close` with the token once, as

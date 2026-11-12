@@ -27,7 +27,8 @@ upload credential, used with the committed fake identities.
 
 Scratch probes at the end of `boot_progress.rs`, with a scratch
 `crc32_le` HLE effect (bitwise, the semantics in `crate::rom` entry 28),
-run release, then reverted. Token used: `0123456789abcdef` four times.
+run release, then reverted. Token used: the value later named
+`FAKE_UPLOAD_TOKEN`.
 
 1. **Without the stub, setting the token faults.** From `sync_open()`
    (the open Sync, no credential): `badge_token set` → `BADGE_TOKEN
@@ -460,10 +461,41 @@ to its home ("Find a sync station", `SYNC_HOME_HASH`) without input:
   clock the emulator ran at about 0.85x to 0.9x there, below the
   displayed speed.
 
+## Gates and the human partner's answers
+
+- **Gate 1** (2026-11-11): the spec approved. **Gate 2** (2026-11-11):
+  the plan approved, run subagent-driven.
+- **Gate 3** (2026-11-11), Sync's frames (`local/m12-frames/`, and the
+  orchestrator's Chrome check of Task 3): the human partner said the
+  frames look right. The partner did not rule on whether
+  re-provisioning's tutorial reset (below) is acceptable; it is
+  recorded as known firmware behaviour, with no code change.
+- **Gate 4** (2026-11-11), the Vercel preview of `6df703a`: a host left
+  to time out (the room gone) and a WebRTC link both worked. Pairing
+  first appeared to fail: Connect showed "No badge found, try again" on
+  both badges (Safari on a Mac and an iPad, one network; the same was
+  seen on main's production deploy). Both badges had been provisioned
+  as the same hacker identity, and Connect's receive branch
+  (`0x4201ee96`, Milestone 10 Task 11) drops a card carrying its own
+  badge ID. The human partner called it a false alarm: with distinct
+  identities pairing works. Gate 4 passed. Known limitation: two badges
+  with the same identity never pair (the notes' "Known limitations",
+  item 1). No code change.
+
+**Re-provisioning, recorded at Gate 3.** `prov apply` on a registered
+badge does not reboot (Task 3's trace, above). `badge_token get` reads
+`BADGE_TOKEN MISSING` for the new identity until the token is set
+again; the provisioner now always sets it. The firmware prints
+`tutorial=reset`: the launcher stays on screen until the next button
+press, which drops into onboarding (the orchestrator's Chrome check:
+re-provisioned as organizer from Sync's screen, onboarding walked
+again, the same no-station frame at about 22.2 s).
+
 ## Dependencies added
 
-None so far. Task 1's CRC is the hand-written bitwise loop the spec
-chose over a direct `crc32fast` dependency.
+None. `git diff 35a6c37..HEAD` touches no `package.json`, `Cargo.toml`,
+`Cargo.lock` or `bun.lock`. Task 1's CRC is the hand-written bitwise
+loop the spec chose over a `crc32fast` dependency.
 
 ## Rulings
 
@@ -503,8 +535,143 @@ Ruling R-T6-3: the HCI command trace came from a temporary `eprintln!` in `Radio
 
 ## Final suites
 
-(Filled at the finish.)
+At `89899dc` (Task 6's last commit; the commit after it is these docs
+only), from the full check list, run once in order, each step timed
+with `/usr/bin/time -p` (wall):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all` | no changes, 0.17 s |
+| `cargo test --workspace` | 757 passed, 0 failed, 1 ignored, 30.06 s: `emulator-core` lib 636; debug `boot_progress` 90 + 1 ignored in 26.81 s; the seven other integration binaries 31 |
+| `cargo test -p emulator-core --release --test boot_progress` | 90 passed, 1 ignored, 18.60 s (20.20 s with the build; the 90 s bound holds) |
+| `cargo clippy --workspace --all-targets` | 0 warnings, 0.61 s |
+| `bun run build:wasm` | OK, 1.44 s |
+| `bun test` | 339 pass, 0 fail, 18,575 `expect()` calls, 20 files, 13.20 s |
+| `bun run typecheck` | 0 errors, 0.24 s |
+| `bun run build` | OK, 0 warnings, 0.22 s |
+
+Against Milestone 11's baseline at `35a6c37`: release `boot_progress`
+88 → 90 (Task 2's two rungs; about 15 s → 18.6 s); `cargo test
+--workspace` 751 → 757 (Task 1's four `crc32_le` tests, Task 2's two
+rungs); `bun test` 319 → 339 (Task 3's 11, Task 5's 9).
+
+`bun run build`'s output (bytes, `ls -l`): `index.html` 984,
+`bridge-Ctgh-ak7.js` 5,919, `firmware-worker-BYvDG9ar.js` 8,946,
+`emulator_wasm_bg-DjWHtz-t.wasm` 142,270 (Vite's gzip 62.64 kB),
+`index-XRjmGPO9.css` 2,962, `index-CCVnrp6Y.js` 261,789 (gzip
+86.61 kB). Against Task 4's record: only `index-*.js` changed,
+261,491 → 261,789 (+298 B, Task 5's signaling client).
 
 ## Milestone 13 backlog
 
-(Filled at the finish.)
+### New in Milestone 12
+
+- **Share between two browsers** (Task 6: the core and the controller
+  model need no change). Three pieces: a two-badge Share rung pinning
+  the probe's end; a browser control that installs a Lua app over the
+  console, as the provisioner types; a two-browser check of a transfer
+  over WebRTC, where the Worker posts the advertisement at most at
+  10 Hz and a DATA frame dwells only 60 to 90 ms (STAT repair should
+  cover the frames it misses; untested).
+- **v392's loader refuses the committed smoke-test manifest**
+  (R-T6-2): `heap_kb must be 48 or 96`, then `wake_lock must be 0 or
+  1`. An install control that sends `frontend/public/apps/smoke-test/`
+  as it is will be refused; Lua mode reads the same file.
+- **A fake sync station.** The protocol is advertisement-only (v392's
+  NimBLE links no connect or GATT procedure, Task 6's trace; Sync's
+  OPEN goes out through `send_open`), so a station is possible on
+  today's model. The human partner chose
+  not to build one this milestone (2026-11-10).
+- **A stopwatch check of Sync's 20 s on a v392 badge** (R-T6-1): from A
+  to "No sync station in range", about 20 s (the emulator's 750 ticks of
+  20 or 30 ms) against about 15 s (every tick 20 ms).
+- **Mobile Safari's speed on the production build** is unmeasured.
+  Milestone 11 closed the 0.0x to 0.2x as a dev-build effect; Gate 4 ran
+  an iPad on the Vercel preview, and its speed was not recorded.
+- **The fetch timeout ends at the headers** (Task 5's deferred minor):
+  `call` clears its timer once `fetch` settles, so a reply whose body
+  stalls hangs `res.json()`, and with it the joiner's offer read,
+  weakening Review Focus 4's bound. Fix: read the body before clearing
+  the timer (R-T5-1 notes the same gap).
+- **Re-provisioning's tutorial reset** ("Gates", above): firmware
+  behaviour, recorded, not ruled on by the human partner.
+- **Milestone 12's other deferred review minors** (the ledger):
+  - Task 1: the wild-buffer test's "independent" reference repeats the
+    stub's loop, and R-T1-1's wording overstates it; the
+    `esp_rom_crc.h` line ranges differ between `rom_stubs.rs`
+    (`:62..:70`) and `rom.rs` (`:23..:70`); a `--` for `—` in the
+    `crc32_le` constructor's doc.
+  - Task 2: the `complete=1` check snapshots the console at the prefix
+    match (it would fail falsely, never pass falsely, if the line moved
+    past the release); `PROVISION_DEADLINE` is reused for the token
+    phase and its doc does not mention the token's ~0.29M steps; a
+    redundant `assert!(text.contains(TOKEN_OK))` after
+    `set_upload_token`'s `Ok`; `set_upload_token`'s needle checks follow
+    list order, not console order, within one chunk.
+  - Task 3: Milestone 11's "reports PROV OK" provisioner test now ends
+    in `typing` (R-T3-2); a caller's `uploadToken` is not validated (a
+    value not 64 bytes long waits to the timeout); a `token as string`
+    cast in `provisioner.ts`; one overlong line in this doc.
+  - Task 4: `lib` ES2022 ahead of `target` ES2020 (R-T4-1's cost); the
+    commented `as unknown as MouseEvent` cast in `shell.test.ts`.
+  - Task 5: no dedicated `close` test for `waitOpen`'s deadline or a bad
+    answer (the same catch covers them); a timed-out `close` is dropped
+    silently (best effort).
+  - Task 6: the LVGL loop's description ("The tick is 20 or 30 ms")
+    omits the `vTaskDelay(1)` at `0x420a3244`; "It is not an emulator
+    fault" overstates, since 20 against 30 ms per tick depends on the
+    emulated redraw time (one cycle per step is a lower bound,
+    `bus.rs:524`; peripheral waits are not modeled); "Core 7.8.54" names
+    no Core spec version.
+
+### Carried from Milestone 11's backlog (still open)
+
+Word for word in `docs/milestone-11-decisions.md`, "Milestone 12
+backlog", minus what this milestone closed: Share's transfer (traced,
+above), Sync's empty-room path (Tasks 1 to 3), the `tsconfig.json`
+`include` (Task 4) and the three signaling items (Task 5).
+
+- **A cold power-on's 466 ms.** The shortcut boot starts the app at
+  0 µs; the badge takes about 466 ms. Adding it would move every pin for
+  no visible gain (Milestone 11's spec, "Non-goals").
+- **A joiner who answered before a cancel waits out `waitOpen`.** A
+  joiner who arrives after the cancel gets the 404 at once. Covering the
+  earlier one needs a new poll, which costs commands (Milestone 11's
+  spec, Part 4.6).
+- **The reset model:** the CPU-reset table's silent rows (INTC, R-T1-2;
+  the external chips); the core reset narrower than the TRM; the SYSTEM
+  clock-gate and reset bits not modeled; DRAM `.noinit` not kept; the
+  RTC and timer-group watchdogs inert; three reboot apps' 465,999 µs
+  deltas, untraced; v335's 0.2M steps after `PROV FAIL`, not
+  established.
+- **The provisioner:** a console at its 256 KiB cap plus a soft reset
+  makes the boot-scoped prompt scan never match (R-T13-3); a provision
+  past the first prompt when the badge reboots loses bytes in the new
+  REPL's terminal probe, then times out cleanly.
+- **The radio model:** `host_rcv_pkt` blocking on the real firmware is
+  not established (Milestone 10's R-T6-2, half open); LE Set Extended
+  Scan Enable's other parameter rules (Core v5.4, 7.8.65).
+- **The browser:** Provision in a tab whose badge was since freed; a
+  Provision and a `startFirmware` racing on a claim; no feedback for a
+  refused Bump; an advertisement change just before a Worker stop never
+  posted; the host tab's stale "Room …: enter this code" line after
+  Remove; `inject` feeding a stopped runtime behind the "another tab"
+  notice; the speed readout at about 1x through the reboot's pause
+  (R-T8-2); a shake or bump across a reboot losing its tail (R-T8-3);
+  `status.softResets` unused by the Worker client.
+- **Carried from Milestone 8's backlog**, as `milestone-11-decisions.md`
+  lists them: Milestone 7's final-review items; speed and timing (Snake's
+  late game-over after an eat, CPI 1, zero-latency RMT, I2C0 and
+  SPIMEM1, PCER/PCMR, `PROVISION_TIMEOUT_STEPS` in steps); apps and UI
+  (no app's deeper screens tested beyond Connect's pairing and Sync's
+  "not ready" and "no station", a browser RNG seed, a console pane,
+  `DeviceMotionEvent`, Milestone 5 Task 7's minors, Task 7's small
+  cleanups, only role hacker's frames compared with hardware);
+  peripherals (RMT, NFC, the busy phase after START, SC7A20H, I2C0's
+  empty-FIFO `OP_WRITE`, the `put` task's CPU time, `R_M5_3`'s closure,
+  `strtol`/`atoi` and `errno`, the 8 MiB stub cap, the idle unmapped
+  accesses); build and tests (the release suite's one chain, Milestone
+  6's test minors); and Milestones 3 and 4 (`MADCTL`, GPIO0 routing, the
+  eFuse block beyond the factory MAC, flagged ROM-stub guesses, edge
+  interrupts, GDMA's corners, the 250,000-step chunks, small
+  duplications).
