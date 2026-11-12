@@ -1153,7 +1153,11 @@ mod tests {
         assert_eq!(rt.console_written(), line.len() as u64);
         call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
         assert_eq!(rt.soft_reset_count(), 1);
-        assert_eq!(rt.console_written(), line.len() as u64, "the reset keeps it");
+        assert_eq!(
+            rt.console_written(),
+            line.len() as u64,
+            "the reset keeps it"
+        );
         rt.bus.write32(USB_SERIAL_JTAG_RANGE.start, u32::from(b'!'));
         assert_eq!(rt.console_written(), line.len() as u64 + 1);
         rt.reset().unwrap();

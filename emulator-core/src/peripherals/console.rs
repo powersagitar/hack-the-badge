@@ -110,7 +110,11 @@ mod tests {
         let ring = c.bytes();
         let tail = String::from_utf8(ring[ring.len() - 5..].to_vec()).unwrap();
         assert_eq!(c.text_since(c.written() - 5), tail);
-        assert_eq!(c.text_since(0), c.text(), "older than the ring: the whole ring");
+        assert_eq!(
+            c.text_since(0),
+            c.text(),
+            "older than the ring: the whole ring"
+        );
         assert_eq!(c.text_since(10), c.text(), "exactly the ring's start");
         assert_eq!(c.text_since(c.written()), "");
         assert_eq!(c.text_since(c.written() + 100), "");
