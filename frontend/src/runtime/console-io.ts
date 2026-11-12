@@ -36,7 +36,9 @@ export function consoleSince(handle: FirmwareEmulatorHandle, at: number): string
  * `consoleWritten()` by the UTF-8 length of `text.slice(i)`. Counting from
  * the end stays exact when the slice was the whole ring (an `at` older
  * than it) or began with U+FFFD; `i` is where an ASCII needle was found,
- * so the tail decodes byte for byte.
+ * so the tail decodes byte for byte. If the bytes after `i` hold invalid
+ * or truncated UTF-8, each U+FFFD there counts 3 bytes for the 1 to 3 it
+ * replaced, so the result is early by up to 2 bytes per U+FFFD.
  */
 export function consoleOffsetOf(handle: FirmwareEmulatorHandle, text: string, i: number): number {
   return handle.consoleWritten() - encoder.encode(text.slice(i)).length;

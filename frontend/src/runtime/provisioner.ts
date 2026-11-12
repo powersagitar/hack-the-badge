@@ -70,6 +70,8 @@ export { LINE_END, PROMPT } from "./console-io";
 export const IDENTITY_PATH = "/littlefs/identity.json";
 /** Why a provision fails when the badge soft-resets after its first `put`. */
 export const REBOOTED_REASON = "the badge rebooted during provisioning";
+/** Why a provision fails when the serial queue refuses bytes. */
+const REFUSED = "the serial queue refused the input";
 /** What `put` prints once it is about to read the payload. */
 export const PUT_READY = "READY";
 /** The host's chunk size: one USB full-speed bulk packet. */
@@ -167,8 +169,6 @@ export function createProvisioner(
     return (result = { kind: "failed", reason });
   }
 
-  const REFUSED = "the serial queue refused the input";
-
   /** Sends `bytes`; false (and the provisioner fails) if the queue refuses any. */
   function send(bytes: Uint8Array): boolean {
     if (handle.serialInput(bytes) === bytes.length) return true;
@@ -177,7 +177,7 @@ export function createProvisioner(
   }
 
   /** Types `line` and starts watching the console from here. */
-  function type(line: string): boolean {
+  function typeCommand(line: string): boolean {
     const at = typeLine(handle, line);
     if (at === null) {
       fail(REFUSED);
@@ -223,7 +223,7 @@ export function createProvisioner(
           if (!consoleSince(handle, bootConsoleStart()).includes(PROMPT)) return result;
           result = { kind: "typing" };
           resetsAtStart = handle.softResetCount();
-          if (type(`put ${IDENTITY_PATH} ${payload.length}`)) phase = "ready";
+          if (typeCommand(`put ${IDENTITY_PATH} ${payload.length}`)) phase = "ready";
           return result;
         case "ready": {
           const text = since();
@@ -244,7 +244,7 @@ export function createProvisioner(
           const ok = text.indexOf(`OK ${payload.length}`);
           // `put` returns to the REPL, which prompts again; type only then.
           if (ok < 0 || text.indexOf(PROMPT, ok) < 0) return result;
-          if (type("prov apply")) phase = "applyReply";
+          if (typeCommand("prov apply")) phase = "applyReply";
           return result;
         }
         case "applyReply": {
@@ -274,7 +274,7 @@ export function createProvisioner(
           // line), in the current boot; never an earlier prompt.
           const from = Math.max(provOkEnd, bootConsoleStart());
           if (!consoleSince(handle, from).includes(PROMPT)) return result;
-          if (type("badge_token set")) phase = "tokenReady";
+          if (typeCommand("badge_token set")) phase = "tokenReady";
           return result;
         }
         case "tokenReady": {

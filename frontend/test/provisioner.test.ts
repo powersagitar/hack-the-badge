@@ -10,7 +10,7 @@ import {
   PUT_CHUNK_GAP_STEPS,
   type ProvisionOptions,
 } from "../src/runtime/provisioner";
-import { consoleSince } from "../src/runtime/console-io";
+import { consoleOffsetOf, consoleSince } from "../src/runtime/console-io";
 import type { FirmwareEmulatorHandle } from "../src/cpu/bridge";
 
 /**
@@ -498,28 +498,64 @@ describe("provisioner", () => {
     expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
   });
 
-  // v392 prints non-ASCII (an em dash): markers are byte offsets, not chars.
-  test("markers stay exact past multi-byte console text", () => {
+  // consoleOffsetOf: the absolute byte offset of text[i], counted back
+  // from consoleWritten() by the UTF-8 length of the tail.
+  test("consoleOffsetOf counts multi-byte text after i in bytes", () => {
     const f = fakeHandle();
-    const p = createProvisioner(f.handle, "{}");
-    f.print("I (1) app: idle — ready\r\nbadge> ");
-    p.poll();
-    f.print("put —\r\nREADY\r\n");
-    p.poll();
-    f.print("OK 2\r\n——badge> ");
+    f.print("ab—cd"); // a b e2 80 94 c d: 7 bytes, 5 chars
+    const text = consoleSince(f.handle, 0);
+    expect(consoleOffsetOf(f.handle, text, 1)).toBe(1); // "b"
+    expect(consoleOffsetOf(f.handle, text, 3)).toBe(5); // "c"
+    expect(consoleOffsetOf(f.handle, text, text.length)).toBe(7);
+  });
+
+  test("consoleOffsetOf is exact when the slice is the whole ring", () => {
+    const f = fakeHandle(undefined, 10);
+    f.print("0123456789—z"); // 14 bytes; the ring keeps bytes 4..13
+    const text = consoleSince(f.handle, 0); // older than the ring
+    expect(text).toBe("456789—z");
+    // "6" is at absolute 6, not at 0 + its index in the text.
+    expect(consoleOffsetOf(f.handle, text, text.indexOf("6"))).toBe(6);
+    expect(consoleOffsetOf(f.handle, text, text.indexOf("z"))).toBe(13);
+  });
+
+  test("consoleOffsetOf is exact when the slice starts mid-character", () => {
+    const f = fakeHandle();
+    f.print("a—b"); // a e2 80 94 b
+    const text = consoleSince(f.handle, 2); // 80 94 b: two U+FFFD, then b
+    expect(text.startsWith("�")).toBe(true);
+    expect(consoleOffsetOf(f.handle, text, text.indexOf("b"))).toBe(4);
+  });
+
+  // v392 prints non-ASCII (an em dash): markers are byte offsets. Here a
+  // char-index provOkEnd would land 80 bytes early, before a stale prompt.
+  test("provOkEnd is a byte offset past multi-byte text", () => {
+    const { f, p } = toFirstChunk("{}");
+    f.print("OK 2\r\nbadge> ");
     p.poll();
     expect(f.typed[2]).toBe("prov apply\n");
-    f.print(`———\r\n${PROV_OK_LINE}\r\n`);
-    p.poll();
-    // A prompt counts only after the PROV OK line.
+    f.print(`prov apply\r\n${"—".repeat(40)}\r\nbadge> \r\n${PROV_OK_LINE}\r\n`);
+    expect(p.poll().kind).toBe("typing");
+    expect(p.poll().kind).toBe("typing");
+    // The stray prompt before the PROV OK line does not start the token.
     expect(f.typed.length).toBe(3);
-    f.print("—badge> ");
+    f.print("badge> ");
     p.poll();
     expect(f.typed[3]).toBe("badge_token set\n");
-    f.print("—BADGE_TOKEN READY\r\n");
+  });
+
+  // The same for the marker past `BADGE_TOKEN READY`: a char-index advance
+  // would land early enough to re-see a stale OK and prompt before READY.
+  test("the token marker is a byte offset past multi-byte text", () => {
+    const { f, p } = toProvOk();
+    f.print("badge> ");
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+    f.print(`badge_token set\r\n${"—".repeat(40)}\r\nBADGE_TOKEN OK\r\nbadge> \r\nBADGE_TOKEN READY\r\n`);
     p.poll();
     expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
-    // The token's READY line is consumed: OK and a prompt finish it.
+    // Only an OK and a prompt after READY finish it.
+    expect(p.poll().kind).toBe("typing");
     f.print("BADGE_TOKEN OK\r\nbadge> ");
     expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
   });
