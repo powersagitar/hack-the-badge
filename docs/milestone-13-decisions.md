@@ -147,12 +147,12 @@ appears at Setup's launch, not at `PROV OK` (Review Focus 4; Task 4's
   and the skipped boot lands on the walked registered screen.
 - **Gate 2** (Task 6): no scope surprise; ride-alongs 4, 6 and 7 went
   in.
-- **Gate 3, the human partner's browser check: pending.** To be run on
-  the prod build (`bun run build && bun run preview`): provision hacker,
-  then the Skip setup button appears with Setup; press it, then
-  `rebooting…`, the registered screen, HOME, the launcher; re-provision
-  from the launcher, press a button, and Setup and the button come back.
-  Their result goes here, in their words.
+- **Gate 3, the human partner's browser check (2026-11-12): passed.**
+  Run on the prod build at 5ded31b (`bun run build && bun run preview`):
+  provision hacker, then the Skip setup button appears with Setup; press
+  it, then `rebooting…`, the registered screen, HOME, the launcher;
+  re-provision from the launcher, press a button, and Setup and the
+  button come back. In their words: "all passed."
 
 ## Dependencies added
 
