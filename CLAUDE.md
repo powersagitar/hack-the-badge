@@ -46,7 +46,10 @@ to its home by itself about 10 s of emulated time later. No browser can advertis
 other, and two badges provisioned with the same identity never pair
 (Connect drops a card with its own badge ID). Share's transfer works
 between two emulated badges in a scratch probe; it is neither pinned
-nor reachable in the browser yet. Every frame
+nor reachable in the browser yet. The LEDs are decoded: a passive
+WS2812 decoder on the RMT transmitter (`peripherals/ws2812.rs`) gives
+the six LEDs' colours (`led_colors`, `led_frame_count`), pinned for
+`prov apply`, the registered screen and Mood LEDs. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
@@ -109,7 +112,7 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 92 rungs plus 1 ignored benchmark, about
+  real-firmware boot ratchet, 95 rungs plus 1 ignored benchmark, about
   18 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
@@ -367,7 +370,9 @@ emulator-core/src/
                         `written`, past a wrap and across a soft reset,
                         and slices by that absolute offset, `text_since`),
                         I2C0 plus the SC7A20H
-                        accelerometer, RMT, efuse.rs (only the factory MAC,
+                        accelerometer, RMT plus ws2812.rs (a passive
+                        decoder of the LED chain's frames; a soft reset
+                        keeps them), efuse.rs (only the factory MAC,
                         opt-in; set it at power-on),
                         the flash MMU, and flash.rs (a synthetic 4 MiB flash
                         and the SPI1 controller).

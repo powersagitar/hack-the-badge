@@ -2234,11 +2234,11 @@ launcher_opens!(
     /// means: looking for a team!", "Press A to choose your mood", footer
     /// "HOME: apps". First stable 8.0M after the release: 20M.
     launcher_opens_mood_leds,
-    8,
+    MOOD_LEDS_CELL,
     "Mood LEDs",
     0,
-    20_000_000,
-    0x0c6c_07b5_b963_4775
+    MOOD_LEDS_RESPONSE_STEPS,
+    MOOD_LEDS_OPEN_HASH
 );
 launcher_opens!(
     /// Socials: "My Socials", "No social profiles are loaded yet." (the
@@ -3560,6 +3560,130 @@ fn run_until_ends_idle_frames_at_the_target() {
         assert_eq!(rt.emulated_time_us(), target, "frame {frame}: {s:?}");
     }
     assert_eq!(rt.emulated_time_us() - start, 120 * BROWSER_FRAME_US);
+}
+
+// ---------------------------------------------------------------------
+// Milestone 14 Task 2: the LED chain (`emulator_core::peripherals::ws2812`).
+//
+// The decoder only observes RMT, so these rungs pin what the firmware
+// sends without moving anything else. Colours are RGB, in chain order;
+// the evidence is in `docs/milestone-14-decisions.md`, "LEDs".
+// ---------------------------------------------------------------------
+
+/// LED frames the firmware sends from power-on to the stable first-run
+/// screen (two dark frames, then all six at [`FIRST_RUN_LEDS`]).
+const FIRST_RUN_LED_FRAMES: u32 = 3;
+/// The first-run screen's LEDs: all six a dim white.
+const FIRST_RUN_LEDS: [u8; 3] = [0x42, 0x42, 0x42];
+/// `prov apply` sends 12 frames: three dim green flashes, each followed
+/// by dark frames, then the role colour.
+const PROV_APPLY_LED_FRAMES: u32 = 12;
+/// The flash colour (`prov apply`, every role).
+const PROV_FLASH_LED: [u8; 3] = [0x00, 0x06, 0x00];
+/// The flashes `prov apply` shows.
+const PROV_FLASHES: usize = 3;
+/// Hacker's role colour as `prov apply` leaves it: all six a dim green,
+/// held on onboarding page 1. (Organizer's is a blue, sponsor's a red,
+/// general's an amber; measured, not pinned.)
+const HACKER_ROLE_LED: [u8; 3] = [0x06, 0x1F, 0x06];
+/// Samples while `prov apply` runs, in steps: far shorter than a flash
+/// (about 200,000 steps between a flash and the next dark frame).
+const LED_SAMPLE_STEPS: u32 = 1_000;
+/// LED frames from power-on to hacker's registered screen: Setup lights
+/// the chain (a fill, a chase, the shake page's blinking pair, the role
+/// colour on all six) and goes dark before it ends.
+const REGISTERED_LED_FRAMES: u32 = 116;
+
+/// The launcher cell, response and open frame of Mood LEDs
+/// ([`launcher_opens_mood_leds`]).
+const MOOD_LEDS_CELL: usize = 8;
+const MOOD_LEDS_RESPONSE_STEPS: u64 = 20_000_000;
+const MOOD_LEDS_OPEN_HASH: u64 = 0x0c6c_07b5_b963_4775;
+/// LED frames from power-on to Mood LEDs' stable open frame.
+const MOOD_LEDS_OPEN_FRAMES: u32 = 227;
+/// Mood LEDs breathes its default mood (green: "looking for a team")
+/// on all six: the colour at the stable open frame, ...
+const MOOD_LEDS_OPEN_LED: [u8; 3] = [0x00, 0x02, 0x01];
+/// ... and at the breath's peak, [`MOOD_LEDS_PEAK_AFTER_STEPS`] later.
+const MOOD_LEDS_PEAK_LED: [u8; 3] = [0x00, 0x21, 0x0E];
+const MOOD_LEDS_PEAK_AFTER_STEPS: u32 = 1_700_000;
+
+/// `prov apply` flashes the chain and leaves the role colour: from the
+/// stable first-run screen (dim white), hacker's identity is put, then
+/// `prov apply` is typed and the run sampled every [`LED_SAMPLE_STEPS`]
+/// up to the prompt after `PROV OK`.
+#[test]
+fn leds_flash_during_prov_apply() {
+    let mut rt = first_run_screen();
+    assert_eq!(rt.led_frame_count(), FIRST_RUN_LED_FRAMES);
+    assert_eq!(rt.led_colors(), vec![FIRST_RUN_LEDS; 6]);
+    provision::put_file(
+        &mut rt,
+        provision::IDENTITY_PATH,
+        &provision::identity_fixture(OWN_ROLE),
+        PROVISION_DEADLINE,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let before = rt.led_frame_count();
+    let marker = rt.console_output().len();
+    let apply = format!("prov apply{}", provision::LINE_END);
+    assert_eq!(rt.serial_input(apply.as_bytes()), apply.len());
+
+    let mut seen = before;
+    let mut flashes = 0;
+    loop {
+        assert!(
+            rt.total_steps() < PROVISION_DEADLINE,
+            "no prompt after PROV OK:\n{}",
+            &rt.console_output()[marker..]
+        );
+        let s = rt.run(LED_SAMPLE_STEPS);
+        assert_eq!(s.last_instruction_fault, None, "{s:?}");
+        if rt.led_frame_count() != seen {
+            seen = rt.led_frame_count();
+            if rt.led_colors() == vec![PROV_FLASH_LED; 6] {
+                flashes += 1;
+            }
+        }
+        let console = rt.console_output();
+        let since = &console[marker..];
+        if let Some(ok) = since.find("PROV OK") {
+            if since[ok..].contains(provision::PROMPT) {
+                break;
+            }
+        }
+    }
+    assert_eq!(rt.led_frame_count() - before, PROV_APPLY_LED_FRAMES);
+    assert_eq!(flashes, PROV_FLASHES);
+    assert_eq!(rt.led_colors(), vec![HACKER_ROLE_LED; 6], "the role colour");
+}
+
+/// Setup ends with the chain dark: at hacker's registered checkpoint
+/// every LED is off, after [`REGISTERED_LED_FRAMES`] frames.
+#[test]
+fn leds_go_dark_on_the_registered_screen() {
+    let rt = registered(OWN_ROLE);
+    assert_eq!(rt.led_frame_count(), REGISTERED_LED_FRAMES);
+    assert_eq!(rt.led_colors(), vec![[0; 3]; 6]);
+}
+
+/// Mood LEDs lights all six LEDs: dim at its stable open frame, at the
+/// breath's peak [`MOOD_LEDS_PEAK_AFTER_STEPS`] later.
+#[test]
+fn mood_leds_light_the_chain() {
+    let mut rt = assert_launcher_opens(
+        MOOD_LEDS_CELL,
+        "Mood LEDs",
+        0,
+        MOOD_LEDS_RESPONSE_STEPS,
+        AFTER_PRESS_STABLE_FOR,
+        MOOD_LEDS_OPEN_HASH,
+    );
+    assert_eq!(rt.led_frame_count(), MOOD_LEDS_OPEN_FRAMES);
+    assert_eq!(rt.led_colors(), vec![MOOD_LEDS_OPEN_LED; 6]);
+    let s = rt.run(MOOD_LEDS_PEAK_AFTER_STEPS);
+    assert_eq!(s.last_instruction_fault, None, "{s:?}");
+    assert_eq!(rt.led_colors(), vec![MOOD_LEDS_PEAK_LED; 6]);
 }
 
 // ---------------------------------------------------------------------

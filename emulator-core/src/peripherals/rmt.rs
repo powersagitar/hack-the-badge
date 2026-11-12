@@ -108,12 +108,19 @@
 //!   modeled (RX channels never see an edge). `TX_SIM` is stored, but a
 //!   sync-group channel starts on its own `TX_START`.
 //!
+//! - **The LED chain** ([`crate::peripherals::ws2812`], Milestone 14 Task
+//!   2): the transmitter hands every word it consumes to
+//!   [`Rmt::ws2812`], and ends its frame wherever it raises `TX_END` or
+//!   stops (an overrun, `TX_STOP`). The decoder only observes: it changes
+//!   no register, interrupt or timing here.
+//!
 //! The APB FIFO data registers (`CHnDATA`, `+0x00..+0x0C`, FIFO mode),
 //! the reserved words `+0x74..+0xC8` and the space after the RAM are not
 //! handled: they read 0, drop writes and are logged by the bus as
 //! unmapped.
 
 use super::set_byte;
+use super::ws2812::Ws2812;
 use crate::mem::soc::SRC_RMT;
 
 /// `RMT_CH0CONF0_REG`; channel `n`'s (`n < 2`) is at `+ 4 * n`.
@@ -264,6 +271,9 @@ pub struct Rmt {
     regs: [u32; (DATE_REG / 4 + 1) as usize],
     ram: [u32; RAM_WORDS],
     tx: [Transmitter; TX_CHANNELS],
+    /// The WS2812B chain on `LED_DIN`, fed every word the transmitters
+    /// consume (module doc). Observation only.
+    pub ws2812: Ws2812,
 }
 
 impl Default for Rmt {
@@ -284,6 +294,7 @@ impl Rmt {
             regs,
             ram: [0; RAM_WORDS],
             tx: [Transmitter::default(); TX_CHANNELS],
+            ws2812: Ws2812::default(),
         }
     }
 
@@ -367,6 +378,9 @@ impl Rmt {
                 *self.reg_mut(word) = conf & TX_CONF0_RW;
                 if bits & CONF0_TX_STOP != 0 {
                     // R/W/SC: the transmitter goes idle at once.
+                    if self.tx[ch].running {
+                        self.ws2812.end_of_transmission();
+                    }
                     self.tx[ch].running = false;
                     self.tx[ch].waiting = 0;
                 }
@@ -468,16 +482,19 @@ impl Rmt {
                     // Reading an exhausted RAM (§33.3.7, register 33.8).
                     self.tx[ch].mem_empty = true;
                     self.tx[ch].running = false;
+                    self.ws2812.end_of_transmission();
                     self.raise(int_tx_err(ch));
                     return;
                 }
                 self.tx[ch].rd = 0;
             }
             let word = self.ram[base + self.tx[ch].rd as usize];
+            self.ws2812.symbol(word);
             let end_marker = word & 0x7FFF == 0 || (word >> 16) & 0x7FFF == 0;
             if end_marker {
                 if !conti {
                     self.tx[ch].running = false;
+                    self.ws2812.end_of_transmission();
                     self.raise(int_tx_end(ch));
                     return;
                 }
@@ -782,6 +799,77 @@ mod tests {
         assert_eq!(rd(&mut r, INT_ST_REG), int_tx_end(0));
         assert_eq!(isr_ack(&mut r, 0), int_tx_end(0));
         assert_eq!(r.pending_sources(), 0);
+    }
+
+    /// The badge's LED frame (observed): 144 bit symbols for six LEDs, the
+    /// reset code and EOF, sent ping-pong as above, reach the WS2812
+    /// decoder whole, in order, as one frame.
+    #[test]
+    fn ping_pong_led_frame_reaches_the_ws2812_decoder() {
+        const BIT1: u32 = 0x0003_8009;
+        const RESET: u32 = 0x0578_0578;
+        // LED k is RGB (k, 0x80 | k, 0) — G = 0x80 | k, R = k, B = 0.
+        let mut frame = Vec::new();
+        for k in 0..6u32 {
+            let grb = (0x80 | k) << 16 | k << 8;
+            for i in (0..24).rev() {
+                frame.push(if grb >> i & 1 == 1 { BIT1 } else { BIT0 });
+            }
+        }
+        frame.extend([RESET, EOF]);
+        let mut r = Rmt::new();
+        new_tx_channel(&mut r, 0, 2);
+        begin_transaction(&mut r, 0);
+        for i in 0..96 {
+            w(&mut r, sym(0, i), frame[i as usize]);
+        }
+        tx_start(&mut r, 0);
+        isr_ack(&mut r, 0);
+        for i in 0..48 {
+            w(&mut r, sym(0, i), frame[96 + i as usize]);
+        }
+        assert_eq!(r.ws2812.frame_count(), 0, "mid-frame");
+        isr_ack(&mut r, 0);
+        w(&mut r, sym(0, 48), frame[144]);
+        w(&mut r, sym(0, 49), frame[145]);
+        enable_interrupt(&mut r, int_tx_thr(0), false);
+        assert!(!r.tx_running(0));
+        assert_eq!(rd(&mut r, INT_ST_REG), int_tx_end(0));
+
+        let expected: Vec<[u8; 3]> = (0..6u8).map(|k| [k, 0x80 | k, 0]).collect();
+        assert_eq!(r.ws2812.colors(), expected.as_slice());
+        assert_eq!(r.ws2812.frame_count(), 1);
+    }
+
+    /// An overrun and `TX_STOP` end the frame too; `TX_STOP` on an idle
+    /// channel publishes nothing.
+    #[test]
+    fn overrun_and_tx_stop_end_the_led_frame() {
+        let mut r = Rmt::new();
+        for i in 0..48 {
+            w(&mut r, sym(1, i), BIT0);
+        }
+        tx_start(&mut r, 1);
+        assert!(!r.tx_running(1), "overrun");
+        assert_eq!(r.ws2812.colors(), &[[0, 0, 0], [0, 0, 0]]);
+        assert_eq!(r.ws2812.frame_count(), 1);
+        set_bits(&mut r, conf0(1), CONF0_TX_STOP);
+        assert_eq!(r.ws2812.frame_count(), 1, "idle: nothing to end");
+
+        // Continuous mode never ends on its own; TX_STOP ends the frame
+        // after the 24 bits sent before the end-marker restarts it.
+        for i in 0..24 {
+            w(&mut r, sym(0, i), BIT0);
+        }
+        w(&mut r, sym(0, 24), EOF);
+        set_bits(&mut r, conf0(0), CONF0_TX_CONTI_MODE);
+        tx_start(&mut r, 0);
+        assert!(r.tx_running(0));
+        let published = r.ws2812.frame_count();
+        assert!(published > 1, "each end-marker ends a frame");
+        set_bits(&mut r, conf0(0), CONF0_TX_STOP);
+        assert!(!r.tx_running(0));
+        assert_eq!(r.ws2812.colors(), &[[0, 0, 0]]);
     }
 
     /// With the threshold interrupt disabled, a wrap-mode transmission
