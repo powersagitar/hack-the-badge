@@ -92,6 +92,10 @@ export const PUT_CHUNK_GAP_STEPS = 48_000;
  * (test-identities.test.ts checks the two are equal).
  */
 export const FAKE_UPLOAD_TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/** How many bytes `badge_token set` reads after `BADGE_TOKEN READY`. */
+export const UPLOAD_TOKEN_BYTES = 64;
+/** Why a provision fails at once when `uploadToken` is not that long. */
+export const BAD_TOKEN_REASON = "upload token must be 64 bytes";
 /** What `badge_token set` prints before it reads the token's bytes. */
 export const BADGE_TOKEN_READY = "BADGE_TOKEN READY";
 /** What `badge_token set` prints once the credential is stored. */
@@ -105,6 +109,8 @@ export interface ProvisionOptions {
   /**
    * The upload credential typed after `prov apply`: left out, it is
    * [`FAKE_UPLOAD_TOKEN`]; `null` skips the token phase (the benchmark).
+   * A token that is not [`UPLOAD_TOKEN_BYTES`] bytes in UTF-8 fails the
+   * provision at its first poll ([`BAD_TOKEN_REASON`]), typing nothing.
    */
   uploadToken?: string | null;
 }
@@ -134,7 +140,9 @@ export function createProvisioner(
 ): Provisioner {
   const encoder = new TextEncoder();
   const payload = encoder.encode(identityJson);
-  const token = options.uploadToken === undefined ? FAKE_UPLOAD_TOKEN : options.uploadToken;
+  const tokenText = options.uploadToken === undefined ? FAKE_UPLOAD_TOKEN : options.uploadToken;
+  /** The token's bytes, or null when the token phase is skipped. */
+  const token = tokenText === null ? null : encoder.encode(tokenText);
   type Phase =
     | "prompt"
     | "ready"
@@ -155,6 +163,12 @@ export function createProvisioner(
   let sent = 0;
   let lastChunkAt = 0;
   let result: ProvisionState = { kind: "waiting" };
+  // `badge_token set` reads exactly UPLOAD_TOKEN_BYTES bytes; any other
+  // length would never get its answer, so it fails before anything is typed.
+  if (token !== null && token.length !== UPLOAD_TOKEN_BYTES) {
+    phase = "done";
+    result = { kind: "failed", reason: BAD_TOKEN_REASON };
+  }
   /** The `PROV OK …` line, reported as `ok` once the token is stored. */
   let provOkLine = "";
   /** Absolute console offset just past the `PROV OK` line: the token's prompt comes after it. */
@@ -286,7 +300,7 @@ export function createProvisioner(
           }
           // One 64-byte USB packet, under the 256-byte RX ring.
           marker = consoleOffsetOf(handle, text, at + BADGE_TOKEN_READY.length);
-          if (send(encoder.encode(token as string))) phase = "tokenReply";
+          if (token !== null && send(token)) phase = "tokenReply";
           return result;
         }
         case "tokenReply": {

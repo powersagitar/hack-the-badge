@@ -129,8 +129,8 @@ WASM redraw benchmark does). The WASM twin (`test/cpu-wasm.test.ts`)
 takes the default, and every frame pin it holds is unchanged. Suites at
 Task 3: release `boot_progress` 90 pass, 1 ignored, 18.5 s;
 `cargo test --workspace` 757 pass, 1 ignored, about 28 s wall (its
-debug `boot_progress` 27.0 s); `bun test` 330 pass, 12.4 s; clippy and `bun run build` 0
-warnings.
+debug `boot_progress` 27.0 s); `bun test` 330 pass, 12.4 s; clippy
+and `bun run build` 0 warnings.
 
 ### Type-checking the test files (Task 4)
 
@@ -447,8 +447,9 @@ quantization of its own work time. The emulator charges 1 cycle per
 step (`emulator-core/src/mem/bus.rs:524`, `Clock::new(XTAL_HZ,
 SYSTIMER_HZ, 1)`), so emulated CPU work is no longer than the badge's;
 peripheral waits (SPI and DMA flushes) modelled slower than the
-hardware would add ticks. No fix, and no pin moves (ruling R-T6-1). The gate's 15 s case (an emulated tick
-slower than the firmware asks for) is not what was found.
+hardware would add ticks. No fix, and no pin moves (ruling R-T6-1).
+The gate's 15 s case (an emulated tick slower than the firmware asks
+for) is not what was found.
 
 **The auto-return.** "No sync station in range" holds, then Sync goes back
 to its home ("Find a sync station", `SYNC_HOME_HASH`) without input:

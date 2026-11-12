@@ -203,6 +203,32 @@ describe("provisioner", () => {
     // By default the token phase follows, so `ok` waits for it.
     expect(p.poll().kind).toBe("typing");
     expect(f.typed.length).toBe(3);
+    // The fake runs the token phase, so the provision ends in `ok`.
+    f.print("badge> ");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed[3]).toBe("badge_token set\n");
+    f.print("badge_token set\r\nBADGE_TOKEN READY\r\n");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
+    f.print("BADGE_TOKEN OK\r\nbadge> ");
+    expect(p.poll()).toEqual({ kind: "ok", line: "PROV OK id=test-fake-badge-0001" });
+  });
+
+  test("an upload token not exactly 64 bytes fails at once", () => {
+    for (const uploadToken of ["", "f".repeat(63), "f".repeat(65), "é".repeat(32) + "f"]) {
+      const f = fakeHandle();
+      const p = createProvisioner(f.handle, "{}", () => 0, { uploadToken });
+      const failed = { kind: "failed", reason: "upload token must be 64 bytes" } as const;
+      expect(p.poll()).toEqual(failed);
+      f.print("badge> ");
+      expect(p.poll()).toEqual(failed);
+      expect(f.typed).toEqual([]);
+    }
+    // 64 bytes in UTF-8 counts, not 64 characters: 32 two-byte characters pass.
+    const f = fakeHandle();
+    const p = createProvisioner(f.handle, "{}", () => 0, { uploadToken: "é".repeat(32) });
+    f.print("badge> ");
+    expect(p.poll().kind).toBe("typing");
   });
 
   test("reports a put error", () => {
