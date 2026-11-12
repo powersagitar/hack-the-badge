@@ -50,14 +50,26 @@
  * reports `ok` at `PROV OK`, as before Milestone 12. The WASM redraw
  * benchmark skips it, so its rows stay like-for-like with Milestones 7,
  * 9 and 11.
+ *
+ * Console offsets (Milestone 13): every marker, `bootConsoleStart()`
+ * included, is an absolute byte offset (`consoleWritten()`), read through
+ * `consoleSince` (`console-io.ts`), so a console past its 256 KiB ring
+ * still finds the current boot's prompt.
+ *
+ * A reboot mid-provision (Milestone 13, ruling 3(b)): once the first `put`
+ * is typed, a rise in `softResetCount()` fails the provision with
+ * `the badge rebooted during provisioning`, and nothing more is typed: the
+ * new boot's REPL never saw the command, and its terminal probe drops
+ * input. A reboot while the provisioner still waits for its first prompt
+ * stays fine (the prompt rule above handles it).
  */
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
+import { completeLine, consoleOffsetOf, consoleSince, PROMPT, typeLine } from "./console-io";
 
-/** The REPL's prompt. */
-export const PROMPT = "badge> ";
+export { LINE_END, PROMPT } from "./console-io";
 export const IDENTITY_PATH = "/littlefs/identity.json";
-/** What ends a REPL line: a single `\n` (`\r\n` would also submit an empty line). */
-export const LINE_END = "\n";
+/** Why a provision fails when the badge soft-resets after its first `put`. */
+export const REBOOTED_REASON = "the badge rebooted during provisioning";
 /** What `put` prints once it is about to read the payload. */
 export const PUT_READY = "READY";
 /** The host's chunk size: one USB full-speed bulk packet. */
@@ -107,17 +119,10 @@ export interface Provisioner {
 /** `put`'s failure messages (decisions file, `PUT_READ`). */
 const PUT_ERRORS = ["usage: put", "path too long", "bad size", "write error", "short read"];
 
-/** The complete line of `text` holding `needle` at `at`, or `undefined` while it is unterminated. */
-function completeLine(text: string, at: number): string | undefined {
-  const start = text.lastIndexOf("\n", at) + 1;
-  const end = text.indexOf("\n", at);
-  return end < 0 ? undefined : text.slice(start, end).trim();
-}
-
 /**
- * `bootConsoleStart` returns the console offset where the current boot
- * began (see the module doc); it is read at every poll, so a reboot while
- * the provisioner waits for its first prompt moves it on.
+ * `bootConsoleStart` returns the absolute console offset where the current
+ * boot began (see the module doc); it is read at every poll, so a reboot
+ * while the provisioner waits for its first prompt moves it on.
  */
 export function createProvisioner(
   handle: FirmwareEmulatorHandle,
@@ -140,13 +145,9 @@ export function createProvisioner(
     | "done";
   let phase: Phase = "prompt";
   /**
-   * Console offset where the current command's output starts. Offsets stay
-   * valid only while the console has not wrapped: it keeps the newest 256 KiB
-   * (`CONSOLE_CAPACITY`, emulator-core `console.rs`), far above what boot
-   * and provisioning print (an idle badge holds about 2.3 KB). Past a wrap,
-   * `since()` is a shifted window: it may re-see older output or, with the
-   * buffer full, show nothing new, and the caller's timeout fires. The same
-   * holds for `bootConsoleStart()`.
+   * Absolute console offset (bytes) where the current command's output
+   * starts. It stays exact past the console's 256 KiB ring; only a command
+   * whose own output overflowed the ring would read from the ring's start.
    */
   let marker = 0;
   let sent = 0;
@@ -154,27 +155,36 @@ export function createProvisioner(
   let result: ProvisionState = { kind: "waiting" };
   /** The `PROV OK …` line, reported as `ok` once the token is stored. */
   let provOkLine = "";
-  /** Console offset just past the `PROV OK` line: the token's prompt comes after it. */
+  /** Absolute console offset just past the `PROV OK` line: the token's prompt comes after it. */
   let provOkEnd = 0;
+  /** `softResetCount()` when the first `put` was typed; a rise after it fails the provision. */
+  let resetsAtStart = 0;
 
-  const since = (): string => handle.consoleOutput().slice(marker);
+  const since = (): string => consoleSince(handle, marker);
 
   function fail(reason: string): ProvisionState {
     phase = "done";
     return (result = { kind: "failed", reason });
   }
 
+  const REFUSED = "the serial queue refused the input";
+
   /** Sends `bytes`; false (and the provisioner fails) if the queue refuses any. */
   function send(bytes: Uint8Array): boolean {
     if (handle.serialInput(bytes) === bytes.length) return true;
-    fail("the serial queue refused the input");
+    fail(REFUSED);
     return false;
   }
 
   /** Types `line` and starts watching the console from here. */
-  function typeLine(line: string): boolean {
-    marker = handle.consoleOutput().length;
-    return send(encoder.encode(`${line}${LINE_END}`));
+  function type(line: string): boolean {
+    const at = typeLine(handle, line);
+    if (at === null) {
+      fail(REFUSED);
+      return false;
+    }
+    marker = at;
+    return true;
   }
 
   /** The first `put` error line in `text`, once it is complete. */
@@ -205,11 +215,15 @@ export function createProvisioner(
 
   return {
     poll(): ProvisionState {
+      if (phase !== "prompt" && phase !== "done" && handle.softResetCount() !== resetsAtStart) {
+        return fail(REBOOTED_REASON);
+      }
       switch (phase) {
         case "prompt":
-          if (handle.consoleOutput().indexOf(PROMPT, bootConsoleStart()) < 0) return result;
+          if (!consoleSince(handle, bootConsoleStart()).includes(PROMPT)) return result;
           result = { kind: "typing" };
-          if (typeLine(`put ${IDENTITY_PATH} ${payload.length}`)) phase = "ready";
+          resetsAtStart = handle.softResetCount();
+          if (type(`put ${IDENTITY_PATH} ${payload.length}`)) phase = "ready";
           return result;
         case "ready": {
           const text = since();
@@ -230,7 +244,7 @@ export function createProvisioner(
           const ok = text.indexOf(`OK ${payload.length}`);
           // `put` returns to the REPL, which prompts again; type only then.
           if (ok < 0 || text.indexOf(PROMPT, ok) < 0) return result;
-          if (typeLine("prov apply")) phase = "applyReply";
+          if (type("prov apply")) phase = "applyReply";
           return result;
         }
         case "applyReply": {
@@ -245,7 +259,7 @@ export function createProvisioner(
               return (result = { kind: "ok", line });
             }
             provOkLine = line;
-            provOkEnd = marker + text.indexOf("\n", okAt) + 1;
+            provOkEnd = consoleOffsetOf(handle, text, text.indexOf("\n", okAt) + 1);
             phase = "tokenPrompt";
             return result;
           }
@@ -259,8 +273,8 @@ export function createProvisioner(
           // The REPL prompts after the `PROV OK` line (and its identity
           // line), in the current boot; never an earlier prompt.
           const from = Math.max(provOkEnd, bootConsoleStart());
-          if (handle.consoleOutput().indexOf(PROMPT, from) < 0) return result;
-          if (typeLine("badge_token set")) phase = "tokenReady";
+          if (!consoleSince(handle, from).includes(PROMPT)) return result;
+          if (type("badge_token set")) phase = "tokenReady";
           return result;
         }
         case "tokenReady": {
@@ -271,7 +285,7 @@ export function createProvisioner(
             return err === undefined ? result : fail(err);
           }
           // One 64-byte USB packet, under the 256-byte RX ring.
-          marker += at + BADGE_TOKEN_READY.length;
+          marker = consoleOffsetOf(handle, text, at + BADGE_TOKEN_READY.length);
           if (send(encoder.encode(token as string))) phase = "tokenReply";
           return result;
         }

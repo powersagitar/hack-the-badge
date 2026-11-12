@@ -10,34 +10,56 @@ import {
   PUT_CHUNK_GAP_STEPS,
   type ProvisionOptions,
 } from "../src/runtime/provisioner";
+import { consoleSince } from "../src/runtime/console-io";
 import type { FirmwareEmulatorHandle } from "../src/cpu/bridge";
 
 /**
  * A fake console: records each `serialInput` call as a string; `print`
- * appends firmware output; `advance` moves `totalSteps()` on.
+ * appends firmware output; `advance` moves `totalSteps()` on; `reboot`
+ * bumps `softResetCount()`. The console mirrors the core's byte ring
+ * (`console.rs`): it keeps the newest `cap` bytes (256 KiB by default),
+ * `consoleWritten()` counts every byte ever written, and `consoleSince`
+ * slices bytes from an absolute offset (the whole ring if it is older)
+ * before decoding.
  */
-function fakeHandle(accept: (bytes: Uint8Array) => number = (b) => b.length) {
-  let output = "";
+function fakeHandle(accept: (bytes: Uint8Array) => number = (b) => b.length, cap = 256 * 1024) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let ring = new Uint8Array(0);
+  let written = 0;
   let steps = 0;
+  let softResets = 0;
   const typed: string[] = [];
   const handle = {
     serialInput(bytes: Uint8Array) {
       const n = accept(bytes);
-      typed.push(new TextDecoder().decode(bytes.subarray(0, n)));
+      typed.push(decoder.decode(bytes.subarray(0, n)));
       return n;
     },
     serialPending: () => 0,
-    consoleOutput: () => output,
+    consoleOutput: () => decoder.decode(ring),
+    consoleWritten: () => written,
+    consoleSince: (at: number) =>
+      at >= written ? "" : decoder.decode(ring.subarray(Math.max(0, ring.length - (written - at)))),
+    softResetCount: () => softResets,
     totalSteps: () => steps,
   } as unknown as FirmwareEmulatorHandle;
   return {
     handle,
     typed,
     print: (s: string) => {
-      output += s;
+      const bytes = encoder.encode(s);
+      const next = new Uint8Array(ring.length + bytes.length);
+      next.set(ring);
+      next.set(bytes, ring.length);
+      ring = next.subarray(Math.max(0, next.length - cap));
+      written += bytes.length;
     },
     advance: (n: number) => {
       steps += n;
+    },
+    reboot: () => {
+      softResets++;
     },
   };
 }
@@ -232,7 +254,7 @@ describe("provisioner", () => {
     const f = fakeHandle();
     f.print("I (10) app: started\r\nbadge> ");
     // The firmware reboots here: the new boot's console starts at this offset.
-    let bootStart = f.handle.consoleOutput().length;
+    let bootStart = f.handle.consoleWritten();
     const p = createProvisioner(f.handle, "{}", () => bootStart);
     expect(p.poll().kind).toBe("waiting");
     f.advance(1_000_000);
@@ -244,7 +266,7 @@ describe("provisioner", () => {
     expect(p.poll().kind).toBe("typing");
     expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
     // A prompt is taken once: a later reboot does not retype the command.
-    bootStart = f.handle.consoleOutput().length;
+    bootStart = f.handle.consoleWritten();
     f.print("badge> ");
     p.poll();
     expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
@@ -397,7 +419,7 @@ describe("provisioner", () => {
     // The old boot prompts, then the firmware reboots in the same frame;
     // the runtime records the new boot's start after both.
     f.print("badge> ");
-    bootStart = f.handle.consoleOutput().length;
+    bootStart = f.handle.consoleWritten();
     f.print("I (5) boot: ESP-IDF\r\n");
     expect(p.poll().kind).toBe("typing");
     expect(p.poll().kind).toBe("typing");
@@ -422,5 +444,118 @@ describe("provisioner", () => {
     f.print("badge> ");
     p.poll();
     expect(f.typed[3]).toBe("badge_token set\n");
+  });
+
+  // ------------------------------------------------------------------
+  // Milestone 13 Task 3: absolute console offsets, and a reboot mid-provision.
+
+  test("consoleSince is exact past a wrap", () => {
+    const f = fakeHandle(undefined, 64);
+    const text = Array.from({ length: 200 }, (_, i) => String.fromCharCode(97 + (i % 26))).join("");
+    f.print(text);
+    expect(f.handle.consoleWritten()).toBe(200);
+    expect(f.handle.consoleOutput()).toBe(text.slice(-64));
+    expect(consoleSince(f.handle, 190)).toBe(text.slice(190));
+    // Older than the ring: the whole ring; at or past the end: nothing.
+    expect(consoleSince(f.handle, 0)).toBe(text.slice(-64));
+    expect(consoleSince(f.handle, 200)).toBe("");
+  });
+
+  // R-T13-3 past a wrap (Review Focus 5): the 256 KiB ring is full, so an
+  // index into the ring's text is no longer an absolute offset.
+  test("finds the first prompt in a full console after a soft reset", () => {
+    const f = fakeHandle();
+    f.print("I (1) app: idle\r\n".repeat(17_000));
+    f.print("x".repeat(300_000 - 7 - f.handle.consoleWritten()));
+    // The old boot's idle prompt, the last thing before the reset.
+    f.print("badge> ");
+    expect(f.handle.consoleWritten()).toBe(300_000);
+    expect(f.handle.consoleOutput().length).toBe(256 * 1024);
+    // The badge reboots at absolute 300,000.
+    const bootStart = f.handle.consoleWritten();
+    const p = createProvisioner(f.handle, "{}", () => bootStart);
+    expect(p.poll().kind).toBe("waiting");
+    f.print("I (5) boot: ESP-IDF\r\n");
+    expect(p.poll().kind).toBe("waiting");
+    f.print("badge> ");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+    // The rest of the flow reads through absolute markers too.
+    f.print("put /littlefs/identity.json 2\r\nREADY\r\n");
+    p.poll();
+    expect(f.typed[1]).toBe("{}");
+    f.print("OK 2\r\nbadge> ");
+    p.poll();
+    expect(f.typed[2]).toBe("prov apply\n");
+    f.print(`prov apply\r\n${PROV_OK_LINE}\r\nbadge> `);
+    p.poll();
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+    f.print("badge_token set\r\nBADGE_TOKEN READY\r\n");
+    p.poll();
+    expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
+    f.print("BADGE_TOKEN OK\r\nbadge> ");
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+  });
+
+  // v392 prints non-ASCII (an em dash): markers are byte offsets, not chars.
+  test("markers stay exact past multi-byte console text", () => {
+    const f = fakeHandle();
+    const p = createProvisioner(f.handle, "{}");
+    f.print("I (1) app: idle — ready\r\nbadge> ");
+    p.poll();
+    f.print("put —\r\nREADY\r\n");
+    p.poll();
+    f.print("OK 2\r\n——badge> ");
+    p.poll();
+    expect(f.typed[2]).toBe("prov apply\n");
+    f.print(`———\r\n${PROV_OK_LINE}\r\n`);
+    p.poll();
+    // A prompt counts only after the PROV OK line.
+    expect(f.typed.length).toBe(3);
+    f.print("—badge> ");
+    p.poll();
+    expect(f.typed[3]).toBe("badge_token set\n");
+    f.print("—BADGE_TOKEN READY\r\n");
+    p.poll();
+    expect(f.typed[4]).toBe(FAKE_UPLOAD_TOKEN);
+    // The token's READY line is consumed: OK and a prompt finish it.
+    f.print("BADGE_TOKEN OK\r\nbadge> ");
+    expect(p.poll()).toEqual({ kind: "ok", line: PROV_OK_LINE });
+  });
+
+  test("fails when the badge reboots mid-provision", () => {
+    const f = fakeHandle();
+    const p = createProvisioner(f.handle, "{}");
+    f.print("badge> ");
+    p.poll();
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+    f.reboot();
+    const failed = { kind: "failed", reason: "the badge rebooted during provisioning" } as const;
+    expect(p.poll()).toEqual(failed);
+    // The new boot's REPL is never typed into.
+    f.print("READY\r\nOK 2\r\nbadge> ");
+    expect(p.poll()).toEqual(failed);
+    f.advance(10 * PUT_CHUNK_GAP_STEPS);
+    expect(p.poll()).toEqual(failed);
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
+  });
+
+  test("a reboot during the token phase also fails the provision", () => {
+    const { f, p } = toProvOk();
+    f.reboot();
+    f.print("badge> ");
+    expect(p.poll()).toEqual({ kind: "failed", reason: "the badge rebooted during provisioning" });
+    expect(f.typed.length).toBe(3);
+  });
+
+  test("a reboot while it waits for the first prompt is fine", () => {
+    const f = fakeHandle();
+    const p = createProvisioner(f.handle, "{}");
+    f.reboot();
+    expect(p.poll().kind).toBe("waiting");
+    f.print("badge> ");
+    expect(p.poll().kind).toBe("typing");
+    expect(f.typed).toEqual(["put /littlefs/identity.json 2\n"]);
   });
 });

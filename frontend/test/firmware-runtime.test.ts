@@ -361,21 +361,29 @@ describe("createFirmwareRuntime", () => {
 
 /**
  * A fake console handle, a settable step counter and emulated time, and a
- * manual frame scheduler.
+ * manual frame scheduler. The console mirrors the core's byte ring: it
+ * keeps the newest `consoleCap` bytes, and `consoleWritten()` counts every
+ * byte ever written.
  */
-function rig() {
-  let consoleText = "";
+function rig(consoleCap = 256 * 1024) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let ring = new Uint8Array(0);
+  let written = 0;
   let steps = 0;
   let timeUs = 0;
   const typed: string[] = [];
   const accel: Array<[number, number, number]> = [];
   const fake = makeFakeHandle({
     serialInput(bytes: Uint8Array): number {
-      typed.push(new TextDecoder().decode(bytes));
+      typed.push(decoder.decode(bytes));
       return bytes.length;
     },
     serialPending: () => 0,
-    consoleOutput: () => consoleText,
+    consoleOutput: () => decoder.decode(ring),
+    consoleWritten: () => written,
+    consoleSince: (at: number) =>
+      at >= written ? "" : decoder.decode(ring.subarray(Math.max(0, ring.length - (written - at)))),
     totalSteps: () => steps,
     emulatedTimeUs: () => timeUs,
     setAcceleration: (x, y, z) => {
@@ -394,7 +402,14 @@ function rig() {
     accel,
     frame,
     buttonCalls: fake.buttonCalls,
-    print: (s: string) => (consoleText += s),
+    print: (s: string) => {
+      const bytes = encoder.encode(s);
+      const next = new Uint8Array(ring.length + bytes.length);
+      next.set(ring);
+      next.set(bytes, ring.length);
+      ring = next.subarray(Math.max(0, next.length - consoleCap));
+      written += bytes.length;
+    },
     setSteps: (n: number) => (steps = n),
     setTimeUs: (n: number) => (timeUs = n),
     armReboot: fake.armReboot,
@@ -608,6 +623,38 @@ describe("FirmwareRuntime provisioning", () => {
     frame();
     expect(typed).toEqual([]);
     print("new boot\r\nbadge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
+  // R-T13-3 past a wrap (Review Focus 5): the boot's start is an absolute
+  // console offset, not the ring's length.
+  test("a provision after a reboot in a wrapped console waits for the new boot's prompt", () => {
+    const { rt, typed, frame, print, armReboot } = rig(64);
+    rt.start();
+    print(`${"x".repeat(200)}\r\nold boot\r\nbadge> `);
+    armReboot();
+    frame(); // ends at the soft reset; the old prompt is still in the ring
+    rt.provision('{"a":1}');
+    frame();
+    frame();
+    expect(typed).toEqual([]);
+    print("new boot\r\nbadge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
+  test("a reboot mid-provision fails it with the reboot's reason", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.provision('{"a":1}');
+    rt.start();
+    print("badge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+    armReboot();
+    frame();
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: "the badge rebooted during provisioning" });
+    print("new boot\r\nbadge> READY\r\n");
     frame();
     expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
   });

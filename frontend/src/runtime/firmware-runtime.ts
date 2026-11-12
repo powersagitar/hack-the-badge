@@ -412,10 +412,11 @@ export function createFirmwareRuntime(
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
   /**
-   * Console offset where the current boot's text begins: 0 until a soft
-   * reset, then the console's length in the frame that ended at it (the
-   * core's `run_until` stops at a reset whose jump passes the target,
-   * which a frame's at most 50 ms target always is).
+   * Absolute console offset (bytes, `consoleWritten()`) where the current
+   * boot's text begins: 0 until a soft reset, then the console's written
+   * count in the frame that ended at it (the core's `run_until` stops at
+   * a reset whose jump passes the target, which a frame's at most 50 ms
+   * target always is). A cold `reset()` starts the count at 0 again.
    */
   let bootConsoleStart = 0;
   /**
@@ -575,7 +576,7 @@ export function createFirmwareRuntime(
     if (r.rebootUs > 0) {
       rebootDebtUs += r.rebootUs;
       shiftTapsPastReboot(r.rebootUs);
-      bootConsoleStart = handle.consoleOutput().length;
+      bootConsoleStart = handle.consoleWritten();
     }
     if (delta > 0) {
       // The real frame time, not the clamped one: see "Pacing" above. The
