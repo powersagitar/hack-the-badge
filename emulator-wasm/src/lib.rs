@@ -148,6 +148,19 @@ impl FirmwareEmulator {
         self.inner.framebuffer().to_vec()
     }
 
+    /// The LED chain's latest frame as a fresh, JS-owned `Uint8Array`:
+    /// R, G, B per LED in chain order, empty until the first frame (see
+    /// `FirmwareRuntime::led_colors`).
+    pub fn led_colors(&self) -> Vec<u8> {
+        self.inner.led_colors().concat()
+    }
+
+    /// LED frames sent since the last cold power-on (see
+    /// `FirmwareRuntime::led_frame_count`).
+    pub fn led_frame_count(&self) -> u32 {
+        self.inner.led_frame_count()
+    }
+
     #[wasm_bindgen(getter, js_name = screenWidth)]
     pub fn screen_width(&self) -> usize {
         self.inner.screen_width()

@@ -75,6 +75,10 @@
 //!   consumes the channel's RMT RAM symbols, pausing at each enabled
 //!   threshold/loop interrupt until the ISR acknowledges it, and `INT_ST`
 //!   drives `SRC_RMT`. `FirmwareBus` holds it as `rmt`.
+//! - [`ws2812`]: [`ws2812::Ws2812`], the badge's six-LED WS2812B chain as
+//!   a passive decoder of the symbols [`rmt::Rmt`] sends (Milestone 14
+//!   Task 2): GRB bits by relative timing into RGB colours per LED. Board
+//!   data, a field of the RMT model (`rmt.ws2812`); it only observes.
 //!
 //! - [`efuse`]: [`efuse::Efuse`], the eFuse controller (Milestone 10 Task
 //!   4), serving only an opt-in, host-set factory MAC in block 1's layout;
@@ -104,6 +108,7 @@ pub mod system;
 pub mod systimer;
 pub mod timg;
 pub mod usb_serial_jtag;
+pub mod ws2812;
 
 /// Replaces byte `idx` (`0..=3`, little-endian, i.e. `idx == 0` is the
 /// least-significant byte) of `word` with `val`, leaving the other three

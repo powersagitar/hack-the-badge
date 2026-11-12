@@ -365,7 +365,7 @@ strapping pin).
 | `LCD_DC` | 0 | ST7789 D/C (command vs. data) |
 | `LCD_CLK` | 1 | ST7789 SPI SCLK |
 | `LCD_CS` | 2 | ST7789 SPI CS (not modeled — see Known Limitations) |
-| `LED_DIN` | 3 | WS2812 chain data (RMT) — unmodeled in v1 |
+| `LED_DIN` | 3 | WS2812B chain data (RMT TX channel 0; six LEDs decoded from the RMT symbols since Milestone 14 Task 2, `peripherals/ws2812.rs`; the pin itself is not modeled) |
 | `LCD_RST` | 4 | ST7789 reset |
 | `I2C_SDA` | 5 | accelerometer (SC7A20H on I2C0, modeled from Milestone 5 Task D-M5-2; the pins themselves are not) |
 | `I2C_SCL` | 6 | accelerometer (as `I2C_SDA`) |
@@ -793,9 +793,10 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   11, the shaken page and the launcher after DOWN keep those hashes;
   page 1, page 3's frames and the launcher (`0x94d7_a7a8_5fa9_3ea3`, a
   few pixels differ) changed and were checked by eye only.
-- No fault, no panic text on the way. Still unmodeled on this path: the
-  LEDs (`prov apply`'s green flashes and role colour are sent over RMT
-  but not shown) and NFC.
+- No fault, no panic text on the way. Still unmodeled on this path:
+  NFC. The LEDs are decoded since Milestone 14 Task 2: `prov apply`'s
+  three green flashes and the role colour are pinned by
+  `leds_flash_during_prov_apply`.
 - **Every launcher app (Milestone 9).** From role hacker's launcher,
   DOWN × row and RIGHT × column select a cell and A opens it; each cell
   has a rung (`LAUNCHER_SELECTED` and the `launcher_opens_*` rungs in
@@ -1195,11 +1196,16 @@ in `milestone-13-decisions.md` is the complete list):
    (splash, first-run, self-test, onboarding, registered screen, launcher)
    matches in orientation, so the conditional Milestone 4 MADCTL task was
    skipped.
-6. **No LED output, no NFC; one I2C device.** The SC7A20H accelerometer
-   answers on I2C0; any other I2C address is NACKed. RMT transmissions
-   are consumed but not shown, and NFC is not modeled (Scanner, Sponsors
-   and Workshop Quest log `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE`
-   and draw anyway).
+6. **No NFC; one I2C device; LEDs by decoding only.** The SC7A20H
+   accelerometer answers on I2C0; any other I2C address is NACKed. NFC
+   is not modeled (Scanner, Sponsors and Workshop Quest log
+   `hal_nfc: rc522_start: ESP_ERR_INVALID_STATE` and draw anyway). The
+   LEDs are modeled since Milestone 14 Task 2: a passive WS2812 decoder
+   reads each RMT transmission's symbols (bits by relative timing) into
+   six RGB colours, `FirmwareRuntime::led_colors()`. RMT still runs in
+   zero emulated time, so a frame's colours appear the moment its
+   transmission starts, and nothing models the LEDs' own timing (a reset
+   code too short to latch would still show).
 7. The dormant items from the history below: flagged ROM-stub guesses
    (item 5) and simplified edge interrupts (item 9). (Items 6 and 7 are
    resolved; so is the old `CPU_FREQ_MHZ` = 160 stub, see "Resolved in
