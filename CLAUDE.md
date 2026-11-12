@@ -35,8 +35,8 @@ by WebRTC on the same network (checked by the human partner on two
 devices). Sync, with the fake upload credential the provisioner sets,
 packs the badge, asks for a station for about 20 s of emulated time and
 ends on "No sync station in range" (no station exists in the browser,
-and none is emulated), then returns to its home by itself about 10 s
-later. No browser can advertise BLE, so emulated badges hear only each
+and none is emulated; about 22 s after A in the browser), then returns
+to its home by itself about 10 s of emulated time later. No browser can advertise BLE, so emulated badges hear only each
 other, and two badges provisioned with the same identity never pair
 (Connect drops a card with its own badge ID). Share's transfer works
 between two emulated badges in a scratch probe; it is neither pinned

@@ -288,7 +288,8 @@ Milestone 10 tools) is the authority; the source only names things.
 
   Against the model: the largest command is 233 parameter bytes (229
   bytes of data), under the 251 data bytes one LE Set Extended
-  Advertising Data command may carry (Core 7.8.54) and the 255 parameter
+  Advertising Data command may carry (Bluetooth Core Specification v5.x,
+  Vol 4, Part E, §7.8.54) and the 255 parameter
   bytes of any command. The largest AD is 229, exactly
   `MAX_ADV_DATA_LEN`, and its report is 26 + 229 = 255 parameter bytes,
   exactly one event's maximum.
@@ -397,15 +398,19 @@ is not needed.
   `lv_timer_create(0x4203a3a0, 20, NULL)` (`li a1, 0x14` at
   `0x4203a8ba`, `lv_timer_create` `0x420c021e`, between
   `lvgl_port_lock` and `lvgl_port_unlock`).
-- The LVGL task (`0x420a318c` on) runs `lv_timer_handler` (`0x420c0332`)
-  and then sleeps whole FreeRTOS ticks: the ms it returns × 100 / 1000
-  (`li a5, 0x64; mul` at `0x420a325c`, then `mulhu` by `0x10624dd3` and
-  `srli 6`), at least 1 (`li a4, 0x1` at `0x420a31ea`), in an
-  event-group wait (the call at `0x420a3292`, bits `0xff`).
-  `CONFIG_FREERTOS_HZ` is 100 (`docs/firmware-emulator-notes.md`).
-- So the task wakes only on 10 ms boundaries. A timer that comes due
-  just after one waits for the next, and the 20 ms timer runs every 20
-  or every 30 ms.
+- The LVGL task (`0x420a318c` on) runs `lv_timer_handler` (`0x420c0332`),
+  then makes a `vTaskDelay(1)`-shaped call at `0x420a3244` (to
+  `0x40391332` with `a0` = 1), then sleeps whole FreeRTOS ticks: the ms
+  `lv_timer_handler` returns × 100 / 1000 (`li a5, 0x64; mul` at
+  `0x420a325c`, then `mulhu` by `0x10624dd3` and `srli 6`), at least 1
+  (`li a4, 0x1` at `0x420a31ea`), in an event-group wait (the call at
+  `0x420a3292`, bits `0xff`). `CONFIG_FREERTOS_HZ` is 100
+  (`docs/firmware-emulator-notes.md`).
+- So each pass sleeps to the next 10 ms tick boundary, then waits
+  ⌊ms/10⌋ more ticks (at least 1), and the task wakes only on 10 ms
+  boundaries. A timer that comes due just after one waits for the next,
+  and the 20 ms timer runs every 20 or every 30 ms: a 30 ms tick is a
+  pass whose own work crosses a boundary.
 
 **Measured** (a scratch traced probe, release, deleted). Entry times of
 `0x4203a3a0` (the registry tick), `0x420493a0`, `0x42048e92`,
@@ -436,8 +441,13 @@ from `sync_open_with_credential()` and A:
   (`SNAKE_MOVE_INTERVAL_US`). v335's and v392's Snake constants were not
   read here.
 
-So 750 ticks explain the 20 s. It is not an emulator fault: no fix, and
-no pin moves (ruling R-T6-1). The gate's 15 s case (an emulated tick
+So 750 ticks explain the 20 s. The emulated clock is not slow (the idle
+launcher ticks at exactly 20 ms); the stretch is the firmware's
+quantization of its own work time. The emulator charges 1 cycle per
+step (`emulator-core/src/mem/bus.rs:524`, `Clock::new(XTAL_HZ,
+SYSTIMER_HZ, 1)`), so emulated CPU work is no longer than the badge's;
+peripheral waits (SPI and DMA flushes) modelled slower than the
+hardware would add ticks. No fix, and no pin moves (ruling R-T6-1). The gate's 15 s case (an emulated tick
 slower than the firmware asks for) is not what was found.
 
 **The auto-return.** "No sync station in range" holds, then Sync goes back
@@ -585,9 +595,6 @@ rungs); `bun test` 319 → 339 (Task 3's 11, Task 5's 9).
 - **A stopwatch check of Sync's 20 s on a v392 badge** (R-T6-1): from A
   to "No sync station in range", about 20 s (the emulator's 750 ticks of
   20 or 30 ms) against about 15 s (every tick 20 ms).
-- **Mobile Safari's speed on the production build** is unmeasured.
-  Milestone 11 closed the 0.0x to 0.2x as a dev-build effect; Gate 4 ran
-  an iPad on the Vercel preview, and its speed was not recorded.
 - **The fetch timeout ends at the headers** (Task 5's deferred minor):
   `call` clears its timer once `fetch` settles, so a reply whose body
   stalls hangs `res.json()`, and with it the joiner's offer read,
@@ -617,12 +624,6 @@ rungs); `bun test` 319 → 339 (Task 3's 11, Task 5's 9).
   - Task 5: no dedicated `close` test for `waitOpen`'s deadline or a bad
     answer (the same catch covers them); a timed-out `close` is dropped
     silently (best effort).
-  - Task 6: the LVGL loop's description ("The tick is 20 or 30 ms")
-    omits the `vTaskDelay(1)` at `0x420a3244`; "It is not an emulator
-    fault" overstates, since 20 against 30 ms per tick depends on the
-    emulated redraw time (one cycle per step is a lower bound,
-    `bus.rs:524`; peripheral waits are not modeled); "Core 7.8.54" names
-    no Core spec version.
 
 ### Carried from Milestone 11's backlog (still open)
 
