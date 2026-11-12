@@ -3,6 +3,14 @@ import { readFileSync } from "node:fs";
 import { initSync, add, FirmwareEmulator } from "../src/cpu/wasm-pkg/emulator_wasm.js";
 import { createFirmwareEmulator, initCpuWasmSync } from "../src/cpu/bridge";
 import { createProvisioner, PROMPT, type ProvisionState } from "../src/runtime/provisioner";
+import { consoleSince } from "../src/runtime/console-io";
+import {
+  createSetupSkipper,
+  SETUP_LAUNCHED,
+  setupOnScreen,
+  SKIP_SETUP_CONFIG_OK,
+  type SkipState,
+} from "../src/runtime/setup-skip";
 import {
   AFTER_PRESS_STABLE_FOR,
   AFTER_SHAKE_PAGES,
@@ -359,4 +367,82 @@ describe("emulator-wasm provisioned boot", () => {
     },
     600_000,
   );
+
+  // The WASM-path twin of boot_progress.rs's
+  // skipping_setup_lands_on_the_registered_screen, through the frontend's
+  // own skipper (src/runtime/setup-skip.ts): from Setup page 1, `config`
+  // then `reboot`, one soft reset, and the new boot lands on the registered
+  // screen the 11-page walk reaches, with no `launched Setup` in it.
+  test(
+    "skips Setup to the registered screen",
+    () => {
+      initCpuWasmSync(
+        readFileSync(new URL("../src/cpu/wasm-pkg/emulator_wasm_bg.wasm", import.meta.url)),
+      );
+      const image = readFileSync(new URL("../public/firmware/firmware.bin", import.meta.url));
+      const handle = createFirmwareEmulator(new Uint8Array(image));
+      try {
+        expect(runUntilStable(handle, FIRST_RUN_MAX_STEPS, BOOT_STABLE_FOR, [SPLASH_HASH])).toBe(
+          FIRST_RUN_HASH,
+        );
+        const json = readFileSync(
+          new URL(`../public/firmware/test-identities/${OWN_ROLE}.json`, import.meta.url),
+          "utf8",
+        );
+        const p = createProvisioner(handle, json);
+        let state: ProvisionState = p.poll();
+        while (
+          (state.kind === "waiting" || state.kind === "typing") &&
+          handle.totalSteps() < PROVISION_DEADLINE
+        ) {
+          expect(handle.run(50_000).lastInstructionFault).toBeUndefined();
+          state = p.poll();
+        }
+        expect(state).toMatchObject({ kind: "ok" });
+        let cap = handle.totalSteps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+        expect(runUntilStable(handle, cap, AFTER_PRESS_STABLE_FOR, [FIRST_RUN_HASH])).toBe(
+          OWN_ROLE_PAGE1_HASH,
+        );
+        expect(setupOnScreen(consoleSince(handle, 0))).toBe(true);
+
+        // The runtime's bookkeeping: the boot's start moves at a soft reset.
+        let bootStart = 0;
+        let resets = handle.softResetCount();
+        const typedFrom = handle.consoleWritten();
+        const skipper = createSetupSkipper(handle, () => bootStart);
+        let skip: SkipState = skipper.poll();
+        const deadline = handle.totalSteps() + SKIP_SETUP_DEADLINE_STEPS;
+        while (skip.kind === "typing" && handle.totalSteps() < deadline) {
+          expect(handle.run(50_000).lastInstructionFault).toBeUndefined();
+          if (handle.softResetCount() !== resets) {
+            resets = handle.softResetCount();
+            bootStart = handle.consoleWritten();
+          }
+          skip = skipper.poll();
+        }
+        expect(skip).toEqual({ kind: "done" });
+        expect(handle.softResetCount()).toBe(1);
+        const reply = consoleSince(handle, typedFrom);
+        expect(reply).toContain(SKIP_SETUP_CONFIG_OK);
+        expect(reply).toContain("rebooting...");
+
+        cap = handle.totalSteps() + SKIP_REGISTERED_STEPS;
+        expect(
+          runUntilStable(handle, cap, AFTER_PRESS_STABLE_FOR, [OWN_ROLE_PAGE1_HASH, SPLASH_HASH]),
+        ).toBe(OWN_ROLE_REGISTERED_HASH);
+        const newBoot = consoleSince(handle, bootStart);
+        expect(newBoot).toContain("app_reg: launched My Badge");
+        expect(newBoot).not.toContain(SETUP_LAUNCHED);
+        expect(setupOnScreen(newBoot)).toBe(false);
+      } finally {
+        handle.dispose();
+      }
+    },
+    600_000,
+  );
 });
+
+/** boot_progress.rs's SKIP_SETUP_DEADLINE_STEPS: the skip's config, reply and reset. */
+const SKIP_SETUP_DEADLINE_STEPS = 3_000_000;
+/** boot_progress.rs's SKIP_REGISTERED_STEPS: the reset to a stable registered screen. */
+const SKIP_REGISTERED_STEPS = 58_000_000;

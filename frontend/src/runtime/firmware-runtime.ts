@@ -112,10 +112,30 @@
  * The runtime also records where the current boot's console text begins
  * (the console's length at the frame that ended at a soft reset), for the
  * provisioner's first prompt (`./provisioner.ts`).
+ *
+ * ## Skip setup (Milestone 13)
+ *
+ * `skipSetup()` starts a `./setup-skip.ts` skipper, polled in the frame
+ * loop beside the provisioner and bounded the same way, in steps. It is
+ * refused (returns `false`, does nothing) unless Setup is on screen, no
+ * provision is in flight (its token phase runs after Setup appears, and
+ * the two must never interleave lines) and no skip is in flight, so a
+ * double press types one `config` and one `reboot`. `setupOnScreen()`
+ * reads the current boot's console from `bootConsoleStart` and is false
+ * while a skip runs; it copies that text, so it belongs in a status, not
+ * in a per-step path.
  */
 import type { ButtonName, ButtonSource } from "../badge/input";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
+import { consoleSince } from "./console-io";
 import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
+import {
+  createSetupSkipper,
+  setupOnScreen as setupOnScreenIn,
+  SKIP_SETUP_TIMEOUT_STEPS,
+  type SetupSkipper,
+  type SkipState,
+} from "./setup-skip";
 
 /** Largest wall-clock delta (ms) one frame advances emulated time by; see "Pacing" above. */
 export const MAX_FRAME_DELTA_MS = 50;
@@ -330,6 +350,18 @@ export interface FirmwareRuntime {
   provision(identityJson: string): void;
   /** The current provisioning state, or `null` if none was started since the last reset. */
   provisionState(): ProvisionState | null;
+  /**
+   * Starts skipping Setup (see "Skip setup"): `true` if a skip started,
+   * `false` (and nothing done) unless Setup is on screen, no provision is
+   * in flight and no skip is in flight.
+   */
+  skipSetup(): boolean;
+  /** The last skip's state, or `null` if none was started since the last reset. */
+  skipState(): SkipState | null;
+  /** Setup is on screen in the current boot, and no skip is running. */
+  setupOnScreen(): boolean;
+  /** A soft reset's pause is still being paid in wall time (see "The reboot's pause"). */
+  rebooting(): boolean;
   /** Shakes the emulated accelerometer (the onboarding's "Shake it!" page). */
   shake(): void;
   /**
@@ -411,6 +443,9 @@ export function createFirmwareRuntime(
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
   let provisionStartedAt = 0;
+  let skipper: SetupSkipper | null = null;
+  let lastSkip: SkipState | null = null;
+  let skipStartedAt = 0;
   /**
    * Absolute console offset (bytes, `consoleWritten()`) where the current
    * boot's text begins: 0 until a soft reset, then the console's written
@@ -449,6 +484,17 @@ export function createFirmwareRuntime(
     } else if (now - provisionStartedAt > PROVISION_TIMEOUT_STEPS) {
       provisioner = null;
       lastState = { kind: "failed", reason: "timed out" };
+    }
+  }
+
+  function pollSkipper(now: number): void {
+    if (!skipper) return;
+    lastSkip = skipper.poll();
+    if (lastSkip.kind !== "typing") {
+      skipper = null;
+    } else if (now - skipStartedAt > SKIP_SETUP_TIMEOUT_STEPS) {
+      skipper = null;
+      lastSkip = { kind: "failed", reason: "timed out" };
     }
   }
 
@@ -586,6 +632,7 @@ export function createFirmwareRuntime(
     }
     // The provisioner's timeout is in steps; holds and shakes in emulated time.
     pollProvisioner(handle.totalSteps());
+    pollSkipper(handle.totalSteps());
     const nowUs = handle.emulatedTimeUs();
     pollMotion(nowUs);
     pollTaps(nowUs);
@@ -644,6 +691,18 @@ export function createFirmwareRuntime(
     provisionStartedAt = handle.totalSteps();
   }
 
+  function setupOnScreen(): boolean {
+    return skipper === null && setupOnScreenIn(consoleSince(handle, bootConsoleStart));
+  }
+
+  function skipSetup(): boolean {
+    if (provisioner !== null || skipper !== null || !setupOnScreen()) return false;
+    skipper = createSetupSkipper(handle, () => bootConsoleStart);
+    lastSkip = { kind: "typing" };
+    skipStartedAt = handle.totalSteps();
+    return true;
+  }
+
   function shake(): void {
     startMotion(shakeAcceleration);
   }
@@ -655,6 +714,8 @@ export function createFirmwareRuntime(
   function reset(): void {
     provisioner = null;
     lastState = null;
+    skipper = null;
+    lastSkip = null;
     motion = null;
     lastMotionAccel = null;
     dropTapsForReset();
@@ -683,6 +744,10 @@ export function createFirmwareRuntime(
     reset,
     provision,
     provisionState: () => lastState,
+    skipSetup,
+    skipState: () => lastSkip,
+    setupOnScreen,
+    rebooting: () => rebootDebtUs > 0,
     shake,
     bump,
     speed: () => speed,

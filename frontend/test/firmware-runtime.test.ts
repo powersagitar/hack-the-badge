@@ -19,6 +19,7 @@ import {
   BUMP_US,
   bumpAcceleration,
 } from "../src/runtime/firmware-runtime";
+import { SKIP_SETUP_TIMEOUT_STEPS } from "../src/runtime/setup-skip";
 
 /**
  * `bun test` has no global `ImageData` — same fact `test/framebuffer.test.ts`
@@ -389,6 +390,11 @@ function rig(consoleCap = 256 * 1024) {
     setAcceleration: (x, y, z) => {
       accel.push([x, y, z]);
     },
+    // A cold power-on builds a new console, as the core's reset() does.
+    reset: () => {
+      ring = new Uint8Array(0);
+      written = 0;
+    },
   });
   const queued: Array<(t: number) => void> = [];
   const rt = createFirmwareRuntime(fake.handle, makeStubCtx().present, {
@@ -725,6 +731,168 @@ describe("FirmwareRuntime provisioning", () => {
     expect(rt.provisionState()).toEqual({ kind: "failed", reason: "timed out" });
     frame();
     expect(rt.provisionState()).toEqual({ kind: "failed", reason: "timed out" });
+  });
+});
+
+const SETUP_LINE = "I (20) app_reg: launched Setup\r\n";
+const CONFIG_TYPED = "config system onboard_build 2147483647\n";
+const REBOOT_TYPED = "reboot\n";
+
+describe("FirmwareRuntime skip setup", () => {
+  test("skipSetup types config, then reboot, and is done at the soft reset", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.start();
+    expect(rt.skipState()).toBeNull();
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.setupOnScreen()).toBe(true);
+    expect(rt.skipSetup()).toBe(true);
+    expect(rt.skipState()).toEqual({ kind: "typing" });
+    // Hidden while the skip runs.
+    expect(rt.setupOnScreen()).toBe(false);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED]);
+    print("OK system.onboard_build=2147483647\r\nbadge> ");
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED]);
+    print("rebooting...\r\n");
+    armReboot();
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "done" });
+    // The new boot has no launch line yet; then it launches My Badge.
+    expect(rt.setupOnScreen()).toBe(false);
+    print("I (5) app_reg: launched My Badge\r\nbadge> ");
+    frame();
+    frame();
+    expect(rt.setupOnScreen()).toBe(false);
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED]);
+  });
+
+  // Review Focus 1: the token phase runs after Setup appears.
+  test("skipSetup refuses while a provision is in flight", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.start();
+    rt.provision('{"a":1}');
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.setupOnScreen()).toBe(true);
+    expect(rt.skipSetup()).toBe(false);
+    expect(rt.skipState()).toBeNull();
+    frame();
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+  });
+
+  // Review Focus 2: exactly one config and one reboot.
+  test("a second skipSetup while one runs is refused", () => {
+    const { rt, typed, frame, print, armReboot } = rig();
+    rt.start();
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.skipSetup()).toBe(true);
+    expect(rt.skipSetup()).toBe(false);
+    frame();
+    expect(rt.skipSetup()).toBe(false);
+    print("OK system.onboard_build=2147483647\r\nbadge> ");
+    frame();
+    expect(rt.skipSetup()).toBe(false);
+    armReboot();
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "done" });
+    // Setup is not on screen in the new boot, so a press is still refused.
+    expect(rt.skipSetup()).toBe(false);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, REBOOT_TYPED]);
+  });
+
+  test("skipSetup refuses when Setup is not on screen", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.start();
+    expect(rt.setupOnScreen()).toBe(false);
+    expect(rt.skipSetup()).toBe(false);
+    print("I (10) app_reg: launched My Badge\r\nbadge> ");
+    expect(rt.skipSetup()).toBe(false);
+    print(`${SETUP_LINE}I (30) app_reg: launched Launcher\r\nbadge> `);
+    expect(rt.setupOnScreen()).toBe(false);
+    expect(rt.skipSetup()).toBe(false);
+    frame();
+    expect(rt.skipState()).toBeNull();
+    expect(typed).toEqual([]);
+  });
+
+  // Review Focus 3: a skip abandoned after config; the next boot is Setup again.
+  test("a reset drops the skip; setupOnScreen recomputes from the new boot", () => {
+    const { rt, typed, frame, print } = rig();
+    rt.start();
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.skipSetup()).toBe(true);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED]);
+    rt.reset();
+    expect(rt.skipState()).toBeNull();
+    expect(rt.setupOnScreen()).toBe(false);
+    print("OK system.onboard_build=2147483647\r\nbadge> ");
+    frame();
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED]);
+    print(`${SETUP_LINE}badge> `);
+    expect(rt.setupOnScreen()).toBe(true);
+    expect(rt.skipSetup()).toBe(true);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED, CONFIG_TYPED]);
+  });
+
+  test("a soft reset into Setup again shows it from the new boot's launch line", () => {
+    const { rt, frame, print, armReboot } = rig();
+    rt.start();
+    print(`${SETUP_LINE}badge> `);
+    armReboot();
+    frame();
+    expect(rt.setupOnScreen()).toBe(false);
+    print(`new boot\r\n${SETUP_LINE}badge> `);
+    expect(rt.setupOnScreen()).toBe(true);
+  });
+
+  test("a skip that never finishes times out in emulated steps", () => {
+    const { rt, typed, frame, print, setSteps } = rig();
+    rt.start();
+    setSteps(1000);
+    print(SETUP_LINE);
+    expect(rt.skipSetup()).toBe(true);
+    setSteps(1000 + SKIP_SETUP_TIMEOUT_STEPS - 1);
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "typing" });
+    setSteps(1000 + SKIP_SETUP_TIMEOUT_STEPS + 1);
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "failed", reason: "timed out" });
+    print("badge> ");
+    frame();
+    expect(rt.skipState()).toEqual({ kind: "failed", reason: "timed out" });
+    expect(typed).toEqual([]);
+    // Setup is still on screen, and a fresh skip works.
+    expect(rt.setupOnScreen()).toBe(true);
+    expect(rt.skipSetup()).toBe(true);
+    frame();
+    expect(typed).toEqual([CONFIG_TYPED]);
+  });
+
+  test("rebooting is true while the reboot's debt is unpaid", () => {
+    const { rt, frameAt, armReboot } = pacedRig();
+    rt.start();
+    frameAt(0);
+    expect(rt.rebooting()).toBe(false);
+    armReboot();
+    frameAt(16);
+    expect(rt.rebooting()).toBe(true);
+    // 16 ms frames pay it down: 29 of them leave 2 ms of the 466.
+    for (let t = 32; t <= 16 + 29 * 16; t += 16) {
+      frameAt(t);
+      expect(rt.rebooting()).toBe(true);
+    }
+    frameAt(16 + 30 * 16);
+    expect(rt.rebooting()).toBe(false);
+    armReboot();
+    frameAt(16 + 31 * 16);
+    expect(rt.rebooting()).toBe(true);
+    rt.reset();
+    expect(rt.rebooting()).toBe(false);
   });
 });
 

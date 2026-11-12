@@ -87,7 +87,14 @@ export interface WorkerClientOptions {
 }
 
 /** The client runtime, plus a promise that settles when the Worker has booted the emulator (or failed to). */
-export interface WorkerFirmwareRuntime extends FirmwareRuntime {
+/**
+ * The Worker-side runtime's Skip-setup calls (Milestone 13 Task 4). They
+ * run in the Worker; carrying them across the message boundary is the
+ * client's to add (Task 5), so the client's API leaves them out until then.
+ */
+type WorkerOnlyCalls = "skipSetup" | "skipState" | "setupOnScreen" | "rebooting";
+
+export interface WorkerFirmwareRuntime extends Omit<FirmwareRuntime, WorkerOnlyCalls> {
   readonly ready: Promise<void>;
   /** Gives the badge its factory MAC; send it before the first `start()`. */
   setMac(mac: Uint8Array): void;
