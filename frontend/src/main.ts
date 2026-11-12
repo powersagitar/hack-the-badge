@@ -71,7 +71,10 @@ function main(): void {
   const shell = mountShell();
   const hub = new RadioHub({
     deliver: (bytes, rssi) => controller.firmware()?.deliverAdvertisement(bytes, rssi),
-    bumpLocal: () => controller.firmware()?.bump(),
+    // The Worker no longer plays a canned bump (Milestone 14 Task 6): a
+    // peer's bump is dropped until Task 13 rewires it to the active motion
+    // source's peerBump.
+    bumpLocal: () => {},
   });
   const radioLinks = mountLinks(shell, hub);
 

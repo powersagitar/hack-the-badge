@@ -19,7 +19,8 @@ import {
   BUMP_US,
   bumpAcceleration,
 } from "../src/runtime/firmware-runtime";
-import { SKIP_SETUP_TIMEOUT_STEPS } from "../src/runtime/setup-skip";
+import { SKIP_REBOOTED_REASON, SKIP_SETUP_TIMEOUT_STEPS } from "../src/runtime/setup-skip";
+import { REBOOTED_REASON } from "../src/runtime/provisioner";
 
 /**
  * `bun test` has no global `ImageData` — same fact `test/framebuffer.test.ts`
@@ -59,6 +60,8 @@ interface FakeHandleOptions extends Partial<FirmwareEmulatorHandle> {
    * default 1,000,000-step cap never binds; 0.0125 is one step at 80 MHz.
    */
   usPerStep?: number;
+  /** Called after the fake's own `powerCycle` (counters, clock and soft resets back to 0). */
+  onPowerCycle?: () => void;
 }
 
 /**
@@ -68,12 +71,12 @@ interface FakeHandleOptions extends Partial<FirmwareEmulatorHandle> {
  * mimics the wasm shim's `target_us as u64` truncation.
  */
 function makeFakeHandle(options: FakeHandleOptions = {}) {
-  const { usPerStep = 1, ...overrides } = options;
+  const { usPerStep = 1, onPowerCycle, ...overrides } = options;
   let timeUs = 0;
   const runBudgets: number[] = [];
   const runUntilCalls: Array<[number, number]> = [];
   const buttonCalls: Array<[number, boolean]> = [];
-  const counters = { resetCalls: 0, disposeCalls: 0 };
+  const counters = { resetCalls: 0, disposeCalls: 0, powerCycles: 0 };
   const width = 4;
   const height = 4;
 
@@ -129,6 +132,14 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
     deliverAdvertisement: () => false,
     softResetCount: () => softResets,
     rebootUs: () => REBOOT_US,
+    powerCycle(): void {
+      counters.powerCycles++;
+      timeUs = 0;
+      softResets = 0;
+      onPowerCycle?.();
+    },
+    ledColors: () => new Uint8Array(0),
+    ledFrameCount: () => 0,
     dispose(): void {
       counters.disposeCalls++;
     },
@@ -151,6 +162,13 @@ function makeFakeHandle(options: FakeHandleOptions = {}) {
       rebootsArmed = 0;
     }
     return s;
+  };
+
+  // A cold reset() starts the core's soft reset count at 0 again.
+  const plainReset = handle.reset;
+  handle.reset = () => {
+    softResets = 0;
+    plainReset();
   };
 
   return { handle, runBudgets, runUntilCalls, buttonCalls, counters, armReboot };
@@ -359,7 +377,7 @@ describe("createFirmwareRuntime", () => {
  * keeps the newest `consoleCap` bytes, and `consoleWritten()` counts every
  * byte ever written.
  */
-function rig(consoleCap = 256 * 1024) {
+function rig(consoleCap = 256 * 1024, now?: () => number) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let ring = new Uint8Array(0);
@@ -388,11 +406,18 @@ function rig(consoleCap = 256 * 1024) {
       ring = new Uint8Array(0);
       written = 0;
     },
+    // The power switch's cold power-on too (Task 3).
+    onPowerCycle: () => {
+      ring = new Uint8Array(0);
+      written = 0;
+      timeUs = 0;
+    },
   });
   const queued: Array<(t: number) => void> = [];
   const rt = createFirmwareRuntime(fake.handle, makeStubCtx().present, {
     scheduleFrame: (cb) => queued.push(cb),
     cancelFrame: () => {},
+    now,
   });
   const frame = () => queued.shift()?.(0);
   return {
@@ -412,6 +437,7 @@ function rig(consoleCap = 256 * 1024) {
     setSteps: (n: number) => (steps = n),
     setTimeUs: (n: number) => (timeUs = n),
     armReboot: fake.armReboot,
+    counters: fake.counters,
   };
 }
 
@@ -1331,5 +1357,124 @@ describe("FirmwareRuntime press hold", () => {
     setTimeUs(PRESS_HOLD_US * 2);
     frame();
     expect(buttonCalls.length).toBe(n);
+  });
+});
+
+describe("FirmwareRuntime acceleration and power (Milestone 14 Task 6)", () => {
+  test("setAcceleration cancels a canned motion and applies the reading", () => {
+    const { rt, accel, frame, setTimeUs } = rig();
+    rt.start();
+    rt.shake();
+    frame();
+    expect(accel.at(-1)).toEqual([2000, 2000, 1000]);
+    rt.setAcceleration([5, -1000, 7]);
+    expect(accel.at(-1)).toEqual([5, -1000, 7]);
+    const n = accel.length;
+    // The shake does not resume, nor put the sensor back at rest when it would have ended.
+    setTimeUs(SHAKE_HALF_US);
+    frame();
+    setTimeUs(10 * SHAKE_HALF_US);
+    frame();
+    expect(accel).toHaveLength(n);
+  });
+
+  test("powerCycle is ignored while rebooting or within 500 ms of the last one", () => {
+    let wallMs = 0;
+    const { rt, frame, counters, armReboot } = rig(256 * 1024, () => wallMs);
+    rt.start();
+    frame();
+    rt.powerCycle();
+    expect(counters.powerCycles).toBe(1);
+    expect(rt.rebooting()).toBe(true);
+    // 50 ms frames pay the 466 ms pause by 500 ms.
+    for (wallMs = 50; wallMs <= 450; wallMs += 50) frame();
+    expect(rt.rebooting()).toBe(true);
+    wallMs = 500;
+    frame();
+    expect(rt.rebooting()).toBe(false);
+    wallMs = 499;
+    rt.powerCycle();
+    expect(counters.powerCycles).toBe(1);
+    wallMs = 500;
+    rt.powerCycle();
+    expect(counters.powerCycles).toBe(2);
+    // A soft reset's pause blocks a press long after the last.
+    for (wallMs = 550; wallMs <= 2_000; wallMs += 50) frame();
+    armReboot();
+    wallMs = 2_050;
+    frame();
+    expect(rt.rebooting()).toBe(true);
+    rt.powerCycle();
+    expect(counters.powerCycles).toBe(2);
+  });
+
+  test("powerCycle fails a running provision or skip as a reboot does", () => {
+    const { rt, typed, frame, print } = rig(256 * 1024, () => 0);
+    rt.provision('{"a":1}');
+    rt.start();
+    print("badge> ");
+    frame();
+    expect(typed).toEqual(["put /littlefs/identity.json 7\n"]);
+    rt.powerCycle();
+    expect(rt.provisionState()).toEqual({ kind: "failed", reason: REBOOTED_REASON });
+    print("badge> OK 7\r\nbadge> ");
+    frame();
+    expect(typed).toHaveLength(1);
+
+    const skip = rig(256 * 1024, () => 0);
+    skip.rt.start();
+    skip.print("I (20) app_reg: launched Setup\r\nbadge> ");
+    expect(skip.rt.skipSetup()).toBe(true);
+    skip.frame();
+    skip.rt.powerCycle();
+    expect(skip.rt.skipState()).toEqual({ kind: "failed", reason: SKIP_REBOOTED_REASON });
+    // Setup is read from the new boot's console, which is empty.
+    expect(skip.rt.setupOnScreen()).toBe(false);
+  });
+
+  test("bootCount counts soft resets and power-ons, and never goes back", () => {
+    let wallMs = 0;
+    const { rt, frame, armReboot } = rig(256 * 1024, () => wallMs);
+    rt.start();
+    frame();
+    expect(rt.bootCount()).toBe(0);
+    armReboot();
+    frame();
+    armReboot();
+    frame();
+    expect(rt.bootCount()).toBe(2);
+    // Two pauses, 932 ms, paid by 50 ms frames.
+    for (let i = 1; i <= 20; i++) {
+      wallMs = i * 50;
+      frame();
+    }
+    expect(rt.rebooting()).toBe(false);
+    // The core's soft reset count restarts at 0: the boot counter moves on by one.
+    rt.powerCycle();
+    expect(rt.bootCount()).toBe(3);
+    armReboot();
+    frame();
+    expect(rt.bootCount()).toBe(4);
+    rt.reset();
+    expect(rt.bootCount()).toBe(5);
+  });
+
+  test("powerCycle drops queued taps and keeps a held button down", () => {
+    let wallMs = 0;
+    const { rt, frame, buttonCalls } = rig(256 * 1024, () => wallMs);
+    rt.start();
+    frame();
+    rt.injectButton("A", "pressed");
+    rt.injectButton("B", "pressed");
+    rt.injectButton("B", "released");
+    rt.powerCycle();
+    // B's deferred release is flushed; A, still held, stays down until let go.
+    expect(buttonCalls).toEqual([
+      [RAW_SLOT_BY_BUTTON.A, true],
+      [RAW_SLOT_BY_BUTTON.B, true],
+      [RAW_SLOT_BY_BUTTON.B, false],
+    ]);
+    rt.injectButton("A", "released");
+    expect(buttonCalls.at(-1)).toEqual([RAW_SLOT_BY_BUTTON.A, false]);
   });
 });

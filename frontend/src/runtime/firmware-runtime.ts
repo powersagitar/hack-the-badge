@@ -123,13 +123,38 @@
  * (ruling T4-2: its `put` could land between `config` and `reboot`):
  * nothing is typed, no provisioner starts, and the provision state is
  * failed with {@link SKIP_IN_PROGRESS_REASON}.
+ *
+ * ## Acceleration, the power switch, LEDs and boots (Milestone 14 Task 6)
+ *
+ * `setAcceleration(mg)` is the page's motion source (the lanyard physics
+ * or the phone): it cancels a canned shake or bump still playing and
+ * applies the reading at once. The canned `shake()` and `bump()` stay for
+ * `test/cpu-wasm.test.ts`; the page no longer plays them.
+ *
+ * `powerCycle()` is the board's power switch: the core's cold power-on
+ * that keeps the flash (`FirmwareEmulatorHandle.powerCycle`). It is
+ * ignored while `rebooting()` and within {@link POWER_CYCLE_GUARD_MS} of
+ * the last accepted one, so a double press boots once. It fails a running
+ * provision ({@link REBOOTED_REASON}) or skip ({@link SKIP_REBOOTED_REASON})
+ * as a reboot does, drops queued taps as `reset()` does (emulated time
+ * restarts at 0), and holds the screen for `rebootUs()` of wall time as a
+ * soft reset does, so `rebooting()` reads true while it boots. The
+ * acceleration the page last set is kept (held host input, as the core
+ * keeps it); only a canned motion is put back at rest.
+ *
+ * `bootCount()` numbers the boots for the console stream: soft resets
+ * plus cold power-ons (`powerCycle()` and `reset()`) since the runtime
+ * was made. The core's `softResetCount()` starts at 0 again at a cold
+ * power-on, so the runtime adds what it had reached, plus one, to a base:
+ * the count only ever rises, by one per boot (controller ruling R2).
  */
 import type { ButtonName, ButtonSource } from "./buttons";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 import { consoleSince } from "./console-io";
-import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
+import { createProvisioner, type ProvisionState, type Provisioner, REBOOTED_REASON } from "./provisioner";
 import {
   createSetupSkipper,
+  SKIP_REBOOTED_REASON,
   setupOnScreen as setupOnScreenIn,
   SKIP_SETUP_TIMEOUT_STEPS,
   type SetupSkipper,
@@ -191,6 +216,12 @@ export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
  * a slow browser does not time out early.
  */
 export const PROVISION_TIMEOUT_STEPS = 60_000_000;
+
+/**
+ * Least wall time (ms) between two accepted `powerCycle()` calls: a
+ * second press inside it is ignored (Milestone 14 Task 6).
+ */
+export const POWER_CYCLE_GUARD_MS = 500;
 
 /** Why `provision()` fails at once while a setup skip is in flight (ruling T4-2). */
 export const SKIP_IN_PROGRESS_REASON = "a setup skip is in progress";
@@ -376,6 +407,28 @@ export interface FirmwareRuntime {
    * a bump; the pulse starts at once (ruling R-T9-2).
    */
   bump(): void;
+  /**
+   * Applies a motion source's reading (mg per axis), cancelling any canned
+   * shake or bump still playing.
+   */
+  setAcceleration(mg: [number, number, number]): void;
+  /**
+   * The power switch: a cold power-on that keeps the flash. Ignored while
+   * {@link rebooting} or within {@link POWER_CYCLE_GUARD_MS} of the last
+   * one; fails a running provision or skip as a reboot does.
+   */
+  powerCycle(): void;
+  /** The LED chain's latest frame: R, G, B per LED in chain order; empty before the first. */
+  ledColors(): Uint8Array;
+  /** LED frames the firmware sent since the last cold power-on. */
+  ledFrameCount(): number;
+  /** The console's absolute written count (see `./console-io.ts`). */
+  consoleWritten(): number;
+  /**
+   * The boot the badge is in: soft resets plus cold power-ons since the
+   * runtime was made, rising by one per boot and never going back.
+   */
+  bootCount(): number;
   /** Re-boots the firmware from the same image, keeping held buttons. */
   reset(): void;
   /**
@@ -438,6 +491,10 @@ export function createFirmwareRuntime(
    * run no new emulated time until it is paid. See "The reboot's pause".
    */
   let rebootDebtUs = 0;
+  /** Wall time (ms) of the last accepted `powerCycle()`, or `null`. */
+  let lastPowerCycleMs: number | null = null;
+  /** Boots before the current cold power-on: see `bootCount()`. */
+  let bootBase = 0;
 
   let provisioner: Provisioner | null = null;
   let lastState: ProvisionState | null = null;
@@ -715,6 +772,45 @@ export function createFirmwareRuntime(
     startMotion(bumpAcceleration);
   }
 
+  function setAcceleration(mg: [number, number, number]): void {
+    motion = null;
+    lastMotionAccel = null;
+    handle.setAcceleration(mg[0], mg[1], mg[2]);
+  }
+
+  /** A cold power-on is about to start: the boot it ends is counted. */
+  function countColdBoot(): void {
+    bootBase += handle.softResetCount() + 1;
+  }
+
+  function powerCycle(): void {
+    const wallMs = now ? now() : performance.now();
+    if (rebootDebtUs > 0) return;
+    if (lastPowerCycleMs !== null && wallMs - lastPowerCycleMs < POWER_CYCLE_GUARD_MS) return;
+    lastPowerCycleMs = wallMs;
+    if (provisioner !== null) {
+      provisioner = null;
+      lastState = { kind: "failed", reason: REBOOTED_REASON };
+    }
+    if (skipper !== null) {
+      skipper = null;
+      lastSkip = { kind: "failed", reason: SKIP_REBOOTED_REASON };
+    }
+    if (motion !== null) {
+      // A canned motion's schedule is in the old boot's emulated time.
+      motion = null;
+      lastMotionAccel = null;
+      handle.setAcceleration(...REST_ACCELERATION);
+    }
+    // Emulated time restarts at 0, as at reset().
+    dropTapsForReset();
+    countColdBoot();
+    bootConsoleStart = 0;
+    // The badge takes its boot time: the screen holds as for a soft reset.
+    rebootDebtUs = handle.rebootUs();
+    handle.powerCycle();
+  }
+
   function reset(): void {
     provisioner = null;
     lastState = null;
@@ -731,6 +827,7 @@ export function createFirmwareRuntime(
     rebootDebtUs = 0;
     // The emulator's acceleration survives a reset; put it back at rest.
     handle.setAcceleration(...REST_ACCELERATION);
+    countColdBoot();
     handle.reset();
   }
 
@@ -754,6 +851,12 @@ export function createFirmwareRuntime(
     rebooting: () => rebootDebtUs > 0,
     shake,
     bump,
+    setAcceleration,
+    powerCycle,
+    ledColors: () => handle.ledColors(),
+    ledFrameCount: () => handle.ledFrameCount(),
+    consoleWritten: () => handle.consoleWritten(),
+    bootCount: () => bootBase + handle.softResetCount(),
     speed: () => speed,
     dispose,
   };
