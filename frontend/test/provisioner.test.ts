@@ -545,7 +545,9 @@ describe("provisioner", () => {
     expect(consoleOffsetOf(f.handle, text, text.indexOf("z"))).toBe(13);
   });
 
-  test("consoleOffsetOf is exact when the slice starts mid-character", () => {
+  // A forward count from the slice's start re-encodes each U+FFFD as 3 bytes and lands at 8.
+  // A char-count tail would also give 4 here: this pins only that the count is not forward.
+  test("consoleOffsetOf does not count forward from a slice that starts mid-character", () => {
     const f = fakeHandle();
     f.print("a—b"); // a e2 80 94 b
     const text = consoleSince(f.handle, 2); // 80 94 b: two U+FFFD, then b

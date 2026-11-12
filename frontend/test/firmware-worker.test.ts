@@ -281,13 +281,13 @@ describe("firmware worker", () => {
     send({ kind: "start" });
     sliceAt(0);
     fake.print(`${SETUP_LINE}badge> `);
-    send({ kind: "skipSetup" });
+    // The first skip, with Setup on screen and nothing in flight, carries
+    // extra fields: they are ignored, and only the kind is read.
+    expect(() => send({ kind: "skipSetup", junk: 1 } as unknown as ToWorker)).not.toThrow();
     // A second one is refused by the runtime: one config, never two.
     send({ kind: "skipSetup" });
     sliceAt(10);
     expect(fake.typed).toEqual([CONFIG_TYPED]);
-    // Extra fields are ignored; only the kind is read.
-    expect(() => send({ kind: "skipSetup", junk: 1 } as unknown as ToWorker)).not.toThrow();
     sliceAt(20);
     expect(fake.typed).toEqual([CONFIG_TYPED]);
   });

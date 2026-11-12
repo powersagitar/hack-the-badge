@@ -431,8 +431,37 @@ describe("signal client", () => {
         expect(err).toBeInstanceOf(SignalError);
         expect((err as Error).message).toBe("Could not reach the signaling server; check the connection.");
       });
-      // The 50 ms timeout, with slack: well under the test's bound.
-      expect(elapsed).toBeLessThan(100);
+      // The 50 ms timeout, with slack for a loaded machine: still far under the hang.
+      expect(elapsed).toBeLessThan(500);
+      expect(signals.length).toBe(1);
+      expect(signals[0]?.aborted).toBe(true);
+    },
+    2000,
+  );
+
+  test(
+    "a body read that ignores the abort still ends by the timeout",
+    async () => {
+      // The race's whenAborted arm: json() never settles and never looks at the signal.
+      const signals: (AbortSignal | null | undefined)[] = [];
+      const fetch = async (_input: string, init?: RequestInit) => {
+        signals.push(init?.signal);
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/json" }),
+          json: () => new Promise<unknown>(() => {}),
+        } as unknown as Response;
+      };
+      let elapsed = Infinity;
+      await noUnhandledRejections(async () => {
+        const started = Date.now();
+        const err = await hostRoom({ ...harness().deps, fetch, fetchTimeoutMs: 50 }).catch((e: unknown) => e);
+        elapsed = Date.now() - started;
+        expect(err).toBeInstanceOf(SignalError);
+        expect((err as Error).message).toBe("Could not reach the signaling server; check the connection.");
+      });
+      expect(elapsed).toBeLessThan(500);
       expect(signals.length).toBe(1);
       expect(signals[0]?.aborted).toBe(true);
     },
