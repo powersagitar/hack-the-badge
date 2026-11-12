@@ -27,7 +27,8 @@
  * page's status line, and ends that side's requests; a link that fails is
  * closed. A 429 says how long to wait ({@link busyMessage}), any 5xx is
  * "Signaling unavailable." (a store failure is a bare 500), and a 404 on
- * join is "Room closed or expired.". Nothing is logged.
+ * join is "Room closed or expired.". The one thing logged is a `close`
+ * that got no reply (a `console.warn`, Milestone 13 Task 8).
  */
 import { acceptOffer, createOffer, type PeerConnectionFactory, type PeerLink } from "./peer-link";
 import { CROCKFORD_ALPHABET, ROOM_CODE_LENGTH, TOKEN_LENGTH, isRoomCode } from "./signal-handler";
@@ -218,7 +219,12 @@ async function waitOpen(d: Deps, link: PeerLink, deadline: number, signal: Abort
   throw new SignalError(signal.aborted ? CANCELLED : NO_PATH);
 }
 
-/** Asks the server to close `room`; best effort: never throws or rejects, and its reply is ignored. */
+/**
+ * Asks the server to close `room`; best effort: never throws or rejects,
+ * and its reply is ignored. A request that never completes (it timed out,
+ * or the server was unreachable) is logged with {@link CLOSE_FAILED_WARNING}
+ * and the room code (never the token); the room then ends at its TTL.
+ */
 function sendClose(d: Deps, room: string, token: string): void {
   call(d, {
     method: "POST",
@@ -228,9 +234,12 @@ function sendClose(d: Deps, room: string, token: string): void {
     keepalive: true,
   }).then(
     () => {},
-    () => {},
+    () => console.warn(CLOSE_FAILED_WARNING, room),
   );
 }
+
+/** What a failed `close` logs, with the room code after it. */
+export const CLOSE_FAILED_WARNING = "signal: close got no reply; the room ends at its TTL:";
 
 /** Hosts a room: returns its code at once, and a promise for the open link. */
 export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {

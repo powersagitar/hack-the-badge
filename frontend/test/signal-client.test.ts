@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
+  CLOSE_FAILED_WARNING,
   SIGNAL_FETCH_TIMEOUT_MS,
   SIGNAL_TIMEOUT_MS,
   SignalError,
@@ -303,7 +304,9 @@ describe("signal client", () => {
       await expect(hosted.connected).rejects.toThrow(/cancelled/i);
     });
     expect(closes).toBe(1);
-    // So is a network failure, or a fetch that throws synchronously.
+    // So is a network failure, or a fetch that throws synchronously; each is logged.
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const rooms: string[] = [];
     for (const broken of [
       () => Promise.reject(new TypeError("Failed to fetch")),
       () => {
@@ -313,12 +316,21 @@ describe("signal client", () => {
       const n = harness();
       const realFetch = n.deps.fetch!;
       n.deps.fetch = (input, init) => (opOf(input, init) === "close" ? broken() : realFetch(input, init));
-      await noUnhandledRejections(async () => {
-        const hosted = await hostRoom(n.deps);
-        expect(() => hosted.cancel()).not.toThrow();
-        await expect(hosted.connected).rejects.toThrow(/cancelled/i);
-      });
+      try {
+        await noUnhandledRejections(async () => {
+          const hosted = await hostRoom(n.deps);
+          rooms.push(hosted.room);
+          expect(() => hosted.cancel()).not.toThrow();
+          await expect(hosted.connected).rejects.toThrow(/cancelled/i);
+        });
+      } catch (e) {
+        warn.mockRestore();
+        throw e;
+      }
     }
+    const warned = [...warn.mock.calls];
+    warn.mockRestore();
+    expect(warned).toEqual(rooms.map((room) => [CLOSE_FAILED_WARNING, room]));
   });
 
   test("cancel_sends_close_with_the_token", async () => {
@@ -510,6 +522,80 @@ describe("signal client", () => {
       await tick();
       expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
     });
+  });
+
+  test("host_sends_close_at_waitOpens_deadline", async () => {
+    // The answer arrives, but the link never opens: waitOpen's deadline fails `connected`.
+    const h = harness();
+    h.net.connectOnAnswer = false;
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      const join = joinRoom(hosted.room, h.deps);
+      await expect(hosted.connected).rejects.toThrow(/could not connect/i);
+      await expect(join).rejects.toThrow(/could not connect/i);
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+    });
+  });
+
+  test("host_sends_close_on_a_bad_answer", async () => {
+    const h = harness();
+    const real = h.deps.fetch!;
+    h.deps.fetch = async (input, init) =>
+      input.includes("want=answer")
+        ? new Response(JSON.stringify({ answer: "not an answer" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        : real(input, init);
+    await noUnhandledRejections(async () => {
+      const hosted = await hostRoom(h.deps);
+      await expect(hosted.connected).rejects.toThrow("The peer's answer could not be used.");
+      await tick();
+      expect(closesOf(h.calls)).toEqual([{ op: "close", room: hosted.room, token: tokenOf(h.calls) }]);
+    });
+  });
+
+  test(
+    "a timed-out close is logged with the room, not the token",
+    async () => {
+      const h = harness();
+      const real = h.deps.fetch!;
+      const hung = hungFetch();
+      h.deps.fetch = (input, init) =>
+        typeof init?.body === "string" && init.body.includes('"close"') ? hung.fetch(input, init) : real(input, init);
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await noUnhandledRejections(async () => {
+          const hosted = await hostRoom({ ...h.deps, fetchTimeoutMs: 20 });
+          hosted.cancel();
+          await expect(hosted.connected).rejects.toThrow(/cancelled/i);
+          await tick(60);
+          expect(hung.signals.length).toBe(1);
+          expect(hung.signals[0]?.aborted).toBe(true);
+          expect(warn.mock.calls).toEqual([[CLOSE_FAILED_WARNING, hosted.room]]);
+          expect(JSON.stringify(warn.mock.calls)).not.toContain(tokenOf(h.calls));
+        });
+      } finally {
+        warn.mockRestore();
+      }
+    },
+    2000,
+  );
+
+  test("a close that gets a reply logs nothing", async () => {
+    const h = harness();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const hosted = await hostRoom(h.deps);
+      hosted.cancel();
+      await expect(hosted.connected).rejects.toThrow(/cancelled/i);
+      await tick();
+      expect(closesOf(h.calls).length).toBe(1);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("host_success_sends_no_close", async () => {
