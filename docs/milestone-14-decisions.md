@@ -21,6 +21,18 @@ plan: `docs/superpowers/plans/2026-11-12-milestone14-badge-page-redesign.md`.
   below after viewing the renamed frames (all 11 roles' onboarding page
   1 and registered screen, and hacker's pages 2 and 7). No name is
   truncated; "Katherine Johnson", the longest, renders whole.
+- **The badge hangs (Task 9's axis gate).** v392 reads single
+  accelerometer axes in several apps ("Accelerometer axes (Task 9)"
+  below), so the hanging rest changes what they show. The human partner
+  answered "Yes, hang it": the hanging physics goes ahead, and Level,
+  Tilt Maze, Accel, Diag, Hopper, 6-7 Counter and the Lua `badge.sensor`
+  bindings behaving as they would on a badge hanging from a lanyard is
+  accepted as faithful.
+- **BOARD_AXES is assumed, verified later.** The human partner answered
+  "Assume, verify later": `BOARD_AXES` is right = +x, up = +y,
+  out = +z, and it is **UNVERIFIED**. The human partner checks the signs
+  on the physical badge (for example with Level or Accel) in Task 14's
+  browser check, and `BOARD_AXES` is fixed then.
 
 ## Re-pins (Task 1)
 
@@ -179,3 +191,158 @@ Task 4 with the Lua sandbox. Task 1 added none.
 Until Task 12 wires the controller, the page does not reference the
 firmware Worker, so the worker, bridge and wasm chunks are absent from
 the build; they return then.
+
+## Accelerometer axes (Task 9)
+
+Traced in v392's disassembly (`firmware.bin`'s IROM segment at
+`0x4200_0020`, llvm-objdump), from the direct reader `0x4200_ae2e`
+(Milestone 10's bump trace) and the sample cache.
+
+- **The API.** The direct reader `0x4200_ae2e` (it takes the mutex,
+  then `0x4200_a9f2` reads OUT_X..OUT_Z as floats in mg). The cache task
+  `0x4200_ae9e` stores a sample every `vTaskDelay(2)` through
+  `0x4200_a970` into `0x3fca_32f4`. Its getter `0x4200_aed4` has three
+  callers, `0x4205_bc46`, `0x4205_c3f4` and `0x4205_c566`, in the Lua
+  `badge.sensor` bindings, which hand x, y and z to Lua apps.
+- **The direct reader's ten callers.** Each feature is named from the
+  strings next to it:
+
+| call site | feature | how it uses the axes |
+|---|---|---|
+| `0x4201_3db4` | "6-7 COUNTER" ("SHAKE UP / DOWN") | x, y and z each feed a chart series (`0x420c_b578`), printed as `X %+.0f Y %+.0f Z %+.0f mg`; then `0x4205_7f5c(x, y, z, t)` (an up/down detector, not traced) |
+| `0x4201_4636` | Accel (`Accel`/`ACC`/`accel`) | prints X, Y and Z separately |
+| `0x4201_d25a` | Connect's bump | the change between two readings: does not depend on how the badge is turned (Milestone 10) |
+| `0x4202_1d48` | Diag | display |
+| `0x4202_81c0` | Hopper ("HARDWARE PHYSICS", "TILT + SHAKE") | tilt and shake, per axis |
+| `0x4203_0234` | Level ("Pitch %s  Roll %s") | x and y separately: the bubble from x and y clamped to ±500 (`0x3c15_5328`/`2c`); "level" (green) only when \|x\| < 100 and \|y\| < 100 (`0x3c15_5330`); pitch and roll in degrees (÷1000, ×57.2958; `0x3c15_5334`/`38`) |
+| `0x4203_1cee` | Tilt Maze | ball velocity += (−x, +y) × 0.00012 per tick (`0x3c15_5348`), damped by 0.985 and clamped to ±4 (`0x3c15_51fc`, `0x3c15_518c`/`98`) |
+| `0x4204_5392` | the hardware self-test | display |
+| `0x4205_0ae4` | the bump-pairing module (`BPI1`) | not traced |
+| `0x4205_a654` | near Workshop Quest / `sensor.shake` | not traced |
+
+- **Ruling.** "Shake it!" (a magnitude EMA, Milestone 5) and Connect's
+  bump (the change between two readings) do not depend on how the badge
+  is turned, but the apps above read single axes. Level and Tilt Maze
+  treat face-up (x = y = 0) as flat. With the hanging rest (0, +1000, 0),
+  Level's bubble sits at one edge (pitch about 90°) and Tilt Maze's ball
+  keeps rolling along one axis. None of these apps is among the 16
+  launcher cells that `boot_progress.rs` pins. How they are reached was
+  not traced. The human partner accepted this as faithful ("Human
+  decisions" above).
+- **BOARD_AXES** = right +x, up +y, out +z (`frontend/src/motion/axes.ts`),
+  **UNVERIFIED**. The photo (`local/m14-design/front.webp`) cannot
+  settle it. The likeliest accelerometer is the small LGA part just
+  below the ESP32-C3 module, about (41.4 %, 62.1 %) of the photo, which
+  is `CHIP_SPOT` in `lanyard.ts`. Its pin-1 mark is not legible. Task
+  14's browser check on the physical badge fixes the signs.
+- **Nothing in the firmware treats "not face-up" as a special case**
+  beyond these apps' own tilt use. No other code reads the sensor.
+
+## Lanyard physics and the sensor (Task 9)
+
+`frontend/src/motion/`: `source.ts` (the `MotionSource` seam),
+`axes.ts`, `sensor.ts` (pure) and `lanyard.ts` (matter.js, headless).
+
+- **World.** A 10-segment rope of point masses (0.04 each, frictionAir
+  0.03, no collisions) from the anchor at (W/2, −10) to the badge's
+  ring, pinned `clip + bh/2` above the badge's centre (the design's
+  `dPC`). The badge is a rigid body of mass 1, with frictionAir 0.022
+  and restitution 0.35. The side walls are static colliders at the
+  stage edges. Gravity is 2400 px/s², and every substep is a fixed
+  1/120 s, at most 12 per `step()` (any further debt is dropped). The
+  layout clamps are the design's `layout()`, as the brief gives them.
+  `relayout` rebuilds the world at rest, which also ends a drag.
+- **Damping.** With the badge's frictionAir at 0.014 (the design's
+  0.993 per step), a drag-and-release was still 36 mg from rest after
+  5 s, against the test's limit of 30. At 0.022 it is about 12 mg.
+- **Drag.** `grab` pins the badge at the grabbed point with a
+  stiffness-0.6 constraint. The grip's target is the pointer, clamped
+  three ways: to the stage ±40 px (as the design does), to within the
+  rope's reach of the anchor, and so that the badge's centre stays
+  between the walls. Speeds are capped at 7200 px/s (the design's 60 px
+  per step) and the spin at 40 rad/s.
+  - Without the reach and wall clamps, a slow push dragged the badge
+    through the right wall. On release the rope whipped it above the
+    anchor, flipped (y = −467, angle −2.36).
+  - A NaN or runaway body rebuilds the world at rest.
+- **Sensor.** The chip spot's acceleration comes from second
+  differences of its position across substeps, so the rotational terms
+  are included. It is averaged over one `step()` call's substeps and
+  passed to `sensorMg`. Gravity is a true 1 g through the badge's tilt.
+  Each axis is clamped to ±2000 mg and rounded, and a non-finite input
+  reads as rest.
+- **Impacts.** On a badge–wall `collisionStart`, the contact point's
+  approach speed (linear plus ω × r) is compared with `IMPACT_PX_S` =
+  **840 px/s**, the design's `detect()` threshold of 7 px per 1/120 s
+  step, unchanged. At most one impact fires per 800 ms of simulated
+  time.
+  - Measured on the design's stage sizes (1000×780 and 820×780 desktop,
+    390×640 mobile): pushing the pointer from the centre past the wall
+    in 80–400 ms fires one impact, and the same push over 700 ms or
+    1500 ms fires none.
+  - A ±20 px, 1 Hz drag fires none.
+  - `impulse("knock")` (a 30,000 px/s² push toward the nearer wall, at
+    most 400 ms, ending at contact) fires exactly one, on both layouts.
+- **Peer bump.** `peerBump()` pushes the badge at 30,000 px/s² for
+  100 ms, away from the nearer wall. That reads about 2000 mg (clamped),
+  far above Connect's 400 mg, for longer than its 40–70 ms sample gap.
+  For 1000 ms afterwards no outgoing impact fires, so a peer's bump is
+  never echoed back.
+- **Shake key.** `impulse("shake")` is six alternating 80 ms pushes at
+  40,000 px/s². Against the WASM twin on "Shake it!" it passed the page
+  (a scratch probe; not a committed test).
+- **The firmware's sample rate.** With the acceleration changed every
+  1 ms on page 6, the frame changed every **~80 ms** (12.5 Hz; gaps 76
+  to 81 ms over 1 s). The page's tick runs the detector and then prints
+  `G-force`, so the detector samples at about that rate. That is
+  inferred, not traced. Connect samples every 40–70 ms (Milestone 10).
+  The lanyard emits one sample per display frame, 60 Hz, which is
+  4–5× faster than either detector needs. Delivery (Task 12) should
+  keep about that rate.
+
+### GAIN_MG_PER_PX_S2 = 0.1
+
+Measured with `frontend/test/physics-shake.test.ts`'s method: the WASM
+twin walked to Setup page 6. The lanyard runs on a 1000×780 desktop
+stage, and the badge is grabbed at its centre. Every 1/60 s the
+lanyard's reading goes to `setAcceleration` and the emulator runs to
+that emulated time. Each drag is 0.5 s at rest, 2 s of drag and 1 s
+after release. The verdict is A: once the page is shaken, A opens page
+7. The page prints the live `G-force` and `Peak`, so the frame changes
+with any motion and "leaves page 6's hash" cannot tell the two cases
+apart.
+
+| gain | gentle (±20 px, 1 Hz): peak \|a\| | gentle: page | vigorous (±120 px, 3 Hz): peak \|a\| | vigorous: page |
+|---|---|---|---|---|
+| 0.01 | 1018 | stayed | 2547 | stayed |
+| 0.02 | 1037 | stayed | 2828 | stayed |
+| 0.025 | 1046 | stayed | 2828 | stayed |
+| 0.03 | 1055 | stayed | 2828 | stayed |
+| 0.04 | 1074 | stayed | 2828 | **passed** |
+| 0.05 | 1092 | stayed | 2828 | passed |
+| 0.08 | 1147 | stayed | 2828 | passed |
+| **0.1** | **1184** | **stayed** | **2828** | **passed** |
+| 0.12 | 1221 | stayed | 2828 | passed |
+| 0.2 | 1368 | stayed | 2828 | passed |
+| 0.3 | 1552 | stayed | 2828 | passed |
+
+Peak |a| is the largest magnitude in mg. 2828 is both in-plane axes at
+the ±2000 clamp.
+
+- **The headroom check.** The face-normal axis reads 0, so a shake
+  needs both in-plane axes high at once (the ~1304 mg trigger above a
+  1000 mg baseline). The vigorous drag reaches 2828 mg, both axes
+  clamped, at every gain from 0.02 up. Below 0.04 the page still
+  stays: the firmware samples about every 80 ms and needs |m − b| past
+  the trigger at one of those samples.
+- **Why 0.1.** It is 2.5× the last failing gain (0.03). The gentle drag
+  then peaks at 1184 mg, a deviation of about 165 mg in the detector's
+  terms, far below "Shake it!"'s 1304 mg and Connect's 400 mg, so
+  ordinary handling doesn't trip either detector. The gentle drag stays
+  even at 0.3, so the upper side has wide margin. The first pick, 0.05,
+  passed before the speed caps and the stage change (where 0.03
+  passed). After them the boundary moved to between 0.03 and 0.04, so
+  0.05 kept too little margin.
+- `physics-shake.test.ts` takes about 8–10 s: one walk to page 6
+  serves both tests, gentle first. The default `bun test` grew from
+  about 16 s to about 24 s.
