@@ -273,7 +273,8 @@ pub enum RomStubEffect {
     /// the little-endian (reflected) CRC-32 of `len = a2` bytes at
     /// `buf = a1`, read through the bus, chained from `crc = a0`; the result
     /// goes to `a0`. ESP-IDF v5.5.3's `components/esp_rom/include/esp_rom_crc.h`
-    /// documents it (`:62`..`:70`, `esp_rom_crc32_le`, which
+    /// documents it (its notes, `:23`..`:60`, and `:62`..`:70`,
+    /// `esp_rom_crc32_le`, which
     /// `esp32c3.rom.api.ld:4` aliases to the ROM's `crc32_le`): polynomial
     /// `0x04c11db7` (`:29`), reflected `0xEDB8_8320`, with a `~` added "at
     /// the beginning and the end" (`:32`), and the seed is "result of last
@@ -1559,7 +1560,7 @@ impl RomStub {
         }
     }
 
-    /// A real high-level-emulated `crc32_le` -- see [`RomStubEffect::Crc32Le`].
+    /// A real high-level-emulated `crc32_le` — see [`RomStubEffect::Crc32Le`].
     pub const fn crc32_le(name: &'static str) -> Self {
         Self {
             name,

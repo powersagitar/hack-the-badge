@@ -509,7 +509,7 @@ loop the spec chose over a `crc32fast` dependency.
 
 ## Rulings
 
-Ruling R-T1-1: `crc32_le_stub_wild_buffer_does_not_panic` asserts the exact result (the CRC of `MAX_STUB_MEMORY_BYTES` zero bytes from seed 0, computed by an independent bitwise loop in the test), not only "some value", so it also pins the cap and the unmapped reads as zeros — cost if wrong: the test costs about 0.1 s in debug; if the cap ever changes, the test follows it through the shared constant.
+Ruling R-T1-1: `crc32_le_stub_wild_buffer_does_not_panic` asserts the exact result (the CRC of `MAX_STUB_MEMORY_BYTES` zero bytes from seed 0, computed in the test by a reference that repeats the stub's bitwise loop, so it checks the cap and the zero reads but not the CRC itself; Milestone 13 Task 8 made it a table-driven reference checked against CRC-32's published `0xCBF43926`), not only "some value", so it also pins the cap and the unmapped reads as zeros — cost if wrong: the test costs about 0.1 s in debug; if the cap ever changes, the test follows it through the shared constant.
 
 Ruling R-T1-2: the stub's citations add ESP-IDF v5.5.3's `esp32c3.rom.api.ld:4` (a third fetched file) to the two the brief named, because `esp_rom_crc.h` documents `esp_rom_crc32_le`, and that alias is what ties the header's semantics to the ROM's `crc32_le` — cost if wrong: one extra citation line.
 

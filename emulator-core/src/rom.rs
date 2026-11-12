@@ -1554,7 +1554,8 @@ pub const MEMCMP: u32 = 0x4000_0360;
 /// `components/esp_rom/esp32c3/ld/esp32c3.rom.ld:415`: `crc32_le =
 /// 0x40000628;`; `esp32c3.rom.api.ld:4` aliases `esp_rom_crc32_le` to it).
 /// Real HLE ([`crate::cpu::rom_stubs::RomStubEffect::Crc32Le`]), with the
-/// semantics of `components/esp_rom/include/esp_rom_crc.h` (`:23`..`:70`):
+/// semantics of `components/esp_rom/include/esp_rom_crc.h` (its notes,
+/// `:23`..`:60`, and `esp_rom_crc32_le`'s declaration, `:62`..`:70`):
 /// zlib's CRC-32, inverted in and out, chainable. Module doc entry 28.
 pub const CRC32_LE: u32 = 0x4000_0628;
 
@@ -4034,18 +4035,31 @@ mod tests {
     fn crc32_le_stub_wild_buffer_does_not_panic() {
         // An unmapped buffer reads 0s, and a huge length is capped at
         // MAX_STUB_MEMORY_BYTES: the result is the CRC of that many zero
-        // bytes, computed here by an independent bitwise reference.
+        // bytes. The reference is table-driven (one lookup per byte, not
+        // the stub's bit loop), and is itself checked against CRC-32's
+        // published check value, crc32("123456789") = 0xCBF43926, in
+        // crc32_le's convention (seed 0, inverted in and out).
+        let table: [u32; 256] = std::array::from_fn(|i| {
+            (0..8).fold(i as u32, |c, _| {
+                if c & 1 != 0 {
+                    (c >> 1) ^ 0xEDB8_8320
+                } else {
+                    c >> 1
+                }
+            })
+        });
+        let reference = |seed: u32, bytes: &mut dyn Iterator<Item = u8>| {
+            !bytes.fold(!seed, |c, b| {
+                (c >> 8) ^ table[((c ^ u32::from(b)) & 0xFF) as usize]
+            })
+        };
+        assert_eq!(reference(0, &mut b"123456789".iter().copied()), 0xCBF4_3926);
         let mut cpu = Cpu::new();
         cpu.set_rom_stubs(esp32c3_rom_stubs());
         let mut bus = empty_firmware_bus();
         let got = crc32_le_call(&mut cpu, &mut bus, 0, 0x1000_0000, u32::MAX);
-        let mut crc = !0u32;
-        for _ in 0..crate::cpu::rom_stubs::MAX_STUB_MEMORY_BYTES {
-            for _ in 0..8 {
-                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
-            }
-        }
-        assert_eq!(got, !crc);
+        let n = crate::cpu::rom_stubs::MAX_STUB_MEMORY_BYTES as usize;
+        assert_eq!(got, reference(0, &mut std::iter::repeat_n(0u8, n)));
     }
 
     #[test]
