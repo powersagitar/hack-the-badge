@@ -111,6 +111,19 @@
 //! [`FirmwareRuntime::soft_reset_count`] counts the resets. The host's own
 //! [`FirmwareRuntime::reset`] stays a cold power-on.
 //!
+//! ## Power cycle (Milestone 14)
+//!
+//! [`FirmwareRuntime::power_cycle`] is the page's power switch: a cold
+//! power-on, like [`FirmwareRuntime::reset`], that keeps **the emulated
+//! flash**, as the physical badge does, so a provisioned badge stays
+//! provisioned. Nothing else survives it that a cold `reset()` loses: RTC
+//! memory and the RTC_CNTL `STORE` registers are lost (they live in the
+//! powered RTC domain), the panel and the LED chain start dark (the LED
+//! colours and frame count go back to none), and the console, the
+//! diagnostics, emulated time, the step count and the soft-reset count
+//! start at 0. As with `reset()`, held buttons, the host-set acceleration
+//! and the factory MAC are host input and are re-applied.
+//!
 //! ## Checkpoints
 //!
 //! A `FirmwareRuntime` is `Clone`, and a clone is a complete, independent
@@ -232,11 +245,36 @@ impl FirmwareRuntime {
     /// image that already parsed once — but the error is propagated rather
     /// than unwrapped so this stays panic-free across the WASM boundary.
     pub fn reset(&mut self) -> Result<(), ImageParseError> {
+        self.power_on(false)
+    }
+
+    /// Pulls the power and turns it back on: [`FirmwareRuntime::reset`]'s
+    /// cold power-on, except that the emulated flash (the provisioned
+    /// identity, `reboot.cfg`, NVS) is kept, as the physical badge's flash
+    /// keeps it. Everything else starts over as in `reset()`: RAM, RTC
+    /// memory, the RTC_CNTL `STORE` registers, every peripheral, the panel,
+    /// the LED chain's colours and frame count, the console and queued
+    /// serial input; emulated time, [`FirmwareRuntime::total_steps`] and
+    /// [`FirmwareRuntime::soft_reset_count`] go back to 0, and
+    /// `rtc_get_reset_reason` reports `POWERON_RESET`. Held buttons, the
+    /// host-set acceleration and the factory MAC are re-applied. See the
+    /// module doc, "Power cycle".
+    pub fn power_cycle(&mut self) -> Result<(), ImageParseError> {
+        self.power_on(true)
+    }
+
+    /// The cold power-on behind [`FirmwareRuntime::reset`] and
+    /// [`FirmwareRuntime::power_cycle`]; `keep_flash` carries the old
+    /// emulated flash chip into the new bus.
+    fn power_on(&mut self, keep_flash: bool) -> Result<(), ImageParseError> {
         let (cpu, bus) = boot_from_firmware_image_with_rom_stubs(&self.image)?;
         let accel = self.acceleration();
         let mac = self.factory_mac();
         self.cpu = cpu;
-        self.bus = bus;
+        let old = std::mem::replace(&mut self.bus, bus);
+        if keep_flash {
+            self.bus.flash_chip = old.flash_chip;
+        }
         self.total_steps = 0;
         self.soft_reset_count = 0;
         self.time_base_us = 0;
@@ -1831,6 +1869,34 @@ mod tests {
         assert_eq!(rt.bus.flash_chip.read(FLASH_PROBE), 0xFF);
         assert_eq!(rt.soft_reset_count(), 0);
         assert_eq!(rt.emulated_time_us(), 0);
+        assert_eq!(reset_reason(&mut rt), crate::rom::POWERON_RESET);
+    }
+
+    /// A power cycle is a cold power-on that keeps the flash, as pulling
+    /// the badge's power keeps its identity.
+    #[test]
+    fn power_cycle_keeps_flash() {
+        use crate::mem::Bus;
+        let mut rt = FirmwareRuntime::from_image(&synthetic_image()).unwrap();
+        assert!(rt.set_factory_mac(&HACKER_MAC));
+        rt.set_raw_button(0, true);
+        rt.bus.flash_chip.program(FLASH_PROBE, &[0x5A]);
+        rt.run(10_000);
+        call_stub(&mut rt, crate::rom::SOFTWARE_RESET_CPU);
+        rt.run(10_000);
+        assert_eq!(rt.soft_reset_count(), 1);
+        rt.power_cycle().expect("power cycle");
+        assert_eq!(rt.bus.flash_chip.read(FLASH_PROBE), 0x5A);
+        assert_eq!(rt.emulated_time_us(), 0);
+        assert_eq!(rt.total_steps(), 0);
+        assert_eq!(rt.soft_reset_count(), 0);
+        assert_eq!(rt.factory_mac(), Some(HACKER_MAC));
+        assert_eq!(rt.bus.read32(MAC_SYS_0), 0x0000_1001);
+        assert!(rt.raw_button(0));
+        assert!(
+            !rt.bus().gpio.pin_level(crate::peripherals::gpio::PIN_START),
+            "held input is re-applied to the new bus"
+        );
         assert_eq!(reset_reason(&mut rt), crate::rom::POWERON_RESET);
     }
 

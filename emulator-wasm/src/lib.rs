@@ -103,6 +103,14 @@ impl FirmwareEmulator {
         Ok(Self { inner })
     }
 
+    /// A cold power-on that keeps the emulated flash (the page's power
+    /// switch).
+    pub fn power_cycle(&mut self) -> Result<(), JsError> {
+        self.inner
+            .power_cycle()
+            .map_err(|e| JsError::new(&format!("re-parsing the retained image failed: {e:?}")))
+    }
+
     /// Re-boots from the same image, keeping held buttons.
     pub fn reset(&mut self) -> Result<(), JsError> {
         self.inner

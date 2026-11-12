@@ -1662,6 +1662,57 @@ fn setup_logs_its_launch_after_a_reboot() {
     assert_no_panic_text(&rt);
 }
 
+/// A power cycle's power-on to the registered screen: first stable at
+/// 38,500,000 steps (through the boot splash), then
+/// [`AFTER_PRESS_STABLE_FOR`] more to confirm, 46,500,000; + 25%, rounded
+/// up to 1,000,000 (v392, role hacker).
+const POWER_CYCLE_REGISTERED_STEPS: u64 = 59_000_000;
+/// Total steps and emulated time once the power-cycled badge's registered
+/// screen is confirmed stable (exact pins, v392, role hacker).
+const POWER_CYCLE_REGISTERED_AT_STEPS: u64 = 46_500_000;
+const POWER_CYCLE_REGISTERED_AT_US: u64 = 1_554_210;
+
+/// Milestone 14's power switch: from hacker's registered screen,
+/// [`FirmwareRuntime::power_cycle`] (a cold power-on that keeps the
+/// flash) boots the provisioned, onboarded badge straight back to My
+/// Badge's registered screen, through the boot splash and without Setup.
+#[test]
+fn power_cycle_boots_to_the_registered_screen() {
+    let (page1, registered_hash) = role_row(OWN_ROLE);
+    let mut rt = registered(OWN_ROLE);
+    rt.power_cycle().expect("power cycle");
+    assert_eq!((rt.total_steps(), rt.emulated_time_us()), (0, 0));
+    assert_eq!(rt.soft_reset_count(), 0);
+    assert_eq!(rt.led_frame_count(), 0, "a power-on clears the LEDs");
+    assert!(rt.led_colors().is_empty());
+    assert!(rt.console_output().is_empty());
+    let (hash, step) = run_until_stable_frame(
+        &mut rt,
+        POWER_CYCLE_REGISTERED_STEPS,
+        AFTER_PRESS_STABLE_FOR,
+        &[page1, SPLASH_HASH],
+    );
+    assert_eq!(
+        hash, registered_hash,
+        "registered after power cycle, step {step}"
+    );
+    assert_eq!(
+        (rt.total_steps(), rt.emulated_time_us()),
+        (
+            POWER_CYCLE_REGISTERED_AT_STEPS,
+            POWER_CYCLE_REGISTERED_AT_US
+        )
+    );
+    assert_eq!(rt.soft_reset_count(), 0, "no reboot on the way");
+    let console = rt.console_output();
+    assert!(
+        console.contains("app_reg: launched My Badge")
+            && !console.contains(provision::SETUP_LAUNCHED),
+        "console:\n{console}"
+    );
+    assert_no_panic_text(&rt);
+}
+
 /// [`registered`], then HOME to the stable launcher.
 fn walk_to_launcher(role: &str) -> FirmwareRuntime {
     walk_to_launcher_from(registered(role), role)
