@@ -44,11 +44,11 @@ const buttons = (root: ParentNode) => [...root.querySelectorAll("button")];
 const button = (root: ParentNode, label: string) => buttons(root).find((b) => b.textContent === label)!;
 const container = () => doc().createElement("div");
 /**
- * A happy-dom mouse event, typed as the DOM lib's for `dispatchEvent` on a
- * DOM-typed element: happy-dom's typings lack only the legacy `isTrusted`,
- * `returnValue` and `srcElement` fields, which no listener here reads.
+ * A mouse event from the test's document's own window (happy-dom's at run
+ * time; the DOM lib's `MouseEvent` by type), so `dispatchEvent` on a
+ * DOM-typed element takes it without a cast.
  */
-const mouse = (type: string) => new win.MouseEvent(type) as unknown as MouseEvent;
+const mouse = (type: string) => new (doc().defaultView!.MouseEvent)(type);
 
 /** A 2D context that records its fills: the colour and the rectangle. */
 function fakeCtx() {
