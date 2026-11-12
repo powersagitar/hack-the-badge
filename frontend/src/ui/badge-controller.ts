@@ -78,6 +78,8 @@ export interface BadgeControllerDeps {
 export const BUMP_REFUSED_NOTE = "bump: the badge isn't running";
 /** How long {@link BUMP_REFUSED_NOTE} stays in the status (ms). */
 export const BUMP_NOTE_MS = 3000;
+/** The status line after the firmware failed to boot. */
+export const START_FAILED_NOTE = "could not start the badge";
 
 export interface BadgeController {
   /** The booted firmware runtime, or `null` before the first boot. */
@@ -193,7 +195,11 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     return claiming;
   }
 
-  /** Starts the firmware if this tab holds (or can take) the badge, else shows the notice. */
+  /**
+   * Starts the firmware if this tab holds (or can take) the badge, else
+   * shows the notice. Booting it if needed and starting it if stopped, so a
+   * retry after a failed boot (Run here, a provision) leaves it running.
+   */
   async function startFirmware(): Promise<void> {
     if (!(await claimBadge())) {
       showNotice();
@@ -208,11 +214,18 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       releaseBadge();
       throw e;
     }
-    // Another tab took the badge while it booted.
-    if (!badgeHold) return;
+    // Another tab took the badge while it booted, or it already runs.
+    if (!badgeHold || running) return;
     rt.start();
     running = true;
     hub.setRunning(true); // the bump gate (Milestone 11 Task 11)
+  }
+
+  /** A failed start's line in the status (cleared by the next provision). */
+  function startFailed(e: unknown): void {
+    console.error("Failed to start the firmware:", e);
+    fetchError = START_FAILED_NOTE;
+    refreshStatus();
   }
 
   /** "Run here": takes the badge from the other tab (which stops), then starts it here. */
@@ -221,7 +234,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     try {
       await startFirmware();
     } catch (e) {
-      console.error("Failed to start the firmware:", e);
+      startFailed(e);
     }
   }
 
@@ -244,19 +257,12 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       fetchError = "";
       lastStarted = "provision";
       try {
-        // Without the badge, boot nothing: another tab runs it.
-        if (!(await claimBadge())) {
-          showNotice();
-          return;
-        }
-        let rt: WorkerFirmwareRuntime;
-        try {
-          rt = await ensureFirmwareRuntime();
-        } catch (e) {
-          // Nothing runs here: let another tab have the badge.
-          releaseBadge();
-          throw e;
-        }
+        // Boots and starts the badge if it isn't running (a retry after a
+        // failed first boot). Without the badge it boots nothing and shows
+        // the notice: another tab runs it.
+        await startFirmware();
+        const rt = firmwareRuntime;
+        if (!badgeHold || !rt) return;
         rt.provision(await deps.fetchIdentity(role));
       } catch (e) {
         console.error(`Could not load test identity ${role}:`, e);
@@ -330,9 +336,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   }
 
   shell.renderLeds([]); // the firmware models no LED peripheral yet
-  void startFirmware().catch((e: unknown) => {
-    console.error("Failed to start the firmware:", e);
-  });
+  void startFirmware().catch(startFailed);
 
   return {
     firmware: () => firmwareRuntime,

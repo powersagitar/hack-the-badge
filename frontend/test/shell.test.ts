@@ -5,7 +5,7 @@ import { BADGE_LOCK_NAME } from "../src/radio/lock";
 import { MemoryStore, handleSignal, memoryDeps } from "../src/radio/signal-handler";
 import type { SignalDeps } from "../src/radio/signal-client";
 import type { FromWorker, ToWorker } from "../src/runtime/firmware-worker-protocol";
-import { type BadgeWorker, createBadgeController, mountLinks } from "../src/ui/badge-controller";
+import { type BadgeWorker, START_FAILED_NOTE, createBadgeController, mountLinks } from "../src/ui/badge-controller";
 import { buildBadgeNotice, buildLinkPanel, buildProvisionControls, mountShell, roleLabel } from "../src/ui/shell";
 import { FakeLockManager } from "./fake-locks";
 import { FakeNetwork } from "./fake-rtc";
@@ -336,7 +336,13 @@ function fakeWorker(boot: "ready" | "error") {
  * The controller starts the firmware as it is created.
  */
 function badgeRig(
-  opts: { otherTab?: boolean; boot?: "ready" | "error"; bump?: () => boolean; bumpNoteMs?: number } = {},
+  opts: {
+    otherTab?: boolean;
+    /** Each Worker's boot outcome, in creation order (`"ready"` past the end), or one for all. */
+    boot?: "ready" | "error" | ReadonlyArray<"ready" | "error">;
+    bump?: () => boolean;
+    bumpNoteMs?: number;
+  } = {},
 ) {
   const { shell, canvas, fills } = pageShell();
   const locks = new FakeLockManager();
@@ -357,7 +363,8 @@ function badgeRig(
     roles: ["hacker"],
     loadImages: async () => ({ wasm: new ArrayBuffer(8), image: new ArrayBuffer(8) }),
     createWorker: () => {
-      const fw = fakeWorker(opts.boot ?? "ready");
+      const { boot } = opts;
+      const fw = fakeWorker(typeof boot === "string" ? boot : (boot?.[workers.length] ?? "ready"));
       workers.push(fw);
       return fw.w;
     },
@@ -450,6 +457,39 @@ describe("badge controller", () => {
     expect(r.workers).toHaveLength(1);
     expect(r.locks.held()).toBe(false);
     expect(r.running).toEqual([]);
+    // The page says so, not only the console.
+    r.controller.refreshStatus();
+    expect(r.statusText()).toContain(START_FAILED_NOTE);
+  });
+
+  test("provision after a failed first boot boots and starts the badge", async () => {
+    let r!: ReturnType<typeof badgeRig>;
+    await quietErrors(async () => {
+      r = badgeRig({ boot: ["error", "ready"] });
+      await settle();
+    });
+    expect(r.running).toEqual([]);
+    button(r.controls(), "Provision test badge").click();
+    await settle();
+    expect(r.workers).toHaveLength(2);
+    const kinds = r.workers[1]!.sent.map((m) => m.kind);
+    expect(kinds).toContain("start");
+    expect(kinds.indexOf("start")).toBeLessThan(kinds.indexOf("provision"));
+    expect(r.running).toEqual([true]);
+    expect(r.locks.held()).toBe(true);
+    r.controller.refreshStatus();
+    expect(r.statusText()).not.toContain(START_FAILED_NOTE);
+  });
+
+  test("provision on a running badge starts nothing again", async () => {
+    const r = badgeRig();
+    await settle();
+    button(r.controls(), "Provision test badge").click();
+    await settle();
+    expect(r.workers).toHaveLength(1);
+    expect(r.workers[0]!.sent.filter((m) => m.kind === "start")).toHaveLength(1);
+    expect(r.workers[0]!.sent.filter((m) => m.kind === "provision")).toHaveLength(1);
+    expect(r.running).toEqual([true]);
   });
 
   test("provision_without_the_badge_boots_no_worker_and_shows_the_notice", async () => {

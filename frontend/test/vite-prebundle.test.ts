@@ -29,8 +29,7 @@ test("pre-bundled valibot evaluates without a process global", async () => {
       "serve",
     );
     // Vite's deprecated manual entry point runs the same optimizer the dev
-    // server does (prepareRolldownOptimizerRun), with the config's
-    // optimizeDeps.rolldownOptions.
+    // server does (prepareRolldownOptimizerRun), with the resolved config.
     await optimizeDeps(config, true);
     let src = readFileSync(join(cacheDir, "deps", "valibot.js"), "utf8");
 
