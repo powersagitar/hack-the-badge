@@ -52,10 +52,10 @@ export const PROVISION_DEADLINE = 36_000_000;
 export const ONBOARDING_RESPONSE_MARGIN = 16_000_000;
 export const OWN_ROLE = "hacker";
 /** ROLE_ROWS' hacker row: onboarding page 1, and the registered screen. */
-export const OWN_ROLE_PAGE1_HASH = 0xbf9ccb7e80b44b1an;
-export const OWN_ROLE_REGISTERED_HASH = 0xbd6d761308a7bf24n;
+export const OWN_ROLE_PAGE1_HASH = 0x1c45937d99c0d2ecn;
+export const OWN_ROLE_REGISTERED_HASH = 0x83ca0950da3c55dan;
 export const TO_SHAKE_PAGE: Array<[number, bigint]> = [
-  [1, 0xe788a78193281b08n], // A: page 2 "This is you"
+  [1, 0xfea79ef13a7fbbean], // A: page 2 "This is you"
   [1, 0x38a9d040707cc4e8n], // A: page 3 "Try every button"
   [1, 0x8a6896e1b5c95d6bn], // A lit
   [2, 0x8b0b8358e2b5d6e8n], // B
@@ -74,7 +74,7 @@ export const SHAKE_HALF_US = 62_500;
 export const SHAKEN_AT_REST_HASH = 0xa80a279b127e1bb1n;
 /** `null`: page 8, animated, not pinned (see boot_progress.rs). */
 export const AFTER_SHAKE_PAGES: Array<[number, bigint | null]> = [
-  [1, 0x110e8782bc4e5ff0n], // A: page 7 "Badge Connect"
+  [1, 0x7f0ce585b026c6c0n], // A: page 7 "Badge Connect"
   [1, null], // A: page 8 "Bump to connect", animated
   [1, 0x0831b6b675e6fe01n], // A: page 9 "HEAT SAFETY"
   [1, 0x21e9c7e1b05439e3n], // A: page 10 "Go explore"

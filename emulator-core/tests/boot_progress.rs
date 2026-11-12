@@ -1226,7 +1226,7 @@ const ONBOARDING_RESPONSE_MARGIN: u64 = 16_000_000;
 /// 8 buttons once"): v335's Aux1 tile (raw slot 8) is gone, and a press of
 /// slot 8 leaves the frame unchanged, so the walk no longer presses it.
 const TO_SHAKE_PAGE: &[(usize, u64)] = &[
-    (1, 0xe788_a781_9328_1b08), // A: page 2 "This is you"
+    (1, 0xfea7_9ef1_3a7f_bbea), // A: page 2 "This is you"
     (1, 0x38a9_d040_707c_c4e8), // A: page 3 "Try every button"
     (1, 0x8a68_96e1_b5c9_5d6b), // A lit
     (2, 0x8b0b_8358_e2b5_d6e8), // B
@@ -1244,7 +1244,7 @@ const TO_SHAKE_PAGE: &[(usize, u64)] = &[
 /// footer "A / START: next   B: back" (role hacker).
 const SHAKEN_AT_REST_HASH: u64 = 0xa80a_279b_127e_1bb1;
 /// Page 7 ("Badge Connect"), after A.
-const ONBOARDING_PAGE7_HASH: u64 = 0x110e_8782_bc4e_5ff0;
+const ONBOARDING_PAGE7_HASH: u64 = 0x7f0c_e585_b026_c6c0;
 /// Onboarding steps after the shake: (slot, expected stable hash for role
 /// hacker); `None` is page 8 ("Bump to connect"), which is animated: its
 /// frame changes 24 times in the [`ANIMATED_PAGE_STEPS`] after the press
@@ -1293,24 +1293,27 @@ const LAUNCHER_AFTER_NAV_HASH: u64 = 0xa2b9_da1f_0e36_757c;
 /// (role, onboarding page 1 hash, registered My Badge screen hash), in
 /// `ROLE_TABLE` order. Both screens show the fake identity's name (and the
 /// role colour), so every role differs. Only hacker's were compared with
-/// the physical badge, on v335 (2026-10-08). v392 re-pinned every page 1
-/// (checked by eye in Milestone 9); the registered screens are unchanged.
+/// the physical badge, on v335 (2026-10-08), and that comparison still
+/// holds for layout. v392 re-pinned every page 1 (checked by eye in
+/// Milestone 9). Milestone 14 renamed the fixtures (spec: Friendly
+/// identities) and re-pinned both columns; the human partner checked the
+/// renamed frames by eye.
 const ROLE_ROWS: &[(&str, u64, u64)] = &[
-    ("hacker", 0xbf9c_cb7e_80b4_4b1a, 0xbd6d_7613_08a7_bf24),
-    ("organizer", 0x3c31_f95a_a12e_406f, 0x1974_c49f_a562_08a3),
-    ("sponsor", 0xc5ba_681b_7473_21bc, 0x0bc2_dee2_1a99_c4c0),
-    ("judge", 0x192b_1f45_de51_5d49, 0x54f8_e3d0_65a3_04c1),
-    ("mentor", 0x4929_00a1_98c0_3e4d, 0x03a9_7611_bf45_9332),
-    ("volunteer", 0xd370_a34f_7bc7_d738, 0xfd95_a0e7_844f_4019),
-    ("media", 0xa0b0_7c3c_ff8f_289d, 0x5092_210f_e8d8_f1d2),
-    ("staff", 0xe912_c748_aab7_152c, 0xc68e_18b7_16ef_40ea),
-    ("general", 0x0c04_ea57_eeb8_f8ec, 0x4574_d9ed_d13c_330a),
+    ("hacker", 0x1c45_937d_99c0_d2ec, 0x83ca_0950_da3c_55da),
+    ("organizer", 0xbc11_2320_8e0c_d357, 0xaf2c_3ce0_0305_d503),
+    ("sponsor", 0x48c4_61eb_3bb4_f4d0, 0xa70c_5cc0_123b_93d4),
+    ("judge", 0x4d1c_e946_d7eb_3e87, 0x68a9_5319_23e9_6293),
+    ("mentor", 0xae1a_f160_422b_d853, 0xa043_1930_243e_4ff0),
+    ("volunteer", 0x017b_6081_6992_ce44, 0xf09f_89b2_0ac6_9c99),
+    ("media", 0x652d_f154_e30b_f6c7, 0x04f3_99ce_2b61_f4fc),
+    ("staff", 0x65db_0aa2_2612_d47c, 0x5dc5_e488_daae_02b2),
+    ("general", 0xa713_09fb_3fff_a163, 0xc566_be81_c7bf_1829),
     (
         "workshop_lead",
-        0x96a7_9955_fffc_187c,
-        0xf8e2_3246_19a6_4d76,
+        0x7601_ff30_62bc_d767,
+        0x2cf2_489d_7b3e_31e1,
     ),
-    ("visitor", 0x2770_ab89_5a47_e576, 0x647a_71d4_5ab8_cf23),
+    ("visitor", 0x26c7_39db_80ec_f6be, 0xea69_0e22_0d10_1b23),
 ];
 
 fn role_row(role: &str) -> (u64, u64) {
@@ -1553,13 +1556,14 @@ const SKIP_SETUP_DEADLINE_STEPS: u64 = 3_000_000;
 /// up to 1,000,000.
 const SKIP_REGISTERED_STEPS: u64 = 58_000_000;
 /// Total steps once the skipped badge's registered screen is confirmed
-/// stable (exact pin, v392, role hacker: page 1 stable and returned at
-/// 36,542,000, reset seen at 38,392,000, registered first stable at
-/// 76,392,000).
-const SKIP_REGISTERED_AT_STEPS: u64 = 84_392_000;
+/// stable (exact pin, v392, role hacker: registered first stable at
+/// 76,742,000 since Milestone 14's fixture rename; before it, page 1
+/// stable and returned at 36,542,000, reset seen at 38,392,000,
+/// registered first stable at 76,392,000).
+const SKIP_REGISTERED_AT_STEPS: u64 = 84_742_000;
 /// Emulated time at [`SKIP_REGISTERED_AT_STEPS`] (exact pin; it counts
 /// through the reset, including its 466 ms).
-const SKIP_REGISTERED_AT_US: u64 = 8_855_536;
+const SKIP_REGISTERED_AT_US: u64 = 8_893_591;
 /// A mid-Setup `reboot`'s reset to Setup page 1 again: `launched Setup`
 /// by 10,850,000 steps after the reset was seen, page 1 first stable at
 /// 14,850,000, confirmed at 22,850,000; + 25%, rounded up to 1,000,000.
@@ -2112,7 +2116,7 @@ macro_rules! launcher_opens {
 
 launcher_opens!(
     /// My Badge opens on hacker's registered screen (role title, the QR
-    /// code, "Test Hacker", the badge ID; `ROLE_ROWS`' hacker entry),
+    /// code, "Ada Lovelace", the badge ID; `ROLE_ROWS`' hacker entry),
     /// first stable 9.0M steps after A's release: 22M.
     launcher_opens_my_badge,
     0,
@@ -2308,12 +2312,13 @@ launcher_opens!(
 /// fake and locally administered.
 const HACKER_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01];
 
-/// Total steps at [`radio_launcher`]: 95 fewer than
-/// [`HACKER_LAUNCHER_STEPS`] (ruling R-T4-1's measurement).
-const RADIO_LAUNCHER_STEPS: u64 = 342_600_681;
+/// Total steps at [`radio_launcher`]: 90 fewer than
+/// [`HACKER_LAUNCHER_STEPS`] (ruling R-T4-1 measured
+/// 95 before Milestone 14's fixture rename).
+const RADIO_LAUNCHER_STEPS: u64 = 342_657_243;
 /// Emulated time at [`radio_launcher`], in microseconds: the same as
 /// [`HACKER_LAUNCHER_US`].
-const RADIO_LAUNCHER_US: u64 = 94_521_615;
+const RADIO_LAUNCHER_US: u64 = 94_501_734;
 
 /// Role hacker's launcher, walked with [`HACKER_MAC`] ([`radio_launcher`]).
 static RADIO_LAUNCHER: OnceLock<FirmwareRuntime> = OnceLock::new();
@@ -2691,11 +2696,12 @@ fn sync_now_without_a_credential_is_not_ready() {
 // ---------------------------------------------------------------------
 
 /// Total steps at [`credential_launcher`] (measured; the spec's probe
-/// measured the same walk at 342,894,540).
-const CREDENTIAL_LAUNCHER_STEPS: u64 = 342_894_540;
+/// measured the same walk at 342,894,540, before Milestone 14's fixture
+/// rename).
+const CREDENTIAL_LAUNCHER_STEPS: u64 = 342_985_252;
 /// Emulated time at [`credential_launcher`], in microseconds (measured;
-/// the spec's probe: 94,521,622).
-const CREDENTIAL_LAUNCHER_US: u64 = 94_521_622;
+/// the spec's probe: 94,521,622, before Milestone 14's fixture rename).
+const CREDENTIAL_LAUNCHER_US: u64 = 94_521_739;
 
 /// Role hacker's launcher with [`HACKER_MAC`] and the fake upload
 /// credential ([`credential_launcher`]).
@@ -2769,12 +2775,13 @@ fn sync_open_with_credential() -> FirmwareRuntime {
 /// the snapshot and checksummed it with the ROM's `crc32_le` (seed 0), up
 /// to its run time, which is left out (measured on v392 with
 /// [`provision::FAKE_UPLOAD_TOKEN`] and hacker's fake identity:
-/// `sync: snapshot 1026 bytes, crc ec2f90df, 37ms, complete=1`). The
+/// `sync: snapshot 1028 bytes, crc f7cd2dea, 37ms, complete=1`; 1026 bytes,
+/// crc `ec2f90df` before Milestone 14's fixture rename). The
 /// packing frame itself (`0xb882_9410_38c1_75a2`, saved as
 /// `local/m12-frames/sync-packing.png`) is finished 1,188,996 steps after
 /// A's press and holds about 4,200,000 steps, under
 /// [`AFTER_PRESS_STABLE_FOR`], so the rung pins this line instead.
-const SYNC_SNAPSHOT_LINE: &str = "sync: snapshot 1026 bytes, crc ec2f90df,";
+const SYNC_SNAPSHOT_LINE: &str = "sync: snapshot 1028 bytes, crc f7cd2dea,";
 /// A's press to [`SYNC_SNAPSHOT_LINE`] (and `complete=1`): measured at
 /// 4,394,418 steps (first seen in 1 ms slices, at 82 ms of the 100 ms
 /// hold; A's release is 4,914,783 steps after the press); + 25 %, rounded
@@ -2954,9 +2961,9 @@ const ORGANIZER_ROLE: &str = "organizer";
 /// Total steps at [`organizer_launcher`] (measured on v392). Its own
 /// value: a walk with a different identity and a MAC differs from both
 /// [`HACKER_LAUNCHER_STEPS`] and [`RADIO_LAUNCHER_STEPS`] (ruling R-T4-1).
-const ORGANIZER_LAUNCHER_STEPS: u64 = 342_889_379;
+const ORGANIZER_LAUNCHER_STEPS: u64 = 342_921_401;
 /// Emulated time at [`organizer_launcher`], in microseconds (measured).
-const ORGANIZER_LAUNCHER_US: u64 = 94_541_620;
+const ORGANIZER_LAUNCHER_US: u64 = 94_601_811;
 
 /// Role organizer's launcher, walked with [`ORGANIZER_MAC`]
 /// ([`organizer_launcher`]).
@@ -3623,17 +3630,20 @@ fn execution_digest_is_unchanged() {
 }
 
 /// Total steps at hacker's launcher checkpoint ([`launcher_for`]), pinned
-/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
-/// performance change.
-const HACKER_LAUNCHER_STEPS: u64 = 342_600_776;
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
+const HACKER_LAUNCHER_STEPS: u64 = 342_657_333;
 /// Emulated time at hacker's launcher checkpoint, in microseconds, pinned
-/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
-/// performance change.
-const HACKER_LAUNCHER_US: u64 = 94_521_615;
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
+const HACKER_LAUNCHER_US: u64 = 94_501_734;
 /// FNV-1a of the whole console output at hacker's launcher checkpoint,
-/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin
-/// it for a performance change.
-const HACKER_LAUNCHER_CONSOLE_HASH: u64 = 0xabcd_cc17_7a35_80fe;
+/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
+const HACKER_LAUNCHER_CONSOLE_HASH: u64 = 0xd9e7_08f4_1965_a9b8;
 
 /// Milestone 7 equivalence proof at the end of the longest chain: hacker's
 /// launcher checkpoint (`launcher_for`).
@@ -3660,27 +3670,30 @@ struct Redraw {
 }
 
 /// HOME from hacker's registered screen to the launcher (3 s window),
-/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin
-/// it for a performance change.
+/// pinned at `6cd0a6e`, re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
 const HOME_REDRAW: Redraw = Redraw {
     emulated_us: 244_000,
-    steps: 18_292_336,
+    steps: 18_318_598,
     end_hash: LAUNCHER_HASH,
 };
 /// DOWN on hacker's launcher (1.5 s window), pinned at `6cd0a6e`,
-/// re-pinned for v392 in Milestone 9. Never re-pin it for a performance
-/// change.
+/// re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
 const DOWN_REDRAW: Redraw = Redraw {
-    emulated_us: 109_000,
-    steps: 7_942_619,
+    emulated_us: 129_000,
+    steps: 7_978_324,
     end_hash: LAUNCHER_AFTER_NAV_HASH,
 };
 /// A from onboarding page 1 to page 2 (role hacker, 3 s window), pinned
-/// at `6cd0a6e`, re-pinned for v392 in Milestone 9. Never re-pin it for a
-/// performance change.
+/// at `6cd0a6e`, re-pinned for v392 in Milestone 9 and for
+/// Milestone 14's fixture rename (its walk types the identity). Never
+/// re-pin it for a performance change.
 const ONBOARDING_REDRAW: Redraw = Redraw {
     emulated_us: 52_000,
-    steps: 2_547_134,
+    steps: 2_577_629,
     end_hash: TO_SHAKE_PAGE[0].1,
 };
 

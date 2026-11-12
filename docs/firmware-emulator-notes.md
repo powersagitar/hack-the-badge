@@ -3679,9 +3679,13 @@ obviously fake identity records, one per role in the firmware's role
 table. They were written by hand from the identity schema traced in
 the v335 image, then `factory.bin` (`docs/milestone-5-decisions.md`,
 "Trace facts"; all eleven still provision on v392), never
-derived from the flash dump or the boot log: "Test <Role>" names,
-`example.com` addresses, `test-` badge IDs, empty contact fields. The
-human partner relayed the Hack the North organizers' permission to commit
-them on 2026-10-08 (ruling R-M5-2). `frontend/test/test-identities.test.ts`
-keeps them obviously fake and within the firmware's field limits; a real
-attendee's identity never belongs there.
+derived from the flash dump or the boot log: `example.com`
+addresses, `test-` badge IDs, empty contact fields. The human partner
+relayed the Hack the North organizers' permission to commit them on
+2026-10-08 (ruling R-M5-2). `frontend/test/test-identities.test.ts`
+keeps them obviously fake and within the firmware's field limits; a
+real attendee's identity never belongs there. Their names were
+"Test <Role>" until Milestone 14, which renamed them to historical
+figures (Ada Lovelace for hacker; the table is in the Milestone 14
+spec, "Friendly identities"), with the human partner overriding
+Milestone 5's naming decision on 2026-11-12 (`docs/milestone-14-decisions.md`).
