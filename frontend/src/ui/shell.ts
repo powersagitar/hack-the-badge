@@ -1,8 +1,7 @@
 /**
  * Page chrome: mounts the on-screen button pad (mouse) and keyboard
- * bindings that both inject `badge.input` events, a tiny LED HUD, and the
- * Lua-sandbox-vs-real-firmware mode toggle (`CLAUDE.md`'s architecture
- * section names this file as where that toggle lives).
+ * bindings that feed the firmware's buttons, a tiny LED HUD, the
+ * provisioning controls, the badge notice and the link panel.
  *
  * Keyboard mapping (documented per spec):
  *   ArrowUp/Down/Left/Right -> UP/DOWN/LEFT/RIGHT
@@ -10,31 +9,19 @@
  *   Enter                   -> START
  *   Escape                  -> HOME
  *   Space                   -> AUX1
- * (unmapped: none needed for the smoke-test app; extend KEY_TO_BUTTON as needed.)
+ * (extend KEY_TO_BUTTON as needed.)
  *
  * The radio link panel ({@link buildLinkPanel}, Milestone 10 Task 10)
  * hosts or joins a WebRTC link, or swaps codes by hand; `main.ts` does the
  * linking.
  *
- * The button pad, keyboard bindings and canvas are shared between modes —
- * `shell.ts` itself has no notion of "which runtime"; `src/main.ts` owns
- * both runtimes and passes this module a single `ButtonInjector` that it
- * internally routes to whichever one is currently active. This module only
- * reports *which* mode was picked, via `mountModeToggle`'s callback.
+ * `shell.ts` has no notion of the runtime: `src/main.ts` passes it a
+ * single `ButtonInjector`, the badge controller's.
  */
-import { BUTTON_NAMES, type ButtonName, type ButtonSource } from "../badge/input";
-import type { Rgb } from "../badge/led";
+import { BUTTON_NAMES, type ButtonName, type ButtonSource, type Rgb } from "../runtime/buttons";
 
 /** `source` is `"pad"` from `mountButtons` and `"key"` from `mountKeyboard`. */
 export type ButtonInjector = (button: ButtonName, kind: "pressed" | "released", source?: ButtonSource) => void;
-
-/** The two emulator modes `CLAUDE.md`'s architecture section describes. */
-export type EmulatorMode = "lua" | "firmware";
-
-const MODE_OPTIONS: Array<{ value: EmulatorMode; label: string }> = [
-  { value: "lua", label: "Lua Sandbox" },
-  { value: "firmware", label: "Real Firmware" },
-];
 
 const KEY_TO_BUTTON: Record<string, ButtonName> = {
   ArrowUp: "UP",
@@ -73,18 +60,6 @@ export interface ShellHandles {
   mountButtons(inject: ButtonInjector): void;
   mountKeyboard(inject: ButtonInjector): void;
   renderLeds(colors: Rgb[]): void;
-  /**
-   * Mounts (or re-renders) the mode-select control into `#mode-toggle`
-   * (a no-op, not an error, if that element isn't present in the page —
-   * same defensive style `mountButtons`/`renderLeds` already use for
-   * `#button-pad`/`#led-row`). `current` controls which option starts
-   * highlighted; `onSelect` fires once per user click on a *different*
-   * option than the one currently highlighted (clicking the already-active
-   * option is a no-op, not a redundant callback). The caller (`main.ts`)
-   * owns actually switching runtimes; this function only reports the choice
-   * and updates which button looks active.
-   */
-  mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void;
   /**
    * Mounts the role picker, "Provision test badge", "Skip setup" (hidden
    * until shown), "Shake" and "Bump" buttons, a status span and a hint
@@ -390,23 +365,6 @@ export function mountShell(): ShellHandles {
     });
   }
 
-  function mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void {
-    const container = document.getElementById("mode-toggle");
-    if (!container) return;
-    container.innerHTML = "";
-    for (const { value, label } of MODE_OPTIONS) {
-      const btn = document.createElement("button");
-      btn.textContent = label;
-      btn.type = "button";
-      btn.className = "mode-btn" + (value === current ? " active" : "");
-      btn.addEventListener("click", () => {
-        if (value === current) return; // already active, nothing to do
-        onSelect(value);
-      });
-      container.appendChild(btn);
-    }
-  }
-
   function mountProvisionControls(
     roles: readonly string[],
     onProvision: (role: string) => void,
@@ -424,7 +382,7 @@ export function mountShell(): ShellHandles {
   /**
    * Paints the whole canvas in the page's background, `shell.css`'s
    * `--bg` (the body's computed background if the token is missing), so
-   * the notice does not sit over the Lua sandbox's last frame.
+   * the notice does not sit over the badge's last frame.
    */
   const clearScreen = (): void => {
     const view = document.defaultView;
@@ -461,7 +419,6 @@ export function mountShell(): ShellHandles {
     mountButtons,
     mountKeyboard,
     renderLeds,
-    mountModeToggle,
     mountProvisionControls,
     mountBadgeNotice,
     mountLinkPanel,

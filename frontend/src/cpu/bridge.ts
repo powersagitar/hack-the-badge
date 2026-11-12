@@ -1,8 +1,6 @@
 /**
- * Thin TS wrapper over the generated wasm-bindgen glue in `wasm-pkg/`,
- * analogous in role to how `src/lua/vm.ts` wraps Fengari for Lua mode — much
- * narrower in scope, though: this is just the CPU/bus surface, not a general
- * value bridge.
+ * Thin TS wrapper over the generated wasm-bindgen glue in `wasm-pkg/`: just
+ * the CPU/bus surface, not a general value bridge.
  *
  * `wasm-pkg/` is **generated and gitignored**. Run `bun run build:wasm` after
  * any change under `emulator-core/` or `emulator-wasm/`, and before

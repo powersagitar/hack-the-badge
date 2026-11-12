@@ -38,11 +38,6 @@ h1 {
   margin: 0;
 }
 
-#mode-toggle {
-  display: flex;
-  gap: 8px;
-}
-
 .mode-btn {
   padding: 6px 14px;
   border-radius: 999px;

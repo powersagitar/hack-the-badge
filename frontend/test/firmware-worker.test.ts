@@ -761,7 +761,6 @@ describe("firmware worker client", () => {
     rt.reset();
     expect(rt.speed()).toBe(0);
     expect(rt.provisionState()).toBeNull();
-    expect(rt.isExitRequested()).toBe(false);
   });
 
   test("skipSetup hides the skip until the next status", () => {

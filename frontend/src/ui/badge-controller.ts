@@ -6,8 +6,8 @@
  * replace comes in through {@link BadgeControllerDeps}; `main.ts` passes
  * the browser's.
  *
- * - {@link createBadgeController}: the mode switch, the lazily booted
- *   firmware Worker, the one-badge-per-browser lock and its notice, the
+ * - {@link createBadgeController}: the firmware Worker (booted at once,
+ *   once this tab holds the badge), the one-badge-per-browser lock and its notice, the
  *   provisioning controls, and the bump gate's `hub.setRunning` calls.
  * - {@link mountLinks}: the radio link panel and its links, with the
  *   hosted room's cancel.
@@ -48,7 +48,7 @@ import {
   type WorkerFirmwareRuntime,
   type WorkerLike,
 } from "../runtime/firmware-worker-client";
-import type { ButtonInjector, EmulatorMode, LinkPanel, ProvisionControls, ShellHandles } from "./shell";
+import type { ButtonInjector, LinkPanel, ProvisionControls, ShellHandles } from "./shell";
 
 /** The Worker the controller boots: a {@link WorkerLike} that also reports its own load failure. */
 export interface BadgeWorker extends WorkerLike {
@@ -56,10 +56,8 @@ export interface BadgeWorker extends WorkerLike {
 }
 
 export interface BadgeControllerDeps {
-  shell: Pick<ShellHandles, "ctx" | "renderLeds" | "mountModeToggle" | "mountBadgeNotice" | "mountProvisionControls">;
+  shell: Pick<ShellHandles, "ctx" | "renderLeds" | "mountBadgeNotice" | "mountProvisionControls">;
   hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning" | "bump">;
-  /** The Lua sandbox's paint loop and input; its `on_tick` timer is not the controller's. */
-  lua: { startPaint(): void; stopPaint(): void; injectButton: ButtonInjector };
   /** The firmware roles the provisioning controls offer. */
   roles: readonly string[];
   /** Fetches the WASM module and `firmware.bin`. */
@@ -82,11 +80,9 @@ export const BUMP_REFUSED_NOTE = "bump: the badge isn't running";
 export const BUMP_NOTE_MS = 3000;
 
 export interface BadgeController {
-  mode(): EmulatorMode;
   /** The booted firmware runtime, or `null` before the first boot. */
   firmware(): WorkerFirmwareRuntime | null;
-  setMode(next: EmulatorMode): Promise<void>;
-  /** The button pad's and keyboard's input, routed to the mode's runtime. */
+  /** The button pad's and keyboard's input, to the firmware (dropped before its boot). */
   inject: ButtonInjector;
   /** The provisioning controls' visibility and status line (`main.ts` polls it). */
   refreshStatus(): void;
@@ -95,28 +91,20 @@ export interface BadgeController {
 }
 
 /**
- * Mounts the mode toggle, the badge notice and the provisioning controls,
- * in Lua mode. The Lua paint loop is the caller's to start.
+ * Mounts the badge notice and the provisioning controls, and starts the
+ * firmware: it claims the badge and, once this tab holds it, boots the
+ * Worker (or shows the notice if another tab holds it).
  */
 export function createBadgeController(deps: BadgeControllerDeps): BadgeController {
-  const { shell, hub, lua } = deps;
+  const { shell, hub } = deps;
   const { locks } = deps;
 
-  let mode: EmulatorMode = "lua";
-
-  // Real-firmware mode is constructed lazily (on first switch to it) rather
-  // than eagerly at startup, so a user who stays in Lua-sandbox mode never
-  // pays the cost of fetching/booting firmware.bin through WASM. Once built,
-  // it's kept alive (not disposed) across later mode switches so switching
-  // back doesn't re-boot from scratch.
-  //
-  // Since Milestone 7 Task 8 the emulator runs in a dedicated Worker
-  // (`runtime/firmware-worker.ts`); this thread only fetches the bytes,
-  // paints the frames the Worker posts and forwards input
-  // (`runtime/firmware-worker-client.ts`). The Worker imports `./cpu/bridge`
-  // lazily: `bridge.ts` imports the gitignored, Rust-toolchain-generated
-  // `src/cpu/wasm-pkg/`, and the Lua-only path never creates the Worker, so
-  // it never loads `src/cpu/`.
+  // The Worker is created only once this tab holds the badge (or a
+  // provision asks for it), and kept until unload. Since Milestone 7 Task 8
+  // the emulator runs in a dedicated Worker (`runtime/firmware-worker.ts`);
+  // this thread only fetches the bytes, paints the frames the Worker posts
+  // and forwards input (`runtime/firmware-worker-client.ts`). The Worker
+  // imports `./cpu/bridge` lazily, so the WASM loads only inside it.
   let firmwareRuntime: WorkerFirmwareRuntime | null = null;
   let firmwareRuntimePromise: Promise<WorkerFirmwareRuntime> | null = null;
 
@@ -146,8 +134,8 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       return rt;
     })().catch((e: unknown) => {
       // Don't let a rejected boot attempt (e.g. a transient fetch failure)
-      // stay cached forever -- reset the slot so the next toggle attempt
-      // retries the fetch/boot instead of replaying this same rejection.
+      // stay cached forever -- reset the slot so the next attempt (Run
+      // here, a provision) retries the fetch/boot instead of replaying this same rejection.
       firmwareRuntimePromise = null;
       throw e;
     });
@@ -179,9 +167,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   }
 
   /**
-   * Frees the badge for another tab (Milestone 11 Task 12): on a switch to
-   * Lua mode, a failed start and unload. Idempotent: the hold is dropped
-   * before it is released, so it is released once.
+   * Frees the badge for another tab (Milestone 11 Task 12): on a failed
+   * start and unload. Idempotent: the hold is dropped before it is
+   * released, so it is released once.
    */
   function releaseBadge(): void {
     const hold = badgeHold;
@@ -189,9 +177,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     hold?.release();
   }
 
-  /** Shows the badge notice, in firmware mode only (it clears the canvas behind it). */
+  /** Shows the badge notice (it clears the canvas behind it). */
   function showNotice(): void {
-    if (mode === "firmware") badgeNotice.setVisible(true);
+    badgeNotice.setVisible(true);
   }
 
   /** Takes the badge if no other tab holds it; `true` if this tab holds it. */
@@ -211,11 +199,6 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       showNotice();
       return;
     }
-    // Switched back to Lua mode while the claim was in flight.
-    if (mode !== "firmware") {
-      releaseBadge();
-      return;
-    }
     badgeNotice.setVisible(false);
     let rt: WorkerFirmwareRuntime;
     try {
@@ -225,8 +208,8 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       releaseBadge();
       throw e;
     }
-    // The user switched away, or another tab took the badge, while it booted.
-    if (mode !== "firmware" || !badgeHold) return;
+    // Another tab took the badge while it booted.
+    if (!badgeHold) return;
     rt.start();
     running = true;
     hub.setRunning(true); // the bump gate (Milestone 11 Task 11)
@@ -235,63 +218,16 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   /** "Run here": takes the badge from the other tab (which stops), then starts it here. */
   async function runHere(): Promise<void> {
     await takeOver(locks);
-    if (mode !== "firmware") return;
     try {
       await startFirmware();
     } catch (e) {
-      console.error("Failed to start real-firmware mode:", e);
+      console.error("Failed to start the firmware:", e);
     }
   }
 
   const inject: ButtonInjector = (button, kind, source) => {
-    if (mode === "lua") {
-      lua.injectButton(button, kind);
-    } else {
-      firmwareRuntime?.injectButton(button, kind, source);
-    }
+    firmwareRuntime?.injectButton(button, kind, source);
   };
-
-  function refreshModeToggle(): void {
-    shell.mountModeToggle(mode, (next) => {
-      void setMode(next);
-    });
-  }
-
-  async function setMode(next: EmulatorMode): Promise<void> {
-    if (next === mode) return;
-    const previous = mode;
-
-    if (previous === "lua") {
-      lua.stopPaint();
-    } else {
-      firmwareRuntime?.stop();
-      running = false;
-      hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
-    }
-
-    mode = next;
-    refreshModeToggle();
-
-    if (next === "lua") {
-      releaseBadge();
-      badgeNotice.setVisible(false);
-      lua.startPaint();
-      return;
-    }
-
-    // next === "firmware"
-    shell.renderLeds([]); // real-firmware mode models no LED peripheral yet
-    try {
-      await startFirmware();
-    } catch (e) {
-      console.error("Failed to start real-firmware mode:", e);
-      // Fall back to Lua-sandbox mode rather than leaving the canvas frozen
-      // with nothing driving it.
-      mode = "lua";
-      refreshModeToggle();
-      lua.startPaint();
-    }
-  }
 
   let fetchError = "";
   /** A refused Bump's reason ({@link BUMP_REFUSED_NOTE}), cleared by `bumpNoteTimer`. */
@@ -360,14 +296,14 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
    * `rebooting…` through the reboot's pause, not a speed (ride-along 4).
    */
   function refreshStatus(): void {
-    provisionControls.setVisible(mode === "firmware");
+    provisionControls.setVisible(true);
     const rt = firmwareRuntime;
     const st = rt?.provisionState() ?? null;
     const skip = rt?.skipState() ?? null;
     const provisionInFlight = st?.kind === "waiting" || st?.kind === "typing";
     const skipTyping = skip?.kind === "typing";
     provisionControls.setSkipVisible(
-      mode === "firmware" && running && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
+      running && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
     );
     provisionControls.setProvisionEnabled(!skipTyping);
     let text = fetchError;
@@ -383,7 +319,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       if (skip?.kind === "typing") text = "skipping setup…";
       else if (skip?.kind === "failed") text = `skip failed: ${skip.reason}`;
     }
-    if (mode === "firmware" && rt) {
+    if (rt) {
       // The emulated/wall ratio: below 1x the step cap binds (slow motion).
       const speed = rt.speed();
       const prefix = rt.rebooting() ? "rebooting…" : speed > 0 ? `${speed.toFixed(1)}x` : "";
@@ -393,12 +329,13 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     }
   }
 
-  refreshModeToggle();
+  shell.renderLeds([]); // the firmware models no LED peripheral yet
+  void startFirmware().catch((e: unknown) => {
+    console.error("Failed to start the firmware:", e);
+  });
 
   return {
-    mode: () => mode,
     firmware: () => firmwareRuntime,
-    setMode,
     inject,
     refreshStatus,
     dispose() {

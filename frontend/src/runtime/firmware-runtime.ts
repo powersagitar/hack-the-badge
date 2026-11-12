@@ -1,12 +1,9 @@
 /**
- * Real-firmware runtime: mirrors `src/runtime/lifecycle.ts`'s role, but for
- * the CPU-emulator side (Milestone 2) instead of the Lua sandbox
- * (Milestone 1). Owns a `FirmwareEmulatorHandle` (`src/cpu/bridge.ts`), drives
- * a frame loop that runs the CPU to the frame's wall-clock time target and
- * hands the reconstructed framebuffer to a `present` callback, and exposes an
- * `injectButton`-shaped API close enough to `lifecycle.ts`'s `AppRuntime` that
- * `shell.ts`'s existing button-pad/keyboard wiring can drive either runtime
- * without knowing which one it's holding.
+ * Real-firmware runtime (Milestone 2). Owns a `FirmwareEmulatorHandle`
+ * (`src/cpu/bridge.ts`), drives a frame loop that runs the CPU to the
+ * frame's wall-clock time target and hands the reconstructed framebuffer to
+ * a `present` callback, and exposes the `injectButton` API `shell.ts`'s
+ * button-pad/keyboard wiring drives.
  *
  * ## Where it runs (Milestone 7 Task 8)
  *
@@ -21,14 +18,11 @@
  * whose `present` blits with `src/render/framebuffer.ts`, capped at
  * `DEFAULT_STEPS_PER_FRAME`) is what the unit tests drive.
  *
- * ## Why `requestAnimationFrame`, unlike `lifecycle.ts`'s `setInterval`
+ * ## Why `requestAnimationFrame`
  *
- * `lifecycle.ts` ticks Lua logic on a timer decoupled from paint (a separate
- * `requestAnimationFrame` loop in `main.ts` repaints the widget tree
- * whenever the browser feels like it). Here there's no such split: "step the
- * CPU" and "show what it drew" are the same visible unit of work each frame,
- * so both happen in one `requestAnimationFrame` callback, the same shape
- * `main.ts`'s existing paint loop already uses for Lua mode.
+ * "Step the CPU" and "show what it drew" are the same visible unit of work
+ * each frame, so both happen in one `requestAnimationFrame` callback rather
+ * than a timer decoupled from paint.
  *
  * `scheduleFrame`/`cancelFrame` are injectable (default: the real
  * `requestAnimationFrame`/`cancelAnimationFrame`) so this module's frame-step
@@ -130,7 +124,7 @@
  * nothing is typed, no provisioner starts, and the provision state is
  * failed with {@link SKIP_IN_PROGRESS_REASON}.
  */
-import type { ButtonName, ButtonSource } from "../badge/input";
+import type { ButtonName, ButtonSource } from "./buttons";
 import type { FirmwareEmulatorHandle } from "../cpu/bridge";
 import { consoleSince } from "./console-io";
 import { createProvisioner, type ProvisionState, type Provisioner } from "./provisioner";
@@ -177,7 +171,7 @@ export const WORKER_STEPS_PER_SLICE = 400_000;
  *
  * Composing the two gives the table below. Total mapping: `NUM_RAW_BUTTON_SLOTS`
  * (`emulator-core/src/runtime.rs`) is 9, exactly `BUTTON_NAMES.length`
- * (`src/badge/input.ts`) — nothing left over on either side.
+ * (`src/runtime/buttons.ts`) — nothing left over on either side.
  */
 export const RAW_SLOT_BY_BUTTON: Record<ButtonName, number> = {
   START: 0,
@@ -350,7 +344,7 @@ export interface FirmwareRuntime {
    */
   stop(): void;
   /**
-   * `lifecycle.ts`'s `AppRuntime.injectButton`, plus the press's source
+   * Presses or releases `button`, from `source`
    * (default `"pad"`): see "Tap sources and taps across `stop()`".
    */
   injectButton(button: ButtonName, kind: "pressed" | "released", source?: ButtonSource): void;
@@ -391,13 +385,6 @@ export interface FirmwareRuntime {
    * second frame after `start()` or `reset()`.
    */
   speed(): number;
-  /**
-   * Real-firmware mode has no Lua-style exit-to-launcher (that's
-   * a Lua-sandbox-mode-only affordance — see `badge.app.exit()` in
-   * `lifecycle.ts`). Always `false`; exists so `shell.ts`/`main.ts` can treat
-   * both runtimes uniformly without a type-level special case.
-   */
-  isExitRequested(): boolean;
   /** Stops the loop (if running) and releases the WASM-side emulator. */
   dispose(): void;
 }
@@ -768,7 +755,6 @@ export function createFirmwareRuntime(
     shake,
     bump,
     speed: () => speed,
-    isExitRequested: () => false,
     dispose,
   };
 }

@@ -26,7 +26,7 @@
 //!   [`crate::peripherals::gpio::Hc165::set_button`]'s index `n - 1`.
 //!
 //! See [`FirmwareRuntime::set_raw_button`]. [`NUM_RAW_BUTTON_SLOTS`] is the
-//! total (9) — which is exactly the number of names in `frontend/src/badge/input.ts`'s
+//! total (9) — which is exactly the number of names in `frontend/src/runtime/buttons.ts`'s
 //! `BUTTON_NAMES`, so the UI-side table is a total mapping with nothing left
 //! over.
 //!

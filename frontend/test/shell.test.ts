@@ -332,14 +332,18 @@ function fakeWorker(boot: "ready" | "error") {
 /**
  * The badge controller over the page's real shell (happy-dom, a fake 2D
  * context on `#badge-screen`), a fake lock manager, and fake Workers. With
- * `otherTab`, another tab holds the badge first.
+ * `otherTab`, another tab holds the badge first, until `freeOtherTab()`.
+ * The controller starts the firmware as it is created.
  */
 function badgeRig(
   opts: { otherTab?: boolean; boot?: "ready" | "error"; bump?: () => boolean; bumpNoteMs?: number } = {},
 ) {
   const { shell, canvas, fills } = pageShell();
   const locks = new FakeLockManager();
-  if (opts.otherTab) void locks.request(BADGE_LOCK_NAME, {}, () => new Promise(() => {}));
+  let freeOtherTab = () => {};
+  if (opts.otherTab) {
+    void locks.request(BADGE_LOCK_NAME, {}, () => new Promise<void>((resolve) => (freeOtherTab = resolve)));
+  }
   const workers: Array<ReturnType<typeof fakeWorker>> = [];
   const running: boolean[] = [];
   const controller = createBadgeController({
@@ -350,7 +354,6 @@ function badgeRig(
       setRunning: (r) => void running.push(r),
       bump: opts.bump ?? (() => false),
     },
-    lua: { startPaint() {}, stopPaint() {}, injectButton() {} },
     roles: ["hacker"],
     loadImages: async () => ({ wasm: new ArrayBuffer(8), image: new ArrayBuffer(8) }),
     createWorker: () => {
@@ -364,7 +367,6 @@ function badgeRig(
     bumpNoteMs: opts.bumpNoteMs,
   });
   const el = (id: string) => doc().getElementById(id)!;
-  const pick = (label: string) => button(el("mode-toggle"), label).click();
   const noticeShown = () => el("badge-notice").style.display !== "none";
   /** The first Worker's `status`, with these fields over an idle default, then a refresh. */
   const status = (fields: Partial<Extract<FromWorker, { kind: "status" }>>) => {
@@ -392,7 +394,7 @@ function badgeRig(
     running,
     fills,
     el,
-    pick,
+    freeOtherTab: () => freeOtherTab(),
     noticeShown,
     canvas,
     status,
@@ -417,13 +419,9 @@ async function quietErrors(body: () => Promise<void>): Promise<unknown[][]> {
 }
 
 describe("badge controller", () => {
-  test("starts in Lua mode, and Real Firmware boots and starts the badge", async () => {
+  test("boots and starts the badge as it is created", async () => {
     const r = badgeRig();
-    expect(r.controller.mode()).toBe("lua");
-    expect(r.el("mode-toggle").querySelector(".active")!.textContent).toBe("Lua Sandbox");
-    r.pick("Real Firmware");
     await settle();
-    expect(r.controller.mode()).toBe("firmware");
     expect(r.workers).toHaveLength(1);
     expect(r.workers[0]!.sent.map((m) => m.kind)).toEqual(["init", "setMac", "start"]);
     expect(r.locks.held()).toBe(true);
@@ -431,22 +429,10 @@ describe("badge controller", () => {
     expect(r.noticeShown()).toBe(false);
   });
 
-  test("switching_to_lua_releases_the_badge", async () => {
+  test("unload_releases_the_badge", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     expect(r.locks.held()).toBe(true);
-    r.pick("Lua Sandbox");
-    await settle();
-    expect(r.controller.mode()).toBe("lua");
-    expect(r.locks.held()).toBe(false);
-    expect(r.running).toEqual([true, false]);
-    // Back to the firmware: the badge is taken again, the same Worker resumes.
-    r.pick("Real Firmware");
-    await settle();
-    expect(r.locks.held()).toBe(true);
-    expect(r.workers).toHaveLength(1);
-    expect(r.running).toEqual([true, false, true]);
     // Unload frees it, and a second free does nothing.
     r.controller.dispose();
     r.controller.dispose();
@@ -455,21 +441,19 @@ describe("badge controller", () => {
   });
 
   test("a_failed_firmware_start_releases_the_badge", async () => {
-    const r = badgeRig({ boot: "error" });
+    let r!: ReturnType<typeof badgeRig>;
     const errors = await quietErrors(async () => {
-      r.pick("Real Firmware");
+      r = badgeRig({ boot: "error" });
       await settle();
     });
     expect(errors.length).toBeGreaterThan(0);
-    expect(r.controller.mode()).toBe("lua");
-    expect(r.el("mode-toggle").querySelector(".active")!.textContent).toBe("Lua Sandbox");
+    expect(r.workers).toHaveLength(1);
     expect(r.locks.held()).toBe(false);
     expect(r.running).toEqual([]);
   });
 
   test("provision_without_the_badge_boots_no_worker_and_shows_the_notice", async () => {
     const r = badgeRig({ otherTab: true });
-    r.pick("Real Firmware");
     await settle();
     expect(r.noticeShown()).toBe(true);
     expect(r.workers).toHaveLength(0);
@@ -482,16 +466,12 @@ describe("badge controller", () => {
   });
 
   test("a_failed_boot_from_provision_releases_the_badge", async () => {
-    const r = badgeRig({ boot: "error" });
-    // Another tab holds the badge while this one enters firmware mode, then frees it.
-    let free = () => {};
-    void r.locks.request(BADGE_LOCK_NAME, {}, () => new Promise<void>((resolve) => (free = resolve)));
+    // Another tab holds the badge while this one starts, then frees it.
+    const r = badgeRig({ boot: "error", otherTab: true });
     await settle();
-    r.pick("Real Firmware");
-    await settle();
-    expect(r.controller.mode()).toBe("firmware");
+    expect(r.noticeShown()).toBe(true);
     expect(r.workers).toHaveLength(0);
-    free();
+    r.freeOtherTab();
     await settle();
     expect(r.locks.held()).toBe(false);
 
@@ -514,7 +494,6 @@ describe("badge controller", () => {
     try {
       r.shell.mountButtons(r.controller.inject);
       r.shell.mountKeyboard(r.controller.inject);
-      r.pick("Real Firmware");
       await settle();
       const sent = r.workers[0]!.sent;
       win.dispatchEvent(new win.KeyboardEvent("keydown", { code: "KeyZ" }));
@@ -536,8 +515,7 @@ describe("badge controller", () => {
   test("Skip setup shows only while Setup is on screen", async () => {
     const r = badgeRig();
     r.controller.refreshStatus();
-    expect(r.skipShown()).toBe(false); // Lua mode, no runtime
-    r.pick("Real Firmware");
+    expect(r.skipShown()).toBe(false); // not booted yet, no runtime
     await settle();
     r.status({ setupOnScreen: true });
     expect(r.skipShown()).toBe(true);
@@ -545,15 +523,10 @@ describe("badge controller", () => {
     expect(r.skipShown()).toBe(false);
     r.status({ setupOnScreen: true });
     expect(r.skipShown()).toBe(true);
-    r.pick("Lua Sandbox");
-    await settle();
-    r.controller.refreshStatus();
-    expect(r.skipShown()).toBe(false);
   });
 
   test("Skip setup hides while a provision is in flight", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     // The token phase runs after Setup appears: Setup is on screen while the provision types.
     r.status({ setupOnScreen: true, provision: { kind: "typing" } });
@@ -568,7 +541,6 @@ describe("badge controller", () => {
 
   test("Skip setup hides while a skip runs, and a click calls skipSetup once", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     r.status({ setupOnScreen: true });
     expect(r.skipShown()).toBe(true);
@@ -600,7 +572,6 @@ describe("badge controller", () => {
 
   test("a provision started after a failed skip shows its own status", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     r.status({ setupOnScreen: true });
     r.skipButton().click();
@@ -628,7 +599,6 @@ describe("badge controller", () => {
 
   test("Skip setup hides on a badge lost to another tab, and a click sends nothing", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     r.status({ setupOnScreen: true });
     expect(r.skipShown()).toBe(true);
@@ -649,7 +619,6 @@ describe("badge controller", () => {
 
   test("a refused Skip setup click keeps the newer provision's status", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     r.status({ setupOnScreen: true });
     r.skipButton().click();
@@ -669,7 +638,6 @@ describe("badge controller", () => {
 
   test("the speed reads rebooting… during the reboot's pause", async () => {
     const r = badgeRig();
-    r.pick("Real Firmware");
     await settle();
     r.status({ speed: 1, rebooting: true });
     expect(r.statusText()).toContain("rebooting…");
@@ -683,7 +651,6 @@ describe("badge controller", () => {
     let gate = false;
     // A 0 ms note: the click shows it synchronously, and the next timer turn clears it.
     const r = badgeRig({ bump: () => gate, bumpNoteMs: 0 });
-    r.pick("Real Firmware");
     await settle();
     button(r.controls(), "Bump").click();
     expect(r.statusText()).toContain("bump: the badge isn't running");
@@ -699,7 +666,6 @@ describe("badge controller", () => {
 
   test("notice_clears_the_canvas", async () => {
     const r = badgeRig({ otherTab: true });
-    r.pick("Real Firmware");
     await settle();
     expect(r.noticeShown()).toBe(true);
     // The whole canvas, in the page's background colour (shell.css's --bg).

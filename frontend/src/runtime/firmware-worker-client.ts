@@ -16,8 +16,8 @@
  *   (`frameAck`); only the latest is painted. While stopped, a frame is
  *   dropped and acknowledged at once, and `stop()` drops and acknowledges
  *   one waiting to be painted, so the Worker never waits on a frame the
- *   client will not paint, and a firmware frame never lands on the canvas
- *   after a switch to Lua mode.
+ *   client will not paint, and a frame never lands on the canvas after a
+ *   stop.
  * - While the page is hidden (`document.visibilitychange`) a started
  *   runtime is paused: the client posts `stop` (which flushes any
  *   deferred release) and posts `start` again when the page is visible.
@@ -50,7 +50,7 @@
  *   runtime refuses (a skip is in flight), so one `config` and one
  *   `reboot` are still typed. `reset()` clears all three.
  */
-import type { ButtonName, ButtonSource } from "../badge/input";
+import type { ButtonName, ButtonSource } from "./buttons";
 import { blitFramebuffer } from "../render/framebuffer";
 import type { FirmwareRuntime, FrameCanceler, FrameScheduler } from "./firmware-runtime";
 import type { FromWorker, ToWorker } from "./firmware-worker-protocol";
@@ -305,7 +305,6 @@ export function createWorkerFirmwareRuntime(
       send({ kind: "reset" });
     },
     speed: () => lastSpeed,
-    isExitRequested: () => false,
     dispose(): void {
       if (disposed) return;
       running = false;

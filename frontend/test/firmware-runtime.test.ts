@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BUTTON_NAMES } from "../src/badge/input";
+import { BUTTON_NAMES } from "../src/runtime/buttons";
 import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import { blitFramebuffer } from "../src/render/framebuffer";
 import {
@@ -330,13 +330,6 @@ describe("createFirmwareRuntime", () => {
     const runtime = createFirmwareRuntime(fake.handle, present, { scheduleFrame: () => 1, cancelFrame: () => {} });
     runtime.reset();
     expect(fake.counters.resetCalls).toBe(1);
-  });
-
-  test("isExitRequested is always false (no Lua-style exit-to-launcher in real-firmware mode)", () => {
-    const { handle } = makeFakeHandle();
-    const { present } = makeStubCtx();
-    const runtime = createFirmwareRuntime(handle, present, { scheduleFrame: () => 1, cancelFrame: () => {} });
-    expect(runtime.isExitRequested()).toBe(false);
   });
 
   test("dispose() stops the loop and releases the handle exactly once, and forbids restart", () => {

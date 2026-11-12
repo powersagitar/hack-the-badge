@@ -35,7 +35,7 @@
  *   latest when it changed, and a re-post while it advertises. Changes
  *   inside one window are coalesced (Milestone 11 Task 11).
  */
-import type { ButtonName, ButtonSource } from "../badge/input";
+import type { ButtonName, ButtonSource } from "./buttons";
 import type { ProvisionState } from "./provisioner";
 import type { SkipState } from "./setup-skip";
 
