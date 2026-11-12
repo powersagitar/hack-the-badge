@@ -390,6 +390,44 @@ describe("signal client", () => {
   );
 
   test(
+    "a body that never ends times out",
+    async () => {
+      // The headers arrive at once, but the body never closes: only the timeout ends the read.
+      // The stream errors when the request's signal aborts, as a browser's body does.
+      const h = harness();
+      const signals: (AbortSignal | null | undefined)[] = [];
+      h.deps.fetch = async (_input, init) => {
+        const signal = init?.signal;
+        signals.push(signal);
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"room":'));
+            signal?.addEventListener(
+              "abort",
+              () => controller.error(new DOMException("The operation was aborted.", "AbortError")),
+              { once: true },
+            );
+          },
+        });
+        return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      let elapsed = Infinity;
+      await noUnhandledRejections(async () => {
+        const started = Date.now();
+        const err = await hostRoom({ ...h.deps, fetchTimeoutMs: 50 }).catch((e: unknown) => e);
+        elapsed = Date.now() - started;
+        expect(err).toBeInstanceOf(SignalError);
+        expect((err as Error).message).toBe("Could not reach the signaling server; check the connection.");
+      });
+      // The 50 ms timeout, with slack: well under the test's bound.
+      expect(elapsed).toBeLessThan(100);
+      expect(signals.length).toBe(1);
+      expect(signals[0]?.aborted).toBe(true);
+    },
+    2000,
+  );
+
+  test(
     "host_cancel_still_aborts_an_in_flight_fetch",
     async () => {
       // The cancel aborts a hung poll long before the (default, 10 s) fetch timeout.

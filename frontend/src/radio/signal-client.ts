@@ -19,8 +19,9 @@
  * against the deadline and the cancel, with no polling.
  *
  * Every request aborts after {@link SIGNAL_FETCH_TIMEOUT_MS} (and a host's
- * polls also on its cancel), so a hung fetch ends as "Could not reach the
- * signaling server" rather than holding the side forever.
+ * polls also on its cancel), its reply's body read included, so a hung
+ * fetch or a stalled body ends as "Could not reach the signaling server"
+ * rather than holding the side forever.
  *
  * Every failure is a {@link SignalError} with a message meant for the
  * page's status line, and ends that side's requests; a link that fails is
@@ -100,19 +101,35 @@ function resolveDeps(deps: SignalDeps) {
 type Deps = ReturnType<typeof resolveDeps>;
 
 /**
- * One request to the server. It aborts on `signal` or after
+ * One request to the server, and its reply's body as JSON (`null` when it
+ * is not JSON, an empty reply included). It aborts on `signal` or after
  * `d.fetchTimeoutMs`, whichever comes first (a hand-made controller and
- * timer, cleared once the fetch settles: ruling R-T5-1); an abort or any
- * throw is a {@link SignalError}.
+ * timer, cleared once the body is read: ruling R-T5-1, extended to the
+ * body in Milestone 13 Task 7); an abort, during the fetch or the body
+ * read, or any throw of the fetch is a {@link SignalError}.
  */
-async function call(d: Deps, init: RequestInit, query = "", signal?: AbortSignal): Promise<Response> {
+async function call(
+  d: Deps,
+  init: RequestInit,
+  query = "",
+  signal?: AbortSignal,
+): Promise<{ res: Response; body: unknown }> {
   const abort = new AbortController();
   const onAbort = () => abort.abort();
   if (signal?.aborted) abort.abort();
   else signal?.addEventListener("abort", onAbort, { once: true });
   const timer = setTimeout(onAbort, d.fetchTimeoutMs);
   try {
-    return await d.fetch(SIGNAL_URL + query, { cache: "no-store", ...init, signal: abort.signal });
+    const res = await d.fetch(SIGNAL_URL + query, { cache: "no-store", ...init, signal: abort.signal });
+    let body: unknown = null;
+    try {
+      // Raced against the abort too, so a body that ignores the signal still ends.
+      body = await Promise.race([res.json(), whenAborted(abort.signal)]);
+    } catch (e) {
+      if (abort.signal.aborted) throw e;
+      // Not JSON: `null`.
+    }
+    return { res, body };
   } catch {
     throw new SignalError("Could not reach the signaling server; check the connection.");
   } finally {
@@ -149,14 +166,9 @@ function isToken(s: unknown): s is string {
 }
 
 /** A JSON reply's string field, or a {@link SignalError}. */
-async function field(res: Response, name: string): Promise<string> {
-  try {
-    const body = (await res.json()) as Record<string, unknown>;
-    const value = body?.[name];
-    if (typeof value === "string" && value.length > 0) return value;
-  } catch {
-    // Not JSON.
-  }
+function field(body: unknown, name: string): string {
+  const value = (body as Record<string, unknown> | null)?.[name];
+  if (typeof value === "string" && value.length > 0) return value;
   throw new SignalError("Unexpected reply from the signaling server.");
 }
 
@@ -234,15 +246,15 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
   let room: string;
   let token: string;
   try {
-    const res = await call(d, {
+    const { res, body } = await call(d, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ op: "create", offer }),
     });
     if (res.status !== 200) throw serverError(res);
-    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    room = body?.room as string;
-    token = body?.token as string;
+    const reply = body as Record<string, unknown> | null;
+    room = reply?.room as string;
+    token = reply?.token as string;
     if (!isRoomCode(room) || !isToken(token)) throw new SignalError("Unexpected reply from the signaling server.");
   } catch (e) {
     link.close();
@@ -263,9 +275,9 @@ export async function hostRoom(deps: SignalDeps = {}): Promise<HostedRoom> {
       for (;;) {
         if (cancel.signal.aborted) throw new SignalError(CANCELLED);
         const poll = call(d, { method: "GET" }, `?room=${room}&want=answer`, cancel.signal);
-        const res = await Promise.race([poll, cancelled]);
+        const { res, body } = await Promise.race([poll, cancelled]);
         if (res.status === 200) {
-          const answer = await field(res, "answer");
+          const answer = field(body, "answer");
           try {
             await link.complete(answer);
           } catch {
@@ -311,10 +323,10 @@ export async function joinRoom(code: string, deps: SignalDeps = {}): Promise<Pee
       `A room code is ${ROOM_CODE_LENGTH} characters from ${CROCKFORD_ALPHABET.slice(0, 4)}…${CROCKFORD_ALPHABET.slice(-4)}.`,
     );
   }
-  const res = await call(d, { method: "GET" }, `?room=${room}&want=offer`);
+  const { res, body } = await call(d, { method: "GET" }, `?room=${room}&want=offer`);
   if (res.status === 404) throw new SignalError(ROOM_CLOSED);
   if (res.status !== 200) throw serverError(res);
-  const offer = await field(res, "offer");
+  const offer = field(body, "offer");
 
   let link: PeerLink;
   let answer: string;
@@ -324,7 +336,7 @@ export async function joinRoom(code: string, deps: SignalDeps = {}): Promise<Pee
     throw new SignalError("The host's offer could not be used.");
   }
   try {
-    const posted = await call(d, {
+    const { res: posted } = await call(d, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ op: "answer", room, answer }),
