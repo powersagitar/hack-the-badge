@@ -597,7 +597,9 @@ shapes; `DEFAULT_STEPS_PER_FRAME` is the in-thread
   new frame after A on Scanner came 852 ms after A, against about 0.2 s
   without the pause. The speed reading counts the paid debt as emulated
   time and leaves the jump out, so it reads about the core's speed
-  through the pause (Milestone 11's R-T8-2). The tap queue's
+  through the pause (Milestone 11's R-T8-2). Since Milestone 13 the page
+  shows `rebooting…` in the readout's place while the debt is unpaid
+  (`rebooting()`, carried in the Worker's `status`). The tap queue's
   `downSince`/`upSince` move past the jump, so a tap held across a reboot
   lasts its full `PRESS_HOLD_US` in wall terms and the release gap counts
   only non-jump time; a shake or bump is not shifted (Milestone 11's
@@ -637,7 +639,21 @@ called the speed normal in the prod build and closed the speed items
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 12)
+### Current state (end of Milestone 13)
+
+**Milestone 13 adds Skip setup.** While the onboarding app ("Setup") is
+on screen, the page shows a **Skip setup** button. It types
+`config system onboard_build 2147483647` and `reboot` into the badge's
+console, and the new boot lands on My Badge's registered screen, the
+frame the 11-page walk ends on ("Onboarding" below). The console gained
+an absolute byte offset (`console_written`, `console_since`), the
+provisioner fails at once when the badge reboots mid-provision, and
+the backlog ride-alongs closed the speed readout through a reboot, a
+refused Bump's silence, the stale room line, the signaling body
+timeout and the smoke-test manifest ("Milestone 13" below;
+[`milestone-13-decisions.md`](milestone-13-decisions.md)). No
+Milestone 12 pin moved. The rest of this section is otherwise unchanged
+from Milestone 12.
 
 **Milestone 12 takes Sync to "No sync station in range".** A ROM
 `crc32_le` stub lets NVS store an upload credential, both provisioning
@@ -724,7 +740,12 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   the firmware's role table. `PROV OK` prints by 28.74M steps for every
   role on v392 (v335: 28.19M to 28.39M, depending on the role). An empty
   record is rejected (`PROV FAIL invalid or missing
-  /littlefs/identity.json`) and the badge stays unregistered.
+  /littlefs/identity.json`) and the badge stays unregistered. Since
+  Milestone 13 the browser's provisioner works in absolute console byte
+  offsets (`console-io.ts`), so a console past its 256 KiB ring still
+  finds the prompt, and a reboot after its first prompt fails the
+  provision at once ("the badge rebooted during provisioning") instead
+  of timing out.
 - **Onboarding.** `prov apply` resets onboarding, and My Badge hands over
   to the onboarding app ("Setup", 11 pages). Page 1 shows the identity's
   name. Page 3 wants every button pressed: eight on v392 ("Press all 8
@@ -734,6 +755,25 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   `FirmwareRuntime::set_acceleration`, at rest (0, 0, +1000) mg) and
   passes after a two-axis shake (the walk shakes at about step 226.0M);
   page 8 is animated; page 11 needs "I agree" ticked, then START.
+  **Skip setup (Milestone 13).** Setup's `finish()` writes
+  `system.onboard_build` and launches My Badge; a boot checks that
+  setting, and Setup itself never re-reads it. So the browser's Skip
+  setup types `config system onboard_build 2147483647` (INT32_MAX, at or
+  above any build number; the REPL answers
+  `OK system.onboard_build=2147483647`), then `reboot`
+  (`rebooting...`, one software reset). The new boot logs
+  `app_reg: launched My Badge`, not Setup, and lands on the registered
+  screen, `0xbd6d_7613_08a7_bf24` for hacker, the walk's own end frame;
+  HOME then opens the launcher (`skipping_setup_lands_on_the_registered_screen`,
+  84,392,000 steps and 8,855,536 µs from a cold boot, the reboot's
+  466 ms included). A reboot while Setup is up comes back to Setup's
+  page 1 and logs `app_reg: launched Setup`
+  (`setup_logs_its_launch_after_a_reboot`), so both ways into Setup log
+  the launch, and the button shows exactly while the current boot's last
+  launch line names Setup. It is hidden while a provision or a skip is
+  in flight; a skip refuses while a provision types, and a provision
+  refuses while a skip types. The rungs still walk all 11 pages
+  (Milestone 5's R-T4-2).
 - **Registered screen and launcher.** Setup ends on My Badge's registered
   screen (role hacker at about step 337.9M; every role's frame differs,
   since it shows the name). HOME opens the launcher, a 4x4 icon grid
@@ -888,6 +928,21 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 13** (details in
+[`milestone-13-decisions.md`](milestone-13-decisions.md) and
+"Milestone 13" below):
+
+- Skip setup: one button from Setup to the registered screen, through
+  the console (Tasks 1 to 6).
+- The provisioner around reboots: a full console plus a soft reset
+  finds the prompt, and a reboot mid-provision fails at once (Task 3).
+- The browser: `rebooting…` through a reboot's pause, a refused Bump's
+  note, Remove clears the hosted room's code line, `status.softResets`
+  removed (Tasks 5 and 6).
+- Signaling: the fetch timeout covers the reply's body (Task 7).
+- The smoke-test manifest within v392's loader rules, and Milestone 12's
+  review minors (Task 8).
 
 **Resolved in Milestone 12** (details in
 [`milestone-12-decisions.md`](milestone-12-decisions.md) and
@@ -1050,8 +1105,8 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 13 candidates)** (the Milestone 13 backlog
-in `milestone-12-decisions.md` is the complete list):
+**Open limitations (Milestone 14 candidates)** (the Milestone 14 backlog
+in `milestone-13-decisions.md` is the complete list):
 
 1. **The radio is a model, not the controller.** The closed controller
    blob and its mask-ROM half never run. `radio/hci.rs` answers only the
@@ -1093,7 +1148,7 @@ in `milestone-12-decisions.md` is the complete list):
 2. **A cold power-on takes no time.** The shortcut boot starts the app
    at 0 µs after a power-on or the reset button; the badge takes about
    466 ms before `cpu_start`. Adding it would move every pin for no
-   visible gain (Milestone 11's spec, "Non-goals"; Milestone 13
+   visible gain (Milestone 11's spec, "Non-goals"; Milestone 14
    backlog). A software
    reset does take it (Milestone 11).
 3. **The CPU-reset table's silent rows.** Where the TRM and ESP-IDF are
@@ -1102,7 +1157,7 @@ in `milestone-12-decisions.md` is the complete list):
    external chips (74HC165, SC7A20H, ST7789, flash) are kept with no
    citation beyond "no TRM reset scope reaches them". The SYSTEM clock
    gates and reset bits are not modeled, and the core reset is narrower
-   than the TRM (`milestone-12-decisions.md`, "Milestone 13 backlog").
+   than the TRM (`milestone-13-decisions.md`, "Milestone 14 backlog").
 4. **The launcher's HOME redraw runs slower than real time in the
    browser.** The core runs about 40M to 42M steps per second in WASM
    against the badge's 80M cycles per second (Milestone 7's bench on
@@ -1185,7 +1240,9 @@ in `milestone-12-decisions.md` is the complete list):
     provisioner always sets it). The firmware prints `tutorial=reset`:
     the launcher stays on screen until the next button press, which
     drops into onboarding. The human partner did not rule on whether
-    this is acceptable (Milestone 12, Gate 3).
+    this is acceptable (Milestone 12, Gate 3). Handled by Skip setup
+    (Milestone 13): the button appears once Setup launches after that
+    press, and skips it again.
 12. **Sync's 20 s is not checked on hardware.** The emulated "Asking the
     station..." lasts 19.98 s: 750 ticks of a 20 ms LVGL timer that the
     firmware's 10 ms sleep rounding runs every 20 or 30 ms (Milestone
@@ -1194,8 +1251,10 @@ in `milestone-12-decisions.md` is the complete list):
 13. **Share is not reachable in the browser.** It works between two
     emulated badges (a scratch probe, Milestone 12 Task 6), but firmware
     mode has no way to install a custom app, so the sender stops at "No
-    custom apps yet"; nothing pins the transfer, and v392's loader
-    refuses the committed `smoke-test/manifest.cfg` (R-T6-2).
+    custom apps yet"; nothing pins the transfer. The committed
+    `smoke-test/manifest.cfg` now has `heap_kb=96` and `wake_lock=0`,
+    within v392's loader rules (Milestone 12's R-T6-2; Milestone 13
+    Task 8), and Lua mode reads it as before.
 
 ### Ground truth from the physical badge
 
@@ -3510,6 +3569,44 @@ Rulings, measurements and traces are in
   ("No badge found, try again" on both), but both badges had the same
   hacker identity, which Connect never pairs (limitation 1); with
   distinct identities it pairs.
+
+### Milestone 13: Skip setup
+
+The spec (`docs/superpowers/specs/2026-11-11-milestone13-skip-setup-design.md`)
+adds a Skip setup button, shown only while Setup is on screen (the
+human partner's call), that uses the firmware's own console, and the
+Milestone 12 backlog items that fit. Rulings, measurements and the
+Milestone 14 backlog are in `docs/milestone-13-decisions.md`. No
+Milestone 12 pin moved.
+
+- **Task 1: the gate.** Two rungs prove the two lines on v392
+  ("Onboarding" above): `skipping_setup_lands_on_the_registered_screen`
+  and `setup_logs_its_launch_after_a_reboot`. The reset comes 1.85M
+  steps after the skip starts; the registered screen is confirmed 46.0M
+  steps after the reset. 92 rungs. The Rust helper is
+  `tests/common/provision.rs`'s `skip_setup`.
+- **Task 2: an absolute console offset.** `Console::written` counts every
+  byte ever written (kept across a soft reset, 0 after a cold reset), and
+  `text_since(at)` decodes the ring from that offset. v392's console is
+  not ASCII (an em dash by 5.5M steps), so the browser slices by bytes in
+  the core, not by characters (`consoleWritten`, `consoleSince`).
+- **Task 3** moved the console helpers into `runtime/console-io.ts`, made
+  the provisioner's markers absolute byte offsets (Milestone 11's
+  R-T13-3 now finds the prompt in a full console) and made a reboot after
+  the first prompt fail the provision at once.
+- **Tasks 4 to 6**: `runtime/setup-skip.ts` (the skipper and the Setup
+  watcher), the Worker's `skipSetup` message and its `status`
+  (`rebooting`, `skip`, `setupOnScreen`; `softResets` removed), and the
+  page: the button, `rebooting…`, a refused Bump's note and Remove
+  clearing the hosted room's line. The controller's smoke check in
+  Chrome: `skipping setup…`, `rebooting…` about 0.2 s later, `1.0x`
+  about 0.5 s after that, then the registered screen and HOME to the
+  launcher.
+- **Task 7**: the signaling fetch timeout covers the reply's body.
+- **Task 8**: the smoke-test manifest (`heap_kb=96`, `wake_lock=0`),
+  `tsconfig.json`'s `target` ES2022 (Vite's `build.target` stays
+  es2020; the build is byte-identical) and all nine of Milestone 12's
+  deferred review minors.
 
 ## Emulated flash chip: what it contains
 

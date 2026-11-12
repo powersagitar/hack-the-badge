@@ -21,7 +21,13 @@ wired in `frontend/src/main.ts`):
 
 **Current state:** the firmware boots to My Badge's first-run screen,
 provisions a fake test identity through its own USB console, walks the
-11-page onboarding app, and reaches the launcher. All 16 of the
+11-page onboarding app, and reaches the launcher. In the browser a
+"Skip setup" button, shown only while that onboarding app is on screen,
+skips it instead: it types `config system onboard_build 2147483647` and
+`reboot` into the console, and the new boot lands on My Badge's
+registered screen, the walk's end frame (rungs
+`skipping_setup_lands_on_the_registered_screen` and
+`setup_logs_its_launch_after_a_reboot`). All 16 of the
 launcher's apps open, each pinned by a rung. v392 enters five apps
 (Scanner, Sync, Share, Sponsors, Workshop Quest) by rebooting, through
 the emulated software reset, which takes the badge's 466 ms (host time
@@ -55,7 +61,7 @@ v392 (the mobile Safari slowness was a dev-build effect). Before
 assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-12-decisions.md`.
+`docs/milestone-3-decisions.md` through `docs/milestone-13-decisions.md`.
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
 the v335 → v392 re-pins. Milestone 10's has the radio's rulings.
 Milestone 11's has the CPU-reset table. Milestone 12's has Sync's and
@@ -85,7 +91,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 339 of them, about 13 s. Most of that is the
+- `bun test`: unit tests, 392 of them, about 16 s. Most of that is the
   WASM twin that provisions and walks to the launcher,
   `test/cpu-wasm.test.ts`. Run one file with
   `bun test path/to/file.test.ts`.
@@ -102,8 +108,8 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 90 rungs plus 1 ignored benchmark, about
-  19 s.
+  real-firmware boot ratchet, 92 rungs plus 1 ignored benchmark, about
+  18 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
@@ -207,15 +213,20 @@ frontend/src/
                         queue (press hold, release gap; per-source holds,
                         key and pad; queued taps survive stop()), the
                         reboot's pause (a frame reports the jump, wall
-                        time pays it, taps shift past it), provision()
-                        and shake() and bump() (one motion schedule). It
+                        time pays it, taps shift past it; rebooting()),
+                        provision() (refused while a skip runs),
+                        skipSetup() (refused while a provision runs or
+                        Setup is not on screen) and setupOnScreen(), and
+                        shake() and bump() (one motion schedule). It
                         runs inside the Worker, which also posts the
                         badge's advertisement (advOut) and takes peers'
                         (advIn).
   runtime/firmware-worker.ts
                         Web Worker that owns the runtime and runs it in
                         capped slices: one frame in flight, a throttled
-                        `status` (immediate on a soft reset), advOut
+                        `status` (speed, rebooting, the provision and skip
+                        states, setupOnScreen; immediate on a soft reset;
+                        setupOnScreen is computed only there), advOut
                         coalesced to 10 Hz, and messages applied between
                         slices.
   runtime/firmware-worker-client.ts
@@ -230,10 +241,27 @@ frontend/src/
                         chunks, then by default `badge_token set` and
                         FAKE_UPLOAD_TOKEN after PROV OK and its prompt
                         (`uploadToken: null` skips the token; the redraw
-                        benchmark does). The first prompt is matched from
-                        the current boot's console start (Milestone 11's
-                        R-T13-3), the token's past the PROV OK line.
-                        Mirrors emulator-core's tests/common/provision.rs.
+                        benchmark does; a token not 64 bytes long fails at
+                        once). The first prompt is matched from the
+                        current boot's console start (Milestone 11's
+                        R-T13-3), the token's past the PROV OK line, all
+                        as absolute byte offsets. A reboot after the first
+                        prompt fails the provision at once ("the badge
+                        rebooted during provisioning"). Mirrors
+                        emulator-core's tests/common/provision.rs.
+  runtime/console-io.ts The console helpers both typists share: PROMPT,
+                        LINE_END, typeLine, completeLine, consoleSince (a
+                        byte-exact slice from an absolute offset, through
+                        the core; v392's console is not ASCII) and
+                        consoleOffsetOf (a needle's absolute offset,
+                        counted back from consoleWritten()).
+  runtime/setup-skip.ts Skip setup: createSetupSkipper types the config
+                        line, waits for its OK and a prompt, types
+                        `reboot`, and is done at the soft reset; a usage:
+                        reply, a reboot before `reboot` or a refused byte
+                        fails it. setupOnScreen(bootText): the current
+                        boot's last complete `app_reg: launched <name>`
+                        line names Setup.
   radio/hub.ts          The radio hub on the main thread: sends the badge's
                         advertisement and bumps to every link, validates
                         peers' messages (a valibot schema), holds the
@@ -251,10 +279,13 @@ frontend/src/
                         Hosts or joins a room on /api/signal (1 s polls,
                         120 s budget). Its messages: busy N min on a 429,
                         "Signaling unavailable" on a 5xx, room closed on a
-                        join's 404. Each request aborts after a 10 s fetch
-                        timeout (SIGNAL_FETCH_TIMEOUT_MS). The host sends
-                        `close` with its token once, best effort, on a
-                        cancel or when `connected` fails.
+                        join's 404. Each request, its reply's body
+                        included, aborts after a 10 s fetch timeout
+                        (SIGNAL_FETCH_TIMEOUT_MS). The host sends `close`
+                        with its token once, best effort, on a cancel or
+                        when `connected` fails; a `close` with no reply
+                        logs one console.warn with the room code (never
+                        the token).
   radio/signal-handler.ts
                         Pure signaling handler (Request in, Response out)
                         over `SignalDeps` (a RoomStore and four Limiters):
@@ -271,12 +302,18 @@ frontend/src/
   bench/                The WASM redraw benchmark and the dev-only bench page.
   ui/shell.ts, ui/badge-controller.ts, main.ts
                         shell.ts: page chrome, input bindings, the mode
-                        toggle, the provisioning controls, the badge notice
-                        (showing it clears the canvas) and the link panel.
+                        toggle, the provisioning controls (with Skip
+                        setup), the badge notice (showing it clears the
+                        canvas) and the link panel.
                         badge-controller.ts: createBadgeController (mode
                         switch, lazy Worker boot, the badge lock and notice,
-                        provisioning, the bump gate) and mountLinks (links,
-                        the hosted room's cancel). main.ts is thin wiring.
+                        provisioning, Skip setup's visibility, the status
+                        line: `rebooting…` through a reboot's pause, the
+                        skip's or the provision's state, whichever the
+                        user started last; the bump gate and a refused
+                        bump's note) and mountLinks (links, the hosted
+                        room's cancel; Remove clears its code line).
+                        main.ts is thin wiring.
 frontend/api/signal.ts  The Vercel function for /api/signal: the handler
                         over @upstash/redis and @upstash/ratelimit
                         (redisRoomStore, upstashLimiter, upstashDeps;
@@ -324,7 +361,11 @@ emulator-core/src/
                         TIMG, RTC_CNTL (the RTC timer, with an offset so it
                         counts through a software reset; STORE0..7),
                         USB-Serial-JTAG (the
-                        console, in both directions), I2C0 plus the SC7A20H
+                        console, in both directions; console.rs keeps the
+                        newest 256 KiB and counts every byte ever written,
+                        `written`, past a wrap and across a soft reset,
+                        and slices by that absolute offset, `text_since`),
+                        I2C0 plus the SC7A20H
                         accelerometer, RMT, efuse.rs (only the factory MAC,
                         opt-in; set it at power-on),
                         the flash MMU, and flash.rs (a synthetic 4 MiB flash
@@ -355,6 +396,8 @@ emulator-core/src/
                         fast-forward.
   runtime.rs            FirmwareRuntime: the whole emulator as one Clone-able
                         object. Buttons by raw slot; serial input; the
+                        console (console_output, console_written,
+                        console_since); the
                         acceleration; run_until and emulated_time_us. The
                         software reset (soft_reset_count): after a reset
                         stub's step it re-boots the image. Both ResetKinds

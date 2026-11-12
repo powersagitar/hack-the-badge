@@ -1323,6 +1323,11 @@ Saved for Milestone 12 by the human partner or the spec:
   bytes during the new REPL's 500 ms terminal probe, then times out
   cleanly. It does not hang or double-type (Task 3 keeps the queued
   input; Task 13's report).
+- Both closed in Milestone 13 (Task 3; `milestone-13-decisions.md`):
+  the provisioner's offsets are absolute byte offsets, so a full console
+  finds the prompt, and a reboot after the first prompt now fails the
+  provision at once with "the badge rebooted during provisioning"
+  instead of timing out.
 
 ### The radio model
 
