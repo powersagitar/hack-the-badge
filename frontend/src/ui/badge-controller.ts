@@ -72,7 +72,14 @@ export interface BadgeControllerDeps {
   fetchIdentity(role: string): Promise<string>;
   /** The Web Locks to hold the badge with; the browser's when omitted. */
   locks?: LockManagerLike | null;
+  /** How long a refused Bump's reason stays in the status (ms); {@link BUMP_NOTE_MS} when omitted. */
+  bumpNoteMs?: number;
 }
+
+/** A refused Bump's reason in the status line: the hub's bump gate is closed. */
+export const BUMP_REFUSED_NOTE = "bump: the badge isn't running";
+/** How long {@link BUMP_REFUSED_NOTE} stays in the status (ms). */
+export const BUMP_NOTE_MS = 3000;
 
 export interface BadgeController {
   mode(): EmulatorMode;
@@ -277,6 +284,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   }
 
   let fetchError = "";
+  /** A refused Bump's reason ({@link BUMP_REFUSED_NOTE}), cleared by `bumpNoteTimer`. */
+  let bumpNote = "";
+  let bumpNoteTimer: ReturnType<typeof setTimeout> | undefined;
   const provisionControls: ProvisionControls = shell.mountProvisionControls(
     deps.roles,
     async (role) => {
@@ -302,12 +312,42 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       }
     },
     () => firmwareRuntime?.shake(),
-    () => hub.bump(),
+    () => {
+      // Ride-along 7: the bump gate closed (stopped or hidden badge) says so for a moment.
+      if (hub.bump()) return;
+      bumpNote = BUMP_REFUSED_NOTE;
+      clearTimeout(bumpNoteTimer);
+      bumpNoteTimer = setTimeout(() => {
+        bumpNote = "";
+        bumpNoteTimer = undefined;
+      }, deps.bumpNoteMs ?? BUMP_NOTE_MS);
+      refreshStatus();
+    },
+    () => {
+      firmwareRuntime?.skipSetup();
+      refreshStatus();
+    },
   );
 
+  /**
+   * The provisioning controls from the runtime's last status. Skip setup
+   * shows only while the firmware's Setup app is on screen, no skip is
+   * typing and no provision is in flight (the provision's token phase runs
+   * after Setup appears; Milestone 13's ruling T4-1). Provision is
+   * disabled while a skip types (ruling T5-1). The speed reads
+   * `rebooting…` through the reboot's pause, not a speed (ride-along 4).
+   */
   function refreshStatus(): void {
     provisionControls.setVisible(mode === "firmware");
-    const st = firmwareRuntime?.provisionState() ?? null;
+    const rt = firmwareRuntime;
+    const st = rt?.provisionState() ?? null;
+    const skip = rt?.skipState() ?? null;
+    const provisionInFlight = st?.kind === "waiting" || st?.kind === "typing";
+    const skipTyping = skip?.kind === "typing";
+    provisionControls.setSkipVisible(
+      mode === "firmware" && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
+    );
+    provisionControls.setProvisionEnabled(!skipTyping);
     let text = fetchError;
     if (st) {
       if (st.kind === "waiting") text = "waiting for the console\u2026";
@@ -315,13 +355,16 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       else if ("line" in st) text = st.line;
       else if ("reason" in st) text = `failed: ${st.reason}`;
     }
-    if (mode === "firmware" && firmwareRuntime) {
+    // A skip's state is newer than the provision's; `done` adds nothing (the screen shows it).
+    if (skip?.kind === "typing") text = "skipping setup…";
+    else if (skip?.kind === "failed") text = `skip failed: ${skip.reason}`;
+    if (mode === "firmware" && rt) {
       // The emulated/wall ratio: below 1x the step cap binds (slow motion).
-      const speed = firmwareRuntime.speed();
-      const prefix = speed > 0 ? `${speed.toFixed(1)}x` : "";
-      provisionControls.setStatus([prefix, text].filter(Boolean).join(" · "));
+      const speed = rt.speed();
+      const prefix = rt.rebooting() ? "rebooting…" : speed > 0 ? `${speed.toFixed(1)}x` : "";
+      provisionControls.setStatus([prefix, text, bumpNote].filter(Boolean).join(" · "));
     } else {
-      provisionControls.setStatus(text);
+      provisionControls.setStatus([text, bumpNote].filter(Boolean).join(" · "));
     }
   }
 
@@ -334,6 +377,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     inject,
     refreshStatus,
     dispose() {
+      clearTimeout(bumpNoteTimer);
       firmwareRuntime?.dispose();
       releaseBadge();
     },
@@ -479,7 +523,11 @@ export function mountLinks(
   function remove(id: string): void {
     const entry = links.get(id);
     if (!entry) return;
-    if (hosting?.link === entry.link) cancelHosting();
+    if (hosting?.link === entry.link) {
+      cancelHosting();
+      // Its "Room …: enter this code" line is stale now (ride-along 6).
+      panel.setStatus("");
+    }
     if (manualOffer === entry.link) manualOffer = null;
     links.delete(id);
     hub.removeLink(id);

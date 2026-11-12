@@ -56,6 +56,10 @@ export function roleLabel(role: string): string {
 export interface ProvisionControls {
   setStatus(text: string): void;
   setVisible(visible: boolean): void;
+  /** Shows or hides "Skip setup" (its `hidden` attribute); hidden when built. */
+  setSkipVisible(visible: boolean): void;
+  /** Enables or disables "Provision test badge". */
+  setProvisionEnabled(enabled: boolean): void;
 }
 
 /** The "Badge running in another tab" notice (Milestone 10 Task 9). */
@@ -82,16 +86,17 @@ export interface ShellHandles {
    */
   mountModeToggle(current: EmulatorMode, onSelect: (mode: EmulatorMode) => void): void;
   /**
-   * Mounts the role picker, "Provision test badge", "Shake" and "Bump"
-   * buttons, a status span and a hint into `#provision-controls` (no-op
-   * handles if the element is missing). `onProvision` gets the selected
-   * role string.
+   * Mounts the role picker, "Provision test badge", "Skip setup" (hidden
+   * until shown), "Shake" and "Bump" buttons, a status span and a hint
+   * into `#provision-controls` (no-op handles if the element is missing).
+   * `onProvision` gets the selected role string.
    */
   mountProvisionControls(
     roles: readonly string[],
     onProvision: (role: string) => void,
     onShake: () => void,
     onBump: () => void,
+    onSkipSetup: () => void,
   ): ProvisionControls;
   /**
    * Mounts the "Badge running in another tab — Run here" notice into
@@ -118,6 +123,7 @@ export function buildProvisionControls(
   onProvision: (role: string) => void,
   onShake: () => void,
   onBump: () => void,
+  onSkipSetup: () => void,
 ): ProvisionControls {
   container.innerHTML = "";
   const select = doc.createElement("select");
@@ -137,6 +143,9 @@ export function buildProvisionControls(
     return btn;
   };
   const provisionBtn = button("Provision test badge", () => onProvision(select.value));
+  // Milestone 13: ends the on-badge Setup app; shown only while it is on screen.
+  const skipBtn = button("Skip setup", onSkipSetup);
+  skipBtn.hidden = true;
   const shakeBtn = button("Shake", onShake);
   // Connect's bump: pairs with every linked badge that is bumped too.
   const bumpBtn = button("Bump", onBump);
@@ -145,14 +154,20 @@ export function buildProvisionControls(
   const hint = doc.createElement("p");
   hint.className = "provision-hint";
   hint.textContent =
-    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. In Connect, press Bump.";
-  container.append(select, provisionBtn, shakeBtn, bumpBtn, status, hint);
+    "After PROV OK, follow the on-badge setup with the button pad; on \u201CShake it!\u201D press Shake. In Connect, press Bump. Press Skip setup to jump past it.";
+  container.append(select, provisionBtn, skipBtn, shakeBtn, bumpBtn, status, hint);
   return {
     setStatus: (text) => {
       status.textContent = text;
     },
     setVisible: (visible) => {
       container.style.display = visible ? "" : "none";
+    },
+    setSkipVisible: (visible) => {
+      skipBtn.hidden = !visible;
+    },
+    setProvisionEnabled: (enabled) => {
+      provisionBtn.disabled = !enabled;
     },
   };
 }
@@ -397,10 +412,13 @@ export function mountShell(): ShellHandles {
     onProvision: (role: string) => void,
     onShake: () => void,
     onBump: () => void,
+    onSkipSetup: () => void,
   ): ProvisionControls {
     const container = document.getElementById("provision-controls");
-    if (!container) return { setStatus: () => {}, setVisible: () => {} };
-    return buildProvisionControls(container, document, roles, onProvision, onShake, onBump);
+    if (!container) {
+      return { setStatus: () => {}, setVisible: () => {}, setSkipVisible: () => {}, setProvisionEnabled: () => {} };
+    }
+    return buildProvisionControls(container, document, roles, onProvision, onShake, onBump, onSkipSetup);
   }
 
   /**

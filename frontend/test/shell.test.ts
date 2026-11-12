@@ -90,6 +90,7 @@ describe("provision controls", () => {
       (role) => calls.push(`provision ${role}`),
       () => calls.push("shake"),
       () => calls.push("bump"),
+      () => calls.push("skip"),
     );
     const labels = buttons(root).map((b) => b.textContent);
     expect(labels).toContain("Shake");
@@ -97,6 +98,37 @@ describe("provision controls", () => {
     button(root, "Bump").click();
     button(root, "Shake").click();
     expect(calls).toEqual(["bump", "shake"]);
+  });
+
+  test("Skip setup sits after Provision test badge, hidden until shown, and calls its handler", () => {
+    const root = container();
+    const calls: string[] = [];
+    const controls = buildProvisionControls(
+      root,
+      doc(),
+      ["hacker"],
+      () => calls.push("provision"),
+      () => {},
+      () => {},
+      () => calls.push("skip"),
+    );
+    const labels = buttons(root).map((b) => b.textContent);
+    expect(labels.indexOf("Skip setup")).toBe(labels.indexOf("Provision test badge") + 1);
+    const skip = button(root, "Skip setup");
+    expect(skip.hidden).toBe(true);
+    controls.setSkipVisible(true);
+    expect(skip.hidden).toBe(false);
+    skip.click();
+    expect(calls).toEqual(["skip"]);
+    controls.setSkipVisible(false);
+    expect(skip.hidden).toBe(true);
+    // The Provision button can be disabled, and enabled again.
+    const provision = button(root, "Provision test badge");
+    controls.setProvisionEnabled(false);
+    expect(provision.disabled).toBe(true);
+    controls.setProvisionEnabled(true);
+    expect(provision.disabled).toBe(false);
+    expect(root.querySelector(".provision-hint")!.textContent).toContain("Press Skip setup to jump past it.");
   });
 });
 
@@ -209,6 +241,28 @@ describe("link panel", () => {
     expect(ops).toContain(`close ${rooms[1]}`);
   });
 
+  test("removing the hosted room clears its code line", async () => {
+    const signal = memoryDeps(undefined, new MemoryStore());
+    const net = new FakeNetwork();
+    const deps: SignalDeps = {
+      factory: net.factory,
+      fetch: (input, init) => handleSignal(new Request(new URL(String(input), "http://localhost"), init), signal),
+      // Nobody joins: the host waits.
+      sleep: () => new Promise<void>(() => {}),
+    };
+    const links = mountLinks(pageShell().shell, { addLink() {}, removeLink() {} }, deps);
+    const panelEl = doc().getElementById("link-panel")!;
+    button(panelEl, "Host link").click();
+    await settle(5);
+    const statusEl = panelEl.querySelector(".link-status")!;
+    expect(statusEl.textContent).toContain("enter this code");
+    button(panelEl.querySelector(".link-list")!, "Remove").click();
+    await settle(5);
+    expect(panelEl.querySelector(".link-list")!.children.length).toBe(0);
+    expect(statusEl.textContent).toBe("");
+    links.closeAll();
+  });
+
   test("the Manual toggle shows the copy-paste codes", () => {
     const { root, calls, panel, byClass } = build();
     const manual = byClass("link-manual");
@@ -277,7 +331,9 @@ function fakeWorker(boot: "ready" | "error") {
  * context on `#badge-screen`), a fake lock manager, and fake Workers. With
  * `otherTab`, another tab holds the badge first.
  */
-function badgeRig(opts: { otherTab?: boolean; boot?: "ready" | "error" } = {}) {
+function badgeRig(
+  opts: { otherTab?: boolean; boot?: "ready" | "error"; bump?: () => boolean; bumpNoteMs?: number } = {},
+) {
   const { shell, canvas, fills } = pageShell();
   const locks = new FakeLockManager();
   if (opts.otherTab) void locks.request(BADGE_LOCK_NAME, {}, () => new Promise(() => {}));
@@ -285,7 +341,12 @@ function badgeRig(opts: { otherTab?: boolean; boot?: "ready" | "error" } = {}) {
   const running: boolean[] = [];
   const controller = createBadgeController({
     shell,
-    hub: { fromLocal() {}, setPaused() {}, setRunning: (r) => void running.push(r), bump: () => false },
+    hub: {
+      fromLocal() {},
+      setPaused() {},
+      setRunning: (r) => void running.push(r),
+      bump: opts.bump ?? (() => false),
+    },
     lua: { startPaint() {}, stopPaint() {}, injectButton() {} },
     roles: ["hacker"],
     loadImages: async () => ({ wasm: new ArrayBuffer(8), image: new ArrayBuffer(8) }),
@@ -297,11 +358,46 @@ function badgeRig(opts: { otherTab?: boolean; boot?: "ready" | "error" } = {}) {
     mac: () => new Uint8Array([0x02, 0, 0, 0, 0x10, 0x01]),
     fetchIdentity: async () => "{}",
     locks,
+    bumpNoteMs: opts.bumpNoteMs,
   });
   const el = (id: string) => doc().getElementById(id)!;
   const pick = (label: string) => button(el("mode-toggle"), label).click();
   const noticeShown = () => el("badge-notice").style.display !== "none";
-  return { controller, shell, locks, workers, running, fills, el, pick, noticeShown, canvas };
+  /** The first Worker's `status`, with these fields over an idle default, then a refresh. */
+  const status = (fields: Partial<Extract<FromWorker, { kind: "status" }>>) => {
+    const data: FromWorker = {
+      kind: "status",
+      speed: 1,
+      rebooting: false,
+      provision: null,
+      skip: null,
+      setupOnScreen: false,
+      ...fields,
+    };
+    workers[0]!.w.onmessage?.({ data });
+    controller.refreshStatus();
+  };
+  const controls = () => el("provision-controls");
+  const skipButton = () => button(controls(), "Skip setup");
+  const skipShown = () => !skipButton().hidden;
+  const statusText = () => controls().querySelector(".provision-status")!.textContent!;
+  return {
+    controller,
+    shell,
+    locks,
+    workers,
+    running,
+    fills,
+    el,
+    pick,
+    noticeShown,
+    canvas,
+    status,
+    controls,
+    skipButton,
+    skipShown,
+    statusText,
+  };
 }
 
 /** Runs `body` with `console.error` silenced, returning what it was called with. */
@@ -432,6 +528,101 @@ describe("badge controller", () => {
       if (savedWindow) Object.defineProperty(globalThis, "window", savedWindow);
       else delete (globalThis as { window?: unknown }).window;
     }
+  });
+
+  test("Skip setup shows only while Setup is on screen", async () => {
+    const r = badgeRig();
+    r.controller.refreshStatus();
+    expect(r.skipShown()).toBe(false); // Lua mode, no runtime
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ setupOnScreen: true });
+    expect(r.skipShown()).toBe(true);
+    r.status({ setupOnScreen: false });
+    expect(r.skipShown()).toBe(false);
+    r.status({ setupOnScreen: true });
+    expect(r.skipShown()).toBe(true);
+    r.pick("Lua Sandbox");
+    await settle();
+    r.controller.refreshStatus();
+    expect(r.skipShown()).toBe(false);
+  });
+
+  test("Skip setup hides while a provision is in flight", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    // The token phase runs after Setup appears: Setup is on screen while the provision types.
+    r.status({ setupOnScreen: true, provision: { kind: "typing" } });
+    expect(r.skipShown()).toBe(false);
+    r.status({ setupOnScreen: true, provision: { kind: "waiting" } });
+    expect(r.skipShown()).toBe(false);
+    r.status({ setupOnScreen: true, provision: { kind: "ok", line: "PROV OK" } });
+    expect(r.skipShown()).toBe(true);
+    r.status({ setupOnScreen: true, provision: { kind: "failed", reason: "timed out" } });
+    expect(r.skipShown()).toBe(true);
+  });
+
+  test("Skip setup hides while a skip runs, and a click calls skipSetup once", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ setupOnScreen: true });
+    expect(r.skipShown()).toBe(true);
+    const provisionBtn = button(r.controls(), "Provision test badge");
+    expect(provisionBtn.disabled).toBe(false);
+    r.skipButton().click();
+    r.skipButton().click(); // a double click
+    const skips = () => r.workers[0]!.sent.filter((m) => m.kind === "skipSetup").length;
+    expect(skips()).toBe(1);
+    r.controller.refreshStatus();
+    expect(r.skipShown()).toBe(false);
+    expect(r.statusText()).toContain("skipping setup…");
+    expect(provisionBtn.disabled).toBe(true);
+    // The Worker still reports Setup on screen while the skip types: still hidden.
+    r.status({ setupOnScreen: true, skip: { kind: "typing" } });
+    expect(r.skipShown()).toBe(false);
+    expect(provisionBtn.disabled).toBe(true);
+    r.status({ setupOnScreen: false, skip: { kind: "done" } });
+    expect(r.skipShown()).toBe(false);
+    expect(r.statusText()).not.toContain("skip");
+    expect(provisionBtn.disabled).toBe(false);
+    expect(skips()).toBe(1);
+    // A failed skip says why, and Setup still on screen offers it again.
+    r.status({ setupOnScreen: true, skip: { kind: "failed", reason: "timed out" } });
+    expect(r.statusText()).toContain("skip failed: timed out");
+    expect(r.skipShown()).toBe(true);
+    expect(provisionBtn.disabled).toBe(false);
+  });
+
+  test("the speed reads rebooting… during the reboot's pause", async () => {
+    const r = badgeRig();
+    r.pick("Real Firmware");
+    await settle();
+    r.status({ speed: 1, rebooting: true });
+    expect(r.statusText()).toContain("rebooting…");
+    expect(r.statusText()).not.toContain("1.0x");
+    r.status({ speed: 1, rebooting: false });
+    expect(r.statusText()).toContain("1.0x");
+    expect(r.statusText()).not.toContain("rebooting");
+  });
+
+  test("a refused bump says why", async () => {
+    let gate = false;
+    const r = badgeRig({ bump: () => gate, bumpNoteMs: 20 });
+    r.pick("Real Firmware");
+    await settle();
+    button(r.controls(), "Bump").click();
+    r.controller.refreshStatus();
+    expect(r.statusText()).toContain("bump: the badge isn't running");
+    await settle(40);
+    r.controller.refreshStatus();
+    expect(r.statusText()).not.toContain("bump:");
+    // An accepted bump says nothing.
+    gate = true;
+    button(r.controls(), "Bump").click();
+    r.controller.refreshStatus();
+    expect(r.statusText()).not.toContain("bump:");
   });
 
   test("notice_clears_the_canvas", async () => {
