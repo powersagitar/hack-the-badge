@@ -221,6 +221,240 @@ earlier provision; the provisioner's token phase looks only past the
 `PROV OK` line (and past `bootConsoleStart()`), and its `READY`/`OK`
 matching only past its own `badge_token set`.
 
+### Share's radio transfer (Task 6)
+
+Sources. The public source (`hackthenorth/badge-firmware`, branch
+`main`, later than v392), fetched into the session scratchpad and read,
+never built: `main/apps/share_xfer.{h,cpp}`, `main/apps/app_share.cpp`,
+`main/apps/app_share_proto.h`, `main/hal/hal_radio.cpp`. v392's
+disassembly (`llvm-objdump` over `firmware.bin`'s segments, the
+Milestone 10 tools) is the authority; the source only names things.
+
+**Transport: advertisements only.** No connection, no GATT, no ACL.
+
+- The source's protocol ("APP1") rides hal_radio's manufacturer-data
+  channel (company `0xFFFF`), like Connect's `BMP2` cards. v392 has the
+  same app: "Share Custom Apps" (`0x3c13c1d8`), " Send an app",
+  " Receive an app", "No custom apps yet" (`0x3c13c6a0`), "WAIT FOR
+  ACCEPTANCE" (`0x3c13c220`), the
+  `share_xfer` log tag and its "offering", "peer accepted" and
+  "accepted" lines.
+- v392's NimBLE logs only three GAP procedures: "stop extended
+  advertising", "extended advertise" and "extended discovery"
+  (`0x3c145da8`, `0x3c145dec`, `0x3c145e34`). In NimBLE's source (as
+  known, not fetched) the connect procedures log "GAP procedure
+  initiated: connect" or "extended connect", and the GATT client logs
+  "GATT procedure initiated"; no such string is in the image, so those
+  functions are not linked.
+- Share's engine (`0x42055c00`..`0x42058400`) reaches the radio only
+  through hal_radio: `hal_radio_send` (`0x42010c54`), pause
+  (`0x42010cc2`, its "ext_adv_stop" warning at `0x42010d1a`), resume
+  (`0x42010d36`, `0x42010da2`), the advertising-interval retune
+  (`0x42010dbe`, "retune" at `0x42010e8a`), the scan-duty setter
+  (`0x42010ec8`), enable (`0x420109c6`, "BLE radio ready" at
+  `0x42010b0a`) and two more hal_radio entries (`0x42010f76`,
+  `0x42011330`). It makes no direct NimBLE call.
+- The probe's HCI trace (below) agrees: every command from both badges is
+  one the model already answers, each with Success, and none is LE
+  Create Connection (`0x200D`), LE Extended Create Connection (`0x2043`)
+  or an ACL packet.
+
+**Frames** (v392, every one checked against the source's
+`app_share_proto.h`):
+
+- `set_adv_payload` (`0x42010712`) refuses a payload over 225 bytes
+  (`li a5, 0xe1; bltu a5, a1` at `0x4201072e`) and wraps it in one AD
+  structure, `len ff ff ff` (`li a5, -0x1` and three `sb` from
+  `0x42010742`): at most 229 bytes of advertising data.
+- Share's send wrapper (`0x42056356`) takes 1 to 225 bytes
+  (`addi a4, a1, -0x1; li a5, 0xe0; bgeu`) and calls `hal_radio_send`.
+- Its header is 12 bytes: `APP1` (`li a5, 0x41`, `0x50`, `0x50`,
+  `0x31`), version 1, the type, `req_id`, `seq`, `total`, `status`, a
+  zero byte. The magic check is `0x42055cda`. The types: OFFER 1
+  (`0x42056380`), ACCEPT 2 (`0x4205641a`), DATA 3 (`0x42056fea`), STAT 4
+  (`0x420564a4`), DONE 5 (`0x42056558`). Bodies are capped at 213 (`li
+  a1, 0xd5` at `0x420563fc`).
+- Measured in the probe (the AD length is the payload + 4):
+
+  | Frame | Payload | AD | LE Set Extended Advertising Data parameters |
+  |---|---|---|---|
+  | OFFER (smoke_test, 2,445 B, 12 frames) | 47 | 51 | 55 |
+  | ACCEPT ("Test Organizer") | 27 | 31 | 35 |
+  | DATA, full | 225 | 229 | 233 |
+  | DATA, last (102 B) | 114 | 118 | 122 |
+  | STAT | 46 | 50 | 54 |
+  | DONE | 13 | 17 | 21 |
+
+  Against the model: the largest command is 233 parameter bytes (229
+  bytes of data), under the 251 data bytes one LE Set Extended
+  Advertising Data command may carry (Core 7.8.54) and the 255 parameter
+  bytes of any command. The largest AD is 229, exactly
+  `MAX_ADV_DATA_LEN`, and its report is 26 + 229 = 255 parameter bytes,
+  exactly one event's maximum.
+  So a full DATA frame fits both directions with no byte to spare, and
+  needs no fragmentation.
+
+**The two-badge probe.** A scratch `#[ignore]` test at the end of
+`boot_progress.rs` (release; deleted, never committed), with a temporary
+env-gated `eprintln!` of each command in `Radio::on_hook` (reverted;
+ruling R-T6-3):
+
+1. Hacker from `radio_launcher()` (`HACKER_MAC`): `put` of a
+   `manifest.cfg` and the committed `smoke-test/main.lua` to
+   `/littlefs/apps/smoke_test/`, no `reload`. Share then reboots into
+   itself and the new boot loads the app (`script_app: loaded lua app:
+   Smoke Test (smoke_test)`). The committed `smoke-test/manifest.cfg` is
+   refused by v392's loader (ruling R-T6-2).
+2. Organizer from `organizer_launcher()` (`ORGANIZER_MAC`). Both open
+   Share (cell 4) to `0xfc51_aedc_c0ab_617d`, the pinned home.
+3. Then lockstep in 1 ms slices (`lockstep_to`, `LINKED_PEER_RSSI`),
+   presses held 100 ms inside the lockstep. Organizer: DOWN, A
+   ("WAITING...", "Ask them to send,\nthen accept here"). Hacker: A, A, A ("Send an
+   app" list with " Smoke Test (hack-the-badge)", then "Send this app?",
+   then "Offering app" / "WAIT FOR ACCEPTANCE").
+4. The organizer's next `uitree` (250 ms on) already shows "Incoming
+   app" / "Smoke Test" / "2 KB  -  v0.1.0" / "A: accept   B: decline".
+   A on the organizer starts it: "SENDING" on the hacker, "Receiving" /
+   "Hold still   -   B: cancel" on the organizer.
+5. The consoles (each badge's own boot clock): hacker `offering
+   smoke_test: bytes=2445 frames=12 req=4903` (I 6781), `peer accepted
+   req=4903; starting sweep` (I 7521); organizer `accepted smoke_test:
+   bytes=2445 frames=12 req=4903` (I 8071), `first DATA seq=0/12
+   bytes=213` (I 8131), `script_app: loaded lua app: Smoke Test
+   (smoke_test)` (I 9491). From acceptance to the install: 1.42 s.
+6. The last screens, held to the probe's end (30 s of rounds):
+   - hacker: "Done", "Sent 'Smoke Test'", "They still need to install
+     it", "A: share more   HOME: home";
+   - organizer: "Done", "Added 'Smoke Test'", "Find it in your
+     launcher", "A: share more   HOME: home".
+
+   No fault, no panic text. Reports queued: 1,217 to the hacker, 2,738 to
+   the organizer.
+7. The HCI commands, per badge: the startup set Milestone 10 traced,
+   then `0x2036` (hacker 2, organizer 3; a 30 ms interval while
+   transferring, 200 to 220 ms otherwise), `0x2041` (2 and 3; a 100 ms
+   window in a 100 ms interval while transferring, 30 ms in 150 ms
+   otherwise), `0x2042` (3 and 5), `0x2039` (4 each) and `0x2037`.
+   The hacker sent `0x2037` 25 times: the placeholder, OFFER × 4, DATA
+   × 13 (11 full, the 102-byte last one twice) and DONE × 7. The
+   organizer sent it 213 times: the placeholder, ACCEPT, and STAT × 211
+   (each bitmap update). All answered Success; no Unknown HCI Command.
+
+**What is missing: nothing in the emulator.** Two emulated badges move an
+app with Share, end to end, on today's controller model. In the browser:
+
+- **No way to install a custom app** in firmware mode. With none, Share's
+  sender stops at "No custom apps yet" / "Install one with the
+  console:\nput + reload". The browser types into the console only for
+  provisioning (`provisioner.ts`).
+- **The browser's advertisement sampling is untested for Share.** The
+  Worker posts the advertisement at most every `ADV_REPOST_MS` (10 Hz),
+  and a DATA frame is held for 3 ticks (60 to 90 ms; the source's
+  `kDwellTicks`). A frame between two posts is never sent to the peer.
+  STAT repair re-sends it, inside the source's 10 s no-progress window
+  (`kStallWindowTicks` 500) and 60 s sweep cap (`kSweepCapTicks` 3000).
+  Share's engine holds the matching constants (`li a4, 0x1f4` at
+  `0x42057304` and three other sites; `li a4, 0x5dc`, the source's
+  1500-tick offer latch, at `0x42056bfc`), but which compare is which
+  was not traced.
+
+**A size for Milestone 13: small.** No core or model change. Three
+pieces:
+
+- a two-badge Share rung pinning the probe's end;
+- a browser control that installs a Lua app over the console, as the
+  provisioner types;
+- a two-browser check of a transfer over WebRTC at 10 Hz.
+
+The connection model left out in Milestone 10 (R-T5-8; Task 7 skipped)
+is not needed.
+
+### Sync's timeout: 20 s from the source's 750 ticks (Task 6)
+
+**v392's constants are the source's** (`bbx_xfer.cpp`: 250 ticks of
+20 ms per OPEN attempt, 3 attempts, "15 s" by its comments):
+
+- `bbx_xfer_tick` is `0x420493a0` (one caller, Sync's `on_tick`,
+  `0x4204457e`). Its state byte is `0x3fcb5e91` (`lbu a5, -0x16f(a5)` at
+  `0x42049412`), and OPEN is state 1 (`0x4204942e`).
+- OPEN branch: `s_ticks` (`0x3fcb5e50`) is incremented at `0x42049444`,
+  then `li a4, 0xf9; bge a4, a5` (`0x4204944e`): under 250 it goes to
+  `0x420497f8`, which re-sends OPEN at tick 20 (`li a4, 0x14`, then
+  `send_open(0)` at `0x42049800`).
+- At 250, `s_open_retries` (`0x3fcb5e4c`) is incremented (`0x4204945a`),
+  then `li a4, 0x2; blt a4, a5` (`0x42049464`): a third timeout calls
+  `finish(8, 2)` (`0x420497ee`), the Failed state with reason 2. Earlier
+  ones re-enter OPEN (`0x42048e92`, which zeroes `s_ticks` and sends
+  OPEN).
+- Reason 2 is "No sync station in range" / "Move closer to the sync
+  desk" (`0x4204401e`..`0x42044030`), drawn by `0x42043b02`.
+- So the timeout is 750 ticks, and 15 s only if every tick is 20 ms.
+
+**The tick is 20 or 30 ms, by the firmware's own scheduling.**
+
+- The app registry's tick is an LVGL timer of 20 ms:
+  `lv_timer_create(0x4203a3a0, 20, NULL)` (`li a1, 0x14` at
+  `0x4203a8ba`, `lv_timer_create` `0x420c021e`, between
+  `lvgl_port_lock` and `lvgl_port_unlock`).
+- The LVGL task (`0x420a318c` on) runs `lv_timer_handler` (`0x420c0332`)
+  and then sleeps whole FreeRTOS ticks: the ms it returns × 100 / 1000
+  (`li a5, 0x64; mul` at `0x420a325c`, then `mulhu` by `0x10624dd3` and
+  `srli 6`), at least 1 (`li a4, 0x1` at `0x420a31ea`), in an
+  event-group wait (the call at `0x420a3292`, bits `0xff`).
+  `CONFIG_FREERTOS_HZ` is 100 (`docs/firmware-emulator-notes.md`).
+- So the task wakes only on 10 ms boundaries. A timer that comes due
+  just after one waits for the next, and the 20 ms timer runs every 20
+  or every 30 ms.
+
+**Measured** (a scratch traced probe, release, deleted). Entry times of
+`0x4203a3a0` (the registry tick), `0x420493a0`, `0x42048e92`,
+`0x42048c82` and `0x42043b02`, in 500-step traced chunks (about 6 us),
+from `sync_open_with_credential()` and A:
+
+| Window | Registry tick intervals | Total |
+|---|---|---|
+| Launcher, idle, 1.5 s | 74, every one 20 ms | — |
+| Snake, 1.5 s | 60 × 20 ms, 8 × 30 ms, 1 × 50 ms | — |
+| Sync, the first OPEN to `finish` | 249 × 20 ms, 500 × 30 ms | 19,984,116 us |
+| Sync, "No sync station" to the home's return | 200 × 20 ms, 201 × 30 ms | 10,066,523 us |
+
+- `bbx_xfer_tick` ran 750 times in OPEN: the 3 × 250 above. 249 × 20 +
+  500 × 30 = 19.98 s; NimBLE's stop is at the firmware's `I (21121)`
+  against OPEN's start at `I (1131)`.
+- The emulated clock is not slow: on the idle launcher every tick is
+  20.000 ms. A tick stretches to 30 ms when its work, or a redraw
+  before it, pushes the next due time past a 10 ms boundary (read from
+  the wait's arithmetic, not traced tick by tick). "Asking the
+  station..." redraws its pulsing border, and two ticks in three are
+  30 ms.
+- The physical badge shows the same quantization. The source's Snake
+  steps every 8 ticks ("160 ms at the 50 Hz app tick",
+  `kStepIntervalTicks`), and the badge (v335) was filmed at 170 ms ± 3
+  ms (Milestone 6, `BADGE_MOVE_INTERVAL_US`), that is 7 × 20 + 30. The
+  emulator's Snake on v392 gives the same 170 ms
+  (`SNAKE_MOVE_INTERVAL_US`). v335's and v392's Snake constants were not
+  read here.
+
+So 750 ticks explain the 20 s. It is not an emulator fault: no fix, and
+no pin moves (ruling R-T6-1). The gate's 15 s case (an emulated tick
+slower than the firmware asks for) is not what was found.
+
+**The auto-return.** "No sync station in range" holds, then Sync goes back
+to its home ("Find a sync station", `SYNC_HOME_HASH`) without input:
+
+- The hold is `error_ticks_ = 400` (`li a5, 0x190; sw a5, 0x3c(s0)` at
+  `0x42043b4e`, in `0x42043b02`), the source's `kErrorHoldTicks` ("~8
+  s").
+- `on_tick` (`0x4204455c`) counts it down (`0x42044574`..`0x4204457c`,
+  then `bbx_xfer_tick`), and the render (`0x4204431c`) keeps the error
+  screen while it is above 0 (`lw a5, 0x3c(a0); bgtz` at `0x4204432a`).
+- Measured: `0x42043b02` at +20.070 s after A, the stable no-station
+  frame at +20.117 s, `SYNC_HOME_HASH` back at +30.137 s: 10.07 s of
+  emulated time (400 ticks, the same 20/30 ms mix).
+- The browser (Task 3, the orchestrator's stopwatch at about 1.0x) saw
+  about 22 s from A and about 12 s of hold. The emulated values are 20.1
+  s and 10.1 s, so the browser ran at about 0.85x to 0.9x there.
+
 ## Dependencies added
 
 None so far. Task 1's CRC is the hand-written bitwise loop the spec
@@ -255,6 +489,12 @@ Ruling R-T5-1: `call` combines the caller's signal and the timeout through a han
 Ruling R-T5-2: `REDIS_OPTIONS.retry` is `{ retries: 0 }`, not the brief's `false`, because @upstash/redis 1.41.0 reads `retry: false` as `attempts: 1` and its request loop runs `i <= attempts`, so `false` still re-sends a request after a network error, with no backoff (`node_modules/@upstash/redis/chunk-*.mjs`, `HttpClient`'s constructor and `request`); `redis_options_disable_retries` pins one fetch per command with `{ retries: 0 }` and two with `false`, so a library upgrade that changes either shows up — cost if wrong: none to behaviour; the option's value differs from the plan's interface line (`REDIS_OPTIONS.retry === false`).
 
 Ruling R-T5-3: `client_stops_on_500`'s count of requests after the failing one leaves out the host's `close`, which a failed host now sends by design; every other request still counts, and `host_sends_close_on_a_server_error` pins the one `close` — cost if wrong: a stray second `close` would not show in that test, but the four `host_*_close*` tests count closes exactly.
+
+Ruling R-T6-1: Sync's 20 s is recorded as the firmware's own timing, with no change: v392 times out after 750 registry ticks (the source's 3 × 250), and its 20 ms LVGL timer runs every 20 or 30 ms because the LVGL task sleeps in whole 10 ms FreeRTOS ticks (`0x420a325c`). The emulated clock gives exactly 20 ms on the idle launcher, and Snake's 7 × 20 + 30 = 170 ms matches the filmed badge — cost if wrong: if the physical badge's "Asking the station..." ticks are mostly 20 ms (its tick work ending before a 10 ms boundary where the emulator's does not), it gives up about 5 s sooner than the emulator; `SYNC_NO_STATION_STEPS` would then be generous, not wrong. A stopwatch on a v392 badge, from A to "No sync station in range", settles it (about 20 s against about 15 s).
+
+Ruling R-T6-2: Share's probe used a hand-written `manifest.cfg` (`heap_kb=48`, `wake_lock=0`, `home_button=1`, `confirm_home=0`), because v392's loader refuses the committed `frontend/public/apps/smoke-test/manifest.cfg`: `script_app: skipping /littlefs/apps/smoke_test: heap_kb must be 48 or 96`, then, with that fixed, `wake_lock must be 0 or 1` (it says `true`/`false`). The committed file is left alone: Lua mode reads it, and changing it is Milestone 13's call — cost if wrong: none to behaviour; a Milestone 13 install control that sends the committed bundle as it is will be refused by the badge.
+
+Ruling R-T6-3: the HCI command trace came from a temporary `eprintln!` in `Radio::on_hook`'s send path, gated by an environment variable and reverted before the commit, because the controller model keeps no command log — cost if wrong: none; re-adding the line reproduces the trace.
 
 ## Final suites
 
