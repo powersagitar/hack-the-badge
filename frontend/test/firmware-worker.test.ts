@@ -1,11 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { CpuRunSummary, FirmwareEmulatorHandle } from "../src/cpu/bridge";
 import {
-  BUMP_US,
   MAX_FRAME_DELTA_MS,
   PRESS_HOLD_US,
   RAW_SLOT_BY_BUTTON,
-  SHAKE_HALF_US,
   WORKER_STEPS_PER_SLICE,
 } from "../src/runtime/firmware-runtime";
 import { createWorkerState, handleMessage, type WorkerHost, type WorkerState } from "../src/runtime/firmware-worker";
@@ -18,6 +16,8 @@ import {
 } from "../src/runtime/firmware-worker-client";
 import { encodeBase64, LINKED_PEER_RSSI, RadioHub } from "../src/radio/hub";
 import { ADV_REPOST_MS, type FromWorker, type ToWorker } from "../src/runtime/firmware-worker-protocol";
+import { REBOOTED_REASON } from "../src/runtime/provisioner";
+import { SKIP_REBOOTED_REASON } from "../src/runtime/setup-skip";
 
 /** `bun test` has no `ImageData`; the client's paint blits with one (see test/framebuffer.test.ts). */
 class FakeImageData {
@@ -37,7 +37,8 @@ class FakeImageData {
 function makeFakeHandle(usPerStep = 1) {
   let timeUs = 0;
   let steps = 0;
-  let consoleText = "";
+  /** The console's bytes: a test can print a partial UTF-8 sequence. */
+  let consoleBytes = new Uint8Array(0);
   const runUntilCalls: Array<[number, number]> = [];
   const buttonCalls: Array<[number, boolean]> = [];
   const accel: Array<[number, number, number]> = [];
@@ -48,6 +49,9 @@ function makeFakeHandle(usPerStep = 1) {
   let advReads = 0;
   let softResets = 0;
   let rebootArmed = false;
+  let powerCycles = 0;
+  let leds = new Uint8Array(0);
+  let ledFrames = 0;
   /** What `setFactoryMac` does: succeed, refuse (`false`) or throw. */
   let macOutcome: "ok" | "refuse" | "throw" = "ok";
   const summary = (n: number): CpuRunSummary => ({
@@ -88,10 +92,9 @@ function makeFakeHandle(usPerStep = 1) {
       return bytes.length;
     },
     serialPending: () => 0,
-    consoleOutput: () => consoleText,
-    consoleWritten: () => new TextEncoder().encode(consoleText).length,
-    consoleSince: (at) =>
-      new TextDecoder().decode(new TextEncoder().encode(consoleText).subarray(Math.max(0, at))),
+    consoleOutput: () => new TextDecoder().decode(consoleBytes),
+    consoleWritten: () => consoleBytes.length,
+    consoleSince: (at) => new TextDecoder().decode(consoleBytes.subarray(Math.max(0, at))),
     setAcceleration: (x, y, z) => {
       accel.push([x, y, z]);
     },
@@ -111,8 +114,26 @@ function makeFakeHandle(usPerStep = 1) {
     },
     softResetCount: () => softResets,
     rebootUs: () => REBOOT_US,
+    powerCycle() {
+      // A cold power-on: the core's counters, clock, console and LEDs start over.
+      powerCycles++;
+      timeUs = 0;
+      steps = 0;
+      softResets = 0;
+      consoleBytes = new Uint8Array(0);
+      leds = new Uint8Array(0);
+      ledFrames = 0;
+    },
+    ledColors: () => leds.slice(),
+    ledFrameCount: () => ledFrames,
     dispose() {},
   };
+  function printBytes(b: Uint8Array): void {
+    const next = new Uint8Array(consoleBytes.length + b.length);
+    next.set(consoleBytes);
+    next.set(b, consoleBytes.length);
+    consoleBytes = next;
+  }
   return {
     handle,
     runUntilCalls,
@@ -124,10 +145,17 @@ function makeFakeHandle(usPerStep = 1) {
     setAdv: (bytes: number[]) => (adv = new Uint8Array(bytes)),
     advReads: () => advReads,
     setMacOutcome: (o: "ok" | "refuse" | "throw") => (macOutcome = o),
-    print: (s: string) => (consoleText += s),
+    print: (s: string) => printBytes(new TextEncoder().encode(s)),
+    printBytes: (b: number[]) => printBytes(new Uint8Array(b)),
     setTimeUs: (t: number) => (timeUs = t),
     /** The next `runUntil` ends in one soft reset. */
     armReboot: () => (rebootArmed = true),
+    powerCycles: () => powerCycles,
+    /** The firmware sends one LED frame. */
+    showLeds: (rgb: number[]) => {
+      leds = new Uint8Array(rgb);
+      ledFrames++;
+    },
   };
 }
 
@@ -379,11 +407,11 @@ describe("firmware worker", () => {
     expect(slices).toHaveLength(1);
   });
 
-  test("reset abandons a provision and a shake", async () => {
+  test("reset abandons a provision and puts the sensor at rest", async () => {
     const { fake, posted, send, sliceAt } = await bootedRig();
     send({ kind: "start" });
     send({ kind: "provision", identityJson: '{"a":1}' });
-    send({ kind: "shake" });
+    send({ kind: "accel", mg: [2000, 2000, 1000] });
     fake.print("badge> ");
     sliceAt(0);
     expect(fake.typed).toEqual(["put /littlefs/identity.json 7\n"]);
@@ -392,7 +420,6 @@ describe("firmware worker", () => {
     expect(fake.accel.at(-1)).toEqual([0, 0, 1000]);
     const nAccel = fake.accel.length;
     fake.print("OK 7\r\nbadge> ");
-    fake.setTimeUs(SHAKE_HALF_US);
     sliceAt(300);
     sliceAt(310);
     expect(fake.typed).toHaveLength(1);
@@ -501,20 +528,6 @@ describe("firmware worker radio", () => {
     for (const m of bad) expect(() => send(m as ToWorker)).not.toThrow();
     expect(fake.delivered).toHaveLength(1);
     expect(posted).toEqual([]);
-  });
-
-  test("bump plays the pulse in emulated time", async () => {
-    const { fake, send, sliceAt } = await bootedRig();
-    send({ kind: "start" });
-    sliceAt(0);
-    send({ kind: "bump" });
-    expect(fake.accel).toEqual([[1000, 0, 1000]]);
-    sliceAt(50);
-    sliceAt(99);
-    expect(fake.accel).toHaveLength(1);
-    sliceAt(100);
-    expect(fake.handle.emulatedTimeUs()).toBe(BUMP_US);
-    expect(fake.accel.at(-1)).toEqual([0, 0, 1000]);
   });
 
   test("advOut is posted on a change, at most every ADV_REPOST_MS, and re-posted that often while advertising", async () => {
@@ -661,8 +674,8 @@ describe("firmware worker client", () => {
       { kind: "stop" },
     ]);
     // After ready, messages go straight through.
-    rt.shake();
-    expect(sent.at(-1)).toEqual({ kind: "shake" });
+    rt.powerCycle();
+    expect(sent.at(-1)).toEqual({ kind: "powerCycle" });
     rt.injectButton("B", "pressed", "key");
     expect(sent.at(-1)).toEqual({ kind: "button", button: "B", pressed: true, source: "key" });
   });
@@ -808,17 +821,12 @@ describe("firmware worker client", () => {
 });
 
 describe("firmware worker client radio", () => {
-  test("setMac is sent before start, and bump is forwarded", () => {
+  test("setMac is sent before start", () => {
     const { rt, sent, reply } = clientRig();
     rt.setMac(new Uint8Array([2, 0, 0, 0, 0x10, 1]));
     rt.start();
     reply({ kind: "ready" });
-    rt.bump();
-    expect(sent.slice(1)).toEqual([
-      { kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) },
-      { kind: "start" },
-      { kind: "bump" },
-    ]);
+    expect(sent.slice(1)).toEqual([{ kind: "setMac", mac: new Uint8Array([2, 0, 0, 0, 0x10, 1]) }, { kind: "start" }]);
   });
 
   test("advOut reaches onAdvertisement, and a throwing listener does not escape", () => {
@@ -869,7 +877,7 @@ describe("firmware worker client radio", () => {
     let client: WorkerFirmwareRuntime | null = null;
     const hub = new RadioHub({
       deliver: (b, r) => client?.deliverAdvertisement(b, r),
-      bumpLocal: () => client?.bump(),
+      bumpLocal: () => {},
     });
     const paused: boolean[] = [];
     const { rt, sent, reply } = clientRig({
@@ -906,21 +914,6 @@ describe("firmware worker client radio", () => {
     expect(paused).toEqual([true]);
     vis.set(false);
     expect(paused).toEqual([true, false]);
-  });
-
-  test("bump is dropped while stopped or hidden, not replayed later", () => {
-    const vis = fakeVisibility();
-    const { rt, sent, reply } = clientRig({ visibility: vis.source });
-    reply({ kind: "ready" });
-    rt.bump(); // not started
-    rt.start();
-    vis.set(true);
-    rt.bump(); // hidden
-    vis.set(false);
-    rt.bump();
-    rt.stop();
-    rt.bump(); // stopped
-    expect(sent.filter((m) => m.kind === "bump")).toHaveLength(1);
   });
 
   test("the hidden-page pause calls onPausedChange: paused before stop, resumed after start", () => {
@@ -1063,4 +1056,302 @@ test("a restart after a capped slice yields through the timer", async () => {
   send({ kind: "stop" });
   send({ kind: "start" });
   expect(slices.at(-1)!.immediate).toBe(false);
+});
+
+const consolesOf = (posted: FromWorker[]) =>
+  posted.filter((m): m is Extract<FromWorker, { kind: "console" }> => m.kind === "console");
+const ledsOf = (posted: FromWorker[]) =>
+  posted.filter((m): m is Extract<FromWorker, { kind: "leds" }> => m.kind === "leds").map((m) => [...m.rgb]);
+
+describe("firmware worker motion, power, LEDs and console (Milestone 14 Task 6)", () => {
+  test("accel applies the latest reading between slices", async () => {
+    const { fake, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    send({ kind: "accel", mg: [10, 20, 30] });
+    send({ kind: "accel", mg: [40, 50, 60] });
+    // Not applied by the message itself: at the start of the next slice.
+    expect(fake.accel).toEqual([]);
+    sliceAt(10);
+    expect(fake.accel).toEqual([[40, 50, 60]]);
+    sliceAt(20);
+    expect(fake.accel).toHaveLength(1);
+    // While stopped it waits for the first slice after the next start.
+    send({ kind: "stop" });
+    send({ kind: "accel", mg: [0, -1000, 0] });
+    expect(fake.accel).toHaveLength(1);
+    send({ kind: "start" });
+    sliceAt(30); // the slice stop() canceled: does nothing
+    expect(fake.accel).toHaveLength(1);
+    sliceAt(40);
+    expect(fake.accel.at(-1)).toEqual([0, -1000, 0]);
+  });
+
+  test("accel rejects non-finite and clamps", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    posted.length = 0;
+    const bad: unknown[] = [
+      { kind: "accel", mg: [NaN, 3000, -9000] },
+      { kind: "accel", mg: [Infinity, 0, 0] },
+      { kind: "accel", mg: [0, 0] },
+      { kind: "accel", mg: [0, 0, 0, 0] },
+      { kind: "accel", mg: [0, 0, "1000"] },
+      { kind: "accel", mg: "0,0,1000" },
+      { kind: "accel", mg: null },
+      { kind: "accel" },
+    ];
+    for (const m of bad) expect(() => send(m as ToWorker)).not.toThrow();
+    sliceAt(10);
+    expect(fake.accel).toEqual([]);
+    expect(posted.filter((m) => m.kind === "error")).toEqual([]);
+    send({ kind: "accel", mg: [100, 3000, -9000] });
+    sliceAt(20);
+    expect(fake.accel).toEqual([[100, 2000, -2000]]);
+    // Truncated to integers, toward zero.
+    send({ kind: "accel", mg: [12.9, -0.5, -999.99] });
+    sliceAt(30);
+    expect(fake.accel.at(-1)).toEqual([12, 0, -999]);
+    expect(Object.is(fake.accel.at(-1)![1], 0)).toBe(true);
+    // A malformed message after a valid one leaves the valid one pending.
+    send({ kind: "accel", mg: [1, 2, 3] });
+    send({ kind: "accel", mg: [NaN, 2, 3] });
+    sliceAt(40);
+    expect(fake.accel.at(-1)).toEqual([1, 2, 3]);
+  });
+
+  test("powerCycle while rebooting is ignored", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    sliceAt(10);
+    posted.length = 0;
+    send({ kind: "powerCycle" });
+    expect(fake.powerCycles()).toBe(1);
+    // A status at once: the badge is booting.
+    expect(statusesOf(posted).at(-1)?.rebooting).toBe(true);
+    // A second press within 500 ms, while it boots: ignored.
+    send({ kind: "powerCycle" });
+    sliceAt(26);
+    send({ kind: "powerCycle" });
+    expect(fake.powerCycles()).toBe(1);
+    // The pause paid and 500 ms gone: a press counts again.
+    // (The last status is the one at 522 ms: statuses go out every 250 ms.)
+    for (let t = 42; t <= 538; t += 16) sliceAt(t);
+    expect(statusesOf(posted).at(-1)?.rebooting).toBe(false);
+    send({ kind: "powerCycle" });
+    expect(fake.powerCycles()).toBe(2);
+    // A soft reset's pause blocks it too, long after the last press.
+    for (let t = 554; t <= 1_100; t += 16) sliceAt(t);
+    fake.armReboot();
+    sliceAt(1_116);
+    send({ kind: "powerCycle" });
+    expect(fake.powerCycles()).toBe(2);
+  });
+
+  test("powerCycle fails a running provision", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    send({ kind: "provision", identityJson: '{"a":1}' });
+    fake.print("badge> ");
+    sliceAt(0);
+    expect(fake.typed).toEqual(["put /littlefs/identity.json 7\n"]);
+    send({ kind: "powerCycle" });
+    expect(statusesOf(posted).at(-1)?.provision).toEqual({ kind: "failed", reason: REBOOTED_REASON });
+    // Nothing more is typed in the new boot.
+    fake.print("badge> ");
+    for (let t = 16; t <= 600; t += 16) sliceAt(t);
+    expect(fake.typed).toHaveLength(1);
+    expect(statusesOf(posted).at(-1)?.provision).toEqual({ kind: "failed", reason: REBOOTED_REASON });
+
+    // A running skip fails the same way.
+    const skip = await bootedRig();
+    skip.send({ kind: "start" });
+    skip.fake.print(SETUP_LINE + "badge> ");
+    skip.sliceAt(0);
+    skip.send({ kind: "skipSetup" });
+    skip.sliceAt(10);
+    expect(skip.fake.typed).toEqual([CONFIG_TYPED]);
+    skip.send({ kind: "powerCycle" });
+    expect(statusesOf(skip.posted).at(-1)?.skip).toEqual({ kind: "failed", reason: SKIP_REBOOTED_REASON });
+  });
+
+  test("leds posts only on change", async () => {
+    const { fake, posted, transfers, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    sliceAt(0);
+    sliceAt(100);
+    expect(ledsOf(posted)).toEqual([]);
+    fake.showLeds([1, 2, 3, 4, 5, 6]);
+    sliceAt(110);
+    expect(ledsOf(posted)).toEqual([[1, 2, 3, 4, 5, 6]]);
+    const first = posted.find((m) => m.kind === "leds") as Extract<FromWorker, { kind: "leds" }>;
+    expect(transfers[posted.indexOf(first)]).toEqual([first.rgb.buffer]);
+    sliceAt(200);
+    sliceAt(300);
+    expect(ledsOf(posted)).toHaveLength(1);
+    // Two frames inside 50 ms: only the latest goes out, on the tick.
+    fake.showLeds([7, 7, 7]);
+    sliceAt(310);
+    fake.showLeds([9, 9, 9]);
+    sliceAt(330);
+    expect(ledsOf(posted)).toEqual([[1, 2, 3, 4, 5, 6], [7, 7, 7]]);
+    sliceAt(350);
+    sliceAt(360);
+    expect(ledsOf(posted)).toEqual([[1, 2, 3, 4, 5, 6], [7, 7, 7], [9, 9, 9]]);
+    // A power cycle clears the chain: the dark frame goes out once.
+    send({ kind: "powerCycle" });
+    sliceAt(420);
+    sliceAt(500);
+    expect(ledsOf(posted).slice(3)).toEqual([[]]);
+    // A stopped Worker posts none.
+    send({ kind: "stop" });
+    fake.showLeds([1, 1, 1]);
+    expect(ledsOf(posted)).toHaveLength(4);
+  });
+
+  test("console streams deltas with the boot counter", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    fake.print("hello ");
+    sliceAt(0);
+    expect(consolesOf(posted)).toEqual([{ kind: "console", text: "hello ", at: 0, boot: 0 }]);
+    fake.print("world\r\n");
+    sliceAt(100); // no status yet: no console either
+    expect(consolesOf(posted)).toHaveLength(1);
+    sliceAt(300);
+    expect(consolesOf(posted).at(-1)).toEqual({ kind: "console", text: "world\r\n", at: 6, boot: 0 });
+    // Each status carries a console chunk only when there is something new.
+    sliceAt(600);
+    expect(consolesOf(posted)).toHaveLength(2);
+    // A soft reset: the old boot's tail, then the new boot at once.
+    fake.print("bye\r\n");
+    fake.armReboot();
+    sliceAt(610);
+    expect(consolesOf(posted).slice(2)).toEqual([
+      { kind: "console", text: "bye\r\n", at: 13, boot: 0 },
+      { kind: "console", text: "", at: 18, boot: 1 },
+    ]);
+    fake.print("new\r\n");
+    for (let t = 626; t <= 1_200; t += 16) sliceAt(t);
+    expect(consolesOf(posted).at(-1)).toEqual({ kind: "console", text: "new\r\n", at: 18, boot: 1 });
+    // A power cycle: the old boot's tail goes out, then boot 2 from offset 0.
+    fake.print("tail");
+    send({ kind: "powerCycle" });
+    expect(consolesOf(posted).slice(-2)).toEqual([
+      { kind: "console", text: "tail", at: 23, boot: 1 },
+      { kind: "console", text: "", at: 0, boot: 2 },
+    ]);
+    fake.print("fresh\r\n");
+    for (let t = 1_216; t <= 1_800; t += 16) sliceAt(t);
+    expect(consolesOf(posted).at(-1)).toEqual({ kind: "console", text: "fresh\r\n", at: 0, boot: 2 });
+    // The chunks are contiguous: together they are each boot's whole console.
+    const byBoot = new Map<number, string>();
+    for (const c of consolesOf(posted)) byBoot.set(c.boot, (byBoot.get(c.boot) ?? "") + c.text);
+    expect([...byBoot]).toEqual([
+      [0, "hello world\r\nbye\r\n"],
+      [1, "new\r\ntail"],
+      [2, "fresh\r\n"],
+    ]);
+  });
+
+  test("console holds back a UTF-8 sequence cut off at the end", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    fake.print("a");
+    fake.printBytes([0xe2, 0x82]); // the first two of "€"'s three bytes
+    sliceAt(0);
+    expect(consolesOf(posted)).toEqual([{ kind: "console", text: "a", at: 0, boot: 0 }]);
+    fake.printBytes([0xac, 0x0a]);
+    sliceAt(300);
+    expect(consolesOf(posted).at(-1)).toEqual({ kind: "console", text: "€\n", at: 1, boot: 0 });
+    // Bytes that are not UTF-8 at all still go out, once more text follows.
+    fake.printBytes([0xff]);
+    sliceAt(600);
+    fake.print("x");
+    sliceAt(900);
+    expect(consolesOf(posted).map((c) => c.text).join("")).toBe("a€\n�x");
+  });
+
+  test("a reset restarts the console at 0 under a new boot", async () => {
+    const { fake, posted, send, sliceAt } = await bootedRig();
+    send({ kind: "start" });
+    fake.print("one\r\n");
+    sliceAt(0);
+    send({ kind: "reset" });
+    expect(consolesOf(posted).at(-1)).toEqual({ kind: "console", text: "", at: 0, boot: 1 });
+  });
+});
+
+describe("firmware worker client motion, power, LEDs and console (Milestone 14 Task 6)", () => {
+  test("setAcceleration posts the latest once per animation frame", () => {
+    const { rt, sent, reply, animationFrame } = clientRig();
+    const accels = () => sent.filter((m) => m.kind === "accel");
+    rt.setAcceleration([1, 2, 3]); // before ready: held, never queued per sample
+    rt.setAcceleration([4, 5, 6]);
+    animationFrame();
+    expect(accels()).toEqual([]);
+    reply({ kind: "ready" });
+    rt.start();
+    animationFrame();
+    expect(accels()).toEqual([{ kind: "accel", mg: [4, 5, 6] }]);
+    const mg: [number, number, number] = [7, 8, 9];
+    rt.setAcceleration(mg);
+    mg[0] = 0; // the caller's array is copied
+    rt.setAcceleration([10, 11, 12]);
+    rt.setAcceleration([13, 14, 15]);
+    animationFrame();
+    animationFrame();
+    expect(accels().slice(1)).toEqual([{ kind: "accel", mg: [13, 14, 15] }]);
+  });
+
+  test("a reading set while hidden reaches the Worker before it resumes", () => {
+    const vis = fakeVisibility();
+    const { rt, sent, reply, animationFrame } = clientRig({ visibility: vis.source });
+    reply({ kind: "ready" });
+    rt.start();
+    vis.set(true);
+    rt.setAcceleration([0, -1000, 0]); // the rest reading; no animation frame while hidden
+    vis.set(false);
+    const tail = sent.slice(-2);
+    expect(tail).toEqual([{ kind: "accel", mg: [0, -1000, 0] }, { kind: "start" }]);
+    animationFrame();
+    expect(sent.filter((m) => m.kind === "accel")).toHaveLength(1);
+  });
+
+  test("onLeds and onConsole hear the Worker; bad messages and throwing listeners are contained", () => {
+    const { rt, reply } = clientRig();
+    reply({ kind: "ready" });
+    const leds: number[][] = [];
+    const chunks: Array<{ text: string; boot: number }> = [];
+    const offLeds = rt.onLeds((rgb) => leds.push([...rgb]));
+    rt.onConsole((c) => chunks.push(c));
+    let offThrowing = () => {};
+    const original = console.error;
+    console.error = () => {};
+    try {
+      offThrowing = rt.onLeds(() => {
+        throw new Error("listener gone");
+      });
+      reply({ kind: "leds", rgb: new Uint8Array([1, 2, 3]) });
+      reply({ kind: "leds", rgb: [1, 2, 3] } as unknown as FromWorker);
+      reply({ kind: "console", text: "hi\n", at: 0, boot: 0 });
+      reply({ kind: "console", text: 5, at: 0, boot: 0 } as unknown as FromWorker);
+    } finally {
+      console.error = original;
+    }
+    expect(leds).toEqual([[1, 2, 3]]);
+    expect(chunks).toEqual([{ text: "hi\n", boot: 0 }]);
+    offLeds();
+    offThrowing();
+    reply({ kind: "leds", rgb: new Uint8Array([4]) });
+    expect(leds).toHaveLength(1);
+  });
+
+  test("the client has no shake or bump", () => {
+    const { rt } = clientRig();
+    expect("shake" in rt).toBe(false);
+    expect("bump" in rt).toBe(false);
+  });
 });

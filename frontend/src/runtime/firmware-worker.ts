@@ -1,8 +1,8 @@
 /**
  * The firmware Worker (Milestone 7 Task 8): owns the WASM emulator and the
  * whole of `./firmware-runtime.ts`'s `FirmwareRuntime` (pacing, the button
- * tap queue, shake schedule, provisioner), so the main thread does no
- * emulation. `./firmware-worker-client.ts` is the main-thread side; the
+ * tap queue, the motion source's readings, provisioner), so the main
+ * thread does no emulation. `./firmware-worker-client.ts` is the main-thread side; the
  * messages are `./firmware-worker-protocol.ts`.
  *
  * ## Slices
@@ -30,10 +30,11 @@
  * buffer transferred; the next frame waits for the client's `frameAck`.
  * `status` (speed, `rebooting`, the provisioning and skip states, and
  * `setupOnScreen`) goes out at most every `STATUS_INTERVAL_MS`, and at
- * once, outside that throttle, when the software reset count changed
- * since the last `status` (Milestone 11 Task 8), so the status line never
- * shows the old boot's state for up to 250 ms. The Worker keeps that count
- * itself; the message does not carry it (Milestone 13 Task 5).
+ * once, outside that throttle, when the boot changed since the last
+ * `status` (a soft reset, Milestone 11 Task 8; an accepted `powerCycle` or
+ * a `reset`, Milestone 14 Task 6), so the status line never shows the old
+ * boot's state for up to 250 ms. The Worker keeps that count itself; the
+ * message does not carry it (Milestone 13 Task 5).
  * `setupOnScreen` decodes the current boot's console, so it is read only
  * when a `status` is built, never per slice.
  *
@@ -53,6 +54,30 @@
  * `MAX_ADVERTISEMENT_BYTES`, an integer RSSI in -128..127) before the
  * emulator sees it; the emulator's decoder rejects the rest.
  *
+ * ## Motion, power, LEDs and the console (Milestone 14 Task 6)
+ *
+ * `accel` is validated ({@link parseAccel}) and only remembered: the latest
+ * reading is applied at the start of the next slice, so a burst of
+ * samples between two slices costs one `setAcceleration`. While stopped
+ * it waits for the first slice after the next `start`.
+ *
+ * `powerCycle` and `reset` are cold power-ons. Before one, the Worker posts
+ * the console text the old boot printed since the last chunk; if the
+ * runtime took it (its `bootCount()` rose; it ignores a press while the
+ * badge boots or within 500 ms of the last), the console restarts at
+ * offset 0 under the new boot, a `status` and an empty `console` chunk
+ * (the reboot marker) go out at once, and the LEDs are posted again on
+ * the next tick (the cold power-on darkens them).
+ *
+ * After each slice, `leds` goes out when `ledFrameCount()` moved since the
+ * last post, at most every `LED_INTERVAL_MS`. With each `status`, the
+ * `console` text since the last chunk goes out, if there is any. A soft
+ * reset's frame ends at the reset (the core's `run_until` stops there),
+ * so everything written by then is the old boot's: its tail goes out
+ * under the old boot, then an empty chunk under the new one. A UTF-8
+ * sequence cut off at the end of the console is held for the next chunk
+ * ({@link cutOffTailBytes}); an old boot's tail is posted whole.
+ *
  * {@link handleMessage} is pure apart from its `WorkerHost`, so it is
  * tested under `bun test` without a real Worker (`test/firmware-worker.test.ts`);
  * the `self.onmessage` wiring at the bottom runs only inside a Worker.
@@ -65,7 +90,15 @@ import {
   WORKER_STEPS_PER_SLICE,
 } from "./firmware-runtime";
 import { MAX_ADVERTISEMENT_BYTES } from "../radio/hub";
-import { ADV_REPOST_MS, type FromWorker, STATUS_INTERVAL_MS, type ToWorker } from "./firmware-worker-protocol";
+import { consoleSince } from "./console-io";
+import {
+  ACCEL_LIMIT_MG,
+  ADV_REPOST_MS,
+  type FromWorker,
+  LED_INTERVAL_MS,
+  STATUS_INTERVAL_MS,
+  type ToWorker,
+} from "./firmware-worker-protocol";
 
 export type Post = (m: FromWorker, transfer?: Transferable[]) => void;
 
@@ -97,8 +130,8 @@ export interface WorkerState {
   lastCapped: boolean;
   /** `host.now()` of the last `status`, or `null` (none yet). */
   lastStatusMs: number | null;
-  /** `softResetCount()` when the last `status` was posted (the message no longer carries it). */
-  lastStatusSoftResets: number;
+  /** The runtime's `bootCount()` when the last `status` was posted (the message does not carry it). */
+  lastStatusBoot: number;
   /** The token of the one live scheduled slice; `0` when none. */
   liveSlice: number;
   sliceSeq: number;
@@ -108,6 +141,16 @@ export interface WorkerState {
   lastAdv: Uint8Array;
   /** `host.now()` of the last `advOut`, or `null` (none yet). */
   lastAdvMs: number | null;
+  /** The latest valid `accel` reading not applied yet, or `null`. */
+  pendingAccel: [number, number, number] | null;
+  /** `ledFrameCount()` at the last `leds` post; `-1` forces the next post (after a cold power-on). */
+  lastLedCount: number;
+  /** `host.now()` of the last `leds`, or `null` (none yet). */
+  lastLedMs: number | null;
+  /** Absolute console offset the next `console` chunk starts at. */
+  consoleAt: number;
+  /** The boot the last `console` chunk belonged to. */
+  consoleBoot: number;
 }
 
 export function createWorkerState(host: WorkerHost): WorkerState {
@@ -120,12 +163,17 @@ export function createWorkerState(host: WorkerHost): WorkerState {
     frameInFlight: false,
     lastCapped: false,
     lastStatusMs: null,
-    lastStatusSoftResets: 0,
+    lastStatusBoot: 0,
     liveSlice: 0,
     sliceSeq: 0,
     macLocked: false,
     lastAdv: new Uint8Array(0),
     lastAdvMs: null,
+    pendingAccel: null,
+    lastLedCount: 0,
+    lastLedMs: null,
+    consoleAt: 0,
+    consoleBoot: 0,
   };
 }
 
@@ -133,12 +181,125 @@ function errorMessage(e: unknown): string {
   return e instanceof Error ? (e.stack ?? e.message) : String(e);
 }
 
-/** The whole-buffer `ArrayBuffer` of `fb`, copied only if `fb` is a view into a larger one. */
-function ownBuffer(fb: Uint16Array): ArrayBuffer {
-  if (fb.byteOffset === 0 && fb.byteLength === fb.buffer.byteLength && fb.buffer instanceof ArrayBuffer) {
-    return fb.buffer;
+/** The whole-buffer `ArrayBuffer` of `a`, copied only if `a` is a view into a larger one. */
+function ownBuffer(a: Uint16Array | Uint8Array): ArrayBuffer {
+  if (a.byteOffset === 0 && a.byteLength === a.buffer.byteLength && a.buffer instanceof ArrayBuffer) {
+    return a.buffer;
   }
-  return fb.slice().buffer as ArrayBuffer;
+  return a.slice().buffer as ArrayBuffer;
+}
+
+/**
+ * An `accel` message's reading as the emulator takes it: three finite
+ * numbers, each clamped to ±`ACCEL_LIMIT_MG` and truncated toward zero
+ * (never `-0`); `null` for anything else.
+ */
+export function parseAccel(mg: unknown): [number, number, number] | null {
+  if (!Array.isArray(mg) || mg.length !== 3) return null;
+  const out: number[] = [];
+  for (const v of mg as unknown[]) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return null;
+    out.push(Math.trunc(Math.min(ACCEL_LIMIT_MG, Math.max(-ACCEL_LIMIT_MG, v))) + 0);
+  }
+  return [out[0]!, out[1]!, out[2]!];
+}
+
+/**
+ * How many bytes at the end of the console (written count `written`) are
+ * a UTF-8 sequence cut off before its last byte: the largest `k` in 3..1
+ * whose last `k` bytes decode to exactly one U+FFFD (a lossy decoder turns
+ * a truncated sequence into one), else 0. A lone byte that is not UTF-8
+ * at all also counts, so it waits for the next chunk; it is never more
+ * than 3 bytes, and it goes out with the next text.
+ */
+export function cutOffTailBytes(handle: FirmwareEmulatorHandle, written: number): number {
+  for (let k = Math.min(3, written); k >= 1; k--) {
+    if (consoleSince(handle, written - k) === "\uFFFD") return k;
+  }
+  return 0;
+}
+
+/**
+ * Posts the console text from `state.consoleAt` on under `state.consoleBoot`,
+ * if there is any, holding back a cut-off UTF-8 sequence when `holdBack`.
+ */
+function flushConsole(state: WorkerState, handle: FirmwareEmulatorHandle, post: Post, holdBack: boolean): void {
+  const written = handle.consoleWritten();
+  if (written <= state.consoleAt) return;
+  let text = consoleSince(handle, state.consoleAt);
+  let end = written;
+  if (holdBack && text.endsWith("\uFFFD")) {
+    const cut = cutOffTailBytes(handle, written);
+    if (cut > 0) {
+      end = written - cut;
+      text = text.slice(0, -1);
+    }
+  }
+  if (end <= state.consoleAt) return;
+  post({ kind: "console", text, at: state.consoleAt, boot: state.consoleBoot });
+  state.consoleAt = end;
+}
+
+/**
+ * Posts the console since the last chunk. On a new boot (a soft reset
+ * ended the frame), the old boot's tail goes out whole under the old
+ * boot, then an empty chunk under the new one.
+ */
+function postConsole(state: WorkerState, handle: FirmwareEmulatorHandle, rt: FirmwareRuntime, post: Post): void {
+  const boot = rt.bootCount();
+  if (boot !== state.consoleBoot) {
+    flushConsole(state, handle, post, false);
+    state.consoleBoot = boot;
+    post({ kind: "console", text: "", at: state.consoleAt, boot });
+  }
+  flushConsole(state, handle, post, true);
+}
+
+function postStatus(state: WorkerState, rt: FirmwareRuntime, post: Post, t: number): void {
+  state.lastStatusMs = t;
+  state.lastStatusBoot = rt.bootCount();
+  post({
+    kind: "status",
+    speed: rt.speed(),
+    rebooting: rt.rebooting(),
+    provision: rt.provisionState(),
+    skip: rt.skipState(),
+    // Copies the boot's console: read only here, never per slice.
+    setupOnScreen: rt.setupOnScreen(),
+  });
+}
+
+/** Posts the LED frame if the firmware sent one since the last post, at most every `LED_INTERVAL_MS`. */
+function pollLeds(state: WorkerState, rt: FirmwareRuntime, post: Post, t: number): void {
+  if (state.lastLedMs !== null && t - state.lastLedMs < LED_INTERVAL_MS) return;
+  const count = rt.ledFrameCount();
+  if (count === state.lastLedCount) return;
+  state.lastLedCount = count;
+  state.lastLedMs = t;
+  const rgb = new Uint8Array(ownBuffer(rt.ledColors()));
+  post({ kind: "leds", rgb }, [rgb.buffer]);
+}
+
+/**
+ * Runs a cold power-on (`powerCycle` or `reset`): flushes the old boot's
+ * console first, and if the runtime took it, restarts the console at 0
+ * under the new boot and posts a `status` and the reboot's empty chunk at
+ * once.
+ */
+function coldBoot(state: WorkerState, rt: FirmwareRuntime, post: Post, run: () => void): void {
+  const handle = state.handle;
+  if (!handle) return;
+  // Held back: a press the runtime ignores must not split a character.
+  flushConsole(state, handle, post, true);
+  const before = rt.bootCount();
+  run();
+  const boot = rt.bootCount();
+  if (boot === before) return;
+  state.consoleAt = 0;
+  state.consoleBoot = boot;
+  state.lastLedCount = -1;
+  postStatus(state, rt, post, state.host.now());
+  post({ kind: "console", text: "", at: 0, boot });
 }
 
 /**
@@ -185,23 +346,14 @@ function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: 
         state.lastCapped = r.capped;
         const t = host.now();
         pollAdvertisement(state, handle, post, t);
-        const softResets = handle.softResetCount();
+        pollLeds(state, rt, post, t);
         if (
           state.lastStatusMs === null ||
           t - state.lastStatusMs >= STATUS_INTERVAL_MS ||
-          softResets !== state.lastStatusSoftResets
+          rt.bootCount() !== state.lastStatusBoot
         ) {
-          state.lastStatusMs = t;
-          state.lastStatusSoftResets = softResets;
-          post({
-            kind: "status",
-            speed: rt.speed(),
-            rebooting: rt.rebooting(),
-            provision: rt.provisionState(),
-            skip: rt.skipState(),
-            // Copies the boot's console: read only here, never per slice.
-            setupOnScreen: rt.setupOnScreen(),
-          });
+          postStatus(state, rt, post, t);
+          postConsole(state, handle, rt, post);
         }
       },
       scheduleFrame: (cb) => {
@@ -211,6 +363,10 @@ function buildRuntime(state: WorkerState, handle: FirmwareEmulatorHandle, post: 
           // A slice canceled by stop() (or replaced by a restart) never runs.
           if (state.liveSlice !== token) return;
           try {
+            // The motion source's latest reading lands before the slice runs.
+            const mg = state.pendingAccel;
+            state.pendingAccel = null;
+            if (mg) rt.setAcceleration(mg);
             cb(0);
           } catch (e) {
             post({ kind: "error", message: `firmware slice failed: ${errorMessage(e)}` });
@@ -290,11 +446,14 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
         // No fields: the kind is the whole message. The runtime refuses a skip it can't start.
         rt.skipSetup();
         break;
-      case "shake":
-        rt.shake();
+      case "accel": {
+        // A malformed reading is ignored; the last valid one stays pending.
+        const mg = parseAccel(msg.mg);
+        if (mg) state.pendingAccel = mg;
         break;
-      case "bump":
-        rt.bump();
+      }
+      case "powerCycle":
+        coldBoot(state, rt, post, () => rt.powerCycle());
         break;
       case "setMac":
         // Once, before the first start: the firmware reads it at boot.
@@ -306,7 +465,7 @@ export function handleMessage(state: WorkerState, msg: ToWorker, post: Post): vo
         if (isAdvIn(msg)) state.handle?.deliverAdvertisement(msg.bytes, msg.rssi);
         break;
       case "reset":
-        rt.reset();
+        coldBoot(state, rt, post, () => rt.reset());
         break;
       case "frameAck":
         state.frameInFlight = false;

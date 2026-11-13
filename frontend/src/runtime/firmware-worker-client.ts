@@ -31,7 +31,7 @@
  *   running and visible, and is dropped otherwise, never queued: a peer's
  *   advertisement is stale by the time a paused badge runs again, and the
  *   hub (`../radio/hub.ts`) holds the latest per peer while paused.
- *   `bump()` is dropped the same way. `advOut` goes to the
+ *   `advOut` goes to the
  *   `onAdvertisement` option. The hidden-page pause
  *   calls `onPausedChange(true)` before its `stop` (or at a `start()` while
  *   the page is hidden, Milestone 11 Task 11), and
@@ -49,6 +49,18 @@
  *   interval; a click then sends a second `skipSetup`, which the Worker's
  *   runtime refuses (a skip is in flight), so one `config` and one
  *   `reboot` are still typed. `reset()` clears all three.
+ * - Motion, power, LEDs and the console (Milestone 14 Task 6; `shake()`
+ *   and `bump()` are gone): `setAcceleration(mg)` keeps the latest
+ *   reading (copied) and posts it on the next animation frame, so at most
+ *   one `accel` goes out per frame. Before `ready` it is held, not queued
+ *   per sample, and goes out on the first frame after `ready`. When the
+ *   hidden-page pause ends, a held reading goes out before `start`, so
+ *   the badge never resumes on a stale one (no animation frame runs while
+ *   hidden). `powerCycle()` posts `powerCycle`; the Worker's runtime
+ *   decides whether to take it, and the next `status` says it is
+ *   rebooting. `onLeds` and `onConsole` add listeners for `leds` and
+ *   `console` (the console's `at` stays in the Worker) and return an
+ *   unsubscribe function; a throwing listener is logged and contained.
  */
 import type { ButtonName, ButtonSource } from "./buttons";
 import { blitFramebuffer } from "../render/framebuffer";
@@ -101,7 +113,11 @@ export interface WorkerClientOptions {
  * whether the Worker's runtime started the skip is known only from the
  * next `status`.
  */
-export interface WorkerFirmwareRuntime extends Omit<FirmwareRuntime, "skipSetup"> {
+export interface WorkerFirmwareRuntime
+  extends Omit<
+    FirmwareRuntime,
+    "skipSetup" | "shake" | "bump" | "ledColors" | "ledFrameCount" | "consoleWritten" | "bootCount"
+  > {
   readonly ready: Promise<void>;
   /**
    * Sends `skipSetup` if the last status showed Setup on screen, then
@@ -113,6 +129,10 @@ export interface WorkerFirmwareRuntime extends Omit<FirmwareRuntime, "skipSetup"
   setMac(mac: Uint8Array): void;
   /** A linked peer's advertisement, heard at `rssi` dBm; dropped unless running and visible. */
   deliverAdvertisement(bytes: Uint8Array, rssi: number): void;
+  /** Hears each LED frame (R, G, B per LED in chain order); returns an unsubscribe function. */
+  onLeds(cb: (rgb: Uint8Array) => void): () => void;
+  /** Hears each serial chunk and the boot it belongs to; returns an unsubscribe function. */
+  onConsole(cb: (chunk: { text: string; boot: number }) => void): () => void;
 }
 
 export function createWorkerFirmwareRuntime(
@@ -151,6 +171,11 @@ export function createWorkerFirmwareRuntime(
   let lastSetupOnScreen = false;
   let pendingFrame: Extract<FromWorker, { kind: "frame" }> | null = null;
   let paintHandle: number | null = null;
+  /** The latest acceleration not posted yet, and its animation frame. */
+  let pendingAccel: [number, number, number] | null = null;
+  let accelHandle: number | null = null;
+  const ledListeners = new Set<(rgb: Uint8Array) => void>();
+  const consoleListeners = new Set<(chunk: { text: string; boot: number }) => void>();
 
   let resolveReady!: () => void;
   let rejectReady!: (e: Error) => void;
@@ -176,6 +201,18 @@ export function createWorkerFirmwareRuntime(
     send({ kind: "frameAck" });
   }
 
+  /** Posts the held acceleration, if any; before `ready` it stays held. */
+  function flushAccel(): void {
+    if (!isReady || disposed || !pendingAccel) return;
+    worker.postMessage({ kind: "accel", mg: pendingAccel });
+    pendingAccel = null;
+  }
+
+  function onAccelFrame(): void {
+    accelHandle = null;
+    flushAccel();
+  }
+
   function dropPendingFrame(): void {
     if (paintHandle !== null) {
       cancelFrame(paintHandle);
@@ -194,6 +231,8 @@ export function createWorkerFirmwareRuntime(
       case "ready": {
         isReady = true;
         for (const m of queue.splice(0)) worker.postMessage(m);
+        // A reading held before ready goes out on the next animation frame.
+        if (pendingAccel) accelHandle ??= scheduleFrame(onAccelFrame);
         resolveReady();
         break;
       }
@@ -216,6 +255,15 @@ export function createWorkerFirmwareRuntime(
       case "advOut":
         if (msg.bytes instanceof Uint8Array) notify(onAdvertisement, msg.bytes);
         break;
+      case "leds":
+        if (msg.rgb instanceof Uint8Array) for (const cb of [...ledListeners]) notify(cb, msg.rgb);
+        break;
+      case "console":
+        if (typeof msg.text === "string" && typeof msg.boot === "number") {
+          const chunk = { text: msg.text, boot: msg.boot };
+          for (const cb of [...consoleListeners]) notify(cb, chunk);
+        }
+        break;
       case "error":
         console.error("firmware worker:", msg.message);
         if (!isReady) rejectReady(new Error(msg.message));
@@ -235,6 +283,8 @@ export function createWorkerFirmwareRuntime(
       dropPendingFrame();
     } else if (!hidden && pausedHidden) {
       pausedHidden = false;
+      // The reading set while hidden lands before the badge runs again.
+      flushAccel();
       send({ kind: "start" });
       notify(onPausedChange, false);
     }
@@ -281,13 +331,25 @@ export function createWorkerFirmwareRuntime(
     skipState: () => lastSkip,
     setupOnScreen: () => lastSetupOnScreen,
     rebooting: () => lastRebooting,
-    shake(): void {
-      send({ kind: "shake" });
+    setAcceleration(mg: [number, number, number]): void {
+      if (disposed) return;
+      pendingAccel = [mg[0], mg[1], mg[2]];
+      if (isReady) accelHandle ??= scheduleFrame(onAccelFrame);
     },
-    bump(): void {
-      // A stopped or hidden badge is not bumped later (ruling R-T9-3).
-      if (!running || pausedHidden) return;
-      send({ kind: "bump" });
+    powerCycle(): void {
+      send({ kind: "powerCycle" });
+    },
+    onLeds(cb) {
+      ledListeners.add(cb);
+      return () => {
+        ledListeners.delete(cb);
+      };
+    },
+    onConsole(cb) {
+      consoleListeners.add(cb);
+      return () => {
+        consoleListeners.delete(cb);
+      };
     },
     setMac(mac: Uint8Array): void {
       send({ kind: "setMac", mac });
@@ -310,6 +372,13 @@ export function createWorkerFirmwareRuntime(
       running = false;
       unsubscribeVisibility();
       dropPendingFrame();
+      if (accelHandle !== null) {
+        cancelFrame(accelHandle);
+        accelHandle = null;
+      }
+      pendingAccel = null;
+      ledListeners.clear();
+      consoleListeners.clear();
       if (isReady) worker.postMessage({ kind: "dispose" });
       disposed = true;
       worker.onmessage = null;

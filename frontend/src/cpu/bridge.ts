@@ -134,6 +134,19 @@ export interface FirmwareEmulatorHandle {
    * (the core's `REBOOT_US`): the reboot's duration.
    */
   rebootUs(): number;
+  /**
+   * A cold power-on that keeps the emulated flash (the page's power switch,
+   * Milestone 14 Task 3): emulated time, the step count, the soft reset
+   * count, the console and the LEDs start over, as after {@link reset}.
+   */
+  powerCycle(): void;
+  /**
+   * The LED chain's latest frame: R, G, B per LED in chain order (a fresh,
+   * JS-owned array); empty until the firmware sends one.
+   */
+  ledColors(): Uint8Array;
+  /** LED frames the firmware sent since the last cold power-on. */
+  ledFrameCount(): number;
   /** Releases the WASM-side emulator. Calling anything else afterwards throws. */
   dispose(): void;
 }
@@ -285,6 +298,18 @@ export function createFirmwareEmulator(image: Uint8Array): FirmwareEmulatorHandl
     rebootUs(): number {
       assertLive();
       return wasm.rebootUs;
+    },
+    powerCycle(): void {
+      assertLive();
+      wasm.power_cycle();
+    },
+    ledColors(): Uint8Array {
+      assertLive();
+      return wasm.led_colors();
+    },
+    ledFrameCount(): number {
+      assertLive();
+      return wasm.led_frame_count();
     },
     dispose(): void {
       if (disposed) return;

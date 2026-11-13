@@ -64,6 +64,9 @@ function makeFake(after: Uint16Array) {
     // The bench never soft-resets; a reboot would add 466,000 µs (REBOOT_US).
     softResetCount: () => 0,
     rebootUs: () => 466_000,
+    powerCycle() {},
+    ledColors: () => new Uint8Array(0),
+    ledFrameCount: () => 0,
     dispose() {},
   };
   // Start somewhere other than zero, so the timing is relative to the press.
