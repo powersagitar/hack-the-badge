@@ -1,63 +1,98 @@
 /**
- * The page's badge wiring, factored out of `main.ts` (Milestone 11 Task 12)
- * so `test/shell.test.ts` can drive it over a real DOM: `main.ts` runs
- * itself on import and reaches `fetch`, `Worker` and `navigator.locks`
- * directly, so it cannot be driven from a test. Everything a test must
- * replace comes in through {@link BadgeControllerDeps}; `main.ts` passes
- * the browser's.
+ * The page's controller store (Milestone 14 Task 12; from Milestone 11
+ * Task 12's controller): non-visual state that the React page reads
+ * through {@link BadgeController.subscribe} and
+ * {@link BadgeController.getSnapshot} (`useSyncExternalStore`). Everything
+ * a test must replace comes in through {@link BadgeControllerDeps};
+ * `main.tsx` passes the browser's, and `test/badge-controller.test.ts`
+ * drives it without a DOM.
  *
- * - {@link createBadgeController}: the firmware Worker (booted at once,
- *   once this tab holds the badge), the one-badge-per-browser lock and its notice, the
- *   provisioning controls, and the bump gate's `hub.setRunning` calls.
- * - {@link mountLinks}: the radio link panel and its links, with the
- *   hosted room's cancel.
+ * - **The firmware Worker**, booted at once once this tab holds the badge
+ *   (or on a provision), and kept until unload. The emulator runs in a
+ *   dedicated Worker (`runtime/firmware-worker.ts`); this thread fetches
+ *   the bytes, blits the frames the Worker posts into the badge's screen
+ *   canvas ({@link BadgeController.setCanvas}) and forwards input. A failed
+ *   boot is not cached: Run here or a provision retries it.
+ * - **One badge per browser** (`radio/lock.ts`, Milestone 10 Task 9): the
+ *   firmware runs only in the tab holding the `htn-badge` Web Lock.
+ *   Another tab shows the tab notice (`tabNotice`), whose Run here takes
+ *   the badge over (the old tab stops). The badge's factory MAC is this
+ *   browser's, sent before its first start.
+ * - **The hub's bump gate** (Milestone 11 Task 11): each start and stop of
+ *   the runtime is paired with `hub.setRunning`, and the hidden-page pause
+ *   pauses the hub (`onPausedChange`).
+ * - **Provisioning and Skip setup** (Milestones 5 and 13): `provision`
+ *   boots and starts the badge if needed, then types the role's identity;
+ *   `skipSetup` is refused unless the badge runs here and its Setup app is
+ *   on screen (Milestone 13's R-FR-1). A boot failure says
+ *   {@link START_FAILED_NOTE}, and an identity that cannot be fetched says
+ *   `could not load <role>`.
+ * - **CONSOLE.LOG** ({@link BadgeController.console}): the Worker's serial
+ *   chunks go to `appendSerial`. The page's status (today's status-line
+ *   texts) goes to `appendPage` as it changes: `rebooting…` when a reboot
+ *   starts, the provision's state (`waiting for the console…`,
+ *   `provisioning…`, its `PROV OK` line, `failed: <reason>`), the skip's
+ *   (`skipping setup…`, `skip failed: <reason>`; `done` adds nothing, the
+ *   screen shows it), failures, links, and phone motion. Each stream is
+ *   logged when its own text changes, so an old skip failure the Worker
+ *   keeps reporting is not repeated under a newer provision.
+ * - **Motion** (spec "Phone motion"): exactly one source drives the
+ *   sensor, through {@link BadgeController.motionSink}. `motion` is
+ *   `"physics"` (the stage's lanyard) or `"phone"` (DeviceMotion, after
+ *   `usePhoneMotion(true)` is granted; asked synchronously, so iOS sees the
+ *   click's gesture). It is offered (`phoneMotionAvailable`) only on a
+ *   touch-first device ({@link TOUCH_FIRST_QUERY}), re-read when that
+ *   media query changes. **While the page is hidden** the sensor gets
+ *   {@link HANGING_REST_MG} and the sink drops samples until it is visible
+ *   (Review Focus 1); the client holds that reading and posts it just
+ *   before the badge's `start` when the page is visible again (Task 6).
+ * - **Links** (`radio/links.ts`): `host`, `cancelHost` and `join`, with
+ *   the summary as `linkStatus`.
  *
- * **The radio (Milestone 10 Task 9).** One badge per browser: the firmware
- * runs only in the tab holding the `htn-badge` Web Lock
- * (`src/radio/lock.ts`); another tab shows "Badge running in another tab —
- * Run here", whose button takes the badge over (the old tab stops). The
- * badge's factory MAC is this browser's, sent to the Worker before its
- * first start. The hub's bump gate is open only while the badge runs here
- * and the page is visible: each `rt.start()` and `firmwareRuntime?.stop()`
- * below is paired with `hub.setRunning`, and the hidden-page pause pauses
- * the hub (`onPausedChange`), Milestone 11 Task 11.
- *
- * **Links (Milestone 10 Task 10).** The link panel ({@link mountLinks})
- * makes WebRTC links (`src/radio/peer-link.ts`) to other browsers: "Host
- * link" creates a room on `/api/signal` and shows its code, and "Join
- * link" joins one. Each link joins the hub as soon as it exists; it carries
- * nothing until its channel opens, and leaves the hub when it closes.
- * Cancelling a hosted room ({@link mountLinks}'s `cancelHosting`: hosting
- * again, unload) also closes the room on the server, best effort
- * (Milestone 11 Task 10).
+ * Status comes from the client's last `status`, which `refreshStatus`
+ * reads: `main.tsx` polls it (as the old `main.ts` did), and every action
+ * here calls it.
  */
-import type { RadioHub } from "../radio/hub";
-import { acquireBadge, type BadgeHold, type LockManagerLike, takeOver } from "../radio/lock";
-import type { PeerLink } from "../radio/peer-link";
+import { BOARD_AXES, type AxisMap } from "../motion/axes";
 import {
-  type HostedRoom,
-  SignalError,
-  type SignalDeps,
-  hostRoom,
-  joinRoom,
-} from "../radio/signal-client";
+  createDeviceMotionSource,
+  motionAvailable,
+  platformSignFix,
+  requestMotionPermission,
+} from "../motion/device-motion";
+import { REST_MG } from "../motion/sensor";
+import type { Mg, MotionSource } from "../motion/source";
+import type { RadioHub } from "../radio/hub";
+import { createLinks, type LinksOptions } from "../radio/links";
+import { acquireBadge, type BadgeHold, type LockManagerLike, takeOver } from "../radio/lock";
+import type { SignalDeps } from "../radio/signal-client";
 import {
   createWorkerFirmwareRuntime,
+  documentVisibility,
+  type WorkerClientOptions,
   type WorkerFirmwareRuntime,
   type WorkerLike,
 } from "../runtime/firmware-worker-client";
-import type { ButtonInjector, LinkPanel, ProvisionControls, ShellHandles } from "./shell";
+import type { ProvisionState } from "../runtime/provisioner";
+import type { SkipState } from "../runtime/setup-skip";
+import type { BadgeClient } from "./Badge";
+import { type ConsoleLog, createConsoleLog } from "./console-log";
 
 /** The Worker the controller boots: a {@link WorkerLike} that also reports its own load failure. */
 export interface BadgeWorker extends WorkerLike {
   addEventListener(type: "error", cb: (e: { message: string }) => void, options: { once: true }): void;
 }
 
+/** Phone motion's browser seams; the real DeviceMotion when omitted. */
+export interface PhoneMotionDeps {
+  available(): boolean;
+  /** Asks for access; called synchronously from the click. */
+  request(): Promise<"granted" | "denied" | "unsupported">;
+  create(): MotionSource;
+}
+
 export interface BadgeControllerDeps {
-  shell: Pick<ShellHandles, "ctx" | "renderLeds" | "mountBadgeNotice" | "mountProvisionControls">;
-  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning">;
-  /** The firmware roles the provisioning controls offer. */
-  roles: readonly string[];
+  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning" | "addLink" | "removeLink">;
   /** Fetches the WASM module and `firmware.bin`. */
   loadImages(): Promise<{ wasm: ArrayBuffer; image: ArrayBuffer }>;
   /** Constructs the firmware Worker; called only once the badge is held (or provisioning). */
@@ -68,51 +103,216 @@ export interface BadgeControllerDeps {
   fetchIdentity(role: string): Promise<string>;
   /** The Web Locks to hold the badge with; the browser's when omitted. */
   locks?: LockManagerLike | null;
+  /** Reaches `/api/signal` and WebRTC; the browser's when omitted. */
+  signal?: SignalDeps;
+  /** Where `pagehide` comes from (it closes the links); `window` when omitted. */
+  pageEvents?: LinksOptions["pageEvents"];
+  /** The Worker client's visibility and frame scheduling; the document's when omitted. */
+  clientOptions?: Pick<WorkerClientOptions, "visibility" | "scheduleFrame" | "cancelFrame">;
+  motion?: PhoneMotionDeps;
+  /** Whether this is a touch-first device ({@link TOUCH_FIRST_QUERY}); `matchMedia`'s when omitted. */
+  touchFirst?: MediaQuerySeam;
 }
 
-/** The status line after the firmware failed to boot. */
+/** The page's state, as the components read it. A new object on every change. */
+export interface BadgeSnapshot {
+  /** The emulated/wall ratio (0 before the first status). */
+  speed: number;
+  /** The badge is in a reboot's pause. */
+  rebooting: boolean;
+  provision: ProvisionState | null;
+  skip: SkipState | null;
+  /** Setup is on screen and the badge runs in this tab. */
+  setupOnScreen: boolean;
+  /** Another tab runs the badge ("Badge running in another tab"). */
+  tabNotice: boolean;
+  /** BADGE LINK's one-line summary. */
+  linkStatus: string;
+  /** The hosted room waiting for a peer, or null (its button cancels it). */
+  hostingRoom: string | null;
+  motion: "physics" | "phone";
+  /** "Use phone motion" is offered: DeviceMotion works here and the device is touch-first. */
+  phoneMotionAvailable: boolean;
+}
+
+/** The page line after the firmware failed to boot. */
 export const START_FAILED_NOTE = "could not start the badge";
 
+/** The board's hanging rest (1 g up, nothing in-plane or out), in the chip's axes. */
+export function hangingRest(axes: AxisMap = BOARD_AXES): Mg {
+  const out: Mg = [0, 0, 0];
+  const [axis, sign] = axes.up;
+  out[axis] = REST_MG * sign;
+  return out;
+}
+
+/** What the sensor reads while the page is hidden: `[0, 1000, 0]` through `BOARD_AXES`. */
+export const HANGING_REST_MG: Mg = hangingRest();
+
 export interface BadgeController {
+  subscribe(cb: () => void): () => void;
+  getSnapshot(): BadgeSnapshot;
   /** The booted firmware runtime, or `null` before the first boot. */
   firmware(): WorkerFirmwareRuntime | null;
-  /** The button pad's and keyboard's input, to the firmware (dropped before its boot). */
-  inject: ButtonInjector;
-  /** The provisioning controls' visibility and status line (`main.ts` polls it). */
+  /** The board's client: the firmware's input, power and LEDs (dropped before its boot). */
+  readonly client: BadgeClient;
+  readonly console: ConsoleLog;
+  /** The badge's screen canvas (the stage's `onCanvas`); frames are dropped without one. */
+  setCanvas(canvas: HTMLCanvasElement | null): void;
+  provision(role: string): Promise<void>;
+  skipSetup(): void;
+  powerCycle(): void;
+  runHere(): Promise<void>;
+  host(): Promise<string>;
+  cancelHost(): void;
+  join(code: string): Promise<void>;
+  usePhoneMotion(on: boolean): Promise<void>;
+  /** The active motion source's sink (stable). */
+  motionSink(): (mg: Mg) => void;
+  /** Re-reads the runtime's last status into the snapshot and the console. */
   refreshStatus(): void;
-  /** Page unload: disposes the runtime and frees the badge. */
+  /** Page unload: disposes the runtime, frees the badge, closes the links. */
   dispose(): void;
 }
 
-/**
- * Mounts the badge notice and the provisioning controls, and starts the
- * firmware: it claims the badge and, once this tab holds it, boots the
- * Worker (or shows the notice if another tab holds it).
- */
-export function createBadgeController(deps: BadgeControllerDeps): BadgeController {
-  const { shell, hub } = deps;
-  const { locks } = deps;
+/** A media query's match, and its changes. */
+export interface MediaQuerySeam {
+  matches(): boolean;
+  /** Calls `cb` when the match may have changed; returns an unsubscribe function. */
+  subscribe(cb: () => void): () => void;
+}
 
-  // The Worker is created only once this tab holds the badge (or a
-  // provision asks for it), and kept until unload. Since Milestone 7 Task 8
-  // the emulator runs in a dedicated Worker (`runtime/firmware-worker.ts`);
-  // this thread only fetches the bytes, paints the frames the Worker posts
-  // and forwards input (`runtime/firmware-worker-client.ts`). The Worker
-  // imports `./cpu/bridge` lazily, so the WASM loads only inside it.
+/**
+ * A touch-first device (the human partner, 2026-11-12: "Use phone motion"
+ * shows only on mobile). Not the 768 px layout breakpoint: a narrow
+ * desktop window never offers phone motion.
+ */
+export const TOUCH_FIRST_QUERY = "(hover: none) and (pointer: coarse)";
+
+/** {@link TOUCH_FIRST_QUERY} through `matchMedia`, or never matching where there is none. */
+export function mediaQuery(query: string): MediaQuerySeam {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return { matches: () => false, subscribe: () => () => {} };
+  }
+  const mq = window.matchMedia(query);
+  return {
+    matches: () => mq.matches,
+    subscribe(cb) {
+      mq.addEventListener("change", cb);
+      return () => mq.removeEventListener("change", cb);
+    },
+  };
+}
+
+function defaultMotion(): PhoneMotionDeps {
+  return {
+    available: motionAvailable,
+    request: requestMotionPermission,
+    create: () =>
+      createDeviceMotionSource(
+        window,
+        platformSignFix(typeof navigator === "undefined" ? "" : navigator.userAgent),
+      ),
+  };
+}
+
+function provisionText(st: ProvisionState | null): string {
+  if (!st) return "";
+  if ("line" in st) return st.line;
+  if ("reason" in st) return `failed: ${st.reason}`;
+  return st.kind === "waiting" ? "waiting for the console…" : "provisioning…";
+}
+
+function skipText(skip: SkipState | null): string {
+  if (skip?.kind === "typing") return "skipping setup…";
+  if (skip?.kind === "failed") return `skip failed: ${skip.reason}`;
+  return "";
+}
+
+function sameJson(a: unknown, b: unknown): boolean {
+  return a === b || JSON.stringify(a) === JSON.stringify(b);
+}
+
+export function createBadgeController(deps: BadgeControllerDeps): BadgeController {
+  const { hub, locks } = deps;
+  const log = createConsoleLog();
+  const note = (text: string) => log.appendPage(text);
+  const visibility = deps.clientOptions?.visibility ?? documentVisibility();
+  const motionDeps = deps.motion ?? defaultMotion();
+  const touchFirst = deps.touchFirst ?? mediaQuery(TOUCH_FIRST_QUERY);
+  /** Phone motion is offered where DeviceMotion works on a touch-first device. */
+  const phoneMotionAvailable = () => motionDeps.available() && touchFirst.matches();
+
+  // --- The store ---------------------------------------------------------
+  const listeners = new Set<() => void>();
+  /** Set by dispose(): nothing boots, starts or turns on after it. */
+  let disposed = false;
+  let snapshot: BadgeSnapshot = {
+    speed: 0,
+    rebooting: false,
+    provision: null,
+    skip: null,
+    setupOnScreen: false,
+    tabNotice: false,
+    linkStatus: "",
+    hostingRoom: null,
+    motion: "physics",
+    phoneMotionAvailable: phoneMotionAvailable(),
+  };
+  function update(next: Partial<BadgeSnapshot>): void {
+    let changed = false;
+    for (const k of Object.keys(next) as (keyof BadgeSnapshot)[]) {
+      if (!sameJson(snapshot[k], next[k])) changed = true;
+    }
+    if (!changed) return;
+    snapshot = { ...snapshot, ...next };
+    for (const cb of [...listeners]) {
+      try {
+        cb();
+      } catch (e) {
+        // One failing subscriber must not abort refreshStatus or the others.
+        console.error("badge controller: listener failed:", e);
+      }
+    }
+  }
+
+  // --- The screen --------------------------------------------------------
+  let canvas: HTMLCanvasElement | null = null;
+  let ctx: CanvasRenderingContext2D | null = null;
+  /** What the client blits into: the current canvas, whenever it mounts. */
+  const screen: Pick<CanvasRenderingContext2D, "putImageData"> = {
+    putImageData: (image: ImageData, dx: number, dy: number) => ctx?.putImageData(image, dx, dy),
+  };
+  function clearScreen(): void {
+    if (canvas && ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // --- The firmware Worker -----------------------------------------------
   let firmwareRuntime: WorkerFirmwareRuntime | null = null;
   let firmwareRuntimePromise: Promise<WorkerFirmwareRuntime> | null = null;
+  const ledListeners = new Set<(rgb: Uint8Array) => void>();
+  /** The page is hidden: the sensor holds the hanging rest. */
+  let hidden = visibility.hidden();
 
   async function ensureFirmwareRuntime(): Promise<WorkerFirmwareRuntime> {
     if (firmwareRuntime) return firmwareRuntime;
     firmwareRuntimePromise ??= (async () => {
       const { wasm, image } = await deps.loadImages();
       const worker = deps.createWorker();
-      const rt = createWorkerFirmwareRuntime(worker, shell.ctx, wasm, image, {
+      const rt = createWorkerFirmwareRuntime(worker, screen, wasm, image, {
+        ...deps.clientOptions,
+        visibility,
         onAdvertisement: (bytes) => hub.fromLocal(bytes),
         onPausedChange: (paused) => hub.setPaused(paused),
       });
       // Before any start: the firmware reads its factory MAC at boot.
       rt.setMac(deps.mac());
+      rt.onConsole(({ text, boot }) => log.appendSerial(text, boot));
+      rt.onLeds((rgb) => {
+        for (const cb of [...ledListeners]) cb(rgb);
+      });
+      // Booted on a hidden page: it starts from the rest, not the default.
+      if (hidden) rt.setAcceleration(HANGING_REST_MG);
       try {
         await new Promise<void>((resolve, reject) => {
           rt.ready.then(resolve, reject);
@@ -124,56 +324,53 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
         rt.dispose();
         throw e;
       }
+      if (disposed) {
+        // Unloaded while it booted: it never runs.
+        rt.dispose();
+        throw new Error("badge controller: disposed while booting");
+      }
       firmwareRuntime = rt;
       return rt;
     })().catch((e: unknown) => {
-      // Don't let a rejected boot attempt (e.g. a transient fetch failure)
-      // stay cached forever -- reset the slot so the next attempt (Run
-      // here, a provision) retries the fetch/boot instead of replaying this same rejection.
+      // A failed boot (e.g. a transient fetch failure) is not cached: the
+      // next attempt (Run here, a provision) retries it.
       firmwareRuntimePromise = null;
       throw e;
     });
     return firmwareRuntimePromise;
   }
 
-  // One badge per browser (src/radio/lock.ts): the firmware runs only while
-  // this tab holds the badge.
+  // --- The badge lock ----------------------------------------------------
   let badgeHold: BadgeHold | null = null;
   let claiming: Promise<boolean> | null = null;
   /**
    * Whether the firmware runs in this tab, set beside each
-   * `hub.setRunning`. A stopped badge posts no status, so Skip setup hides
-   * on it (Milestone 13's final review, R-FR-1).
+   * `hub.setRunning`. A stopped badge posts no status, so Skip setup is
+   * off on it (Milestone 13's final review, R-FR-1).
    */
   let running = false;
-  const badgeNotice = shell.mountBadgeNotice(() => {
-    void runHere();
-  });
 
   /** Another tab took the badge over: stop here and offer it back. */
   function onBadgeLost(): void {
     badgeHold = null;
     firmwareRuntime?.stop();
     running = false;
-    hub.setRunning(false); // the bump gate (Milestone 11 Task 11)
-    refreshStatus();
+    hub.setRunning(false);
     showNotice();
+    refreshStatus();
   }
 
-  /**
-   * Frees the badge for another tab (Milestone 11 Task 12): on a failed
-   * start and unload. Idempotent: the hold is dropped before it is
-   * released, so it is released once.
-   */
+  /** Frees the badge for another tab (a failed start, unload). Idempotent. */
   function releaseBadge(): void {
     const hold = badgeHold;
     badgeHold = null;
     hold?.release();
   }
 
-  /** Shows the badge notice (it clears the canvas behind it). */
+  /** Shows the tab notice; the screen behind it is cleared. */
   function showNotice(): void {
-    badgeNotice.setVisible(true);
+    clearScreen();
+    update({ tabNotice: true });
   }
 
   /** Takes the badge if no other tab holds it; `true` if this tab holds it. */
@@ -189,38 +386,35 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
 
   /**
    * Starts the firmware if this tab holds (or can take) the badge, else
-   * shows the notice. Booting it if needed and starting it if stopped, so a
-   * retry after a failed boot (Run here, a provision) leaves it running.
+   * shows the notice: booting it if needed and starting it if stopped.
    */
   async function startFirmware(): Promise<void> {
     if (!(await claimBadge())) {
       showNotice();
       return;
     }
-    badgeNotice.setVisible(false);
+    update({ tabNotice: false });
     let rt: WorkerFirmwareRuntime;
     try {
       rt = await ensureFirmwareRuntime();
     } catch (e) {
-      // Nothing runs here: let another tab have the badge.
-      releaseBadge();
+      releaseBadge(); // nothing runs here: let another tab have the badge
       throw e;
     }
     // Another tab took the badge while it booted, or it already runs.
-    if (!badgeHold || running) return;
+    if (!badgeHold || running || disposed) return;
     rt.start();
     running = true;
-    hub.setRunning(true); // the bump gate (Milestone 11 Task 11)
-  }
-
-  /** A failed start's line in the status (cleared by the next provision). */
-  function startFailed(e: unknown): void {
-    console.error("Failed to start the firmware:", e);
-    fetchError = START_FAILED_NOTE;
+    hub.setRunning(true);
     refreshStatus();
   }
 
-  /** "Run here": takes the badge from the other tab (which stops), then starts it here. */
+  function startFailed(e: unknown): void {
+    console.error("Failed to start the firmware:", e);
+    note(START_FAILED_NOTE);
+    refreshStatus();
+  }
+
   async function runHere(): Promise<void> {
     await takeOver(locks);
     try {
@@ -230,199 +424,193 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     }
   }
 
-  const inject: ButtonInjector = (button, kind, source) => {
-    firmwareRuntime?.injectButton(button, kind, source);
+  // --- Status -> snapshot and page lines --------------------------------
+  let wasRebooting = false;
+  let lastProvisionText = "";
+  let lastSkipText = "";
+
+  function refreshStatus(): void {
+    const rt = firmwareRuntime;
+    const provision = rt?.provisionState() ?? null;
+    const skip = rt?.skipState() ?? null;
+    const rebooting = rt?.rebooting() ?? false;
+    if (rebooting && !wasRebooting) note("rebooting…");
+    wasRebooting = rebooting;
+    const p = provisionText(provision);
+    if (p !== lastProvisionText) {
+      lastProvisionText = p;
+      if (p) note(p);
+    }
+    const s = skipText(skip);
+    if (s !== lastSkipText) {
+      lastSkipText = s;
+      if (s) note(s);
+    }
+    update({
+      speed: rt?.speed() ?? 0,
+      rebooting,
+      provision,
+      skip,
+      setupOnScreen: running && rt !== null && rt.setupOnScreen(),
+    });
+  }
+
+  // --- Visibility and motion ---------------------------------------------
+  const sink = (mg: Mg): void => {
+    if (hidden) return;
+    firmwareRuntime?.setAcceleration(mg);
+  };
+  const unsubscribeVisibility = visibility.subscribe(() => {
+    const now = visibility.hidden();
+    if (now === hidden) return;
+    hidden = now;
+    if (hidden) firmwareRuntime?.setAcceleration(HANGING_REST_MG);
+  });
+
+  let phone: MotionSource | null = null;
+  /**
+   * Counts phone-motion turns, so a permission answer that arrives after
+   * a later turn (off, or dispose) is ignored; `requesting` keeps a second
+   * "on" click from asking again while the first is pending.
+   */
+  let motionSeq = 0;
+  let requesting = false;
+
+  async function usePhoneMotion(on: boolean): Promise<void> {
+    if (!on) {
+      motionSeq++;
+      requesting = false;
+      phone?.stop();
+      if (snapshot.motion === "phone") note("phone motion off: the swing drives the badge");
+      update({ motion: "physics" });
+      return;
+    }
+    if (snapshot.motion === "phone" || requesting) return;
+    const seq = ++motionSeq;
+    requesting = true;
+    // Asked before any await: iOS needs the click's user gesture.
+    const pending = motionDeps.request();
+    let answer: Awaited<typeof pending>;
+    try {
+      answer = await pending;
+    } catch {
+      answer = "denied";
+    }
+    if (seq !== motionSeq || disposed) return; // turned off meanwhile
+    requesting = false;
+    if (answer !== "granted") {
+      note(
+        answer === "denied"
+          ? "phone motion was denied: the swing still drives the badge"
+          : "phone motion is not available here (it needs a phone and HTTPS): the swing still drives the badge",
+      );
+      return;
+    }
+    phone ??= motionDeps.create();
+    phone.start(sink);
+    update({ motion: "phone" });
+    note("phone motion on: the phone is the badge");
+  }
+
+  const unsubscribeTouchFirst = touchFirst.subscribe(() => update({ phoneMotionAvailable: phoneMotionAvailable() }));
+
+  // --- Links -------------------------------------------------------------
+  const links = createLinks(hub, deps.signal, { note, pageEvents: deps.pageEvents });
+  const syncLinks = () => update({ linkStatus: links.summary(), hostingRoom: links.hosting() });
+  const unsubscribeLinks = links.subscribe(syncLinks);
+
+  // --- The board's client ------------------------------------------------
+  const client: BadgeClient = {
+    injectButton: (button, kind, source) => firmwareRuntime?.injectButton(button, kind, source),
+    powerCycle: () => controller.powerCycle(),
+    rebooting: () => firmwareRuntime?.rebooting() ?? false,
+    onLeds(cb) {
+      ledListeners.add(cb);
+      return () => {
+        ledListeners.delete(cb);
+      };
+    },
   };
 
-  let fetchError = "";
-  /**
-   * Which of the two the user started last: its state is the status text.
-   * The runtime keeps a finished skip's state through later provisions.
-   */
-  let lastStarted: "provision" | "skip" | null = null;
-  const provisionControls: ProvisionControls = shell.mountProvisionControls(
-    deps.roles,
-    async (role) => {
-      fetchError = "";
-      lastStarted = "provision";
+  const controller: BadgeController = {
+    subscribe(cb) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+      };
+    },
+    getSnapshot: () => snapshot,
+    firmware: () => firmwareRuntime,
+    client,
+    console: log,
+    setCanvas(next) {
+      canvas = next;
+      ctx = next?.getContext("2d") ?? null;
+      if (snapshot.tabNotice) clearScreen();
+    },
+    async provision(role) {
       try {
         // Boots and starts the badge if it isn't running (a retry after a
         // failed first boot). Without the badge it boots nothing and shows
         // the notice: another tab runs it.
         await startFirmware();
-        const rt = firmwareRuntime;
-        if (!badgeHold || !rt) return;
-        rt.provision(await deps.fetchIdentity(role));
+      } catch (e) {
+        startFailed(e);
+        return;
+      }
+      const rt = firmwareRuntime;
+      if (!badgeHold || !rt) return;
+      let identity: string;
+      try {
+        identity = await deps.fetchIdentity(role);
       } catch (e) {
         console.error(`Could not load test identity ${role}:`, e);
-        fetchError = `could not load ${role}`;
+        note(`could not load ${role}`);
+        return;
       }
+      rt.provision(identity);
+      refreshStatus();
     },
-    () => {
-      // A stopped badge types nothing, and a refused click keeps the last
-      // status line (Milestone 13's final review, R-FR-1 and R-FR-3).
+    skipSetup() {
+      // A stopped badge types nothing, and the client refuses a click
+      // unless Setup is on screen (Milestone 13's R-FR-1 and R-FR-3).
       const rt = firmwareRuntime;
       if (!running || !rt?.setupOnScreen()) return;
-      lastStarted = "skip";
       rt.skipSetup();
       refreshStatus();
     },
-  );
-
-  /**
-   * The provisioning controls from the runtime's last status. Skip setup
-   * shows only while the firmware's Setup app is on screen, no skip is
-   * typing, no provision is in flight (the provision's token phase runs
-   * after Setup appears; Milestone 13's ruling T4-1) and the badge runs in
-   * this tab (a stopped badge posts no status; R-FR-1). Provision is
-   * disabled while a skip types (ruling T5-1). The speed reads
-   * `rebooting…` through the reboot's pause, not a speed (ride-along 4).
-   */
-  function refreshStatus(): void {
-    provisionControls.setVisible(true);
-    const rt = firmwareRuntime;
-    const st = rt?.provisionState() ?? null;
-    const skip = rt?.skipState() ?? null;
-    const provisionInFlight = st?.kind === "waiting" || st?.kind === "typing";
-    const skipTyping = skip?.kind === "typing";
-    provisionControls.setSkipVisible(
-      running && rt !== null && rt.setupOnScreen() && !skipTyping && !provisionInFlight,
-    );
-    provisionControls.setProvisionEnabled(!skipTyping);
-    let text = fetchError;
-    if (st) {
-      if (st.kind === "waiting") text = "waiting for the console\u2026";
-      else if (st.kind === "typing") text = "provisioning\u2026";
-      else if ("line" in st) text = st.line;
-      else if ("reason" in st) text = `failed: ${st.reason}`;
-    }
-    // The skip's state shows only while it is the newer of the two (`lastStarted`);
-    // `done` adds nothing (the screen shows it).
-    if (lastStarted === "skip") {
-      if (skip?.kind === "typing") text = "skipping setup…";
-      else if (skip?.kind === "failed") text = `skip failed: ${skip.reason}`;
-    }
-    if (rt) {
-      // The emulated/wall ratio: below 1x the step cap binds (slow motion).
-      const speed = rt.speed();
-      const prefix = rt.rebooting() ? "rebooting…" : speed > 0 ? `${speed.toFixed(1)}x` : "";
-      provisionControls.setStatus([prefix, text].filter(Boolean).join(" · "));
-    } else {
-      provisionControls.setStatus(text);
-    }
-  }
-
-  shell.renderLeds([]); // the firmware models no LED peripheral yet
-  void startFirmware().catch(startFailed);
-
-  return {
-    firmware: () => firmwareRuntime,
-    inject,
+    powerCycle() {
+      // The Worker's runtime ignores a press while it reboots (Review Focus 2).
+      if (!running) return;
+      firmwareRuntime?.powerCycle();
+    },
+    runHere,
+    host: () => links.host(),
+    cancelHost: () => links.cancelHost(),
+    join: (code) => links.join(code),
+    usePhoneMotion,
+    motionSink: () => sink,
     refreshStatus,
     dispose() {
-      firmwareRuntime?.dispose();
+      if (disposed) return;
+      disposed = true;
+      motionSeq++;
+      unsubscribeVisibility();
+      unsubscribeTouchFirst();
+      unsubscribeLinks();
+      phone?.stop();
+      links.dispose();
+      const rt = firmwareRuntime;
+      firmwareRuntime = null;
+      rt?.dispose();
+      if (running) {
+        running = false;
+        hub.setRunning(false);
+      }
       releaseBadge();
     },
   };
-}
 
-function errorText(e: unknown, fallback: string): string {
-  return e instanceof SignalError ? e.message : fallback;
-}
-
-/**
- * Mounts the link panel and runs its links into `hub`: one hosted room at
- * a time (hosting again cancels a room no one has joined yet) and any
- * number of links; a link leaves the hub when it closes. Returns the panel
- * and a function that closes every link (for unload). `signal` reaches
- * `/api/signal` and WebRTC; the browser's when omitted.
- */
-export function mountLinks(
-  shell: Pick<ShellHandles, "mountLinkPanel">,
-  hub: Pick<RadioHub, "addLink" | "removeLink">,
-  signal: SignalDeps = {},
-): { panel: LinkPanel; closeAll(): void } {
-  const links = new Map<string, PeerLink>();
-  let hosting: HostedRoom | null = null;
-  /**
-   * Counts host presses and cancels: a room whose `hostRoom` returns after
-   * a later press or a cancel is closed at once, not orphaned.
-   */
-  let hostSeq = 0;
-
-  function track(link: PeerLink): void {
-    links.set(link.id, link);
-    hub.addLink(link);
-    link.onStateChange((state) => {
-      if (state !== "closed") return;
-      links.delete(link.id);
-      hub.removeLink(link.id);
-    });
-  }
-
-  /**
-   * The cancel wiring (Milestone 11 Task 10): stops waiting on the hosted
-   * room, closes its link, and has `hostRoom`'s cancel send `close` (best
-   * effort, never throws), so a later joiner hears "Room closed or
-   * expired." at once. Every path that drops a hosted room comes here.
-   */
-  function cancelHosting(): void {
-    hostSeq++;
-    const h = hosting;
-    hosting = null;
-    h?.cancel();
-  }
-
-  async function host(): Promise<void> {
-    cancelHosting();
-    const seq = hostSeq;
-    panel.setStatus("Creating a room\u2026");
-    try {
-      const h = await hostRoom(signal);
-      if (seq !== hostSeq) {
-        // Hosted again, or cancelled, while this room was made.
-        h.cancel();
-        return;
-      }
-      hosting = h;
-      track(h.link);
-      panel.setStatus(`Room ${h.room}: enter this code in the other browser\u2019s Join link, within 2 minutes.`);
-      h.connected.then(
-        () => {
-          if (hosting === h) hosting = null;
-          panel.setStatus(`Room ${h.room}: linked.`);
-        },
-        (e: unknown) => {
-          if (hosting !== h) return; // replaced or removed: its status is stale
-          hosting = null;
-          panel.setStatus(errorText(e, "Linking failed."));
-        },
-      );
-    } catch (e) {
-      if (seq === hostSeq) panel.setStatus(errorText(e, "Could not host a room."));
-    }
-  }
-
-  async function join(code: string): Promise<void> {
-    panel.setStatus(`Joining ${code.trim()}\u2026`);
-    try {
-      const link = await joinRoom(code, signal);
-      track(link);
-      panel.setStatus("Linked.");
-    } catch (e) {
-      panel.setStatus(errorText(e, "Could not join the room."));
-    }
-  }
-
-  const panel = shell.mountLinkPanel({
-    onHost: () => void host(),
-    onJoin: (code) => void join(code),
-  });
-  return {
-    panel,
-    closeAll() {
-      cancelHosting();
-      for (const link of links.values()) link.close();
-    },
-  };
+  void startFirmware().catch(startFailed);
+  return controller;
 }

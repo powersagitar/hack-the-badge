@@ -39,4 +39,14 @@ describe("keyAction", () => {
     expect(keyAction("ArrowUp", el("BUTTON"))).toEqual({ button: "UP" });
     expect(keyAction("Escape", el("BUTTON"))).toEqual({ button: "HOME" });
   });
+
+  test("an open list or its trigger keeps every key (the role Select)", () => {
+    const role = (tagName: string, r: string) => el(tagName, { getAttribute: (n: string) => (n === "role" ? r : null) });
+    for (const code of ["Escape", "ArrowUp", "ArrowDown", "Enter", "Space", "KeyS"]) {
+      expect(keyAction(code, role("DIV", "option"))).toBeNull();
+      expect(keyAction(code, role("DIV", "listbox"))).toBeNull();
+      expect(keyAction(code, role("BUTTON", "combobox"))).toBeNull();
+    }
+    expect(keyAction("Escape", role("DIV", "img"))).toEqual({ button: "HOME" });
+  });
 });

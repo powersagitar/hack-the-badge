@@ -2,8 +2,8 @@
  * The main-thread side of the firmware Worker (Milestone 7 Task 8): a
  * `FirmwareRuntime` whose methods post messages to `./firmware-worker.ts`
  * and whose synchronous getters (`speed()`, `provisionState()`) return the
- * last `status` the Worker posted, so `main.ts` and `shell.ts` use it
- * exactly as they used the in-thread runtime.
+ * last `status` the Worker posted, so the page's controller
+ * (`../ui/badge-controller.ts`) uses it as it used the in-thread runtime.
  *
  * - `init` (the WASM bytes and `firmware.bin`, transferred) is posted at
  *   once; every other message sent before the Worker's `ready` is queued
@@ -137,7 +137,7 @@ export interface WorkerFirmwareRuntime
 
 export function createWorkerFirmwareRuntime(
   worker: WorkerLike,
-  ctx: CanvasRenderingContext2D,
+  ctx: Pick<CanvasRenderingContext2D, "putImageData">,
   wasm: ArrayBuffer,
   image: ArrayBuffer,
   options: WorkerClientOptions = {},

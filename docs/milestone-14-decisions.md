@@ -693,3 +693,112 @@ the ±2000 clamp.
 - **The rope** is drawn as the design's `tick`: quadratic segments
   through the rope's nodes, ending 12 px above the ring, toward the
   anchor.
+
+## Controller and tools (Task 12)
+
+`frontend/src/ui/badge-controller.ts` (the store), `ToolsPanel.tsx`,
+`frontend/src/radio/links.ts`; `main.ts`, `ui/shell.ts`, `ui/shell.css`
+and `test/shell.test.ts` are deleted, and their still-relevant coverage
+moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
+`test/links.test.ts` and `test/app-shell.test.tsx`.
+
+- **The store.** `createBadgeController(deps)` keeps the old controller's
+  logic (badge lock, lazy Worker boot that is not cached on failure, the
+  hub's running gate, the skip gate) and exposes one immutable
+  `BadgeSnapshot` through `subscribe`/`getSnapshot`. `main.tsx` polls
+  `refreshStatus()` every 250 ms, as the old `main.ts` did, and every
+  action refreshes too.
+- **Beyond the brief's interface:** `client` (a stable `BadgeClient` for
+  the stage, forwarding to the firmware once it boots, LED listeners
+  included), `setCanvas` (the stage's `onCanvas`; the Worker client
+  blits through a forwarder, so the Worker boots before the canvas
+  mounts; its `ctx` type is now `Pick<…, "putImageData">`),
+  `cancelHost`, `refreshStatus`, and the snapshot field `hostingRoom`.
+  `createLinks` takes a third `options` argument: `note` (the console's
+  `appendPage`) and `pageEvents` (where `pagehide` comes from).
+- **Page lines.** The texts are the old status line's. Each stream is
+  logged when its own text changes: `rebooting…` on a reboot's start, the
+  provision's (`waiting for the console…`, `provisioning…`, its PROV OK
+  line, `failed: …`) and the skip's (`skipping setup…`, `skip failed: …`;
+  `done` adds nothing). The old "whichever was started last" rule
+  (`lastStarted`) is gone: in a log both streams coexist, and an old skip
+  failure the Worker keeps reporting is not repeated. The speed is not a
+  line; it is the header's SPEED INDEX. `rebooting…` can land just after
+  the console's reboot marker, since the marker comes with the serial
+  chunk and the line with the next status poll.
+- **Boot failure (Task 4 minor).** A failed boot from a provision now
+  says `could not start the badge` (`START_FAILED_NOTE`); only a failed
+  identity fetch says `could not load <role>`, and keeps the badge.
+- **Hidden page (Review Focus 1).** On hidden, the controller sets the
+  hanging rest `[0, 1000, 0]` through `BOARD_AXES` (`HANGING_REST_MG`) and
+  its sink drops samples until visible. The client holds that reading (no
+  animation frame runs while hidden) and posts it just before `start`
+  (Task 6). A badge booted on a hidden page gets the rest before its
+  first start.
+- **Phone motion.** `usePhoneMotion(true)` calls the permission request
+  before any `await` (iOS's gesture). Denied or unsupported keeps
+  `"physics"` with a `[page]` line saying why. The stage's `sink` is the
+  controller's while `motion` is `"physics"` and `null` otherwise, which
+  stops the lanyard's readings; the phone source gets the same gated sink.
+  Lanyard-follows-phone, drag/keys off and bumps are Task 13's (R3), so
+  `onLanyard` is not wired yet.
+  **"Use phone motion" shows only on a touch-first device** (the human
+  partner, 2026-11-12; the controller's ruling on "mobile"):
+  `phoneMotionAvailable` is `motionAvailable()` and
+  `matchMedia("(hover: none) and (pointer: coarse)")`
+  (`TOUCH_FIRST_QUERY`), not the 768 px layout breakpoint, so a narrow
+  desktop window never offers it. Desktop Chrome on localhost has
+  DeviceMotion, and before this the button showed there. The query is a
+  controller dep (`touchFirst`, a `MediaQuerySeam`), and a change of its
+  match re-reads the field. A phone-motion source that is already on is
+  left alone if the match flips.
+- **BADGE LINK.** `summary()` is `Hosting <room>`, `Linked to N badge(s)`
+  (joined by " · " when both apply), or the signal client's last message.
+  **Cancelling a hosted room:** while a room waits, Host link becomes
+  "Cancel host" (the design's `.ghost.on`), which closes the room on the
+  server and notes `Stopped hosting room <room>.`; the design has no other
+  slot for it. An open link that closes notes `A badge link closed.`; a
+  link that never opened notes its failure's reason instead. `pagehide`
+  closes every link and cancels a waiting room.
+- **Unload.** `main.tsx` disposes the controller on `pagehide` (not
+  `beforeunload`, which mobile browsers skip), freeing the badge lock; a
+  page restored from the back/forward cache reloads.
+- **Escape and the ROLE select (Task 11 minor).** A real conflict: with
+  the Radix Select open, focus is on a `role="option"` div, so Escape,
+  the arrows and Enter also pressed HOME/UP/DOWN/START. `keyAction` now
+  ignores targets with role `combobox`, `listbox` or `option`; Radix still
+  closes on Escape (`tools-panel.test.tsx` opens the real Select and
+  checks both).
+- **CONSOLE.LOG rows** got `shrink-0`: mounted in the aside's fixed-height
+  column, wrapped rows shrank to one line and overlapped (seen in the
+  browser).
+- **Tab notice** colours are theme tokens (`--notice`, `--notice-border`,
+  `--notice-foreground`), from the design's banner.
+- **Build:** JS 483.81 kB (gzip 155.95 kB), CSS 27.54 kB; the worker,
+  bridge and wasm chunks are back.
+- **Fix round 1 (review).**
+  - Phone motion: a sequence number and a pending flag. A second "on"
+    click while the permission prompt is open asks nothing, and an "off"
+    (or dispose) while it is open wins over a late grant. The request
+    itself is still made synchronously inside the click.
+  - `dispose()` sets the runtime to null, closes the hub's running gate
+    (`setRunning(false)`), and stops a boot that is still in flight from
+    ever starting. `Links.dispose()` removes its `pagehide` listener and
+    closes the links. `main.tsx` clears its status poll on `pagehide`.
+  - A store subscriber that throws is logged and does not stop the
+    others or `refreshStatus`.
+  - `main.tsx` guards construction. If the hub, the controller or the
+    first render throws, the page shows a plain "Failed to start: …"
+    (the old `main.ts` fallback).
+  - **Focus after choosing a role: kept on the ROLE trigger** (the
+    reviewer's choice 6). Radix returns focus to the trigger when the
+    list closes, and that is the expected keyboard behaviour: a
+    keyboard-only visitor can Tab on to PROVISION from there. Blurring
+    would drop that visitor's place to `<body>`. While the trigger has
+    focus, the badge keys stay with it (ruling above): its arrows reopen
+    the list. A mouse visitor's next click (PROVISION, the board) moves
+    focus off it, and the keys work again.
+  - The tab notice's screen clear is covered again (the ported
+    `notice_clears_the_canvas`). The screen is cleared when the badge is
+    lost with the canvas already mounted, and when the canvas mounts
+    under the notice. A frame blits into whichever canvas is current.

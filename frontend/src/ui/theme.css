@@ -45,6 +45,11 @@
   --placeholder: #6f6f6f;
   --ring: #b07ccb;
 
+  /* The tab notice ("Badge running in another tab"). */
+  --notice: #1a1220;
+  --notice-border: #5a3b6b;
+  --notice-foreground: #e6d6ee;
+
   /* Not in the design; shadcn's components reference it. */
   --destructive: #e5484d;
 
@@ -79,6 +84,9 @@
   --color-placeholder: var(--placeholder);
   --color-ring: var(--ring);
   --color-destructive: var(--destructive);
+  --color-notice: var(--notice);
+  --color-notice-border: var(--notice-border);
+  --color-notice-foreground: var(--notice-foreground);
 
   /* 6 px controls; 12 px desktop panels; 14 px mobile panels. */
   --radius-sm: calc(var(--radius) - 2px);
