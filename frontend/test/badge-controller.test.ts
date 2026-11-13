@@ -6,6 +6,7 @@ import {
   type BadgeController,
   type BadgeWorker,
   HANGING_REST_MG,
+  type PhoneMotionDeps,
   START_FAILED_NOTE,
   createBadgeController,
 } from "../src/ui/badge-controller";
@@ -89,6 +90,11 @@ function rig(
   if (opts.hidden) visibility.set(true);
   const frames: Array<() => void> = [];
   const phone = fakePhone();
+  const motionDeps: PhoneMotionDeps = {
+    available: () => opts.motionAvailable ?? true,
+    request: async () => opts.permission ?? "granted",
+    create: () => phone.source,
+  };
   const controller: BadgeController = createBadgeController({
     hub: {
       fromLocal() {},
@@ -116,11 +122,7 @@ function rig(
       scheduleFrame: (cb) => frames.push(() => cb(0)),
       cancelFrame: () => {},
     },
-    motion: {
-      available: () => opts.motionAvailable ?? true,
-      request: async () => opts.permission ?? "granted",
-      create: () => phone.source,
-    },
+    motion: motionDeps,
   });
   /** Runs the queued animation frames. */
   const flushFrames = () => {
@@ -155,6 +157,7 @@ function rig(
     sent,
     snap,
     phone,
+    motionDeps,
     freeOtherTab: () => freeOtherTab(),
   };
 }
@@ -470,5 +473,121 @@ describe("badge controller", () => {
     await r.controller.usePhoneMotion(true);
     expect(r.snap().motion).toBe("physics");
     expect(r.pageLines().at(-1)).toMatch(/phone motion is not available/);
+  });
+
+  test("phone motion turned off while its permission is pending stays off", async () => {
+    const r = rig();
+    await settle();
+    let grant!: (a: "granted") => void;
+    let requests = 0;
+    // Hold the answer: the permission prompt is still open.
+    const motion = r.motionDeps;
+    motion.request = () => {
+      requests++;
+      return new Promise((resolve) => (grant = resolve));
+    };
+    const on = r.controller.usePhoneMotion(true);
+    const again = r.controller.usePhoneMotion(true); // a second quick click
+    expect(requests).toBe(1); // asked once, synchronously inside the click
+    await r.controller.usePhoneMotion(false);
+    grant("granted");
+    await on;
+    await again;
+    expect(r.snap().motion).toBe("physics");
+    expect(r.phone.started()).toBe(false);
+    expect(r.pageLines().filter((l) => l.startsWith("phone motion on"))).toHaveLength(0);
+  });
+
+  test("dispose stops the badge and closes the gate", async () => {
+    const r = rig();
+    await settle();
+    r.controller.dispose();
+    expect(r.controller.firmware()).toBeNull();
+    expect(r.running).toEqual([true, false]);
+    // Nothing reaches a disposed Worker.
+    r.controller.powerCycle();
+    r.controller.skipSetup();
+    expect(r.sent().filter((m) => m.kind === "powerCycle" || m.kind === "skipSetup")).toHaveLength(0);
+  });
+
+  test("a throwing subscriber does not stop the others or the status", async () => {
+    const r = rig();
+    await settle();
+    let heard = 0;
+    r.controller.subscribe(() => {
+      throw new Error("bad subscriber");
+    });
+    r.controller.subscribe(() => heard++);
+    const errors = await quietErrors(async () => r.status({ speed: 0.5 }));
+    expect(errors.length).toBe(1);
+    expect(heard).toBe(1);
+    expect(r.snap().speed).toBe(0.5);
+  });
+});
+
+/** A canvas whose 2D context records its clears and blits. */
+function fakeCanvas() {
+  const calls: string[] = [];
+  const ctx = {
+    clearRect: (x: number, y: number, w: number, h: number) => void calls.push(`clear ${x},${y},${w},${h}`),
+    putImageData: (img: { width: number; height: number }) => void calls.push(`blit ${img.width}x${img.height}`),
+  };
+  const canvas = { width: 320, height: 240, getContext: () => ctx } as unknown as HTMLCanvasElement;
+  return { canvas, calls };
+}
+
+describe("the badge's screen", () => {
+  test("the screen clears when the badge is lost to another tab", async () => {
+    const r = rig();
+    const { canvas, calls } = fakeCanvas();
+    r.controller.setCanvas(canvas);
+    await settle();
+    expect(calls).toEqual([]);
+    void r.locks.request(BADGE_LOCK_NAME, { steal: true }, () => new Promise(() => {}));
+    await settle();
+    expect(r.snap().tabNotice).toBe(true);
+    expect(calls).toEqual(["clear 0,0,320,240"]);
+  });
+
+  test("a canvas that mounts under the tab notice is cleared", async () => {
+    const r = rig({ otherTab: true });
+    await settle();
+    expect(r.snap().tabNotice).toBe(true);
+    const { canvas, calls } = fakeCanvas();
+    r.controller.setCanvas(canvas);
+    expect(calls).toEqual(["clear 0,0,320,240"]);
+  });
+
+  test("a frame blits into the current canvas", async () => {
+    // Bun has no ImageData; blitFramebuffer only builds one (test/framebuffer.test.ts).
+    const g = globalThis as { ImageData?: unknown };
+    const saved = Object.getOwnPropertyDescriptor(g, "ImageData");
+    g.ImageData = class {
+      constructor(
+        readonly data: Uint8ClampedArray,
+        readonly width: number,
+        readonly height: number,
+      ) {}
+    };
+    try {
+      const r = rig();
+      await settle();
+      const first = fakeCanvas();
+      const second = fakeCanvas();
+      r.controller.setCanvas(first.canvas);
+      const frame = () =>
+        r.workers[0]!.w.onmessage?.({ data: { kind: "frame", pixels: new ArrayBuffer(4 * 2 * 2), width: 4, height: 2 } });
+      frame();
+      r.flushFrames();
+      r.controller.setCanvas(second.canvas); // a new canvas (a layout flip)
+      frame();
+      r.flushFrames();
+      expect(first.calls).toEqual(["blit 4x2"]);
+      expect(second.calls).toEqual(["blit 4x2"]);
+      expect(r.sent().filter((m) => m.kind === "frameAck")).toHaveLength(2);
+    } finally {
+      if (saved) Object.defineProperty(g, "ImageData", saved);
+      else delete g.ImageData;
+    }
   });
 });

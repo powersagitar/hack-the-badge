@@ -163,4 +163,28 @@ describe("links", () => {
     expect(ops).toContain(`close ${waiting}`);
     expect(c.hub.links.size).toBe(0);
   });
+
+  test("dispose closes the links and stops listening for pagehide", async () => {
+    const { deps, ops } = network();
+    const pageEvents = new EventTarget();
+    let added = 0;
+    let removed = 0;
+    const events = {
+      addEventListener: (t: string, cb: EventListenerOrEventListenerObject) => {
+        added++;
+        pageEvents.addEventListener(t, cb);
+      },
+      removeEventListener: (t: string, cb: EventListenerOrEventListenerObject) => {
+        removed++;
+        pageEvents.removeEventListener(t, cb);
+      },
+    };
+    const a = createLinks(fakeHub(), deps, { pageEvents: events });
+    const room = await a.host();
+    a.dispose();
+    await settle();
+    expect([added, removed]).toEqual([1, 1]);
+    expect(ops).toContain(`close ${room}`);
+    expect(a.hosting()).toBeNull();
+  });
 });

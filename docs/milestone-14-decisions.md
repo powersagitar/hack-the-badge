@@ -767,3 +767,29 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   `--notice-foreground`), from the design's banner.
 - **Build:** JS 483.81 kB (gzip 155.95 kB), CSS 27.54 kB; the worker,
   bridge and wasm chunks are back.
+- **Fix round 1 (review).**
+  - Phone motion: a sequence number and a pending flag. A second "on"
+    click while the permission prompt is open asks nothing, and an "off"
+    (or dispose) while it is open wins over a late grant. The request
+    itself is still made synchronously inside the click.
+  - `dispose()` sets the runtime to null, closes the hub's running gate
+    (`setRunning(false)`), and stops a boot that is still in flight from
+    ever starting. `Links.dispose()` removes its `pagehide` listener and
+    closes the links. `main.tsx` clears its status poll on `pagehide`.
+  - A store subscriber that throws is logged and does not stop the
+    others or `refreshStatus`.
+  - `main.tsx` guards construction. If the hub, the controller or the
+    first render throws, the page shows a plain "Failed to start: …"
+    (the old `main.ts` fallback).
+  - **Focus after choosing a role: kept on the ROLE trigger** (the
+    reviewer's choice 6). Radix returns focus to the trigger when the
+    list closes, and that is the expected keyboard behaviour: a
+    keyboard-only visitor can Tab on to PROVISION from there. Blurring
+    would drop that visitor's place to `<body>`. While the trigger has
+    focus, the badge keys stay with it (ruling above): its arrows reopen
+    the list. A mouse visitor's next click (PROVISION, the board) moves
+    focus off it, and the keys work again.
+  - The tab notice's screen clear is covered again (the ported
+    `notice_clears_the_canvas`). The screen is cleared when the badge is
+    lost with the canvas already mounted, and when the canvas mounts
+    under the notice. A frame blits into whichever canvas is current.

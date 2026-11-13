@@ -23,7 +23,8 @@
  *   link that opens, a failure's reason, a cancelled room, and an open
  *   link that closes ("A badge link closed."). A link that never opened
  *   says why through its failure instead.
- * - **pagehide** closes every link and cancels a waiting room.
+ * - **pagehide** closes every link and cancels a waiting room, until
+ *   {@link Links.dispose} removes that listener (and closes them too).
  */
 import type { RadioHub } from "./hub";
 import type { PeerLink } from "./peer-link";
@@ -42,6 +43,8 @@ export interface Links {
   subscribe(cb: () => void): () => void;
   /** Closes every link and cancels a waiting room (what pagehide does). */
   closeAll(): void;
+  /** Closes everything and stops listening for pagehide (the controller's dispose). */
+  dispose(): void;
 }
 
 export interface LinksOptions {
@@ -226,5 +229,9 @@ export function createLinks(
       };
     },
     closeAll,
+    dispose() {
+      pageEvents?.removeEventListener("pagehide", closeAll);
+      closeAll();
+    },
   };
 }

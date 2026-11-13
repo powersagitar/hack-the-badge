@@ -11,9 +11,12 @@
  * - The hub delivers linked peers' advertisements to the firmware. A peer's
  *   bump is dropped until Task 13 rewires it to the active motion source's
  *   `peerBump` (ruling R3).
- * - `pagehide` disposes the controller (it frees the badge for another tab;
- *   the links close on it too). A page restored from the back/forward
- *   cache reloads, since its badge is gone.
+ * - Construction is guarded: if the hub, the controller or the first
+ *   render throws, the page shows a plain "Failed to start" message.
+ * - `pagehide` stops the status poll and disposes the controller (it
+ *   frees the badge for another tab and closes the links). A page
+ *   restored from the back/forward cache reloads, since its badge is
+ *   gone.
  */
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
@@ -21,7 +24,7 @@ import { RadioHub } from "./radio/hub";
 import { loadOrCreateMac } from "./radio/lock";
 import { testIdentityUrl } from "./runtime/test-identities";
 import { App } from "./ui/App";
-import { type BadgeWorker, createBadgeController } from "./ui/badge-controller";
+import { type BadgeController, type BadgeWorker, createBadgeController } from "./ui/badge-controller";
 import "./ui/theme.css";
 
 const FIRMWARE_IMAGE_URL = "/firmware/firmware.bin";
@@ -50,43 +53,64 @@ function browserStorage(): Storage | null {
   }
 }
 
+function main(root: HTMLElement): void {
+  let controller: BadgeController | null = null;
+  const hub = new RadioHub({
+    deliver: (bytes, rssi) => controller?.firmware()?.deliverAdvertisement(bytes, rssi),
+    // A peer's bump is dropped until Task 13 rewires it to the active motion
+    // source's peerBump (ruling R3).
+    bumpLocal: () => {},
+  });
+
+  const c = createBadgeController({
+    hub,
+    loadImages: async () => {
+      const [wasm, image] = await Promise.all([fetchBytes(CPU_WASM_URL), fetchBytes(FIRMWARE_IMAGE_URL)]);
+      return { wasm, image };
+    },
+    // A real Worker's handlers take DOM event types; the client needs only `data`.
+    createWorker: () =>
+      new Worker(new URL("./runtime/firmware-worker.ts", import.meta.url), {
+        type: "module",
+      }) as unknown as BadgeWorker,
+    mac: () => loadOrCreateMac(browserStorage()),
+    fetchIdentity: async (role) => {
+      const res = await fetch(testIdentityUrl(role));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.text();
+    },
+  });
+  controller = c;
+
+  const poll = setInterval(() => c.refreshStatus(), STATUS_POLL_MS);
+  window.addEventListener("pagehide", () => {
+    clearInterval(poll);
+    c.dispose();
+  });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) window.location.reload();
+  });
+
+  createRoot(root).render(
+    <StrictMode>
+      <App controller={c} />
+    </StrictMode>,
+  );
+}
+
+/** A plain-DOM message when the page cannot start at all (as the old `main.ts` showed). */
+function showStartFailure(root: HTMLElement | null, e: unknown): void {
+  console.error("Failed to start the badge emulator:", e);
+  const pre = document.createElement("pre");
+  pre.style.cssText = "color:#ff6666;white-space:pre-wrap;padding:16px;font-family:monospace";
+  pre.textContent = `Failed to start: ${e instanceof Error ? e.message : String(e)}`;
+  (root ?? document.body).replaceChildren(pre);
+}
+
 const root = document.getElementById("root");
-if (!root) throw new Error("index.html has no #root");
-
-const hub = new RadioHub({
-  deliver: (bytes, rssi) => controller.firmware()?.deliverAdvertisement(bytes, rssi),
-  // A peer's bump is dropped until Task 13 rewires it to the active motion
-  // source's peerBump (ruling R3).
-  bumpLocal: () => {},
-});
-
-const controller = createBadgeController({
-  hub,
-  loadImages: async () => {
-    const [wasm, image] = await Promise.all([fetchBytes(CPU_WASM_URL), fetchBytes(FIRMWARE_IMAGE_URL)]);
-    return { wasm, image };
-  },
-  // A real Worker's handlers take DOM event types; the client needs only `data`.
-  createWorker: () =>
-    new Worker(new URL("./runtime/firmware-worker.ts", import.meta.url), {
-      type: "module",
-    }) as unknown as BadgeWorker,
-  mac: () => loadOrCreateMac(browserStorage()),
-  fetchIdentity: async (role) => {
-    const res = await fetch(testIdentityUrl(role));
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.text();
-  },
-});
-
-setInterval(() => controller.refreshStatus(), STATUS_POLL_MS);
-window.addEventListener("pagehide", () => controller.dispose());
-window.addEventListener("pageshow", (e) => {
-  if (e.persisted) window.location.reload();
-});
-
-createRoot(root).render(
-  <StrictMode>
-    <App controller={controller} />
-  </StrictMode>,
-);
+try {
+  if (!root) throw new Error("index.html has no #root");
+  main(root);
+} catch (e) {
+  showStartFailure(root, e);
+}

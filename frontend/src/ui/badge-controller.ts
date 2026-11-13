@@ -208,6 +208,8 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
 
   // --- The store ---------------------------------------------------------
   const listeners = new Set<() => void>();
+  /** Set by dispose(): nothing boots, starts or turns on after it. */
+  let disposed = false;
   let snapshot: BadgeSnapshot = {
     speed: 0,
     rebooting: false,
@@ -227,7 +229,14 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     }
     if (!changed) return;
     snapshot = { ...snapshot, ...next };
-    for (const cb of [...listeners]) cb();
+    for (const cb of [...listeners]) {
+      try {
+        cb();
+      } catch (e) {
+        // One failing subscriber must not abort refreshStatus or the others.
+        console.error("badge controller: listener failed:", e);
+      }
+    }
   }
 
   // --- The screen --------------------------------------------------------
@@ -277,6 +286,11 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       } catch (e) {
         rt.dispose();
         throw e;
+      }
+      if (disposed) {
+        // Unloaded while it booted: it never runs.
+        rt.dispose();
+        throw new Error("badge controller: disposed while booting");
       }
       firmwareRuntime = rt;
       return rt;
@@ -351,7 +365,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       throw e;
     }
     // Another tab took the badge while it booted, or it already runs.
-    if (!badgeHold || running) return;
+    if (!badgeHold || running || disposed) return;
     rt.start();
     running = true;
     hub.setRunning(true);
@@ -417,17 +431,36 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   });
 
   let phone: MotionSource | null = null;
+  /**
+   * Counts phone-motion turns, so a permission answer that arrives after
+   * a later turn (off, or dispose) is ignored; `requesting` keeps a second
+   * "on" click from asking again while the first is pending.
+   */
+  let motionSeq = 0;
+  let requesting = false;
 
   async function usePhoneMotion(on: boolean): Promise<void> {
     if (!on) {
+      motionSeq++;
+      requesting = false;
       phone?.stop();
       if (snapshot.motion === "phone") note("phone motion off: the swing drives the badge");
       update({ motion: "physics" });
       return;
     }
-    if (snapshot.motion === "phone") return;
+    if (snapshot.motion === "phone" || requesting) return;
+    const seq = ++motionSeq;
+    requesting = true;
     // Asked before any await: iOS needs the click's user gesture.
-    const answer = await motionDeps.request();
+    const pending = motionDeps.request();
+    let answer: Awaited<typeof pending>;
+    try {
+      answer = await pending;
+    } catch {
+      answer = "denied";
+    }
+    if (seq !== motionSeq || disposed) return; // turned off meanwhile
+    requesting = false;
     if (answer !== "granted") {
       note(
         answer === "denied"
@@ -520,11 +553,20 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     motionSink: () => sink,
     refreshStatus,
     dispose() {
+      if (disposed) return;
+      disposed = true;
+      motionSeq++;
       unsubscribeVisibility();
       unsubscribeLinks();
       phone?.stop();
-      links.closeAll();
-      firmwareRuntime?.dispose();
+      links.dispose();
+      const rt = firmwareRuntime;
+      firmwareRuntime = null;
+      rt?.dispose();
+      if (running) {
+        running = false;
+        hub.setRunning(false);
+      }
       releaseBadge();
     },
   };
