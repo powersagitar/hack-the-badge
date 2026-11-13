@@ -65,13 +65,13 @@ describe("App", () => {
     expect(view.queryByRole("group", { name: "Emulator mode" })).toBeNull();
   });
 
-  test("App lays out an empty stage slot and an empty aside slot", () => {
+  test("App lays out the stage with the badge and an empty aside slot", () => {
     const view = rtl.render(<App controller={fakeController} />);
     const stage = view.container.querySelector('[data-slot="stage"]');
     const aside = view.container.querySelector("aside");
     expect(stage).not.toBeNull();
     expect(aside).not.toBeNull();
-    expect(stage!.childElementCount).toBe(0);
+    expect(stage!.querySelector('img[alt="Hack the North 2026 hacker badge, front"]')).not.toBeNull();
     expect(aside!.childElementCount).toBe(0);
     // The stage comes before the aside, and the footer after both.
     const order = [...view.container.querySelectorAll("header, [data-slot=stage], aside, footer")].map((el) =>
