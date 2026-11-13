@@ -21,7 +21,8 @@ export const CLAMP_MG = 2000;
 
 const finite = (v: number) => (Number.isFinite(v) ? v : 0);
 
-function clampRound(v: number): number {
+/** Clamps to ±CLAMP_MG and rounds to whole mg (never -0). */
+export function clampRound(v: number): number {
   const r = Math.round(Math.max(-CLAMP_MG, Math.min(CLAMP_MG, v)));
   return r === 0 ? 0 : r; // no -0
 }
