@@ -40,7 +40,9 @@
  *   sensor, through {@link BadgeController.motionSink}. `motion` is
  *   `"physics"` (the stage's lanyard) or `"phone"` (DeviceMotion, after
  *   `usePhoneMotion(true)` is granted; asked synchronously, so iOS sees the
- *   click's gesture). **While the page is hidden** the sensor gets
+ *   click's gesture). It is offered (`phoneMotionAvailable`) only on a
+ *   touch-first device ({@link TOUCH_FIRST_QUERY}), re-read when that
+ *   media query changes. **While the page is hidden** the sensor gets
  *   {@link HANGING_REST_MG} and the sink drops samples until it is visible
  *   (Review Focus 1); the client holds that reading and posts it just
  *   before the badge's `start` when the page is visible again (Task 6).
@@ -108,6 +110,8 @@ export interface BadgeControllerDeps {
   /** The Worker client's visibility and frame scheduling; the document's when omitted. */
   clientOptions?: Pick<WorkerClientOptions, "visibility" | "scheduleFrame" | "cancelFrame">;
   motion?: PhoneMotionDeps;
+  /** Whether this is a touch-first device ({@link TOUCH_FIRST_QUERY}); `matchMedia`'s when omitted. */
+  touchFirst?: MediaQuerySeam;
 }
 
 /** The page's state, as the components read it. A new object on every change. */
@@ -127,6 +131,7 @@ export interface BadgeSnapshot {
   /** The hosted room waiting for a peer, or null (its button cancels it). */
   hostingRoom: string | null;
   motion: "physics" | "phone";
+  /** "Use phone motion" is offered: DeviceMotion works here and the device is touch-first. */
   phoneMotionAvailable: boolean;
 }
 
@@ -170,6 +175,35 @@ export interface BadgeController {
   dispose(): void;
 }
 
+/** A media query's match, and its changes. */
+export interface MediaQuerySeam {
+  matches(): boolean;
+  /** Calls `cb` when the match may have changed; returns an unsubscribe function. */
+  subscribe(cb: () => void): () => void;
+}
+
+/**
+ * A touch-first device (the human partner, 2026-11-12: "Use phone motion"
+ * shows only on mobile). Not the 768 px layout breakpoint: a narrow
+ * desktop window never offers phone motion.
+ */
+export const TOUCH_FIRST_QUERY = "(hover: none) and (pointer: coarse)";
+
+/** {@link TOUCH_FIRST_QUERY} through `matchMedia`, or never matching where there is none. */
+export function mediaQuery(query: string): MediaQuerySeam {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return { matches: () => false, subscribe: () => () => {} };
+  }
+  const mq = window.matchMedia(query);
+  return {
+    matches: () => mq.matches,
+    subscribe(cb) {
+      mq.addEventListener("change", cb);
+      return () => mq.removeEventListener("change", cb);
+    },
+  };
+}
+
 function defaultMotion(): PhoneMotionDeps {
   return {
     available: motionAvailable,
@@ -205,6 +239,9 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
   const note = (text: string) => log.appendPage(text);
   const visibility = deps.clientOptions?.visibility ?? documentVisibility();
   const motionDeps = deps.motion ?? defaultMotion();
+  const touchFirst = deps.touchFirst ?? mediaQuery(TOUCH_FIRST_QUERY);
+  /** Phone motion is offered where DeviceMotion works on a touch-first device. */
+  const phoneMotionAvailable = () => motionDeps.available() && touchFirst.matches();
 
   // --- The store ---------------------------------------------------------
   const listeners = new Set<() => void>();
@@ -220,7 +257,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     linkStatus: "",
     hostingRoom: null,
     motion: "physics",
-    phoneMotionAvailable: motionDeps.available(),
+    phoneMotionAvailable: phoneMotionAvailable(),
   };
   function update(next: Partial<BadgeSnapshot>): void {
     let changed = false;
@@ -475,6 +512,8 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     note("phone motion on: the phone is the badge");
   }
 
+  const unsubscribeTouchFirst = touchFirst.subscribe(() => update({ phoneMotionAvailable: phoneMotionAvailable() }));
+
   // --- Links -------------------------------------------------------------
   const links = createLinks(hub, deps.signal, { note, pageEvents: deps.pageEvents });
   const syncLinks = () => update({ linkStatus: links.summary(), hostingRoom: links.hosting() });
@@ -557,6 +596,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       disposed = true;
       motionSeq++;
       unsubscribeVisibility();
+      unsubscribeTouchFirst();
       unsubscribeLinks();
       phone?.stop();
       links.dispose();

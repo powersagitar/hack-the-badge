@@ -74,6 +74,7 @@ function rig(
     permission?: "granted" | "denied" | "unsupported";
     motionAvailable?: boolean;
     identity?: "ok" | "fail";
+    touchFirst?: boolean;
   } = {},
 ) {
   const locks = new FakeLockManager();
@@ -90,6 +91,12 @@ function rig(
   if (opts.hidden) visibility.set(true);
   const frames: Array<() => void> = [];
   const phone = fakePhone();
+  let touch = opts.touchFirst ?? true;
+  const touchCbs = new Set<() => void>();
+  const setTouchFirst = (t: boolean) => {
+    touch = t;
+    for (const cb of [...touchCbs]) cb();
+  };
   const motionDeps: PhoneMotionDeps = {
     available: () => opts.motionAvailable ?? true,
     request: async () => opts.permission ?? "granted",
@@ -123,6 +130,13 @@ function rig(
       cancelFrame: () => {},
     },
     motion: motionDeps,
+    touchFirst: {
+      matches: () => touch,
+      subscribe(cb) {
+        touchCbs.add(cb);
+        return () => void touchCbs.delete(cb);
+      },
+    },
   });
   /** Runs the queued animation frames. */
   const flushFrames = () => {
@@ -158,6 +172,7 @@ function rig(
     snap,
     phone,
     motionDeps,
+    setTouchFirst,
     freeOtherTab: () => freeOtherTab(),
   };
 }
@@ -464,6 +479,25 @@ describe("badge controller", () => {
     expect(r.snap().motion).toBe("physics");
     expect(r.phone.started()).toBe(false);
     expect(r.pageLines().at(-1)).toMatch(/phone motion was denied/);
+  });
+
+  test("phone motion is offered only on a touch-first device", async () => {
+    const desktop = rig({ touchFirst: false });
+    await settle();
+    // DeviceMotion exists (desktop Chrome on localhost), but no touch-first device: hidden.
+    expect(desktop.snap().phoneMotionAvailable).toBe(false);
+    // The media query starts matching (devtools device mode): it is offered.
+    desktop.setTouchFirst(true);
+    expect(desktop.snap().phoneMotionAvailable).toBe(true);
+    desktop.setTouchFirst(false);
+    expect(desktop.snap().phoneMotionAvailable).toBe(false);
+
+    const phone = rig({ touchFirst: true });
+    await settle();
+    expect(phone.snap().phoneMotionAvailable).toBe(true);
+    const noApi = rig({ touchFirst: true, motionAvailable: false });
+    await settle();
+    expect(noApi.snap().phoneMotionAvailable).toBe(false);
   });
 
   test("phone motion unavailable is reported in the snapshot", async () => {

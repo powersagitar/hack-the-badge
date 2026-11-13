@@ -741,8 +741,17 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   controller's while `motion` is `"physics"` and `null` otherwise, which
   stops the lanyard's readings; the phone source gets the same gated sink.
   Lanyard-follows-phone, drag/keys off and bumps are Task 13's (R3), so
-  `onLanyard` is not wired yet. Desktop Chrome on localhost reports
-  DeviceMotion available, so the button shows there (Task 10's note).
+  `onLanyard` is not wired yet.
+  **"Use phone motion" shows only on a touch-first device** (the human
+  partner, 2026-11-12; the controller's ruling on "mobile"):
+  `phoneMotionAvailable` is `motionAvailable()` and
+  `matchMedia("(hover: none) and (pointer: coarse)")`
+  (`TOUCH_FIRST_QUERY`), not the 768 px layout breakpoint, so a narrow
+  desktop window never offers it. Desktop Chrome on localhost has
+  DeviceMotion, and before this the button showed there. The query is a
+  controller dep (`touchFirst`, a `MediaQuerySeam`), and a change of its
+  match re-reads the field. A phone-motion source that is already on is
+  left alone if the match flips.
 - **BADGE LINK.** `summary()` is `Hosting <room>`, `Linked to N badge(s)`
   (joined by " · " when both apply), or the signal client's last message.
   **Cancelling a hosted room:** while a room waits, Host link becomes
