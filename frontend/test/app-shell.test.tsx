@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { Window } from "happy-dom";
 import type { AppController } from "../src/ui/App";
-import type { BadgeSnapshot } from "../src/ui/badge-controller";
+import type { BadgeSnapshot, ControllerLanyard } from "../src/ui/badge-controller";
+import type { StageLanyard } from "../src/ui/Stage";
 
 /**
  * The React page's tests run on a happy-dom `Window`, installed as the
@@ -78,6 +79,7 @@ function fakeController(fields: Partial<BadgeSnapshot> = {}) {
   const calls: string[] = [];
   const log = consoleLog.createConsoleLog();
   const sink = () => {};
+  const lanyards: (ControllerLanyard | null)[] = [];
   const controller: AppController = {
     subscribe: (cb) => {
       listeners.add(cb);
@@ -88,6 +90,7 @@ function fakeController(fields: Partial<BadgeSnapshot> = {}) {
     console: log,
     setCanvas() {},
     motionSink: () => sink,
+    setLanyard: (l) => void lanyards.push(l),
     runHere: async () => void calls.push("runHere"),
     provision: async () => {},
     skipSetup() {},
@@ -100,7 +103,7 @@ function fakeController(fields: Partial<BadgeSnapshot> = {}) {
     snapshot = { ...snapshot, ...next };
     for (const cb of [...listeners]) cb();
   };
-  return { controller, calls, log, set };
+  return { controller, calls, log, set, lanyards };
 }
 
 describe("App", () => {
@@ -135,6 +138,38 @@ describe("App", () => {
       el.getAttribute("data-slot") ?? el.tagName.toLowerCase(),
     );
     expect(order).toEqual(["header", "stage", "aside", "footer"]);
+  });
+
+  test("the stage hands its lanyard to the controller; phone motion turns off drags and S/K", () => {
+    const { controller, set, lanyards } = fakeController();
+    const view = rtl.render(<App controller={controller} />);
+    const lanyard = lanyards.at(-1) as StageLanyard;
+    expect(lanyard).toBeTruthy();
+    const pushes: string[] = [];
+    lanyard.impulse = (kind) => void pushes.push(kind);
+    lanyard.grab = () => (pushes.push("grab"), true);
+    const keyS = () =>
+      rtl.act(() => void window.dispatchEvent(new win.KeyboardEvent("keydown", { code: "KeyS", bubbles: true }) as unknown as Event));
+    const body = view.container.querySelector<HTMLElement>(".badge")!;
+    const down = () =>
+      rtl.act(
+        () =>
+          void body.dispatchEvent(
+            new win.PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse", button: 0, pointerId: 1 }) as unknown as Event,
+          ),
+      );
+    keyS();
+    down();
+    expect(pushes).toEqual(["shake", "grab"]);
+    rtl.act(() => void window.dispatchEvent(new win.PointerEvent("pointerup", { pointerId: 1 }) as unknown as Event));
+    rtl.act(() => set({ motion: "phone" }));
+    keyS();
+    down();
+    expect(pushes).toEqual(["shake", "grab"]);
+    // The same lanyard stays with the controller (it follows the phone).
+    expect(lanyards.at(-1)).toBe(lanyard);
+    view.unmount();
+    expect(lanyards.at(-1)).toBeNull();
   });
 
   test("the tab notice shows with the snapshot, and Run here takes the badge", () => {

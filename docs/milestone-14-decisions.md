@@ -802,3 +802,78 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
     `notice_clears_the_canvas`). The screen is cleared when the badge is
     lost with the canvas already mounted, and when the canvas mounts
     under the notice. A frame blits into whichever canvas is current.
+
+## Bumps through motion (Task 13)
+
+`frontend/src/radio/hub.ts`, `ui/badge-controller.ts`, `ui/Stage.tsx`,
+`ui/App.tsx`, `ui/Badge.tsx`, `motion/lanyard.ts` (`follow`) and
+`main.tsx`.
+
+- **`RadioHub.bump()` is now `broadcastBump()`.** It keeps the gate
+  (running and not paused, else `false`) and sends `{t:"bump"}` to every
+  link, but no longer bumps the local badge: the local badge already
+  felt the impact through its motion source. Its only caller is the
+  controller's impact handler. A peer's bump still calls `bumpLocal`, and
+  is still dropped while paused (R-T9-3, Review Focus 4).
+- **Ruling R3 is wired.** `main.tsx`'s `bumpLocal` is
+  `controller.peerBump()`. That calls the *active* source's `peerBump`,
+  read at call time from `snapshot.motion`: the lanyard's impulse in
+  physics mode, and the phone's +1000 mg pulse in phone mode. It follows
+  every switch, and a lanyard rebuilt on a layout flip. Before the stage
+  hands over a lanyard, or after `dispose()`, a peer's bump is dropped.
+- **Only the active source's impacts are sent.** The controller
+  subscribes to both sources' `onImpact`, and each handler checks
+  `snapshot.motion`. In phone mode the lanyard still hits walls as it
+  follows the phone, but those hits are not sent. Only the phone's jolt
+  detector speaks for the badge, so one shake never sends two bumps. A
+  peer's pulse is never echoed: the phone excludes the pulse from its
+  jump detector (Task 10), and the lanyard has its 1 s quiet window
+  (Task 9).
+- **The stage hands its lanyard over.** `Stage`'s `onLanyard` is
+  `controller.setLanyard`. The stage reports `null` when its lanyard
+  goes, so a replaced lanyard is unsubscribed and no longer heard.
+  `dispose()` unsubscribes both sources.
+- **The gating lives in the Stage (`phoneMotion` prop).** In phone mode
+  the stage passes the Badge no lanyard. Grabs and the S/K keys find
+  nothing to push, and a drag in progress ends (Badge's existing
+  lanyard-change cleanup). The controller still holds the real lanyard.
+  The lanyard's own `sensorMg` is not sent, because the stage's `sink` is
+  `null` in phone mode (Task 12).
+- **The lanyard follows the phone (`Lanyard.follow(mg | null)`).** The
+  phone source's `onMotion` readings go to `lanyard.follow` while
+  `motion` is `"phone"`. Turning phone motion off calls `follow(null)`.
+  The reading is proper acceleration (f = a − g), so in the anchor's (the
+  hand's) frame each body feels −f. The simulation's gravity already
+  covers the rest reading, so `follow` applies only the difference to the
+  rope nodes and the badge, at `GRAVITY_PX_S2 / REST_MG` = 2.4 px/s² per
+  mg (1 g is the simulation's gravity):
+  x = −right·2.4, y = (up − 1000)·2.4, in screen px/s², with y down.
+  - **Why every body, not just the anchor point.** The anchor is not a
+    body. Moving the anchor is equivalent, in its frame, to this uniform
+    inertial force. It is the brief's "force at the rope anchor", stated
+    so the physics is exact.
+  - **What you see.** A phone jerked right leaves the badge lagging left.
+    A tilted phone makes the badge hang toward true down.
+  - **Clamp.** The upward part is limited to 0.75 g
+    (`FOLLOW_MAX_LIFT_PX_S2`), so a phone held flat or upside down still
+    leaves a quarter g down, and the badge hangs on the stage, not above
+    its anchor.
+  - **Bad readings.** A non-finite axis reads 0. The speed caps and the
+    runaway rebuild still apply (test `following the phone sways the
+    badge, and stays finite and clamped`).
+- **Per-pointer release (deferred from Task 11): fixed.** Each pad press
+  records its `pointerId`. A window `pointerup` or `pointercancel`
+  releases only that pointer's button, and only once no other pointer
+  still holds it. A second finger lifting off the photo no longer
+  releases the thumb's D-pad direction. The drag still ends on any
+  pointerup, as before. Taps from a keyboard click and AUX1 are
+  unchanged. Residual risk: a touch whose up and cancel never arrive
+  would leave its button held. Browsers send `pointercancel` for that
+  case, so no blanket release was kept.
+- **Browser check** (`bun run dev`, Chrome): two hard drags into each
+  wall logged no errors (only the existing favicon 404). **Found, not
+  caused here:** at 857×778, a 960 px fling over 8 frames swings the
+  badge over the top of its anchor, and it stays wedged upside down
+  between the walls above the stage. The same happens with this task's
+  lanyard change reverted (a headless probe gives identical poses).
+  "Reset swing" recovers it. Task 9's physics, for Task 14 or a later fix.

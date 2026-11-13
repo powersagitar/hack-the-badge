@@ -8,9 +8,10 @@
  *   through the WASM CPU emulator in a Web Worker
  *   (`runtime/firmware-worker.ts`). This file polls its status every
  *   {@link STATUS_POLL_MS}, as the old `main.ts` did.
- * - The hub delivers linked peers' advertisements to the firmware. A peer's
- *   bump is dropped until Task 13 rewires it to the active motion source's
- *   `peerBump` (ruling R3).
+ * - The hub delivers linked peers' advertisements to the firmware, and a
+ *   peer's bump to the controller's `peerBump` (the active motion source:
+ *   the lanyard, or the phone; ruling R3). The controller sends the
+ *   local impacts (`hub.broadcastBump`).
  * - Construction is guarded: if the hub, the controller or the first
  *   render throws, the page shows a plain "Failed to start" message.
  * - `pagehide` stops the status poll and disposes the controller (it
@@ -57,9 +58,7 @@ function main(root: HTMLElement): void {
   let controller: BadgeController | null = null;
   const hub = new RadioHub({
     deliver: (bytes, rssi) => controller?.firmware()?.deliverAdvertisement(bytes, rssi),
-    // A peer's bump is dropped until Task 13 rewires it to the active motion
-    // source's peerBump (ruling R3).
-    bumpLocal: () => {},
+    bumpLocal: () => controller?.peerBump(),
   });
 
   const c = createBadgeController({

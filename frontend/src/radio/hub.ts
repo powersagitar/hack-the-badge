@@ -20,12 +20,16 @@
  *   a throw. An advert is delivered at {@link LINKED_PEER_RSSI}.
  * - **No hop.** A peer's message is never forwarded to another link: a
  *   radio does not relay what it hears.
- * - **Bump.** {@link RadioHub.bump} (the page's Bump button) bumps the
- *   local badge and sends `{ t: "bump" }` to every link; a peer's bump
- *   bumps only the local badge. It is gated on the local badge: while it
- *   is not running ({@link RadioHub.setRunning}, which
- *   `ui/badge-controller.ts` calls at the runtime's start and stop) or the hub is paused (the page is
- *   hidden), `bump()` sends nothing, bumps nothing and returns `false`
+ * - **Bump** (Milestone 14 Task 13). {@link RadioHub.broadcastBump} sends
+ *   `{ t: "bump" }` to every link; the controller calls it on the active
+ *   motion source's impact (a swing into a stage wall, or a phone jolt).
+ *   It does not bump the local badge, which already felt the impact
+ *   through its motion source. A peer's bump calls the target's
+ *   `bumpLocal` (the active motion source's `peerBump`). The send is
+ *   gated on the local badge: while it is not running
+ *   ({@link RadioHub.setRunning}, which `ui/badge-controller.ts` calls at
+ *   the runtime's start and stop) or the hub is paused (the page is
+ *   hidden), `broadcastBump()` sends nothing and returns `false`
  *   (Milestone 11's ruling R-T11-1, revising Milestone 10's R-T10-1). A
  *   new hub is not running.
  * - **Paused** (the hidden-page pause, Milestone 7's ruling R-T8-10): the
@@ -72,7 +76,7 @@ export interface RadioLink {
 export interface RadioHubTarget {
   /** A peer's advertisement, validated, heard at `rssi` dBm. */
   deliver(bytes: Uint8Array, rssi: number): void;
-  /** Bumps the local badge. */
+  /** A peer bumped us: the active motion source's `peerBump`. */
   bumpLocal(): void;
 }
 
@@ -149,18 +153,17 @@ export class RadioHub {
   }
 
   /**
-   * The page's Bump button: bumps the local badge and every linked peer,
-   * and returns `true`. While the badge is not running, or the hub is
-   * paused, it does nothing and returns `false`.
+   * A local impact: sends `{ t: "bump" }` to every linked peer, and
+   * returns `true`. While the badge is not running, or the hub is paused,
+   * it sends nothing and returns `false`.
    */
-  bump(): boolean {
+  broadcastBump(): boolean {
     if (!this.running || this.paused) return false;
-    this.guard(() => this.target.bumpLocal());
     this.broadcast({ t: "bump" });
     return true;
   }
 
-  /** Whether the local badge's runtime is started; gates {@link bump}. */
+  /** Whether the local badge's runtime is started; gates {@link broadcastBump}. */
   setRunning(running: boolean): void {
     this.running = running;
   }
