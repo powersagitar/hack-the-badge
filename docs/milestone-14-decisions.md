@@ -615,3 +615,36 @@ the ±2000 clamp.
 - `physics-shake.test.ts` takes about 7–10 s: one walk to page 6 serves
   both tests, gentle first. The default `bun test` grew from about 16 s
   to about 23 s.
+
+## Phone motion (Task 10)
+
+`frontend/src/motion/device-motion.ts`, the second `MotionSource`.
+
+- **Mapping.** `accelerationIncludingGravity` (m/s²) / 9.80665 × 1000 ×
+  `signFix`, phone x/y/z as the board's right/up/out through
+  `BOARD_AXES`, clamped by sensor.ts's `clampRound` (now exported, so
+  both sources share one clamp).
+- **`platformSignFix`** returns 1 everywhere until Task 14's real-device
+  check on iOS and Android fills its table.
+- **"Unsupported".** `motionAvailable()` is false when
+  `DeviceMotionEvent` is missing or `isSecureContext` is false (Chrome
+  hides the API outside a secure context; iOS keeps it but never
+  grants it over plain HTTP). `requestMotionPermission()` returns
+  "unsupported" then; "granted" where there is no
+  `requestPermission` (Android, desktop); otherwise iOS's answer, with a
+  rejection (e.g. no user gesture) read as "denied". A desktop browser
+  may report available and never send an event; it then never drives
+  the badge.
+- **Ignored events.** A null `accelerationIncludingGravity`, or any
+  null or non-finite component, produces no sample.
+- **Peer pulse.** +1000 mg on chip x (index 0) for readings in the
+  100 ms after `peerBump()`; peerBump itself emits nothing, the next
+  phone events carry it (phones send at about 60 Hz).
+- **Impacts.** The Euclidean jump between consecutive *raw* readings
+  (the pulse excluded, so a peer's bump is never echoed back) above
+  1500 mg fires `onImpact`, at most once per 800 ms. `stop()` forgets
+  the previous reading, so a restart never counts as a jump.
+- **Clock.** `createDeviceMotionSource` takes an optional third
+  argument, `now` (ms, default `performance.now`), beyond the brief's
+  signature, so the tests drive the pulse and the cooldown by hand.
+- **onMotion** gets the same samples as the sink, only while started.
