@@ -106,3 +106,90 @@
     @apply text-accent-text hover:text-link-hover;
   }
 }
+
+/*
+ * The hanging badge (Task 11): the design's `.badge`, `.hit`, `.led` and
+ * lanyard styles, with its values. Hit targets are `<button>`s laid over
+ * the photo; `.is-down` is a held button (or the power switch while the
+ * badge reboots), `.side` the AUX1 slide switch, `.power` the power
+ * switch. The LED glow's colour comes from `--rgb` and its brightness
+ * from `opacity`, both written per frame by the stage.
+ */
+:root {
+  --lanyard: #3b1f52;
+}
+
+@layer components {
+  .badge {
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    will-change: transform;
+    filter: drop-shadow(0 28px 34px rgba(0, 0, 0, 0.7));
+  }
+  .badge.grabbing {
+    cursor: grabbing;
+  }
+  .hit {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    aspect-ratio: 1 / 1;
+    border-radius: 50%;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+    cursor: pointer;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    transition:
+      box-shadow 0.12s,
+      background-color 0.08s;
+  }
+  .hit:hover {
+    box-shadow: 0 0 0 2px rgba(234, 215, 245, 0.28);
+  }
+  .hit:focus-visible {
+    outline: none;
+    box-shadow:
+      0 0 0 3px #f2d8ff,
+      0 0 14px 2px rgba(201, 120, 255, 0.7);
+  }
+  .hit.is-down {
+    background: radial-gradient(circle, rgba(0, 0, 0, 0.55) 0 38%, rgba(0, 0, 0, 0.18) 60%, transparent 72%);
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.55);
+  }
+  .hit.side {
+    border-radius: 6px;
+    aspect-ratio: 1 / 2;
+  }
+  .hit.side.is-down {
+    background: rgba(200, 110, 255, 0.22);
+    box-shadow:
+      0 0 0 2px #c96eff,
+      0 0 12px 2px rgba(200, 110, 255, 0.6);
+  }
+  .hit.power {
+    aspect-ratio: auto;
+    border-radius: 6px;
+  }
+  .led {
+    position: absolute;
+    width: 15%;
+    aspect-ratio: 1 / 1;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    pointer-events: none;
+    mix-blend-mode: screen;
+    opacity: 0;
+    background: radial-gradient(
+      circle,
+      #fff 0 5%,
+      rgb(var(--rgb, 255, 255, 255)) 12%,
+      rgba(var(--rgb, 255, 255, 255), 0.42) 26%,
+      rgba(var(--rgb, 255, 255, 255), 0.12) 46%,
+      transparent 68%
+    );
+  }
+}

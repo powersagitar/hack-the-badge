@@ -615,3 +615,49 @@ the ±2000 clamp.
 - `physics-shake.test.ts` takes about 7–10 s: one walk to page 6 serves
   both tests, gentle first. The default `bun test` grew from about 16 s
   to about 23 s.
+
+## Badge component (Task 11)
+
+`frontend/src/ui/Badge.tsx`, `Stage.tsx`, `badge-geometry.ts` and
+`keyboard.ts`; the photo is `frontend/public/badge/front.webp` (sha256
+`f1e63701…89bd4`).
+
+- **`LED_CHAIN_TO_SPOT = [0, 1, 3, 5, 4, 2]` is a best guess (Ruling
+  R8).** Task 2's evidence ("Chain index → board position" above) shows
+  the chain follows the ring but not where it starts or which way it
+  turns. The guess walks clockwise from the top-left spot: TL, TR,
+  mid-right, bottom-right, bottom-left, mid-left. It fits the shake page
+  lighting chain 3 and 4 as a neighbouring pair (bottom-right and
+  bottom-left). **The human partner confirms it on the physical badge in
+  Task 14** (where Setup's chase starts and which way it turns).
+- **Desktop stage width cap: 1016 px** (`md:max-w-[1016px]`,
+  `STAGE_MAX_W`). The design's stage at 1440 px is about 1016 px (border
+  box), and the page's 1360 px cap keeps it there at wider windows, so
+  the cap changes nothing the design draws. It guards the lanyard: past
+  about that width the rope can't swing the badge into a wall (Task 9),
+  so drags would never bump.
+- **The LED glow.** Opacity is `max(r,g,b)/255` (off is 0), as the
+  brief says, and `--rgb` is the colour scaled to full brightness, so
+  the brightness is counted once, not twice. The firmware's colours peak
+  at about `0x42`, so the glows read at about 26% opacity; Task 14's
+  look decides whether that needs a curve.
+- **Layout and hit sizes** follow `matchMedia("(min-width: 768px)")`
+  (Tailwind's `md`, the same breakpoint as the shell), not
+  `pointer: coarse`. A layout change builds a new lanyard (its size
+  clamps differ); a resize relays it out.
+- **Keyboard.** `keyAction(code, target?)` takes the event's target as
+  an optional second argument, which the brief's one-argument signature
+  leaves out but its "ignores typing in inputs" needs. Fields (input,
+  select, textarea, editable content) keep their keys. Enter and Space
+  on a focused button or link stay that control's activation, so a
+  keyboard-only visitor can still click a board button (a tap) or
+  "Reset swing". Keys with Ctrl, Meta or Alt are ignored, a held key
+  repeats nothing, and a window blur releases every key-held button.
+- **AUX1** toggles through the `pad` source both from the pointer and
+  from Space, so the runtime's per-source hold matches the drawn state.
+- **The power hit area** keeps the design's `.hit` translate (it is
+  centred on 34.1%, 1.5%), as the design draws it.
+- **"Reset swing"** is `lanyard.reset()` (Task 9's rebuild at rest).
+- **The rope** is drawn as the design's `tick`: quadratic segments
+  through the rope's nodes, ending 12 px above the ring, toward the
+  anchor.

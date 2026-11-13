@@ -11,10 +11,12 @@
  * - **Mobile**: one column with 16 px gutters, a 640 px stage, the aside's
  *   sections stacked under it, and the stacked footer.
  *
- * The stage and the aside are empty slots for now: the lanyard and the
- * badge (Tasks 9-11) go in the stage, FIRMWARE TOOLS and CONSOLE.LOG
- * (Tasks 8 and 12) in the aside.
+ * The stage holds the hanging badge ({@link Stage}, Task 11; Task 12
+ * wires its client, sink and lanyard). The aside is an empty slot for
+ * now: FIRMWARE TOOLS and CONSOLE.LOG (Tasks 8 and 12) go in it.
  */
+
+import { Stage } from "./Stage";
 
 /**
  * The page's controller. A placeholder until Task 12's controller store,
@@ -32,10 +34,7 @@ export function App(_props: AppProps) {
       <div className="mx-auto flex w-full max-w-[1360px] flex-auto flex-col gap-4 md:gap-6">
         <Header />
         <div className="flex flex-col gap-4 md:flex-row md:flex-wrap md:items-stretch md:gap-6">
-          <div
-            data-slot="stage"
-            className="stage-grid relative h-[640px] w-full min-w-0 overflow-hidden rounded-panel-mobile border border-border bg-card md:h-[780px] md:w-auto md:flex-[999_1_560px] md:rounded-panel"
-          />
+          <Stage />
           <aside className="flex min-w-0 flex-col gap-4 md:flex-[1_1_320px]" />
         </div>
         <Footer />
