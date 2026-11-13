@@ -11,31 +11,60 @@
  * - **Mobile**: one column with 16 px gutters, a 640 px stage, the aside's
  *   sections stacked under it, and the stacked footer.
  *
- * The stage holds the hanging badge ({@link Stage}, Task 11; Task 12
- * wires its client, sink and lanyard). The aside is an empty slot for
- * now: FIRMWARE TOOLS and CONSOLE.LOG (Tasks 8 and 12) go in it.
+ * It reads the controller store (`./badge-controller.ts`, Task 12)
+ * through `useSyncExternalStore`: the tab notice under the header, the
+ * stage ({@link Stage}: the controller's client, its motion sink while
+ * the swing drives the sensor, and its screen canvas), and the aside's
+ * FIRMWARE TOOLS ({@link ToolsPanel}) and CONSOLE.LOG
+ * ({@link ConsolePanel}). The frame loop and the screen never go through
+ * these renders.
  */
 
+import { useSyncExternalStore } from "react";
+import type { BadgeController } from "./badge-controller";
+import { ConsolePanel } from "./ConsolePanel";
 import { Stage } from "./Stage";
+import { TabNotice, ToolsPanel } from "./ToolsPanel";
 
-/**
- * The page's controller. A placeholder until Task 12's controller store,
- * which the panels will read; the shell reads nothing from it yet.
- */
-export type AppController = object;
+/** What the page reads from its controller. */
+export type AppController = Pick<
+  BadgeController,
+  | "subscribe"
+  | "getSnapshot"
+  | "client"
+  | "console"
+  | "setCanvas"
+  | "motionSink"
+  | "runHere"
+  | "provision"
+  | "skipSetup"
+  | "host"
+  | "cancelHost"
+  | "join"
+  | "usePhoneMotion"
+>;
 
 export interface AppProps {
   controller: AppController;
 }
 
-export function App(_props: AppProps) {
+export function App({ controller }: AppProps) {
+  const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   return (
     <div className="box-border flex min-h-screen flex-col bg-background px-4 pt-5 pb-7 font-sans text-foreground md:px-[clamp(16px,3vw,40px)] md:pt-7 md:pb-10">
       <div className="mx-auto flex w-full max-w-[1360px] flex-auto flex-col gap-4 md:gap-6">
         <Header />
+        {snapshot.tabNotice && <TabNotice onRunHere={() => void controller.runHere()} />}
         <div className="flex flex-col gap-4 md:flex-row md:flex-wrap md:items-stretch md:gap-6">
-          <Stage />
-          <aside className="flex min-w-0 flex-col gap-4 md:flex-[1_1_320px]" />
+          <Stage
+            client={controller.client}
+            sink={snapshot.motion === "physics" ? controller.motionSink() : null}
+            onCanvas={controller.setCanvas}
+          />
+          <aside className="flex min-w-0 flex-col gap-4 md:flex-[1_1_320px]">
+            <ToolsPanel snapshot={snapshot} actions={controller} />
+            <ConsolePanel log={controller.console} />
+          </aside>
         </div>
         <Footer />
       </div>

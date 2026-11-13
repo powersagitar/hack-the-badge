@@ -75,7 +75,7 @@ const ConsoleRow = memo(function ConsoleRow({ entry }: { entry: ConsoleEntry }) 
   return (
     <div
       data-source={entry.source}
-      className={cn("min-h-[1.5em] break-words whitespace-pre-wrap", muted && "text-muted-foreground")}
+      className={cn("min-h-[1.5em] shrink-0 break-words whitespace-pre-wrap", muted && "text-muted-foreground")}
     >
       {muted ? `[${entry.source}] ${entry.text}` : entry.text}
     </div>

@@ -40,7 +40,7 @@
  */
 
 export function blitFramebuffer(
-  ctx: CanvasRenderingContext2D,
+  ctx: Pick<CanvasRenderingContext2D, "putImageData">,
   pixels: Uint16Array,
   width: number,
   height: number,

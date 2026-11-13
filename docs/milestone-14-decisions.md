@@ -693,3 +693,77 @@ the ±2000 clamp.
 - **The rope** is drawn as the design's `tick`: quadratic segments
   through the rope's nodes, ending 12 px above the ring, toward the
   anchor.
+
+## Controller and tools (Task 12)
+
+`frontend/src/ui/badge-controller.ts` (the store), `ToolsPanel.tsx`,
+`frontend/src/radio/links.ts`; `main.ts`, `ui/shell.ts`, `ui/shell.css`
+and `test/shell.test.ts` are deleted, and their still-relevant coverage
+moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
+`test/links.test.ts` and `test/app-shell.test.tsx`.
+
+- **The store.** `createBadgeController(deps)` keeps the old controller's
+  logic (badge lock, lazy Worker boot that is not cached on failure, the
+  hub's running gate, the skip gate) and exposes one immutable
+  `BadgeSnapshot` through `subscribe`/`getSnapshot`. `main.tsx` polls
+  `refreshStatus()` every 250 ms, as the old `main.ts` did, and every
+  action refreshes too.
+- **Beyond the brief's interface:** `client` (a stable `BadgeClient` for
+  the stage, forwarding to the firmware once it boots, LED listeners
+  included), `setCanvas` (the stage's `onCanvas`; the Worker client
+  blits through a forwarder, so the Worker boots before the canvas
+  mounts; its `ctx` type is now `Pick<…, "putImageData">`),
+  `cancelHost`, `refreshStatus`, and the snapshot field `hostingRoom`.
+  `createLinks` takes a third `options` argument: `note` (the console's
+  `appendPage`) and `pageEvents` (where `pagehide` comes from).
+- **Page lines.** The texts are the old status line's. Each stream is
+  logged when its own text changes: `rebooting…` on a reboot's start, the
+  provision's (`waiting for the console…`, `provisioning…`, its PROV OK
+  line, `failed: …`) and the skip's (`skipping setup…`, `skip failed: …`;
+  `done` adds nothing). The old "whichever was started last" rule
+  (`lastStarted`) is gone: in a log both streams coexist, and an old skip
+  failure the Worker keeps reporting is not repeated. The speed is not a
+  line; it is the header's SPEED INDEX. `rebooting…` can land just after
+  the console's reboot marker, since the marker comes with the serial
+  chunk and the line with the next status poll.
+- **Boot failure (Task 4 minor).** A failed boot from a provision now
+  says `could not start the badge` (`START_FAILED_NOTE`); only a failed
+  identity fetch says `could not load <role>`, and keeps the badge.
+- **Hidden page (Review Focus 1).** On hidden, the controller sets the
+  hanging rest `[0, 1000, 0]` through `BOARD_AXES` (`HANGING_REST_MG`) and
+  its sink drops samples until visible. The client holds that reading (no
+  animation frame runs while hidden) and posts it just before `start`
+  (Task 6). A badge booted on a hidden page gets the rest before its
+  first start.
+- **Phone motion.** `usePhoneMotion(true)` calls the permission request
+  before any `await` (iOS's gesture). Denied or unsupported keeps
+  `"physics"` with a `[page]` line saying why. The stage's `sink` is the
+  controller's while `motion` is `"physics"` and `null` otherwise, which
+  stops the lanyard's readings; the phone source gets the same gated sink.
+  Lanyard-follows-phone, drag/keys off and bumps are Task 13's (R3), so
+  `onLanyard` is not wired yet. Desktop Chrome on localhost reports
+  DeviceMotion available, so the button shows there (Task 10's note).
+- **BADGE LINK.** `summary()` is `Hosting <room>`, `Linked to N badge(s)`
+  (joined by " · " when both apply), or the signal client's last message.
+  **Cancelling a hosted room:** while a room waits, Host link becomes
+  "Cancel host" (the design's `.ghost.on`), which closes the room on the
+  server and notes `Stopped hosting room <room>.`; the design has no other
+  slot for it. An open link that closes notes `A badge link closed.`; a
+  link that never opened notes its failure's reason instead. `pagehide`
+  closes every link and cancels a waiting room.
+- **Unload.** `main.tsx` disposes the controller on `pagehide` (not
+  `beforeunload`, which mobile browsers skip), freeing the badge lock; a
+  page restored from the back/forward cache reloads.
+- **Escape and the ROLE select (Task 11 minor).** A real conflict: with
+  the Radix Select open, focus is on a `role="option"` div, so Escape,
+  the arrows and Enter also pressed HOME/UP/DOWN/START. `keyAction` now
+  ignores targets with role `combobox`, `listbox` or `option`; Radix still
+  closes on Escape (`tools-panel.test.tsx` opens the real Select and
+  checks both).
+- **CONSOLE.LOG rows** got `shrink-0`: mounted in the aside's fixed-height
+  column, wrapped rows shrank to one line and overlapped (seen in the
+  browser).
+- **Tab notice** colours are theme tokens (`--notice`, `--notice-border`,
+  `--notice-foreground`), from the design's banner.
+- **Build:** JS 483.81 kB (gzip 155.95 kB), CSS 27.54 kB; the worker,
+  bridge and wasm chunks are back.
