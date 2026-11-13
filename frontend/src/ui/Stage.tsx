@@ -159,7 +159,7 @@ export function Stage({ client = null, sink = null, onLanyard, onCanvas }: Stage
       last = now;
       const { rope, badge } = lanyard.pose();
       if (!drawn || Math.abs(drawn.bh - badge.h) > 0.5) {
-        drawn = { bw: badge.w, bh: badge.h, clip: Math.round(badge.w * 0.2) };
+        drawn = { bw: badge.w, bh: badge.h, clip: badge.clip };
         setSize(drawn);
       }
       if (parts.root) {
@@ -192,7 +192,8 @@ export function Stage({ client = null, sink = null, onLanyard, onCanvas }: Stage
     <div
       ref={stageRef}
       data-slot="stage"
-      className="stage-grid relative h-[640px] w-full min-w-0 overflow-hidden rounded-panel-mobile border border-border bg-card md:h-[780px] md:w-auto md:max-w-[1016px] md:flex-[999_1_560px] md:rounded-panel"
+      style={layout === "desktop" ? { maxWidth: STAGE_MAX_W } : undefined}
+      className="stage-grid relative h-[640px] w-full min-w-0 overflow-hidden rounded-panel-mobile border border-border bg-card md:h-[780px] md:w-auto md:flex-[999_1_560px] md:rounded-panel"
     >
       <svg
         aria-hidden="true"

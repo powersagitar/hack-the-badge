@@ -123,6 +123,53 @@ describe("Badge", () => {
     expect(a.className).not.toContain("is-down");
   });
 
+  test("a button released over another hit target still lets go", () => {
+    const b = renderBadge();
+    const up = b.view.getByRole("button", { name: "Badge button UP" });
+    const left = b.view.getByRole("button", { name: "Badge button LEFT" });
+    rtl.act(() => void up.dispatchEvent(pointer("pointerdown") as unknown as Event));
+    rtl.act(() => void left.dispatchEvent(pointer("pointerup") as unknown as Event));
+    expect(b.calls).toEqual([
+      ["UP", "pressed", "pad"],
+      ["UP", "released", "pad"],
+    ]);
+    expect(up.className).not.toContain("is-down");
+  });
+
+  test("a new lanyard mid-drag ends the drag", () => {
+    const fl2 = fakeLanyard();
+    const stage = document.createElement("div");
+    document.body.appendChild(stage);
+    const parts: BadgeParts = { root: null, leds: [], power: null };
+    const first = fakeLanyard();
+    const props = { layout: "desktop" as const, size: { bw: 354, bh: 550, clip: 71 }, client: null, stageRef: { current: stage }, parts };
+    const view = rtl.render(<Badge {...props} lanyard={first.lanyard} />, { container: stage });
+    rtl.act(() => void parts.root!.dispatchEvent(pointer("pointerdown") as unknown as Event));
+    expect(parts.root!.className).toContain("grabbing");
+    view.rerender(<Badge {...props} lanyard={fl2.lanyard} />);
+    expect(first.log.at(-1)).toBe("release");
+    expect(parts.root!.className).not.toContain("grabbing");
+    // Moves no longer drag either lanyard.
+    rtl.act(() => void window.dispatchEvent(pointer("pointermove", { clientX: 5, clientY: 5 }) as unknown as Event));
+    expect(fl2.log).toEqual([]);
+    expect(first.log.filter((l) => l.startsWith("drag"))).toEqual([]);
+  });
+
+  test("an inline onCanvas gets the canvas once, not on every render", () => {
+    const stage = document.createElement("div");
+    document.body.appendChild(stage);
+    const parts: BadgeParts = { root: null, leds: [], power: null };
+    const seen: (HTMLCanvasElement | null)[] = [];
+    const props = { layout: "desktop" as const, client: null, lanyard: null, stageRef: { current: stage }, parts };
+    const view = rtl.render(<Badge {...props} size={{ bw: 354, bh: 550, clip: 71 }} onCanvas={(c) => seen.push(c)} />, {
+      container: stage,
+    });
+    view.rerender(<Badge {...props} size={{ bw: 300, bh: 466, clip: 60 }} onCanvas={(c) => seen.push(c)} />);
+    view.rerender(<Badge {...props} size={{ bw: 300, bh: 466, clip: 60 }} onCanvas={(c) => seen.push(c)} />);
+    expect(seen.length).toBe(1);
+    expect(seen[0]?.tagName).toBe("CANVAS");
+  });
+
   test("a pointer up elsewhere releases a held button", () => {
     const b = renderBadge();
     const up = b.view.getByRole("button", { name: "Badge button UP" });
@@ -245,6 +292,8 @@ describe("Stage", () => {
     expect(view.getByRole("button", { name: "Power switch: reboot the badge" }).className).toContain("is-down");
     expect(view.getByText("DRAG THE BADGE TO SWING IT · PRESS THE BUTTONS ON THE BOARD")).toBeTruthy();
     expect(view.getByRole("button", { name: "Reset swing" })).toBeTruthy();
+    // The desktop cap, so the rope can still reach the walls.
+    expect(view.container.querySelector<HTMLElement>("[data-slot=stage]")!.style.maxWidth).toBe("1016px");
   });
 
   test("ledGlow scales the colour to full and keeps the brightness in opacity", () => {

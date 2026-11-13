@@ -98,7 +98,8 @@ export interface Point {
 
 export interface Pose {
   rope: Point[];
-  badge: { x: number; y: number; angle: number; w: number; h: number };
+  /** `clip`: the ring's height above the badge's top edge (px), as the physics pins it. */
+  badge: { x: number; y: number; angle: number; w: number; h: number; clip: number };
 }
 
 export interface Lanyard {
@@ -471,6 +472,7 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
           angle: badge.angle,
           w: geo.bw,
           h: geo.bh,
+          clip: geo.clip,
         },
       };
     },

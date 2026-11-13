@@ -630,8 +630,7 @@ the ±2000 clamp.
   lighting chain 3 and 4 as a neighbouring pair (bottom-right and
   bottom-left). **The human partner confirms it on the physical badge in
   Task 14** (where Setup's chase starts and which way it turns).
-- **Desktop stage width cap: 1016 px** (`md:max-w-[1016px]`,
-  `STAGE_MAX_W`). The design's stage at 1440 px is about 1016 px (border
+- **Desktop stage width cap: 1016 px** (`STAGE_MAX_W`, an inline `maxWidth` on the desktop layout). The design's stage at 1440 px is about 1016 px (border
   box), and the page's 1360 px cap keeps it there at wider windows, so
   the cap changes nothing the design draws. It guards the lanyard: past
   about that width the rope can't swing the badge into a wall (Task 9),

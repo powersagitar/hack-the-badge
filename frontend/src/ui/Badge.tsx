@@ -5,8 +5,10 @@
  * hangs from (the design's markup, `Main.dc.html`'s badge `div`).
  *
  * - **Buttons.** Pointer down presses (`injectButton(name, "pressed",
- *   "pad")`), pointer up releases, and a pointer up anywhere (the window)
- *   releases every held pad button, as the design's `onUp`. A keyboard
+ *   "pad")`), and a pointer up anywhere releases every held pad button
+ *   (one window listener, as the design's `onUp`). A hit button never stops
+ *   a pointerup: a mouse gets no implicit capture, so a press released
+ *   over another hit target must still reach the window. A keyboard
  *   click (`detail === 0`) taps: pressed, then released 150 ms later; the
  *   runtime's tap queue holds it long enough for the firmware.
  * - **AUX1** is the side slide switch: a press (or Space) toggles it, on
@@ -66,7 +68,10 @@ export interface BadgeProps {
   /** The stage, for pointer coordinates. */
   stageRef: RefObject<HTMLElement | null>;
   parts: BadgeParts;
-  /** Receives the 320×240 screen canvas (the client blits frames into it). */
+  /**
+   * Receives the 320×240 screen canvas (the client blits frames into it),
+   * once per canvas element; it need not be a stable function.
+   */
   onCanvas?: (canvas: HTMLCanvasElement | null) => void;
 }
 
@@ -117,6 +122,39 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
   const taps = useRef(new Set<ReturnType<typeof setTimeout>>());
 
   const geo = useMemo(() => ringGeometry(size), [size]);
+
+  // A new lanyard (a layout flip) mid-drag: the old one lets go, and so does the badge.
+  useEffect(
+    () => () => {
+      if (!dragging.current) return;
+      dragging.current = false;
+      lanyard?.release();
+      setGrabbing(false);
+    },
+    [lanyard],
+  );
+
+  // The screen canvas goes to `onCanvas` once per element, through a stable
+  // ref callback: an inline `onCanvas` never sees a null/canvas churn.
+  const onCanvasLatest = useRef(onCanvas);
+  onCanvasLatest.current = onCanvas;
+  const canvas = useMemo(() => {
+    let el: HTMLCanvasElement | null = null;
+    let delivered: HTMLCanvasElement | null | undefined;
+    const deliver = () => {
+      const cb = onCanvasLatest.current;
+      if (!cb || delivered === el) return;
+      delivered = el;
+      cb(el);
+    };
+    const ref = (next: HTMLCanvasElement | null) => {
+      el = next;
+      deliver();
+    };
+    return { ref, deliver };
+  }, []);
+  // A callback that arrives after the canvas mounted still gets it.
+  useEffect(() => canvas.deliver());
 
   // Press/release by source; `down` (the drawn state) is any source holding.
   const api = useMemo(() => {
@@ -272,7 +310,7 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
         style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block", pointerEvents: "none", userSelect: "none" }}
       />
       <canvas
-        ref={onCanvas}
+        ref={canvas.ref}
         width={320}
         height={240}
         aria-label="Badge screen"
@@ -316,10 +354,6 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
               if (e.pointerType === "mouse" && e.button !== 0) return;
               if (isAux) api.toggleAux();
               else api.press(name, "pad");
-            }}
-            onPointerUp={(e) => {
-              e.stopPropagation();
-              if (!isAux) api.release(name, "pad");
             }}
             onClick={(e) => {
               if (e.detail !== 0) return;
