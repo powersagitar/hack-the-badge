@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { BADGE_LOCK_NAME } from "../src/radio/lock";
-import type { Mg, MotionSource } from "../src/motion/source";
+import { createDeviceMotionSource, PEER_BUMP_MG, STANDARD_GRAVITY } from "../src/motion/device-motion";
+import type { Mg } from "../src/motion/source";
 import type { FromWorker, ToWorker } from "../src/runtime/firmware-worker-protocol";
 import {
   type BadgeController,
   type BadgeWorker,
+  type ControllerLanyard,
   HANGING_REST_MG,
+  type PhoneSource,
   type PhoneMotionDeps,
   START_FAILED_NOTE,
   createBadgeController,
@@ -57,13 +60,65 @@ function fakeVisibility() {
 
 function fakePhone() {
   let sink: ((mg: Mg) => void) | null = null;
-  const source: MotionSource = {
+  let peerBumps = 0;
+  const impacts = new Set<() => void>();
+  const motions = new Set<(mg: Mg) => void>();
+  const source: PhoneSource = {
     start: (s) => void (sink = s),
     stop: () => void (sink = null),
-    peerBump() {},
-    onImpact: () => () => {},
+    peerBump: () => void peerBumps++,
+    onImpact(cb) {
+      impacts.add(cb);
+      return () => void impacts.delete(cb);
+    },
+    onMotion(cb) {
+      motions.add(cb);
+      return () => void motions.delete(cb);
+    },
   };
-  return { source, emit: (mg: Mg) => sink?.(mg), started: () => sink !== null };
+  return {
+    source,
+    emit(mg: Mg) {
+      if (!sink) return;
+      sink(mg);
+      for (const cb of [...motions]) cb(mg);
+    },
+    started: () => sink !== null,
+    peerBumps: () => peerBumps,
+    impact: () => impacts.forEach((cb) => cb()),
+    listeners: () => impacts.size + motions.size,
+  };
+}
+
+/** The stage's lanyard, as the controller sees it: records bumps and follows, fires impacts. */
+function fakeLanyard() {
+  let peerBumps = 0;
+  const follows: (Mg | null)[] = [];
+  const impacts = new Set<() => void>();
+  const lanyard: ControllerLanyard = {
+    peerBump: () => void peerBumps++,
+    follow: (mg) => void follows.push(mg),
+    onImpact(cb) {
+      impacts.add(cb);
+      return () => void impacts.delete(cb);
+    },
+  };
+  return { lanyard, follows, peerBumps: () => peerBumps, impact: () => impacts.forEach((cb) => cb()), listeners: () => impacts.size };
+}
+
+/** The real DeviceMotion source over a fake window and clock. */
+function realPhone() {
+  const win = new EventTarget();
+  let now = 0;
+  const source = createDeviceMotionSource(win, 1, () => now);
+  /** One `devicemotion` event, in g along the phone's x/y/z. */
+  const move = (gx: number, gy: number, gz: number) => {
+    const ev = Object.assign(new Event("devicemotion"), {
+      accelerationIncludingGravity: { x: gx * STANDARD_GRAVITY, y: gy * STANDARD_GRAVITY, z: gz * STANDARD_GRAVITY },
+    });
+    win.dispatchEvent(ev);
+  };
+  return { source, move, advance: (ms: number) => void (now += ms) };
 }
 
 function rig(
@@ -75,6 +130,7 @@ function rig(
     motionAvailable?: boolean;
     identity?: "ok" | "fail";
     touchFirst?: boolean;
+    phone?: PhoneSource;
   } = {},
 ) {
   const locks = new FakeLockManager();
@@ -91,6 +147,7 @@ function rig(
   if (opts.hidden) visibility.set(true);
   const frames: Array<() => void> = [];
   const phone = fakePhone();
+  const bumps: string[] = [];
   let touch = opts.touchFirst ?? true;
   const touchCbs = new Set<() => void>();
   const setTouchFirst = (t: boolean) => {
@@ -100,13 +157,14 @@ function rig(
   const motionDeps: PhoneMotionDeps = {
     available: () => opts.motionAvailable ?? true,
     request: async () => opts.permission ?? "granted",
-    create: () => phone.source,
+    create: () => opts.phone ?? phone.source,
   };
   const controller: BadgeController = createBadgeController({
     hub: {
       fromLocal() {},
       setPaused() {},
       setRunning: (r) => void running.push(r),
+      broadcastBump: () => (bumps.push("bump"), true),
       addLink() {},
       removeLink() {},
     },
@@ -171,6 +229,7 @@ function rig(
     sent,
     snap,
     phone,
+    bumps,
     motionDeps,
     setTouchFirst,
     freeOtherTab: () => freeOtherTab(),
@@ -470,6 +529,101 @@ describe("badge controller", () => {
     await r.controller.usePhoneMotion(false);
     expect(r.snap().motion).toBe("physics");
     expect(r.phone.started()).toBe(false);
+  });
+
+  test("peer bump with phone motion pulses readings", async () => {
+    const p = realPhone();
+    const r = rig({ phone: p.source });
+    await settle();
+    const l = fakeLanyard();
+    r.controller.setLanyard(l.lanyard);
+    const accel = () => r.sent().filter((m) => m.kind === "accel").at(-1);
+    // Physics: a peer's bump is an impulse on the lanyard.
+    r.controller.peerBump();
+    expect(l.peerBumps()).toBe(1);
+
+    await r.controller.usePhoneMotion(true);
+    p.move(0, 1, 0); // upright: 1 g up
+    r.flushFrames();
+    expect(accel()).toEqual({ kind: "accel", mg: [0, 1000, 0] });
+    // Phone: the same bump becomes a pulse on the phone's next readings.
+    r.controller.peerBump();
+    expect(l.peerBumps()).toBe(1);
+    p.move(0, 1, 0);
+    r.flushFrames();
+    expect(accel()).toEqual({ kind: "accel", mg: [PEER_BUMP_MG, 1000, 0] });
+    // The pulse was not echoed back to the peers.
+    expect(r.bumps).toEqual([]);
+    p.advance(200);
+    p.move(0, 1, 0);
+    r.flushFrames();
+    expect(accel()).toEqual({ kind: "accel", mg: [0, 1000, 0] });
+
+    // Back to physics: the lanyard takes peer bumps again.
+    await r.controller.usePhoneMotion(false);
+    r.controller.peerBump();
+    expect(l.peerBumps()).toBe(2);
+  });
+
+  test("an impact broadcasts a bump", async () => {
+    const r = rig();
+    await settle();
+    const l = fakeLanyard();
+    r.controller.setLanyard(l.lanyard);
+    l.impact();
+    expect(r.bumps).toEqual(["bump"]);
+
+    // Phone mode: the phone's jolts send; the lanyard following it does not.
+    await r.controller.usePhoneMotion(true);
+    l.impact();
+    expect(r.bumps).toEqual(["bump"]);
+    r.phone.impact();
+    expect(r.bumps).toEqual(["bump", "bump"]);
+    await r.controller.usePhoneMotion(false);
+    r.phone.impact();
+    l.impact();
+    expect(r.bumps).toEqual(["bump", "bump", "bump"]);
+
+    // A replaced lanyard is no longer heard, and dispose lets go of all.
+    const l2 = fakeLanyard();
+    r.controller.setLanyard(l2.lanyard);
+    expect(l.listeners()).toBe(0);
+    l.impact();
+    expect(r.bumps).toHaveLength(3);
+    l2.impact();
+    expect(r.bumps).toHaveLength(4);
+    r.controller.dispose();
+    expect(l2.listeners()).toBe(0);
+    expect(r.phone.listeners()).toBe(0);
+  });
+
+  test("with phone motion on, the lanyard follows the phone", async () => {
+    const r = rig();
+    await settle();
+    const l = fakeLanyard();
+    r.controller.setLanyard(l.lanyard);
+    r.phone.emit([1, 2, 3]); // not started: nothing
+    await r.controller.usePhoneMotion(true);
+    r.phone.emit([300, 900, 0]);
+    expect(l.follows).toEqual([[300, 900, 0]]);
+    // A lanyard rebuilt (a layout flip) while the phone drives follows too.
+    const l2 = fakeLanyard();
+    r.controller.setLanyard(l2.lanyard);
+    r.phone.emit([0, 1000, 0]);
+    expect(l2.follows).toEqual([[0, 1000, 0]]);
+    expect(l.follows).toHaveLength(1);
+    // Off: the lanyard is let go of, and the swing is its own again.
+    await r.controller.usePhoneMotion(false);
+    expect(l2.follows.at(-1)).toBeNull();
+    r.controller.peerBump();
+    expect(l2.peerBumps()).toBe(1);
+    expect(r.phone.peerBumps()).toBe(0);
+  });
+
+  test("a peer bump with no lanyard yet is dropped without a throw", async () => {
+    const r = rig();
+    await settle();
+    expect(() => r.controller.peerBump()).not.toThrow();
   });
 
   test("denied phone motion keeps physics and explains", async () => {

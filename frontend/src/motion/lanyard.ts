@@ -19,13 +19,17 @@
  *   WALL_REARM_MS away) whose edge approached faster than IMPACT_PX_S
  *   fires onImpact, at most once per IMPACT_COOLDOWN_MS of simulated
  *   time (the design's `detect()`; see wallCheck).
+ * - Following the phone (follow()): while phone motion drives the
+ *   sensor, the phone's in-plane reading is the anchor's (the hand's)
+ *   acceleration, felt by the rope and the badge as the equivalent
+ *   inertial force, so the drawn badge sways with the phone.
  *
  * Constants and their tuning: docs/milestone-14-decisions.md, "Lanyard
  * physics and the sensor (Task 9)".
  */
 import Matter from "matter-js";
 import { BOARD_AXES, type AxisMap } from "./axes";
-import { sensorMg } from "./sensor";
+import { REST_MG, sensorMg } from "./sensor";
 import type { Mg, MotionSource } from "./source";
 
 const { Bodies, Body, Composite, Constraint, Engine, Vertices } = Matter;
@@ -74,6 +78,14 @@ const PEER_BUMP_MS = 100;
 const PEER_BUMP_PX_S2 = 30_000;
 /** No outgoing impact right after a peer's bump: never echo it back. */
 const PEER_BUMP_QUIET_MS = 1000;
+/** Following the phone: px/s² per mg, so 1 g is the simulation's gravity. */
+const FOLLOW_PX_S2_PER_MG = GRAVITY_PX_S2 / REST_MG;
+/**
+ * Following the phone: the most the reading may lift against gravity
+ * (px/s²). A phone held flat or upside down leaves a quarter g down, so
+ * the badge still hangs below its anchor, on the stage.
+ */
+const FOLLOW_MAX_LIFT_PX_S2 = 0.75 * GRAVITY_PX_S2;
 /** A runaway (or NaN) body speed; the world is rebuilt at rest past it. */
 const RUNAWAY_PX_S = 50_000;
 /**
@@ -116,6 +128,11 @@ export interface Lanyard {
   reading(): Mg;
   /** Re-centres the badge, at rest ("Reset swing"). */
   reset(): void;
+  /**
+   * Follows the phone: `mg` (the phone's reading, in the chip's axes) is
+   * the anchor's motion until the next call; `null` stops following.
+   */
+  follow(mg: Mg | null): void;
 }
 
 export interface LanyardOptions {
@@ -168,6 +185,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
   let knockDir = 1;
   let lastImpact = Number.NEGATIVE_INFINITY;
   let quietUntil = Number.NEGATIVE_INFINITY;
+  /** The phone's pull on every body (px/s²), from follow(); zero when not following. */
+  let hand: Point = { x: 0, y: 0 };
 
   // The chip spot's last position and velocity (px, px/s), for the
   // acceleration's finite differences; null right after a (re)build.
@@ -360,6 +379,11 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       // matter.js forces are in mass·px/ms².
       Body.applyForce(badge, badge.position, { x: (badge.mass * ax) / 1e6, y: 0 });
     }
+    if (hand.x !== 0 || hand.y !== 0) {
+      for (const b of [badge, ...nodes]) {
+        Body.applyForce(b, b.position, { x: (b.mass * hand.x) / 1e6, y: (b.mass * hand.y) / 1e6 });
+      }
+    }
   }
 
   function healthy(): boolean {
@@ -523,6 +547,22 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     reset() {
       build(geo.W, geo.H);
       current = sensorMg(0, { x: 0, y: 0 }, gain, axes);
+    },
+    follow(mg) {
+      if (!mg) {
+        hand = { x: 0, y: 0 };
+        return;
+      }
+      const along = ([axis, sign]: AxisMap["right"]) => {
+        const v = mg[axis] * sign;
+        return Number.isFinite(v) ? v : 0;
+      };
+      // The reading is proper acceleration, f = a − g. In the anchor's
+      // frame each body feels −f; the simulation's gravity already gives
+      // the rest's share, so the rest is the difference (screen y is down).
+      const x = -along(axes.right) * FOLLOW_PX_S2_PER_MG;
+      const y = (along(axes.up) - REST_MG) * FOLLOW_PX_S2_PER_MG;
+      hand = { x, y: Math.max(-FOLLOW_MAX_LIFT_PX_S2, y) };
     },
     start(s) {
       sink = s;

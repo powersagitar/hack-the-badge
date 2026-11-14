@@ -181,6 +181,41 @@ describe("Badge", () => {
     ]);
   });
 
+  test("a second finger lifting off releases only its own button", () => {
+    const b = renderBadge();
+    const up = b.view.getByRole("button", { name: "Badge button UP" });
+    const a = b.view.getByRole("button", { name: "Badge button A" });
+    const touch = (type: string, id: number) => pointer(type, { pointerType: "touch", pointerId: id });
+    rtl.act(() => void up.dispatchEvent(touch("pointerdown", 7) as unknown as Event));
+    rtl.act(() => void a.dispatchEvent(touch("pointerdown", 8) as unknown as Event));
+    // A third finger taps the photo and lifts: nothing it pressed.
+    rtl.act(() => void window.dispatchEvent(touch("pointerup", 9) as unknown as Event));
+    rtl.act(() => void window.dispatchEvent(touch("pointerup", 8) as unknown as Event));
+    expect(b.calls).toEqual([
+      ["UP", "pressed", "pad"],
+      ["A", "pressed", "pad"],
+      ["A", "released", "pad"],
+    ]);
+    expect(up.className).toContain("is-down");
+    rtl.act(() => void window.dispatchEvent(touch("pointercancel", 7) as unknown as Event));
+    expect(b.calls.at(-1)).toEqual(["UP", "released", "pad"]);
+  });
+
+  test("two fingers on one button hold it until both lift", () => {
+    const b = renderBadge();
+    const up = b.view.getByRole("button", { name: "Badge button UP" });
+    const touch = (type: string, id: number) => pointer(type, { pointerType: "touch", pointerId: id });
+    rtl.act(() => void up.dispatchEvent(touch("pointerdown", 1) as unknown as Event));
+    rtl.act(() => void up.dispatchEvent(touch("pointerdown", 2) as unknown as Event));
+    rtl.act(() => void window.dispatchEvent(touch("pointerup", 1) as unknown as Event));
+    expect(b.calls).toEqual([["UP", "pressed", "pad"]]);
+    rtl.act(() => void window.dispatchEvent(touch("pointerup", 2) as unknown as Event));
+    expect(b.calls).toEqual([
+      ["UP", "pressed", "pad"],
+      ["UP", "released", "pad"],
+    ]);
+  });
+
   test("AUX1 toggles and reports its state", () => {
     const b = renderBadge();
     const aux = b.view.getByRole("button", { name: "AUX1 switch, off" });

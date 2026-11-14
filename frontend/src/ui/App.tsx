@@ -14,7 +14,8 @@
  * It reads the controller store (`./badge-controller.ts`, Task 12)
  * through `useSyncExternalStore`: the tab notice under the header, the
  * stage ({@link Stage}: the controller's client, its motion sink while
- * the swing drives the sensor, and its screen canvas), and the aside's
+ * the swing drives the sensor, its lanyard hand-off and the phone-motion
+ * gate, and its screen canvas), and the aside's
  * FIRMWARE TOOLS ({@link ToolsPanel}) and CONSOLE.LOG
  * ({@link ConsolePanel}). The frame loop and the screen never go through
  * these renders.
@@ -35,6 +36,7 @@ export type AppController = Pick<
   | "console"
   | "setCanvas"
   | "motionSink"
+  | "setLanyard"
   | "runHere"
   | "provision"
   | "skipSetup"
@@ -59,6 +61,8 @@ export function App({ controller }: AppProps) {
           <Stage
             client={controller.client}
             sink={snapshot.motion === "physics" ? controller.motionSink() : null}
+            onLanyard={controller.setLanyard}
+            phoneMotion={snapshot.motion === "phone"}
             onCanvas={controller.setCanvas}
           />
           <aside className="flex min-w-0 flex-col gap-4 md:flex-[1_1_320px]">

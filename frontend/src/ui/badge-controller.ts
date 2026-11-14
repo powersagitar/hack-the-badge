@@ -46,6 +46,14 @@
  *   {@link HANGING_REST_MG} and the sink drops samples until it is visible
  *   (Review Focus 1); the client holds that reading and posts it just
  *   before the badge's `start` when the page is visible again (Task 6).
+ * - **Bumps** (Task 13, ruling R3): the stage hands its lanyard in
+ *   ({@link BadgeController.setLanyard}). The active source's impacts
+ *   (a swing into a wall, or a phone jolt) call `hub.broadcastBump()`;
+ *   the other source's are ignored. A peer's bump
+ *   ({@link BadgeController.peerBump}, the hub's `bumpLocal`) goes to the
+ *   active source's `peerBump`: an impulse on the lanyard, or a pulse on
+ *   the phone's readings. While the phone drives, the lanyard follows
+ *   its readings (`follow`), so the drawn badge sways with it.
  * - **Links** (`radio/links.ts`): `host`, `cancelHost` and `join`, with
  *   the summary as `linkStatus`.
  *
@@ -61,6 +69,7 @@ import {
   requestMotionPermission,
 } from "../motion/device-motion";
 import { REST_MG } from "../motion/sensor";
+import type { Lanyard } from "../motion/lanyard";
 import type { Mg, MotionSource } from "../motion/source";
 import type { RadioHub } from "../radio/hub";
 import { createLinks, type LinksOptions } from "../radio/links";
@@ -83,16 +92,22 @@ export interface BadgeWorker extends WorkerLike {
   addEventListener(type: "error", cb: (e: { message: string }) => void, options: { once: true }): void;
 }
 
+/** The phone's motion source: its readings also go to `onMotion` (the lanyard follows them). */
+export type PhoneSource = MotionSource & { onMotion(cb: (mg: Mg) => void): () => void };
+
+/** What the controller needs of the stage's lanyard. */
+export type ControllerLanyard = Pick<Lanyard & MotionSource, "peerBump" | "onImpact" | "follow">;
+
 /** Phone motion's browser seams; the real DeviceMotion when omitted. */
 export interface PhoneMotionDeps {
   available(): boolean;
   /** Asks for access; called synchronously from the click. */
   request(): Promise<"granted" | "denied" | "unsupported">;
-  create(): MotionSource;
+  create(): PhoneSource;
 }
 
 export interface BadgeControllerDeps {
-  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning" | "addLink" | "removeLink">;
+  hub: Pick<RadioHub, "fromLocal" | "setPaused" | "setRunning" | "addLink" | "removeLink" | "broadcastBump">;
   /** Fetches the WASM module and `firmware.bin`. */
   loadImages(): Promise<{ wasm: ArrayBuffer; image: ArrayBuffer }>;
   /** Constructs the firmware Worker; called only once the badge is held (or provisioning). */
@@ -169,6 +184,10 @@ export interface BadgeController {
   usePhoneMotion(on: boolean): Promise<void>;
   /** The active motion source's sink (stable). */
   motionSink(): (mg: Mg) => void;
+  /** The stage's lanyard as it is built (the stage's `onLanyard`), or null when it goes. */
+  setLanyard(lanyard: ControllerLanyard | null): void;
+  /** A linked peer bumped us (the hub's `bumpLocal`): the active motion source's `peerBump`. */
+  peerBump(): void;
   /** Re-reads the runtime's last status into the snapshot and the console. */
   refreshStatus(): void;
   /** Page unload: disposes the runtime, frees the badge, closes the links. */
@@ -467,7 +486,23 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     if (hidden) firmwareRuntime?.setAcceleration(HANGING_REST_MG);
   });
 
-  let phone: MotionSource | null = null;
+  let phone: PhoneSource | null = null;
+  let lanyard: ControllerLanyard | null = null;
+  let unsubscribeLanyard = () => {};
+  let unsubscribePhone = () => {};
+  /** Only the active source's impacts reach the peers. */
+  const impactFrom = (source: "physics" | "phone") => () => {
+    if (snapshot.motion === source) hub.broadcastBump();
+  };
+
+  function setLanyard(next: ControllerLanyard | null): void {
+    if (next === lanyard) return;
+    unsubscribeLanyard();
+    unsubscribeLanyard = () => {};
+    lanyard = next;
+    if (!next || disposed) return;
+    unsubscribeLanyard = next.onImpact(impactFrom("physics"));
+  }
   /**
    * Counts phone-motion turns, so a permission answer that arrives after
    * a later turn (off, or dispose) is ignored; `requesting` keeps a second
@@ -483,6 +518,7 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       phone?.stop();
       if (snapshot.motion === "phone") note("phone motion off: the swing drives the badge");
       update({ motion: "physics" });
+      lanyard?.follow(null);
       return;
     }
     if (snapshot.motion === "phone" || requesting) return;
@@ -506,7 +542,18 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       );
       return;
     }
-    phone ??= motionDeps.create();
+    if (!phone) {
+      const p = motionDeps.create();
+      const offImpact = p.onImpact(impactFrom("phone"));
+      const offMotion = p.onMotion((mg) => {
+        if (snapshot.motion === "phone") lanyard?.follow(mg);
+      });
+      unsubscribePhone = () => {
+        offImpact();
+        offMotion();
+      };
+      phone = p;
+    }
     phone.start(sink);
     update({ motion: "phone" });
     note("phone motion on: the phone is the badge");
@@ -590,6 +637,12 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
     join: (code) => links.join(code),
     usePhoneMotion,
     motionSink: () => sink,
+    setLanyard,
+    peerBump() {
+      if (disposed) return;
+      if (snapshot.motion === "phone") phone?.peerBump();
+      else lanyard?.peerBump();
+    },
     refreshStatus,
     dispose() {
       if (disposed) return;
@@ -599,6 +652,8 @@ export function createBadgeController(deps: BadgeControllerDeps): BadgeControlle
       unsubscribeTouchFirst();
       unsubscribeLinks();
       phone?.stop();
+      unsubscribePhone();
+      unsubscribeLanyard();
       links.dispose();
       const rt = firmwareRuntime;
       firmwareRuntime = null;

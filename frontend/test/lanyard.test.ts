@@ -293,6 +293,36 @@ describe("lanyard", () => {
     expect(impacts).toBe(0);
   });
 
+  test("following the phone sways the badge, and stays finite and clamped", () => {
+    const { l, readings, run } = rig();
+    run(1000);
+    const x0 = centre(l).x;
+    // The phone accelerates right (its reading leans right): the badge lags left.
+    const lean: Mg = [...REST];
+    lean[BOARD_AXES.right[0]] = 500 * BOARD_AXES.right[1];
+    l.follow(lean);
+    run(600);
+    expect(centre(l).x).toBeLessThan(x0 - 40);
+    // Upside down: the badge still hangs below the anchor, on the stage.
+    const upsideDown: Mg = [0, 0, 0];
+    upsideDown[BOARD_AXES.up[0]] = -2000 * BOARD_AXES.up[1];
+    l.follow(upsideDown);
+    run(1500);
+    expect(centre(l).y).toBeGreaterThan(l.pose().rope[0].y);
+    // A violent, jittery phone (and a NaN reading) never explodes the world.
+    for (let i = 0; i < 120; i++) {
+      l.follow(i % 7 === 0 ? [Number.NaN, 0, 0] : [i % 2 ? 2000 : -2000, i % 3 ? 2000 : -2000, 0]);
+      l.step(FRAME_MS);
+    }
+    for (const mg of readings) for (const v of mg) expect(Math.abs(v)).toBeLessThanOrEqual(CLAMP_MG);
+    const p = l.pose();
+    expect(Number.isFinite(p.badge.x + p.badge.y + p.badge.angle)).toBe(true);
+    // Not following: it settles back under the anchor.
+    l.follow(null);
+    run(8000);
+    expect(Math.abs(centre(l).x - x0)).toBeLessThan(10);
+  });
+
   test("shake and peerBump move the reading; stop() silences the sink", () => {
     const { l, readings, run } = rig();
     run(1000);

@@ -110,7 +110,7 @@ describe("RadioHub", () => {
     hub.setRunning(true);
     quietly(() => {
       expect(() => hub.fromLocal(ADV)).not.toThrow();
-      expect(() => hub.bump()).not.toThrow();
+      expect(() => hub.broadcastBump()).not.toThrow();
     });
     expect(good.sent.map((m) => m.t)).toEqual(["adv", "bump"]);
   });
@@ -172,54 +172,42 @@ describe("RadioHub", () => {
     expect(delivered).toHaveLength(1);
   });
 
-  test("bump_hits_local_and_every_link", () => {
+  test("broadcastBump sends to links without a local bump", () => {
     const { hub, localBumps } = hubRig();
     const a = fakeLink("a");
     const b = fakeLink("b");
     hub.addLink(a.link);
     hub.addLink(b.link);
     hub.setRunning(true);
-    expect(hub.bump()).toBe(true);
-    expect(localBumps()).toBe(1);
+    expect(hub.broadcastBump()).toBe(true);
+    // The local badge already felt the impact through its motion source.
+    expect(localBumps()).toBe(0);
     expect(a.sent).toEqual([{ t: "bump" }]);
     expect(b.sent).toEqual([{ t: "bump" }]);
   });
 
-  test("bump_while_stopped_sends_nothing", () => {
+  test("broadcastBump is gated while stopped or paused", () => {
     const { hub, localBumps } = hubRig();
     const a = fakeLink("a");
     hub.addLink(a.link);
     // A new hub's badge is not running yet.
-    expect(hub.bump()).toBe(false);
+    expect(hub.broadcastBump()).toBe(false);
     hub.setRunning(true);
     hub.setRunning(false);
-    expect(hub.bump()).toBe(false);
-    expect(a.sent).toEqual([]);
-    expect(localBumps()).toBe(0);
-    hub.setRunning(true);
-    expect(hub.bump()).toBe(true);
-    expect(a.sent).toEqual([{ t: "bump" }]);
-    expect(localBumps()).toBe(1);
-  });
-
-  test("bump_while_hidden_sends_nothing", () => {
-    const { hub, localBumps } = hubRig();
-    const a = fakeLink("a");
-    hub.addLink(a.link);
+    expect(hub.broadcastBump()).toBe(false);
     hub.setRunning(true);
     hub.setPaused(true);
-    expect(hub.bump()).toBe(false);
+    expect(hub.broadcastBump()).toBe(false);
     expect(a.sent).toEqual([]);
-    expect(localBumps()).toBe(0);
     // Not replayed when the page is visible again.
     hub.setPaused(false);
     expect(a.sent).toEqual([]);
-    expect(hub.bump()).toBe(true);
+    expect(hub.broadcastBump()).toBe(true);
     expect(a.sent).toEqual([{ t: "bump" }]);
-    expect(localBumps()).toBe(1);
+    expect(localBumps()).toBe(0);
   });
 
-  test("a peer's bump bumps only the local badge", () => {
+  test("peer bump calls bumpLocal", () => {
     const { hub, localBumps } = hubRig();
     const a = fakeLink("a");
     const b = fakeLink("b");
@@ -227,8 +215,24 @@ describe("RadioHub", () => {
     hub.addLink(b.link);
     a.receive({ t: "bump" });
     expect(localBumps()).toBe(1);
+    // Never echoed back, nor forwarded.
     expect(a.sent).toEqual([]);
     expect(b.sent).toEqual([]);
+  });
+
+  test("peer bump while paused is dropped", () => {
+    const { hub, localBumps } = hubRig();
+    const a = fakeLink("a");
+    hub.addLink(a.link);
+    hub.setRunning(true);
+    hub.setPaused(true);
+    expect(() => a.receive({ t: "bump" })).not.toThrow();
+    expect(localBumps()).toBe(0);
+    // Not replayed on resume (ruling R-T9-3); the next one is heard.
+    hub.setPaused(false);
+    expect(localBumps()).toBe(0);
+    a.receive({ t: "bump" });
+    expect(localBumps()).toBe(1);
   });
 
   test("paused_hub_keeps_only_the_latest_advertisement_per_peer", () => {
@@ -301,7 +305,7 @@ describe("RadioHub", () => {
     quietly(() => {
       expect(() => a.receive({ t: "adv", b: encodeBase64(ADV) })).not.toThrow();
       expect(() => a.receive({ t: "bump" })).not.toThrow();
-      expect(() => hub.bump()).not.toThrow();
+      expect(() => hub.broadcastBump()).not.toThrow();
     });
     expect(a.sent).toEqual([{ t: "bump" }]);
   });

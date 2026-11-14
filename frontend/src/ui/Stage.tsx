@@ -5,9 +5,12 @@
  *
  * - **The lanyard** (`../motion/lanyard.ts`) is created here, from the
  *   stage's size and the layout, and handed out through `onLanyard` (the
- *   controller subscribes its impacts and bumps it). A layout change
- *   builds a new one (its badge-size clamps differ); a resize relays it
- *   out (`ResizeObserver`).
+ *   controller subscribes its impacts, bumps it and, with phone motion
+ *   on, has it follow the phone). A layout change builds a new one (its
+ *   badge-size clamps differ); a resize relays it out (`ResizeObserver`).
+ * - **Phone motion** (`phoneMotion`): the phone is the badge, so the
+ *   badge gets no lanyard to grab or push: drags and the S/K keys do
+ *   nothing, and a drag in progress ends.
  * - **The frame loop** (`requestAnimationFrame`) steps the lanyard by the
  *   frame's wall time, then writes the badge's transform, the rope's SVG
  *   paths (the design's `tick`), the LED glows from the client's latest
@@ -63,6 +66,8 @@ export interface StageProps {
   sink?: ((mg: Mg) => void) | null;
   /** Hears the lanyard as it is built (and null when it goes). */
   onLanyard?: (lanyard: StageLanyard | null) => void;
+  /** Phone motion drives the badge: drags and the impulse keys are off. */
+  phoneMotion?: boolean;
   /** Receives the badge's screen canvas. */
   onCanvas?: (canvas: HTMLCanvasElement | null) => void;
 }
@@ -97,7 +102,7 @@ function sizeOf(width: number, height: number, layout: Layout): BadgeSize {
   return { bw, bh, clip };
 }
 
-export function Stage({ client = null, sink = null, onLanyard, onCanvas }: StageProps) {
+export function Stage({ client = null, sink = null, onLanyard, phoneMotion = false, onCanvas }: StageProps) {
   const layout = useLayout();
   const stageRef = useRef<HTMLDivElement | null>(null);
   const ribbon = useRef<SVGPathElement | null>(null);
@@ -128,7 +133,9 @@ export function Stage({ client = null, sink = null, onLanyard, onCanvas }: Stage
   }, [layout]);
 
   useEffect(() => {
+    if (!lanyard) return;
     onLanyard?.(lanyard);
+    return () => onLanyard?.(null);
   }, [lanyard, onLanyard]);
 
   useEffect(() => {
@@ -207,7 +214,7 @@ export function Stage({ client = null, sink = null, onLanyard, onCanvas }: Stage
         layout={layout}
         size={size}
         client={client}
-        lanyard={lanyard}
+        lanyard={phoneMotion ? null : lanyard}
         stageRef={stageRef}
         parts={parts}
         onCanvas={onCanvas}

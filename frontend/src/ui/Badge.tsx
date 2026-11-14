@@ -5,10 +5,13 @@
  * hangs from (the design's markup, `Main.dc.html`'s badge `div`).
  *
  * - **Buttons.** Pointer down presses (`injectButton(name, "pressed",
- *   "pad")`), and a pointer up anywhere releases every held pad button
- *   (one window listener, as the design's `onUp`). A hit button never stops
- *   a pointerup: a mouse gets no implicit capture, so a press released
- *   over another hit target must still reach the window. A keyboard
+ *   "pad")`), and that pointer's up or cancel anywhere releases it (one
+ *   window listener, as the design's `onUp`, but by `pointerId`: on
+ *   multi-touch, a second finger lifting off leaves the thumb's D-pad
+ *   press held; a button two fingers hold is released when both lift).
+ *   A hit button never stops a pointerup: a mouse gets no implicit
+ *   capture, so a press released over another hit target must still
+ *   reach the window. A keyboard
  *   click (`detail === 0`) taps: pressed, then released 150 ms later; the
  *   runtime's tap queue holds it long enough for the firmware.
  * - **AUX1** is the side slide switch: a press (or Space) toggles it, on
@@ -117,6 +120,8 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
   const live = useRef({ client, lanyard });
   live.current = { client, lanyard };
   const held = useRef<Held>(new Map());
+  /** Which pad button each pointer holds down (by `pointerId`). */
+  const pointers = useRef(new Map<number, ButtonName>());
   const auxOn = useRef(false);
   const dragging = useRef(false);
   const taps = useRef(new Set<ReturnType<typeof setTimeout>>());
@@ -178,6 +183,17 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
     const releaseAll = (source: ButtonSource) => {
       for (const [name, sources] of [...held.current]) if (sources.has(source)) release(name, source);
     };
+    const pressPointer = (name: ButtonName, pointerId: number) => {
+      pointers.current.set(pointerId, name);
+      press(name, "pad");
+    };
+    /** A pointer lifted: its button lets go, unless another pointer still holds it. */
+    const releasePointer = (pointerId: number) => {
+      const name = pointers.current.get(pointerId);
+      if (name === undefined) return;
+      pointers.current.delete(pointerId);
+      if (![...pointers.current.values()].includes(name)) release(name, "pad");
+    };
     const toggleAux = () => {
       auxOn.current = !auxOn.current;
       live.current.client?.injectButton("AUX1", auxOn.current ? "pressed" : "released", "pad");
@@ -197,7 +213,7 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
       live.current.lanyard?.release();
       setGrabbing(false);
     };
-    return { press, release, releaseAll, toggleAux, tap, endDrag };
+    return { press, release, releaseAll, pressPointer, releasePointer, toggleAux, tap, endDrag };
   }, []);
 
   // Window listeners: the drag, pad releases, the keyboard and visibility.
@@ -207,9 +223,9 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
       if (!dragging.current || !stage) return;
       live.current.lanyard?.drag(toStage(stage, e));
     };
-    const onUp = () => {
+    const onUp = (e: PointerEvent) => {
       api.endDrag();
-      api.releaseAll("pad");
+      api.releasePointer(e.pointerId);
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -353,7 +369,7 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
               e.stopPropagation();
               if (e.pointerType === "mouse" && e.button !== 0) return;
               if (isAux) api.toggleAux();
-              else api.press(name, "pad");
+              else api.pressPointer(name, e.pointerId);
             }}
             onClick={(e) => {
               if (e.detail !== 0) return;
