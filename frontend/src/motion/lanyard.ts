@@ -28,15 +28,16 @@
  * physics and the sensor (Task 9)".
  */
 import Matter from "matter-js";
+import { BOARD_CORNERS, PHOTO } from "../ui/badge-geometry";
 import { BOARD_AXES, type AxisMap } from "./axes";
 import { REST_MG, sensorMg } from "./sensor";
 import type { Mg, MotionSource } from "./source";
 
 const { Bodies, Body, Composite, Constraint, Engine, Vertices } = Matter;
 
-/** The photo's size (local/m14-design/front.webp), for the aspect ratio. */
-export const IMG_W = 974;
-export const IMG_H = 1513;
+/** The photo's size (`PHOTO`), for the aspect ratio. */
+export const IMG_W = PHOTO.w;
+export const IMG_H = PHOTO.h;
 export const ROPE_SEGMENTS = 10;
 export const GRAVITY_PX_S2 = 2400;
 export const STEP_MS = 1000 / 120;
@@ -55,10 +56,11 @@ export const IMPACT_PX_S = 840;
 export const IMPACT_COOLDOWN_MS = 800;
 /**
  * The accelerometer's spot on the board, as fractions of the photo
- * (x from the left, y from the top). Estimate: the small LGA part just
- * below the ESP32-C3 module; its marking is not legible in the photo.
+ * (x from the left, y from the top): the centre of the 2×2 mm LGA-12
+ * below the ESP32-C3 module, the board's only such part (located on the
+ * scan by its side pads, 4 a side; Task 11c).
  */
-export const CHIP_SPOT = { x: 0.414, y: 0.621 };
+export const CHIP_SPOT = { x: 0.406, y: 0.6234 };
 
 /** A sideways push: the "hand" accelerates the badge at `ax` px/s². */
 interface Push {
@@ -232,11 +234,20 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     const ring = nodes[nodes.length - 1].position;
     const dPC = clip + bh / 2;
     badge = Bodies.rectangle(ring.x, ring.y + dPC, bw, bh, {
+      // The board's outline: each corner its own radius (TL, TR, BR, BL).
+      chamfer: { radius: [BOARD_CORNERS.tl, BOARD_CORNERS.tr, BOARD_CORNERS.br, BOARD_CORNERS.bl].map((r) => r * bw) },
       frictionAir: 0.022,
       restitution: 0.35,
       friction: 0.05,
       collisionFilter: { group: 0, category: 0x1, mask: 0x4 },
     });
+    // matter.js centres the polygon on its centroid, which the unequal
+    // chamfers move off the rectangle's centre (about 1 px). The photo and
+    // the hang point are placed from body.position, so make the rectangle's
+    // centre (its bounds' centre) the body's, and put it where it hangs.
+    const { min, max } = badge.bounds;
+    Body.setCentre(badge, { x: (min.x + max.x) / 2, y: (min.y + max.y) / 2 });
+    Body.setPosition(badge, { x: ring.x, y: ring.y + dPC });
     Body.setMass(badge, 1);
     parts.push(badge);
     parts.push(

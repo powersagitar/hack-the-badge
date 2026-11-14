@@ -40,15 +40,15 @@ describe("lanyard", () => {
     const p = l.pose();
     expect(p.rope.length).toBeGreaterThanOrEqual(10);
     expect(p.rope[0]).toEqual({ x: 500, y: -10 });
-    // Desktop clamp: bh = max(280, min(560, H-230, (W-48)*1513/974)).
-    expect(p.badge.h).toBeCloseTo(550, 5); // min(560, 780-230, 952*1513/974)
-    expect(p.badge.w).toBeCloseTo((550 * 974) / 1513, 5);
+    // Desktop clamp: bh = max(280, min(560, H-230, (W-48)*1523/974)).
+    expect(p.badge.h).toBeCloseTo(550, 5); // min(560, 780-230, 952*1523/974)
+    expect(p.badge.w).toBeCloseTo((550 * 974) / 1523, 5);
     expect(Math.abs(p.badge.angle)).toBeLessThan(0.05);
   });
 
   test("mobile layout uses its own clamp", () => {
     const l = createLanyard({ width: 390, height: 640, layout: "mobile" });
-    // max(260, min(560, 640-190, (390-40)*1513/974)) = 450
+    // max(260, min(560, 640-190, (390-40)*1523/974)) = 450
     expect(l.pose().badge.h).toBeCloseTo(450, 5);
   });
 
@@ -73,6 +73,51 @@ describe("lanyard", () => {
   test("grab misses outside the badge", () => {
     const { l } = rig();
     expect(l.grab({ x: 5, y: 5 })).toBe(false);
+  });
+
+  test("the body has the board's rounded corners, the bottom-right the largest", () => {
+    // A point 1.5% of the width in from both edges is inside the photo's
+    // rectangle but outside every corner's arc (the smallest radius is
+    // 9.3%: the arc is 2.7% in along the diagonal).
+    const { l, run } = rig();
+    run(1000);
+    const { x, y, w, h, angle } = l.pose().badge;
+    expect(Math.abs(angle)).toBeLessThan(0.01);
+    const d = 0.015 * w;
+    for (const [sx, sy] of [
+      [-1, -1],
+      [1, -1],
+      [1, 1],
+      [-1, 1],
+    ]) {
+      expect(l.grab({ x: x + sx * (w / 2 - d), y: y + sy * (h / 2 - d) })).toBe(false);
+    }
+    // 8% of the width in along the bottom edge is board at the bottom-left
+    // (radius 9.6%) but not yet at the bottom-right (radius 18.9%).
+    const along = 0.08 * w;
+    expect(l.grab({ x: x - w / 2 + along, y: y + h / 2 - d })).toBe(true);
+    l.release();
+    expect(l.grab({ x: x + w / 2 - along, y: y + h / 2 - d })).toBe(false);
+  });
+
+  test("the pose's centre is the photo rectangle's centre, despite the unequal corners", () => {
+    // Half a pixel inside each straight edge's middle is board, half a
+    // pixel outside is not: the body sits on the rectangle the photo is drawn in.
+    const { l, run } = rig();
+    run(1000);
+    const { x, y, w, h } = l.pose().badge;
+    for (const [dx, dy] of [
+      [w / 2, 0],
+      [-w / 2, 0],
+      [0, h / 2],
+      [0, -h / 2],
+    ]) {
+      const ux = Math.sign(dx);
+      const uy = Math.sign(dy);
+      expect(l.grab({ x: x + dx - ux * 0.5, y: y + dy - uy * 0.5 })).toBe(true);
+      l.release();
+      expect(l.grab({ x: x + dx + ux * 0.5, y: y + dy + uy * 0.5 })).toBe(false);
+    }
   });
 
   test("relayout mid-swing stays finite and clamped", () => {
