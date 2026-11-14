@@ -24,15 +24,16 @@
  * physics and the sensor (Task 9)".
  */
 import Matter from "matter-js";
+import { BOARD_CORNERS, PHOTO } from "../ui/badge-geometry";
 import { BOARD_AXES, type AxisMap } from "./axes";
 import { sensorMg } from "./sensor";
 import type { Mg, MotionSource } from "./source";
 
 const { Bodies, Body, Composite, Constraint, Engine, Vertices } = Matter;
 
-/** The photo's size (local/m14-design/front.webp), for the aspect ratio. */
-export const IMG_W = 974;
-export const IMG_H = 1513;
+/** The photo's size (`PHOTO`), for the aspect ratio. */
+export const IMG_W = PHOTO.w;
+export const IMG_H = PHOTO.h;
 export const ROPE_SEGMENTS = 10;
 export const GRAVITY_PX_S2 = 2400;
 export const STEP_MS = 1000 / 120;
@@ -51,10 +52,11 @@ export const IMPACT_PX_S = 840;
 export const IMPACT_COOLDOWN_MS = 800;
 /**
  * The accelerometer's spot on the board, as fractions of the photo
- * (x from the left, y from the top). Estimate: the small LGA part just
- * below the ESP32-C3 module; its marking is not legible in the photo.
+ * (x from the left, y from the top): the centre of the 2×2 mm LGA-12
+ * below the ESP32-C3 module, the board's only such part (its 12 pads,
+ * 4/2/4/2 a side, located on the scan; Task 11c).
  */
-export const CHIP_SPOT = { x: 0.414, y: 0.621 };
+export const CHIP_SPOT = { x: 0.4115, y: 0.6191 };
 
 /** A sideways push: the "hand" accelerates the badge at `ax` px/s². */
 interface Push {
@@ -213,6 +215,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     const ring = nodes[nodes.length - 1].position;
     const dPC = clip + bh / 2;
     badge = Bodies.rectangle(ring.x, ring.y + dPC, bw, bh, {
+      // The board's outline: each corner its own radius (TL, TR, BR, BL).
+      chamfer: { radius: [BOARD_CORNERS.tl, BOARD_CORNERS.tr, BOARD_CORNERS.br, BOARD_CORNERS.bl].map((r) => r * bw) },
       frictionAir: 0.022,
       restitution: 0.35,
       friction: 0.05,

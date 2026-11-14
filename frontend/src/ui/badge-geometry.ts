@@ -1,50 +1,80 @@
 /**
- * The badge photo's geometry: the design's values
- * (local/m14-design/Main.dc.html and Mobile.dc.html), in percent of the
- * 974×1513 photo (`public/badge/front.webp`), x from the left and y from
- * the top. Positions are centres; `s` is a hit target's width.
+ * The badge photo's geometry, in percent of the 974×1523 photo
+ * (`public/badge/front.webp`), x from the left and y from the top.
+ * Positions are centres; `s` is a hit target's width.
+ *
+ * The photo is cut from the organizers' orthographic close-up scan and
+ * levelled on the board's long straight edges (Task 11c, Ruling R14).
+ * Every value is measured on it by `frontend/scripts/badge-features.py`
+ * (run through `badge-photo.py --geometry`); see
+ * docs/milestone-14-decisions.md, "Badge photo from the scan (Task 11c)".
  */
 import type { ButtonName } from "../runtime/buttons";
 
-export const PHOTO = { w: 974, h: 1513, src: "/badge/front.webp" };
+export const PHOTO = { w: 974, h: 1523, src: "/badge/front.webp" };
 
-/** The LCD's rectangle, where the 320×240 framebuffer is drawn. */
-export const SCREEN = { left: 15.39, top: 14.76, width: 45.45, height: 21.93 };
+/**
+ * The board outline's corner radii, as fractions of the photo's width
+ * (each an arc tangent to its two edges, fitted to the scan's outline).
+ * The bottom-right corner is about twice the others. The photo's top edge
+ * is the power switch's actuator, 0.46% above the board's top edge.
+ */
+export const BOARD_CORNERS = { tl: 0.093, tr: 0.0946, br: 0.189, bl: 0.0964 } as const;
 
-/** The power slide switch at the top edge. */
-export const POWER = { left: 34.1, top: 1.5, width: 10.5, height: 4 };
+/**
+ * The LCD's rectangle, where the 320×240 framebuffer is drawn: 4:3,
+ * centred on the flat glass (inside the polarizer's line), as wide as the
+ * design's relation to the glass (1% wider than it, 2.2 px over each side;
+ * 2.9 px of glass above and below). `rotateDeg` is the glass's angle
+ * against the levelled board, clockwise positive (CSS `rotate()`'s
+ * sense): the LCD is mounted 0.32° counter-clockwise of the board, so the
+ * canvas turns with it about the rectangle's centre. `left`, `top`,
+ * `width` and `height` are the rectangle before that turn.
+ */
+export const SCREEN = { left: 15.02, top: 14.75, width: 45.96, height: 22.04, rotateDeg: -0.32 };
+
+/** The power slide switch at the top edge: centred on its body; the design's hit size, scaled as the hit sizes below. */
+export const POWER = { left: 34.05, top: 1.96, width: 10.57, height: 4 };
 
 /** The lanyard's two mounting holes (the split rings hang in them). */
 export const HOLES = [
-  [19.59, 3.08],
-  [80.18, 2.83],
+  [19.47, 3.03],
+  [80.46, 3.02],
 ] as const;
 
-/** The six WS2812s around the board (the design's `LEDS`). */
+/** The six WS2812-2020s around the board (the design's `LEDS`): the packages' centres. */
 export const LED_SPOTS = [
-  [10.3, 5.58],
-  [85.13, 5.45],
-  [17.08, 52.44],
-  [79.53, 51.85],
-  [17.27, 91.19],
-  [77.86, 91.19],
+  [10.32, 5.8],
+  [85.59, 5.58],
+  [16.88, 52.51],
+  [79.55, 52.09],
+  [16.66, 90.86],
+  [77.43, 91.49],
 ] as const;
 
-const DPAD = { desktop: 8.25, mobile: 9.6 };
-const ROUND = { desktop: 10.31, mobile: 12.5 };
-const SIDE = { desktop: 6.09, mobile: 7.5 };
+/**
+ * Hit sizes: the design's, scaled by 1.007, the factor by which the same
+ * switches appear larger in this photo than in the previous one (from the
+ * eight switch centres' spread), so each keeps its ratio to the real part.
+ */
+const DPAD = { desktop: 8.31, mobile: 9.67 };
+const ROUND = { desktop: 10.38, mobile: 12.59 };
+const SIDE = { desktop: 6.13, mobile: 7.55 };
 
-/** Hit targets; mobile's are bigger (the design's Mobile artboard). AUX1 is the side switch. */
+/**
+ * Hit targets, centred on the tactile switches' housings; mobile's are
+ * bigger (the design's Mobile artboard). AUX1 is the side slide switch's body.
+ */
 export const BUTTON_SPOTS: Record<ButtonName, { x: number; y: number; s: { desktop: number; mobile: number } }> = {
-  UP: { x: 24.44, y: 62.06, s: DPAD },
-  LEFT: { x: 17.57, y: 67.11, s: DPAD },
-  RIGHT: { x: 31.41, y: 67.11, s: DPAD },
-  DOWN: { x: 24.74, y: 72.36, s: DPAD },
-  A: { x: 84.34, y: 63.44, s: ROUND },
-  B: { x: 69.12, y: 68.2, s: ROUND },
-  HOME: { x: 44.18, y: 81.28, s: ROUND },
-  START: { x: 59.2, y: 81.28, s: ROUND },
-  AUX1: { x: 4.41, y: 37.28, s: SIDE },
+  UP: { x: 23.72, y: 62.17, s: DPAD },
+  LEFT: { x: 16.28, y: 67.19, s: DPAD },
+  RIGHT: { x: 30.63, y: 67.29, s: DPAD },
+  DOWN: { x: 24.08, y: 72.48, s: DPAD },
+  A: { x: 84.31, y: 64.22, s: ROUND },
+  B: { x: 68.99, y: 68.68, s: ROUND },
+  HOME: { x: 43.77, y: 81.59, s: ROUND },
+  START: { x: 59.03, y: 81.5, s: ROUND },
+  AUX1: { x: 4.7, y: 37.65, s: SIDE },
 };
 
 /** The order the hit targets are drawn (and tabbed through): the design's `BTNS`. */

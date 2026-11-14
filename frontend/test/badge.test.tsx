@@ -3,6 +3,7 @@ import { Window } from "happy-dom";
 import type { Point } from "../src/motion/lanyard";
 import type { ButtonName, ButtonSource } from "../src/runtime/buttons";
 import type { BadgeClient, BadgeParts } from "../src/ui/Badge";
+import { SCREEN } from "../src/ui/badge-geometry";
 
 /**
  * The badge and the stage on a happy-dom `Window`, installed as the global
@@ -260,14 +261,21 @@ describe("Badge", () => {
     input.remove();
   });
 
+  test("the screen canvas turns with the LCD glass", () => {
+    const b = renderBadge();
+    const canvas = b.view.getByRole("img", { name: "Badge screen" });
+    expect(canvas.style.transform).toBe(`rotate(${SCREEN.rotateDeg}deg)`);
+    expect(SCREEN.rotateDeg).toBe(-0.32);
+  });
+
   test("mobile hit targets are bigger", () => {
     const desk = renderBadge("desktop");
     const dw = desk.view.getByRole("button", { name: "Badge button A" }).style.width;
     rtl.cleanup();
     const mob = renderBadge("mobile");
     const mw = mob.view.getByRole("button", { name: "Badge button A" }).style.width;
-    expect(dw).toBe("10.31%");
-    expect(mw).toBe("12.5%");
+    expect(dw).toBe("10.38%");
+    expect(mw).toBe("12.59%");
   });
 });
 

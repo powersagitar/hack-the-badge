@@ -321,6 +321,7 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
           top: `${SCREEN.top}%`,
           width: `${SCREEN.width}%`,
           height: `${SCREEN.height}%`,
+          transform: `rotate(${SCREEN.rotateDeg}deg)`,
           imageRendering: "pixelated",
           pointerEvents: "none",
           background: "#000",

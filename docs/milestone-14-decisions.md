@@ -320,7 +320,7 @@ only while the CLI ran; `paths` alone serves `tsc`, Bun and Vite (whose
 `@` alias is in `vite.config.ts`).
 
 Removed: `fengari` (^0.1.5) and `fengari-interop` (^0.1.4), removed in
-Task 4 with the Lua sandbox. Tasks 1 and 2 added none.
+Task 4 with the Lua sandbox. Tasks 1, 2 and 11c added none.
 
 ## Build size (Task 7)
 
@@ -653,7 +653,8 @@ the ±2000 clamp.
 
 `frontend/src/ui/Badge.tsx`, `Stage.tsx`, `badge-geometry.ts` and
 `keyboard.ts`; the photo is `frontend/public/badge/front.webp` (sha256
-`f1e63701…89bd4`).
+`889d5131…fe758` since Task 11c, from the organizers' scan; Task 11's
+was the design's `f1e63701…89bd4`).
 
 - **`LED_CHAIN_TO_SPOT = [0, 1, 3, 5, 4, 2]` is a best guess (Ruling
   R8).** Task 2's evidence ("Chain index → board position" above) shows
@@ -802,3 +803,156 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
     `notice_clears_the_canvas`). The screen is cleared when the badge is
     lost with the canvas already mounted, and when the canvas mounts
     under the notice. A frame blits into whichever canvas is current.
+
+## Badge photo from the scan (Task 11c)
+
+The photo is now cut from the organizers' public close-up page,
+https://badge.hackthenorth.com/closeup?side=front, as the previous one
+came from their site. That page serves an orthographic, scanner-style
+image of the real board (5643×3518 PNG, sha256
+`7b080d2904278896a19423ba3ef147df513c9360baf3b13227dd3a1c5636fa4c`; kept
+in `local/m14-source/`, never committed). The human partner confirms in
+Task 14 that we may publish it. New `front.webp`: 974×1523, 238,600
+bytes, sha256
+`889d513105b5f426e711ef79a0830ed8322a1fcfaee9fe30130ff86d0c1fe758`.
+Task 11b's rotated photo (branch `m14-t11b`) is superseded.
+
+**Reproduce.** Two committed scripts, `frontend/scripts/badge-photo.py`
+(the image, and the outline's numbers) and `badge-features.py` (the
+features' positions, loaded by the first with `--geometry`). Python only
+through the local venv (Pillow 11.3.0, numpy 2.0.2; no project
+dependency):
+
+```
+local/.venv/bin/python -I frontend/scripts/badge-photo.py \
+    local/m14-source/badge-front.7b080d290427.png \
+    frontend/public/badge/front.webp --geometry
+```
+
+A re-run writes byte-identical bytes. The method is in each script's
+module doc.
+
+**Level (Ruling R14: the board, not the LCD).** Edge fits on the turned
+scan (robust lines, rms 0.35–0.53 px), counter-clockwise positive:
+
+| edge | before | after levelling |
+|---|---|---|
+| left (long) | +0.348° | +0.012° |
+| right (long) | +0.318° | −0.018° |
+| top | −0.386° | −0.055° |
+| bottom | −0.380° | −0.047° |
+
+The levelling rotation is the long sides' mean, −0.333° (clockwise).
+Shear: the sides and the top/bottom disagree by 0.050°, under the 0.1°
+limit, which is why the short edges read about −0.05° after.
+
+**LCD and "Hack the North" box against the levelled board** (clockwise
+positive, CSS's sense):
+
+- LCD glass (the polarizer's thin line): left −0.293°, right −0.280°,
+  top −0.346°, bottom −0.364°; mean **−0.32°**, so the LCD is mounted
+  0.32° counter-clockwise of the board (Task 11b saw about 0.27° on the
+  camera photo). Past R14's 0.1°, so `SCREEN.rotateDeg = -0.32` and
+  `Badge.tsx` turns the screen canvas by it (CSS `rotate()` about the
+  rectangle's centre). The rectangle is fitted in the glass's own frame.
+- "Hack the North" box: left −0.067°, right +0.125°, top −0.013°,
+  bottom −0.004°; mean +0.010°: level with the board, as silkscreen is.
+
+**The outline.** Traced per row and per column on the levelled scan,
+not modelled, so the photo has the board's real edge:
+
+- **The strips are panel rails, not board.** The dark purple strips
+  along both long sides carry plated holes and screws, sit across a thin
+  light gap from the board, and are missing from the camera photo's
+  outline, so they are a panel frame broken off before the badge is worn
+  (or the fixture). They are cut away, with the clamps, the background
+  and the "1269" serial sticker, which is on the right rail.
+- **The edge** is the outer edge of the board's dark solder-mask margin.
+  The thin light rim beside the sides and the top (the gap, or the
+  edge's face lit from one side) is left out: 1.5 px at most, and it
+  would be a light halo on the dark stage.
+- **Two side recesses**, which the previous photo filled in: left,
+  y 490–852 px, up to 22.8 px deep (the USB-C shell and the AUX1
+  slide switch's actuator stand in it and are kept); right, y 553–1063
+  px, up to 31.9 px deep. The camera photo's outline has both.
+- **The right edge tapers** inward from about y 1137 px to the
+  bottom-right corner (5.5 px by y 1354); it is traced as it is.
+- **The power switch's actuator** stands 7 px (0.46% of the height)
+  above the board's top edge. It is kept, so the photo's top row is the
+  actuator's top and the board's top edge is at y 7 px.
+- **The four holes** are through-holes (the background shows through
+  them) and are transparent: centres (189.6, 46.2), (783.7, 46.0),
+  (190.1, 1482.0), (784.3, 1481.8) px, radius 24.5–24.7 px.
+- **Corners: each its own radius** (the human partner's request). An
+  arc tangent to the two edge lines, fitted to the middle 60% of each
+  traced corner:
+
+  | corner | scan px | photo px | fraction of the width | trace vs arc (rms / max, scan px) |
+  |---|---|---|---|---|
+  | top-left | 292.0 | 90.6 | 0.0930 | 1.00 / 2.85 |
+  | top-right | 297.1 | 92.2 | 0.0946 | 0.70 / 1.81 |
+  | bottom-left | 302.4 | 93.9 | 0.0964 | 0.82 / 2.18 |
+  | bottom-right | 593.3 | 184.1 | 0.1890 | 1.44 / 3.87 |
+
+  The bottom-right is about twice the others. The mask uses the trace,
+  not the arcs. `BOARD_CORNERS` in `badge-geometry.ts` holds the
+  fractions, and the lanyard's matter.js body is now a rectangle with
+  those per-corner chamfers (it was a sharp rectangle), so grabbing and
+  wall contact follow the board's corners. Nothing modelled the board
+  with one radius. The badge's invisible 28 px grab margin (`inset: -28`,
+  `borderRadius: 32` in `Badge.tsx`) is the design's hit slop, not the
+  outline, and is unchanged; the drop shadow follows the alpha.
+- **Size.** The board (actuator excluded) is 3138.8 × 4885.5 scan px,
+  aspect 0.64247; the photo is 974 × 1523 (scale 0.310315), aspect
+  0.63953 with the actuator's 7 px. Lanczos downscale premultiplied by
+  the 4×4-supersampled mask (about 1 px of feather at final size); WebP
+  quality 88, lossless alpha, method 6. On the dark stage there is no
+  halo and no fixture left (checked at 2× on all four corners, both
+  recesses and the bottom-right's green light leak).
+
+**Geometry, old → new** (percent of the photo; x of 974, y of the
+height, 1513 before and 1523 now). All measured by `badge-features.py`
+on the levelled scan and mapped by the image's own crop and scale:
+
+| value | old | new | measured as |
+|---|---|---|---|
+| `PHOTO` | 974 × 1513 | 974 × 1523 | |
+| `SCREEN` | 15.39, 14.76, 45.45 × 21.93 | 15.02, 14.75, 45.96 × 22.04, `rotateDeg` −0.32 | below |
+| `POWER` | 34.1, 1.5, 10.5 × 4 | 34.05, 1.96, 10.57 × 4 | its body's centre |
+| `HOLES` | 19.59, 3.08 / 80.18, 2.83 | 19.47, 3.03 / 80.46, 3.02 | fitted circles |
+| `LED_SPOTS[0..5]` | 10.3,5.58; 85.13,5.45; 17.08,52.44; 79.53,51.85; 17.27,91.19; 77.86,91.19 | 10.32,5.8; 85.59,5.58; 16.88,52.51; 79.55,52.09; 16.66,90.86; 77.43,91.49 | the white packages' centres |
+| UP / LEFT / RIGHT / DOWN | 24.44,62.06 / 17.57,67.11 / 31.41,67.11 / 24.74,72.36 | 23.72,62.17 / 16.28,67.19 / 30.63,67.29 / 24.08,72.48 | the black housings' centres |
+| A / B | 84.34,63.44 / 69.12,68.2 | 84.31,64.22 / 68.99,68.68 | 〃 |
+| HOME / START | 44.18,81.28 / 59.2,81.28 | 43.77,81.59 / 59.03,81.5 | 〃 |
+| AUX1 | 4.41, 37.28 | 4.7, 37.65 | the side switch's body |
+| hit `s` (desktop / mobile) | DPAD 8.25/9.6, ROUND 10.31/12.5, SIDE 6.09/7.5 | 8.31/9.67, 10.38/12.59, 6.13/7.55 | ×1.007, below |
+| `CHIP_SPOT` (fractions) | 0.414, 0.621 | 0.4115, 0.6191 | the LGA-12's pads' centroid |
+| `BOARD_CORNERS` | (none) | tl 0.093, tr 0.0946, br 0.189, bl 0.0964 | above |
+
+- **SCREEN.** The flat glass inside the polarizer's line is 443.2 ×
+  341.6 px in its own frame (aspect 1.2976, as Task 11b found on the
+  camera photo), centred at (370.1, 392.5) px. The design's relation
+  (Task 11b's fit: a 4:3 rectangle 442.68 px wide on a glass 438.28 px
+  wide, centred) gives 447.6 × 335.7 px: 2.2 px past the glass on each
+  side, 2.9 px of glass above and below, 4:3 to 0.02%. Checked in the
+  browser at 1440×900 and 390×844: the frame sits evenly in the glass,
+  turned with it.
+- **Hit sizes.** The switches are the same parts in both photos, so the
+  hit sizes keep the design's ratio to them by scaling with how large
+  the parts appear: the eight switch centres' spread is 1.0069× the
+  previous photo's (x 1.0070, y 1.0069). The parts' own edges on the
+  blurred camera photo could not give that: its tactile housings read
+  60.4 px (here 58.9 px, −2.5%) and the side switch's length 62 px
+  (here 68 px, +10%), disagreeing in sign. Mobile stays larger by the
+  same factors. `POWER`'s size is scaled the same way.
+- **LEDs.** The physical layout fits the existing index order (0
+  top-left, 1 top-right, 2 mid-left, 3 mid-right, 4 bottom-left, 5
+  bottom-right); `LED_CHAIN_TO_SPOT` is unchanged (Ruling R10).
+- **The accelerometer, identified.** The scan resolves it: the 2×2 mm
+  package below the ESP32-C3 module has 12 pads, 4/2/4/2 a side (an
+  LGA-12 2×2 mm, the SC7A20H's package), and it is the only such part
+  on the board. Its marking reads upside down ("A9" / "XXL"), with the
+  round pin-1 dot at the package's lower-right as the photo shows it.
+  `CHIP_SPOT` is the centroid of its pads. The dot's corner is a lead
+  for Task 14's axis check (`BOARD_AXES` stays unverified; this task
+  does not change it).
