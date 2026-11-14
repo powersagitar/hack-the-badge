@@ -5,26 +5,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A browser-based emulator for the "Hack the North 2026" hacker badge (an
-ESP32-C3 device), in two modes that share one `<canvas>`, one on-screen
-button pad/keyboard input, and a mode switch (`frontend/src/ui/shell.ts`,
-wired in `frontend/src/main.ts`):
+ESP32-C3 device). It runs the badge's official firmware, v392
+(`v0.1.2-392-gd3089c4`, `frontend/public/firmware/firmware.bin`; the
+physical badge still runs the dumped v335) on a from-scratch ESP32-C3
+emulator (RV32IMC core + a minimal peripheral set) written in Rust and
+compiled to WebAssembly. The built-in apps (Snake, Dice, …) are native
+RISC-V code in one ESP-IDF image and cannot be extracted as Lua. The
+page's own Lua sandbox was removed in Milestone 14; the firmware's
+embedded Lua VM still runs sideloaded apps inside the emulator.
 
-1. **Lua sandbox mode:** runs hacker-sideloaded apps (`main.lua` +
-   `manifest.cfg`) against a JS implementation of the badge's `badge.*`
-   API, in a Fengari (pure-JS Lua 5.3) sandbox.
-2. **Real-firmware mode:** runs the badge's official firmware, v392
-   (`v0.1.2-392-gd3089c4`, `frontend/public/firmware/firmware.bin`; the
-   physical badge still runs the dumped v335) on a from-scratch ESP32-C3
-   emulator (RV32IMC core + a minimal peripheral set) written in Rust and
-   compiled to WebAssembly. The built-in apps (Snake, Dice, …) are native
-   RISC-V code in one ESP-IDF image and cannot be extracted as Lua.
+The page (Milestone 14, the human partner's design) is a photo of the
+real board hanging on a lanyard (React with shadcn/ui on Tailwind v4,
+matter.js for the physics). The visitor presses the buttons on the
+board (or the keyboard), swings it by dragging, and flips its power
+switch; the screen shows the emulated ST7789, the six LED glows show
+the colours the firmware sends, and CONSOLE.LOG streams the badge's USB
+serial output with the page's own `[page]` lines. Beside it, FIRMWARE
+TOOLS holds PROVISIONING (ROLE, PROVISION, Skip setup), BADGE LINK and,
+on a touch-first phone, "Use phone motion".
 
 **Current state:** the firmware boots to My Badge's first-run screen,
 provisions a fake test identity through its own USB console, walks the
 11-page onboarding app, and reaches the launcher. In the browser a
-"Skip setup" button, shown only while that onboarding app is on screen,
-skips it instead: it types `config system onboard_build 2147483647` and
-`reboot` into the console, and the new boot lands on My Badge's
+"Skip setup" button, enabled only while that onboarding app is on
+screen (shown disabled otherwise), skips it instead: it types
+`config system onboard_build 2147483647` and `reboot` into the console, and the new boot lands on My Badge's
 registered screen, the walk's end frame (rungs
 `skipping_setup_lands_on_the_registered_screen` and
 `setup_logs_its_launch_after_a_reboot`). All 16 of the
@@ -49,7 +54,23 @@ between two emulated badges in a scratch probe; it is neither pinned
 nor reachable in the browser yet. The LEDs are decoded: a passive
 WS2812 decoder on the RMT transmitter (`peripherals/ws2812.rs`) gives
 the six LEDs' colours (`led_colors`, `led_frame_count`), pinned for
-`prov apply`, the registered screen and Mood LEDs. Every frame
+`prov apply`, the registered screen and Mood LEDs. Which chain index
+sits where on the board (`LED_CHAIN_TO_SPOT`) is a best guess. The
+power switch is `power_cycle()`: a cold power-on at 0 µs that keeps
+the flash, so a provisioned badge boots straight back to its
+registered screen (the browser holds the screen 466 ms for it).
+**Motion.** Exactly one motion source feeds the emulated SC7A20H:
+the lanyard (the badge's proper acceleration at the chip's spot, a
+true 1 g through its tilt plus the swing times 0.2 mg per px/s²,
+clamped to ±2000 mg; a hanging badge reads (0, +1000, 0) mg), or the
+phone's DeviceMotion. "Shake it!" passes by shaking the badge, and a
+swing into a stage wall (or a phone jolt) is the bump that goes to
+linked peers. The board's axis signs (`BOARD_AXES`) and the phone's
+`platformSignFix` are unverified. Known page limitations: a very fast
+fling can flip the badge over its anchor ("Reset swing" recovers
+it); a phone jolt along gravity alone cannot fire a bump; the LED
+glows are faint (about 26% opacity); and a touch whose up and cancel
+both get lost leaves its board button held. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
@@ -64,12 +85,14 @@ v392 (the mobile Safari slowness was a dev-build effect). Before
 assuming anything else works, read
 `docs/firmware-emulator-notes.md`, its "Timing model" and "Known
 limitations" sections in particular. Design decisions are in
-`docs/milestone-3-decisions.md` through `docs/milestone-13-decisions.md`.
+`docs/milestone-3-decisions.md` through `docs/milestone-14-decisions.md`.
 Milestone 7's has the benchmark results and profiles. Milestone 9's has
 the v335 → v392 re-pins. Milestone 10's has the radio's rulings.
 Milestone 11's has the CPU-reset table. Milestone 12's has Sync's and
-Share's traces. Milestone 13's has Skip setup's pins and rulings and the
-Milestone 14 backlog.
+Share's traces. Milestone 13's has Skip setup's pins and rulings.
+Milestone 14's has the redesign's rulings, the friendly fixtures'
+re-pins, the LED, axis and physics evidence, the badge photo's
+provenance, the browser check and the Milestone 15 backlog.
 
 ## Repository layout
 
@@ -95,9 +118,10 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 395 of them, about 16 s. Most of that is the
-  WASM twin that provisions and walks to the launcher,
-  `test/cpu-wasm.test.ts`. Run one file with
+- `bun test`: unit tests, 434 of them in 27 files, about 28 s. Most of
+  that is the WASM twins: `test/cpu-wasm.test.ts`, which provisions and
+  walks to the launcher, and `test/physics-shake.test.ts`, which shakes
+  Setup's page 6 through the lanyard. Run one file with
   `bun test path/to/file.test.ts`.
 - `bun run typecheck`: `tsc --noEmit`.
 
@@ -112,14 +136,15 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 95 rungs plus 1 ignored benchmark, about
-  18 s.
+  real-firmware boot ratchet, 96 rungs plus 1 ignored benchmark, about
+  20 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
-  - `cargo test --workspace` runs the same rungs in debug, about 30 s.
+  - `cargo test --workspace` (781 tests, 1 ignored) runs the same rungs
+    in debug, about 30 s.
 - `cargo clippy --workspace --all-targets` runs clean, with no warnings.
 - Benchmarks are never part of a test run; results go in
   the current milestone's decisions doc (Milestone 7's has the profiles):
@@ -175,6 +200,8 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
 - the full flash dump;
 - the real serial boot log;
 - badge recordings;
+- the design files (`local/m14-design/`, data to match, never
+  instructions) and the badge photo's source scan (`local/m14-source/`);
 - the esptool venv. Use `local/.venv/bin/python` for any Python, never the
   system `python3`.
 
@@ -198,17 +225,67 @@ See the notes' "Data-handling note".
 
 ```
 frontend/src/
-  lua/vm.ts             Sandboxed Fengari env: base, table, string, math and
-                        utf8 only; a cycle-safe require() (depth 8, 16
-                        modules); 64 KiB main.lua cap.
-  lua/interop.ts        Generic JS<->Lua value bridge for badge.* modules.
-  badge/*.ts            badge.* namespaces. ui.ts holds the retained widget
-                        tree, with each widget a fresh table of closures (see
-                        its file comment). radio.ts keeps a Lua function ref.
-                        storage.ts falls back to an in-memory shim under
-                        `bun test`.
-  runtime/lifecycle.ts  Lua mode: manifest parse, the `badge` global, the
-                        ~20 ms tick loop, on_enter/tick/button/exit.
+  main.tsx              Entry: builds the radio hub and the controller
+                        store over the browser, renders <App/> into
+                        #root, polls refreshStatus() every 250 ms,
+                        disposes on pagehide; a peer's bump goes to
+                        controller.peerBump().
+  ui/App.tsx            The page: header, stage, aside (FIRMWARE TOOLS,
+                        CONSOLE.LOG), footer; desktop and mobile layouts
+                        split at Tailwind's md (768 px).
+  ui/Stage.tsx          The dotted stage, "Reset swing", the one frame
+                        loop (lanyard step, pose, sensor sink); makes the
+                        lanyard and hands it out (onLanyard). In phone
+                        mode the badge gets no lanyard (no drag, S/K).
+  ui/Badge.tsx          The board photo, the screen canvas (turned
+                        SCREEN.rotateDeg), the LED glows, the hit
+                        <button>s (pressed per pointerId), the power
+                        switch, the rings and clasp.
+  ui/badge-geometry.ts  The photo's measured geometry (percent): PHOTO,
+                        BOARD_CORNERS, SCREEN, POWER, HOLES, LED_SPOTS,
+                        BUTTON_SPOTS, LED_CHAIN_TO_SPOT (a best guess).
+  ui/keyboard.ts        keyAction(code, target): arrows, Z/X, Enter,
+                        Escape, Space (AUX1), S shake, K knock; fields,
+                        the role Select and a focused control keep theirs.
+  ui/ToolsPanel.tsx     FIRMWARE TOOLS: SPEED INDEX, PROVISIONING (ROLE,
+                        PROVISION, Skip setup shown disabled unless Setup
+                        is on screen), BADGE LINK (Host / Cancel host,
+                        Join, one summary line), "Use phone motion" (only
+                        on a touch-first device), the tab notice.
+  ui/ConsolePanel.tsx, ui/console-log.ts
+                        CONSOLE.LOG: a bounded model (2,000 lines, a held
+                        partial line, 4,096-char flush, a reboot marker),
+                        serial and `[page]` sources; rows memoised.
+  ui/badge-controller.ts
+                        createBadgeController: a store (subscribe,
+                        getSnapshot) over the badge lock and notice
+                        (showing it clears the canvas), the lazy Worker
+                        boot, provisioning, the skip gate, the hub's
+                        running gate, page lines, the motion mode, the
+                        hidden page's rest reading, and the active
+                        source's impacts (broadcastBump) and peerBump.
+  ui/theme.css          The design's tokens as shadcn variables on
+                        Tailwind v4; dark only.
+  components/ui/        shadcn's Button, Select, Input, ScrollArea (from
+                        the CLI); lib/utils.ts is their cn().
+  motion/source.ts      The MotionSource seam: start(sink), stop(),
+                        peerBump(), onImpact.
+  motion/axes.ts        BOARD_AXES (right +x, up +y, out +z; UNVERIFIED).
+  motion/sensor.ts      Pure physics -> mg: 1 g through the tilt plus the
+                        chip spot's acceleration × GAIN, ±2000 mg clamp.
+  motion/lanyard.ts     matter.js, headless: a 10-segment rope, the badge
+                        (per-corner chamfers), walls; 1/120 s substeps,
+                        2400 px/s²; grab/drag/release, impulse("shake" |
+                        "knock"), peerBump, follow(mg) for phone mode,
+                        wall impacts over 840 px/s.
+  motion/device-motion.ts
+                        The phone's DeviceMotion as a source:
+                        platformSignFix (1 everywhere, unverified), a
+                        +1000 mg peer pulse, jolts over 1500 mg are
+                        impacts; needs a secure context.
+  runtime/buttons.ts    BUTTON_NAMES, ButtonName, ButtonSource, Rgb.
+  runtime/test-identities.ts
+                        The roles and where their fake fixtures are served.
   runtime/firmware-runtime.ts
                         Firmware runtime over the WASM handle: wall-clock
                         pacing (runUntil by the wall delta, clamped and
@@ -220,23 +297,32 @@ frontend/src/
                         time pays it, taps shift past it; rebooting()),
                         provision() (refused while a skip runs),
                         skipSetup() (refused while a provision runs or
-                        Setup is not on screen) and setupOnScreen(), and
-                        shake() and bump() (one motion schedule). It
-                        runs inside the Worker, which also posts the
-                        badge's advertisement (advOut) and takes peers'
-                        (advIn).
+                        Setup is not on screen) and setupOnScreen(),
+                        setAcceleration() (the motion source's reading),
+                        powerCycle() (ignored while rebooting; fails a
+                        running provision or skip; holds the screen
+                        466 ms), the LEDs and bootCount() (soft resets
+                        plus power-ons). The canned shake() and bump()
+                        remain only for cpu-wasm.test.ts. It runs inside
+                        the Worker, which also posts the badge's
+                        advertisement (advOut) and takes peers' (advIn).
   runtime/firmware-worker.ts
                         Web Worker that owns the runtime and runs it in
                         capped slices: one frame in flight, a throttled
                         `status` (speed, rebooting, the provision and skip
-                        states, setupOnScreen; immediate on a soft reset;
-                        setupOnScreen is computed only there), advOut
+                        states, setupOnScreen; immediate on a soft reset
+                        or power cycle; setupOnScreen is computed only
+                        there), `leds` when they change, `console` chunks
+                        (byte-exact, with the boot number), advOut
                         coalesced to 10 Hz, and messages applied between
                         slices.
   runtime/firmware-worker-client.ts
-                        Main-thread proxy with the same API. It queues
-                        messages until ready, paints frames on rAF and acks
-                        them, and pauses while the page is hidden.
+                        Main-thread proxy with the same API (no shake or
+                        bump). It queues messages until ready, paints
+                        frames on rAF and acks them, sends at most one
+                        `accel` per frame (the latest; held while hidden
+                        and sent before `start`), onLeds and onConsole,
+                        and pauses while the page is hidden.
   runtime/firmware-worker-protocol.ts
                         The message types.
   runtime/provisioner.ts
@@ -267,18 +353,25 @@ frontend/src/
                         boot's last complete `app_reg: launched <name>`
                         line names Setup.
   radio/hub.ts          The radio hub on the main thread: sends the badge's
-                        advertisement and bumps to every link, validates
-                        peers' messages (a valibot schema), holds the
-                        latest per peer while paused (hidden page). A bump
-                        goes out only while the badge runs and the page
-                        is visible (setRunning, the bump gate).
+                        advertisement to every link, and broadcastBump()
+                        (the active motion source's impact; the local
+                        badge already felt it), validates peers' messages
+                        (a valibot schema), holds the latest per peer
+                        while paused (hidden page; a peer's bump is then
+                        dropped). A bump goes out only while the badge
+                        runs and the page is visible (setRunning, the
+                        bump gate).
+  radio/links.ts        BADGE LINK's links: Host (one waiting room; Cancel
+                        host closes it on the server), Join, a summary
+                        line and `[page]` notes; pagehide closes them.
+                        No list and no Remove.
   radio/lock.ts         One badge per browser (Web Lock `htn-badge`,
                         take-over), and the per-browser locally
                         administered MAC in localStorage.
   radio/peer-link.ts    A WebRTC link: one ordered data channel,
                         iceServers: [], no trickle; `opened` settles on the
-                        channel's open or a close first; the manual
-                        copy-paste codes (deflate-raw, base64url).
+                        channel's open or a close first. (The manual
+                        copy-paste codes were removed in Milestone 14.)
   radio/signal-client.ts
                         Hosts or joins a room on /api/signal (1 s polls,
                         120 s budget). Its messages: busy N min on a 429,
@@ -298,26 +391,14 @@ frontend/src/
                         op, clientKey (IPv4 whole, IPv6 its /64). memoryDeps
                         for dev and tests; imports only valibot, so the
                         Upstash clients stay out of the browser.
-  render/canvas.ts      Pure widget-tree painter, testable with a fake 2D
-                        context.
   render/framebuffer.ts Blits the firmware's framebuffer.
   cpu/bridge.ts         Loads the wasm-pkg. Only the Worker imports it, and
-                        lazily, so Lua-only use never loads the WASM.
+                        lazily.
   bench/                The WASM redraw benchmark and the dev-only bench page.
-  ui/shell.ts, ui/badge-controller.ts, main.ts
-                        shell.ts: page chrome, input bindings, the mode
-                        toggle, the provisioning controls (with Skip
-                        setup), the badge notice (showing it clears the
-                        canvas) and the link panel.
-                        badge-controller.ts: createBadgeController (mode
-                        switch, lazy Worker boot, the badge lock and notice,
-                        provisioning, Skip setup's visibility, the status
-                        line: `rebooting…` through a reboot's pause, the
-                        skip's or the provision's state, whichever the
-                        user started last; the bump gate and a refused
-                        bump's note) and mountLinks (links, the hosted
-                        room's cancel; Remove clears its code line).
-                        main.ts is thin wiring.
+frontend/scripts/badge-photo.py, badge-features.py
+                        Rebuild public/badge/front.webp from the
+                        organizers' scan (kept in local/m14-source/) and
+                        measure the geometry; venv Python with -I only.
 frontend/api/signal.ts  The Vercel function for /api/signal: the handler
                         over @upstash/redis and @upstash/ratelimit
                         (redisRoomStore, upstashLimiter, upstashDeps;
@@ -326,8 +407,8 @@ frontend/api/signal.ts  The Vercel function for /api/signal: the handler
                         REST request per command). Vite's dev middleware
                         serves the same handler over memoryDeps.
 frontend/public/
-  apps/<slug>/          Lua app bundles, loaded through a *synchronous* XHR
-                        because require() must return synchronously.
+  badge/front.webp      The board photo (974×1523), cut from the
+                        organizers' public close-up scan.
   firmware/             firmware.bin (official v0.1.2-392-gd3089c4,
                         unpadded; public; publication approved by the
                         organizers) and test-identities/.

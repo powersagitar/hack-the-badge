@@ -33,6 +33,80 @@ plan: `docs/superpowers/plans/2026-11-12-milestone14-badge-page-redesign.md`.
   out = +z, and it is **UNVERIFIED**. The human partner checks the signs
   on the physical badge (for example with Level or Accel) in Task 14's
   browser check, and `BOARD_AXES` is fixed then.
+- **From the spec ("Decided by the human partner"):** no landing or
+  intro, straight to the page; the swing feeds the accelerometer
+  continuously, and shakes and bumps fall out of the physics; the LEDs
+  show the firmware's real colours; the identity rename re-pins the
+  tests, with no separate test-only copy; CONSOLE.LOG is the real serial
+  output with the page's status lines merged in, leaving room for a
+  later "what you did" stream; manual pairing, the links list, Remove
+  and the Shake and Bump buttons are removed; the UI stack is shadcn/ui
+  (React, Tailwind) and the physics matter.js, not three.js; console
+  typing is out of scope but easy to add; phone motion is in scope (the
+  phone is the badge, and the drawn badge follows it); the swing keeps
+  the design's look, and the sensor gets a true 1 g through the tilt
+  plus the motion times a tuned constant; keyboard impulse keys shake
+  and bump.
+- **Straighten the photo (2026-11-12).** The human partner saw the
+  screen "a bit off in person" and chose "Straighten the photo" (Task
+  11b). Then they named the source, the organizers' close-up page, and
+  asked to "do whatever you can to restore the exact shape of the
+  physical badge" (2026-11-12): Task 11c rebuilt the photo from that
+  scan and superseded 11b (Rulings R13, R14, R16 below).
+- **"Use phone motion" only on mobile (2026-11-12).** "Makes no sense on
+  desktop": the button shows only on a touch-first device (Ruling R12).
+- **Per-corner radii (2026-11-14).** "The corners of the badge have
+  different radii": Task 11c measured each corner and gave the photo's
+  mask, `BOARD_CORNERS` and the lanyard body one radius each ("Badge
+  photo from the scan (Task 11c)").
+
+## Rulings
+
+The controller's rulings are R1–R16 in the ledger
+(`local/m14-sdd-ledger.md`). The four the plan asks this doc to hold:
+
+- **The axis mapping.** `BOARD_AXES` = right +x, up +y, out +z
+  (`motion/axes.ts`), so a hanging badge reads (0, +1000, 0) mg and a
+  phone held upright reads +1000 mg up. Assumed and **unverified** (the
+  human partner's "assume, verify later"); the evidence and the apps
+  that read single axes are in "Accelerometer axes (Task 9)". Task 11c
+  identified the chip (an LGA-12 2×2 mm package below the module) and
+  its pin-1 dot, a lead for the check.
+- **The gain.** `GAIN_MG_PER_PX_S2` = 0.2: the lowest measured gain at
+  which a vigorous drag passes "Shake it!" at every sampled phase and a
+  gentle one at none ("GAIN_MG_PER_PX_S2 = 0.2").
+- **The LED order.** `LED_CHAIN_TO_SPOT` = [0, 1, 3, 5, 4, 2], clockwise
+  from the top-left (R8, made concrete as R10): the chain runs 0→5
+  around the board and the shake page lights 3 and 4 together, but
+  where index 0 sits and which way the chain turns is a **best guess**
+  ("Chain index → board position").
+- **The impact threshold.** A wall contact is an impact when its edge
+  approached faster than `IMPACT_PX_S` = 840 px/s (the design's 7 px per
+  1/120 s step), at most one per 800 ms; on the phone, a jump over
+  1500 mg between raw readings, at most one per 800 ms ("Lanyard physics
+  and the sensor", "Phone motion").
+
+The ledger rulings that changed behaviour or the plan:
+
+- **R1:** WS2812 bits by relative timing (duration0 > duration1), not
+  absolute high time; rests on the firmware's observed 9/3 and 3/9 tick
+  symbols.
+- **R7:** the plan's `leds_show_the_role_colour_when_registered` is
+  `leds_go_dark_on_the_registered_screen`, because the LEDs are measured
+  dark there; the role colour is pinned in `leds_flash_during_prov_apply`.
+- **R10:** the LED order above, over the brief's identity fallback.
+- **R12:** "Use phone motion" shows only on a touch-first device:
+  `motionAvailable()` and `(hover: none) and (pointer: coarse)`, not the
+  768 px layout breakpoint.
+- **R13, R14, R16:** the photo comes from the organizers' orthographic
+  scan (R13); it is levelled on the board, not the LCD, which then turns
+  by `SCREEN.rotateDeg` = −0.32 (R14); the power switch's actuator is
+  kept in the outline rather than cropped (R16).
+- **R15:** the fling flip-over (Task 9's physics) is a documented known
+  limitation and a browser-check item, not a fix task.
+- **Recorded (Task 6 minor):** the Worker posts a `console` chunk with a
+  status only when there is new text (and at once on a reset), not with
+  every status as the brief said; an empty chunk would carry nothing.
 
 ## Re-pins (Task 1)
 
@@ -1049,3 +1123,237 @@ on the levelled scan and mapped by the image's own crop and scale:
   silkscreen at the package's upper right. The dot's corner is a lead
   for Task 14's axis check (`BOARD_AXES` stays unverified; this task
   does not change it).
+
+## Final suites (Task 14)
+
+On `m14-t14` at `247dac6` plus this task's docs (no code changed),
+2026-11-14, Bun 1.4.4, rustc 1.98.1:
+
+| command | result |
+|---|---|
+| `cargo test --workspace` | 781 passed, 0 failed, 1 ignored (the `bench_redraws` benchmark) |
+| `cargo test -p emulator-core --release --test boot_progress` | 96 passed, 1 ignored, 19.7 s |
+| `cargo clippy --workspace --all-targets` | clean, 0 warnings |
+| `bun run build:wasm` | ok |
+| `bun test` | 434 pass, 0 fail, 27 files, 27.5 s |
+| `bun run typecheck` | ok |
+| `bun run build` | ok: JS 486.20 kB (gzip 156.84 kB), CSS 27.61 kB (gzip 6.25 kB), worker 12.77 kB, bridge 6.66 kB, wasm 146.60 kB; `dist/` 4112 KiB |
+
+Every count matches the milestone's expected baselines (Milestone 13
+ended at 764 / 92 / 395). The movements are this milestone's new tests
+and rungs, and the pins that moved are only Task 1's ("Re-pins").
+
+## Browser check (pending)
+
+**PENDING: the human partner's answers go here.** Run `bun run build &&
+bun run preview` (port 4173) on desktop; on the phone, the deployed
+build or an HTTPS dev server (iOS grants DeviceMotion only in a secure
+context). Each item: pass, or what was seen.
+
+1. Desktop and phone layouts against each artboard (`Main.dc.html`,
+   `Mobile.dc.html`). —
+2. Provision, then shake to pass "Shake it!": by dragging on desktop;
+   with phone motion on the phone (iOS, and Android if available). —
+3. Skip setup works. —
+4. Mood LEDs: **the LED positions match the physical badge's chain**
+   (where Setup's chase starts and which way it turns). Fix
+   `LED_CHAIN_TO_SPOT` (`frontend/src/ui/badge-geometry.ts`) if not; R10's
+   [0, 1, 3, 5, 4, 2] is a best guess. —
+5. Power switch: the badge reboots and stays registered. —
+6. Two linked browsers reach "SYNCED" in Connect by swinging into a
+   wall. —
+7. CONSOLE.LOG streams serial output with `[page]` lines. —
+8. On the phone, an upright phone reads about 1 g "up" (the Shake it!
+   page shows G-force). Fix `platformSignFix`
+   (`frontend/src/motion/device-motion.ts`, 1 everywhere, unverified)
+   per platform if not: iOS —, Android —.
+
+Extras:
+
+9. `BOARD_AXES`' signs on the physical badge, through the Level or
+   Accel app (right +x, up +y, out +z is assumed). —
+10. The LED glows' brightness: at the firmware's levels they show at
+    about 26% opacity. Faint, or fine? —
+11. The new badge photo's alignment: the outline's per-corner shape
+    (the bottom-right about twice the others), the screen in its glass
+    (SCREEN overhangs the polarizer by 2.2 px each side, kept from the
+    design's relation), the buttons, LEDs and power switch. —
+12. The fling flip-over (R15): a very fast fling can swing the badge
+    over its anchor; "Reset swing" recovers it. Acceptable as a known
+    limitation? —
+13. The close-up scan (https://badge.hackthenorth.com/closeup?side=front,
+    the organizers' public site) may be published as the cut-out
+    `front.webp`? —
+
+## Milestone 15 backlog
+
+### New in Milestone 14
+
+The deferred review minors from the controller's ledger and the
+browser check's open items. The browser check above may close some.
+
+- **Physics (Task 9, R15):** the fling flip-over: clamp the board's
+  angle about the anchor, or stop the rope whipping it over.
+- **Physics (Task 9):** "Shake it!" passes by sampling phase (100% of
+  phases on 1000×780, 96% on 390×640, per the replica); on stages
+  narrower than about 600 px a moderate shake hits the walls and sends
+  peer bumps; a ±40 px, 1 Hz drag reads 548 mg and can trip Connect's
+  local detector (the spec accepts it); stray doc comments above
+  `let walls` in `lanyard.ts`.
+- **Phone motion (Task 10):** compute the jolt detector's jump on the
+  unclamped readings, so a jolt along gravity can fire alone; export
+  sensor.ts's `finite` instead of duplicating it in `device-motion.ts`;
+  `device-motion.test.ts`'s `afterEach` sets absent globals to
+  `undefined` instead of deleting them.
+- **Phone motion (Task 13):** in phone mode, `follow` leaves the
+  sideways pull unclamped against as little as 0.25 g down, so the
+  drawn badge can swing near horizontal (cosmetic).
+- **Pointers and keys (Tasks 11, 13):** a backstop for the per-pointer
+  release (clear pointers and `releaseAll("pad")` on a hidden page or a
+  window blur), so a lost touch-up cannot strand a pad button; the drag
+  ends on any pointer's up (a second finger); the keyboard tap and the
+  pointer share the `pad` source, so a 150 ms tap's release frees a
+  finger-held button, and an unrelated pointerup can cut that tap short.
+- **The LEDs (Tasks 2, 11):** one WS2812 decoder serves both RMT TX
+  channels (fine while only channel 0 is used); a brightness curve if
+  the human partner finds the glows faint; `LED_CHAIN_TO_SPOT` if the
+  check finds it wrong.
+- **The power cycle (Tasks 3, 6):** `power_cycle_boots_to_the_registered_screen`
+  ignores Setup's page 1 as well as the splash in
+  `run_until_stable_frame`, so a regression back to Setup would time out
+  rather than fail fast; up to three bytes of a UTF-8 sequence cut at a
+  cold power-on are lost from the console stream; `powerCycle`'s and
+  `reset`'s bookkeeping runs before the handle call (cosmetic); the
+  console protocol's `at` is stale after a 256 KiB ring wrap (note it in
+  `firmware-worker-protocol.ts`).
+- **CONSOLE.LOG (Task 8):** a held prompt (`hack> `) stays invisible
+  until more output follows (show the held tail as a provisional row,
+  for a future input row); `role="log"` implies `aria-live="polite"`, so
+  a screen reader reads boot bursts (consider `aria-live="off"`); the
+  view drifts at the line cap while scrolled up; `createConsoleLog(NaN)`
+  is unbounded.
+- **The controller (Task 12):** `rebooting…` can land after the
+  console's reboot marker (the 250 ms status poll); `dispose()` during a
+  boot logs a `console.error` and a "could not start the badge" line on
+  unload; `main.tsx`'s start-failure fallback hard-codes a colour
+  instead of a theme token.
+- **The links (Task 5):** `track()` deleting closed links from its map
+  has no test.
+- **The UI stack (Task 7):** `select.tsx` carries `tw-animate-css`
+  classes (`animate-in`, `fade-in-0`, `zoom-in-95`, `slide-in-from-*`)
+  with no such dependency, so they do nothing (delete them or add it);
+  `theme.css`'s `--destructive` token is outside the design (for the
+  `aria-invalid` classes); JetBrains Mono loads at 400/600 only while
+  `.field` uses 500 (the design's link, verbatim; the human partner's
+  call).
+- **Small cleanups (Tasks 1, 4):** `redraw-bench.ts`'s comment around
+  :93–96 wants a reflow; `badge-controller.ts` has doc lines past the
+  wrap width.
+- **The photo (Task 11c):** the SCREEN rectangle overhangs the
+  polarizer's glass by 2.2 px each side (the design's 4:3 relation,
+  kept); inset it if the browser check prefers.
+
+### Carried from Milestone 13's backlog (still open)
+
+Word for word in `docs/milestone-13-decisions.md`, "Milestone 14
+backlog" (with Milestone 14's notes added to three items: Share's
+install control, the cold power-on's 466 ms and RMT), minus what this
+milestone deleted: all of Task 6's items
+(`shell.ts`'s fallback literal, R-T6-1's fallback to the older `PROV OK`
+line, `lastStarted`, Remove's `Room X: linked.` line and the refused
+Bump's note: the files, the status line and the controls are gone,
+Tasks 5 and 12) and Task 8's `manifest.test.ts` (deleted with the Lua
+sandbox, Task 4). From the Milestone 8 carry-over, "a console pane" and
+`DeviceMotionEvent` are done (CONSOLE.LOG, phone motion), and the
+Milestone 11 browser item "a shake or bump across a reboot losing its
+tail (R-T8-3)" no longer applies: the page plays no canned motion.
+
+#### New in Milestone 13
+
+- **Task 1 (the rungs):** `skip_setup` can panic through `type_line`'s
+  assert on a refused queue while it returns `Err` for `reboot`'s
+  refusal (an inconsistent `Result` contract); the reboot rung
+  re-implements `skip_setup`'s reset-wait loop (`FRAME_CHUNK` against
+  `CHUNK`; a `reboot_and_wait` helper could serve both); it borrows
+  `SKIP_SETUP_DEADLINE_STEPS` for the reboot alone (R-T1-3); the two
+  rungs sit after the `provisions_role!` list, not near
+  `walk_to_registered_from`; the reboot rung's emulated time
+  (12,630,966 µs) is unpinned.
+- **Task 2 (the console offset):** `cpu-wasm.test.ts`'s no-wrap guard
+  (~:390) compares JS string length, not bytes (use `consoleWritten()`);
+  `text_since` silently returns the whole ring for an `at` older than
+  the ring (documented; a caller can detect `written - at >
+  CONSOLE_CAPACITY`).
+- **Task 3 (the provisioner):** `!==` against the doc's "a rise" for the
+  reboot check (a safe superset, R-T3-1).
+- **Task 4 (the skipper):** `setup-skip.ts`'s `usage:` match is not
+  anchored to a line start or to before the OK (the firmware's help text
+  has "Heap usage: …").
+- **Task 5 (the Worker):** no test pins `setupOnScreen` being
+  computed only when a status is built (verified by reading
+  `firmware-worker.ts`); a refused provision overwrites an earlier
+  `done` state with `failed` (R-T4-2).
+- **Task 8 (the minors):** `signal-client.test.ts` (~:318-329) restores
+  the `warn` spy through a catch-rethrow and an after-loop, where
+  `try`/`finally` is simpler.
+- **The final review:** `setupOnScreen` decodes the whole boot's
+  console, up to 256 KiB, four times a second (once per status); it
+  could scan only from the last `app_reg: launched` offset.
+
+#### Carried from Milestone 12's backlog (still open)
+
+- **Share between two browsers** (Task 6: the core and the controller
+  model need no change). Three pieces: a two-badge Share rung pinning
+  the probe's end; a browser control that installs a Lua app over the
+  console, as the provisioner types (the committed `smoke-test` app went
+  with the Lua sandbox in Milestone 14, so it needs its own bundle); a
+  two-browser check of a transfer over WebRTC, where the Worker posts
+  the advertisement at most at 10 Hz and a DATA frame dwells only 60 to
+  90 ms (STAT repair should cover the frames it misses; untested).
+- **A fake sync station.** The protocol is advertisement-only (v392's
+  NimBLE links no connect or GATT procedure, Task 6's trace; Sync's
+  OPEN goes out through `send_open`), so a station is possible on
+  today's model. The human partner chose
+  not to build one this milestone (2026-11-10).
+- **A stopwatch check of Sync's 20 s on a v392 badge** (R-T6-1): from A
+  to "No sync station in range", about 20 s (the emulator's 750 ticks of
+  20 or 30 ms) against about 15 s (every tick 20 ms).
+
+#### Carried from Milestone 11's backlog (still open)
+
+- **A cold power-on's 466 ms.** The shortcut boot starts the app at
+  0 µs; the badge takes about 466 ms. Adding it would move every pin for
+  no visible gain (Milestone 11's spec, "Non-goals"). Milestone 14's
+  `power_cycle()` starts at 0 µs too.
+- **A joiner who answered before a cancel waits out `waitOpen`.** A
+  joiner who arrives after the cancel gets the 404 at once. Covering the
+  earlier one needs a new poll, which costs commands (Milestone 11's
+  spec, Part 4.6).
+- **The reset model:** the CPU-reset table's silent rows (INTC, R-T1-2;
+  the external chips); the core reset narrower than the TRM; the SYSTEM
+  clock-gate and reset bits not modeled; DRAM `.noinit` not kept; the
+  RTC and timer-group watchdogs inert; three reboot apps' 465,999 µs
+  deltas, untraced; v335's 0.2M steps after `PROV FAIL`, not
+  established.
+- **The radio model:** `host_rcv_pkt` blocking on the real firmware is
+  not established (Milestone 10's R-T6-2, half open); LE Set Extended
+  Scan Enable's other parameter rules (Core v5.4, 7.8.65).
+- **The browser:** Provision in a tab whose badge was since freed; a
+  Provision and a `startFirmware` racing on a claim; an advertisement
+  change just before a Worker stop never posted; `inject` feeding a
+  stopped runtime behind the "another tab" notice.
+- **Carried from Milestone 8's backlog**, as `milestone-11-decisions.md`
+  lists them: Milestone 7's final-review items; speed and timing (Snake's
+  late game-over after an eat, CPI 1, zero-latency RMT, I2C0 and
+  SPIMEM1, PCER/PCMR, `PROVISION_TIMEOUT_STEPS` in steps); apps and UI
+  (no app's deeper screens tested beyond Connect's pairing and Sync's
+  "not ready" and "no station", a browser RNG seed, Milestone 5 Task 7's
+  minors, Task 7's small cleanups, only role hacker's frames compared
+  with hardware); peripherals (RMT beyond the LED decoder, NFC, the busy
+  phase after START, SC7A20H, I2C0's empty-FIFO `OP_WRITE`, the `put`
+  task's CPU time, `R_M5_3`'s closure, `strtol`/`atoi` and `errno`, the
+  8 MiB stub cap, the idle unmapped accesses); build and tests (the
+  release suite's one chain, Milestone 6's test minors); and Milestones
+  3 and 4 (`MADCTL`, GPIO0 routing, the eFuse block beyond the factory
+  MAC, flagged ROM-stub guesses, edge interrupts, GDMA's corners, the
+  250,000-step chunks, small duplications).
