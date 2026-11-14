@@ -265,18 +265,32 @@ def report(m, scale, height):
             sizes.append((sw_["box"][2] - sw_["box"][0]) * scale)
     print(f"tactile housing width: mean {np.mean(sizes):.2f} photo px ({100 * np.mean(sizes) / c.w:.3f} %)")
 
-    # CHIP_SPOT: the LGA-12 (2 x 2 mm, pads 4/2/4/2 around a dark body whose
-    # purple-grey matches the board's), located by its 12 silver pads: the
-    # centroid of the silver pixels within 55 px of the estimate, twice.
+    # CHIP_SPOT: the LGA-12 (2 x 2 mm, pads 4/2/4/2 a side around a dark
+    # body whose purple-grey matches the board's), located by its pads: the
+    # small bright components (20-400 px; the silkscreen's are larger)
+    # within 55 px. The four on each side (more than 25 px out in x) are
+    # symmetric about the centre: x is the mean of the two sides' columns,
+    # y the mean of the eight. From the old estimate: first the mean of the
+    # pads within 75 px, then the sides, twice.
     cx, cy = c.scan_of_old(*OLD["CHIP"])
-    for _ in range(3):
-        o, ys, xs = c.window((cx, cy), 55)
-        R, G, B = c.R[ys, xs], c.G[ys, xs], c.B[ys, xs]
-        yy, xx = np.mgrid[ys, xs]
-        silver = (c.lum[ys, xs] > 120) & (np.abs(B - G) < 22) & (np.abs(R - G) < 30) & ((xx - cx) ** 2 + (yy - cy) ** 2 < 55**2)
-        cx, cy = float(xx[silver].mean()), float(yy[silver].mean())
+    for k in range(3):
+        o, ys, xs = c.window((cx, cy), 75)
+        pads = []
+        for pix in label(c.lum[ys, xs] > 140):
+            if 20 <= len(pix) <= 400:
+                py = np.mean([q[0] for q in pix]) + o[1]
+                px = np.mean([q[1] for q in pix]) + o[0]
+                if math.hypot(px - cx, py - cy) < (75 if k == 0 else 55):
+                    pads.append((px, py))
+        if k == 0:
+            cx, cy = float(np.mean([q[0] for q in pads])), float(np.mean([q[1] for q in pads]))
+            continue
+        left = [q for q in pads if q[0] < cx - 25]
+        right = [q for q in pads if q[0] > cx + 25]
+        cx = (np.mean([q[0] for q in left]) + np.mean([q[0] for q in right])) / 2
+        cy = float(np.mean([q[1] for q in left + right]))
     fx, fy = c.photo(cx, cy)
-    print(f"CHIP_SPOT = {{ x: {fx / c.w:.4f}, y: {fy / c.h:.4f} }}  ({int(silver.sum())} pad pixels; scan {cx:.1f}, {cy:.1f})")
+    print(f"CHIP_SPOT = {{ x: {fx / c.w:.4f}, y: {fy / c.h:.4f} }}  ({len(left)} + {len(right)} side pads; photo {fx:.1f}, {fy:.1f})")
     found["CHIP"] = dict(box=(cx - 34, cy - 34, cx + 34, cy + 34), centre=(cx, cy))
     return found
 

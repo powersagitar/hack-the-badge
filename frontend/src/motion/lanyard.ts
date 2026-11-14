@@ -53,10 +53,10 @@ export const IMPACT_COOLDOWN_MS = 800;
 /**
  * The accelerometer's spot on the board, as fractions of the photo
  * (x from the left, y from the top): the centre of the 2×2 mm LGA-12
- * below the ESP32-C3 module, the board's only such part (its 12 pads,
- * 4/2/4/2 a side, located on the scan; Task 11c).
+ * below the ESP32-C3 module, the board's only such part (located on the
+ * scan by its side pads, 4 a side; Task 11c).
  */
-export const CHIP_SPOT = { x: 0.4115, y: 0.6191 };
+export const CHIP_SPOT = { x: 0.406, y: 0.6234 };
 
 /** A sideways push: the "hand" accelerates the badge at `ax` px/s². */
 interface Push {
@@ -222,6 +222,13 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       friction: 0.05,
       collisionFilter: { group: 0, category: 0x1, mask: 0x4 },
     });
+    // matter.js centres the polygon on its centroid, which the unequal
+    // chamfers move off the rectangle's centre (about 1 px). The photo and
+    // the hang point are placed from body.position, so make the rectangle's
+    // centre (its bounds' centre) the body's, and put it where it hangs.
+    const { min, max } = badge.bounds;
+    Body.setCentre(badge, { x: (min.x + max.x) / 2, y: (min.y + max.y) / 2 });
+    Body.setPosition(badge, { x: ring.x, y: ring.y + dPC });
     Body.setMass(badge, 1);
     parts.push(badge);
     parts.push(

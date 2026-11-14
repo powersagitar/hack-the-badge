@@ -273,7 +273,7 @@ def _scan_in(ok, black, bright, start, step, stop, need=3):
     return None
 
 
-def trace_outline(lev, box):
+def trace_outline(lev, box, radii):
     """The board's edge per row (left, right) and per column (top, bottom).
 
     Rows are scanned inward from just outside the straight sides (in the
@@ -349,6 +349,21 @@ def trace_outline(lev, box):
         return out
 
     left, right, top, bottom = (median9(v) for v in (left, right, top, bottom))
+    # Along the straight top and bottom edges, a column whose scan went
+    # deeper than its neighbours' (through a dark part standing on the
+    # edge: the power switch's body) is the edge: more than 3 px past the
+    # median of the 101 columns around it, it takes that median. Columns
+    # that reach out past it (the power switch's actuator) are kept.
+    for v, a, b, sign in (
+        (top, L + radii["TL"], Rt - radii["TR"], 1),
+        (bottom, L + radii["BL"], Rt - radii["BR"], -1),
+    ):
+        ref = v.copy()
+        for x in range(int(a), int(b) + 1):
+            win = ref[x - 50 : x + 51]
+            med = np.median(win[~np.isnan(win)])
+            if np.isnan(v[x]) or sign * (v[x] - med) > 3:
+                v[x] = med
     # Rows (columns) whose scans met at the middle without finding board, or
     # that lie outside the board, have no edge.
     return dict(left=left, right=right, top=top, bottom=bottom)
@@ -359,14 +374,16 @@ def build_mask(shape, trace, holes):
 
     Inside means right of the row's left edge, left of its right edge,
     below the column's top edge and above its bottom edge, and outside
-    the four holes.
+    the four holes. A row with no side edges (above or below the board's
+    straight sides: the power switch's actuator) is bounded by the
+    columns alone.
     """
     h, w = shape
     n = SUPERSAMPLE
     off = (np.arange(n) + 0.5) / n
     big = 1e9
-    lft = np.nan_to_num(trace["left"], nan=big)
-    rgt = np.nan_to_num(trace["right"], nan=-big)
+    lft = np.nan_to_num(trace["left"], nan=-big)
+    rgt = np.nan_to_num(trace["right"], nan=big)
     top = np.nan_to_num(trace["top"], nan=big)
     bot = np.nan_to_num(trace["bottom"], nan=-big)
     ys = np.arange(h)
@@ -391,7 +408,8 @@ def measure_outline(scan):
     S = B - G
     lines = axis_edges(lev)
     lev_edges = fit_edges(lev)
-    trace = trace_outline(lev, lines)
+    radii = {c: corner_radius(S, c, *lines) for c in ("TL", "TR", "BL", "BR")}
+    trace = trace_outline(lev, lines, {k: v["r"] for k, v in radii.items()})
     # The photo's frame: the traced board's extents.
     box = (
         float(np.nanmin(trace["left"])),
@@ -399,7 +417,6 @@ def measure_outline(scan):
         float(np.nanmax(trace["right"])),
         float(np.nanmax(trace["bottom"])),
     )
-    radii = {c: corner_radius(S, c, *lines) for c in ("TL", "TR", "BL", "BR")}
     holes = [hole_circle(S, g) for g in level_points(HOLE_GUESS, angle, scan.size)]
     return dict(edges=edges, angle=angle, lev=lev, lev_edges=lev_edges, lines=lines, box=box, trace=trace, radii=radii, holes=holes)
 
@@ -429,7 +446,8 @@ def render(m):
         pm = Image.fromarray(rgb[..., ch] * mask)
         planes.append(np.asarray(pm.resize((WIDTH, height), Image.Resampling.LANCZOS, box=box)))
     alpha = np.asarray(Image.fromarray(mask).resize((WIDTH, height), Image.Resampling.LANCZOS, box=box))
-    alpha = np.clip(alpha, 0, 1)
+    # Lanczos rings: clear its faint lobe (under 6/255) just outside the edge.
+    alpha = np.where(alpha < 6 / 255, 0, np.clip(alpha, 0, 1))
     out = np.zeros((height, WIDTH, 4), np.uint8)
     safe = np.maximum(alpha, 1e-3)
     for ch in range(3):
@@ -437,6 +455,16 @@ def render(m):
     out[..., 3] = np.round(alpha * 255).astype(np.uint8)
     out[out[..., 3] == 0, :3] = 0
     return Image.fromarray(out), scale, height
+
+
+def ccw(edge, deg):
+    """An edge's tilt, counter-clockwise on screen positive.
+
+    A side's fit is x against y (x growing downward is counter-clockwise);
+    a top or bottom's is y against x (y grows downward, so y growing to
+    the right is clockwise).
+    """
+    return deg if edge in ("left", "right") else -deg
 
 
 def main(argv):
@@ -449,12 +477,12 @@ def main(argv):
     e = m["edges"]
     print("turned scan", scan.size)
     for k in ("left", "right", "top", "bottom"):
-        print(f"  {k:6s} edge {e[k]['deg']:+.4f} deg (rms {e[k]['rms']:.2f} px, {e[k]['kept']}/{e[k]['n']} points)")
+        print(f"  {k:6s} edge {ccw(k, e[k]['deg']):+.4f} deg ccw (rms {e[k]['rms']:.2f} px, {e[k]['kept']}/{e[k]['n']} points)")
     print(f"  shear (sides vs top/bottom): {abs((e['left']['deg'] + e['right']['deg']) / 2 + (e['top']['deg'] + e['bottom']['deg']) / 2):.4f} deg")
     print(f"level: rotate {m['angle']:+.4f} deg (counter-clockwise positive)")
     le = m["lev_edges"]
     for k in ("left", "right", "top", "bottom"):
-        print(f"  levelled {k:6s} {le[k]['deg']:+.4f} deg")
+        print(f"  levelled {k:6s} {ccw(k, le[k]['deg']):+.4f} deg ccw")
     L, T, Rt, Bm = m["box"]
     print(f"board box (levelled scan px): x {L:.2f}-{Rt:.2f}, y {T:.2f}-{Bm:.2f}; {Rt - L:.2f} x {Bm - T:.2f}, aspect {(Rt - L) / (Bm - T):.5f}")
     img, scale, height = render(m)
@@ -469,8 +497,11 @@ def main(argv):
     for side, depth in (("left", tr["left"] - lines[0]), ("right", lines[2] - tr["right"])):
         rows = np.where(depth > 15)[0]
         rows = rows[(rows > T + 400) & (rows < Bm - 700)]
-        if len(rows):
-            print(f"  {side} recess: y {(rows[0] - T) * scale:.1f}-{(rows[-1] - T) * scale:.1f} photo px, depth up to {np.nanmax(depth[rows]) * scale:.2f} photo px")
+        # Each run of rows more than 15 scan px in (a recess, or the right
+        # edge's taper toward the bottom-right corner).
+        for run in np.split(rows, np.where(np.diff(rows) > 1)[0] + 1):
+            if len(run):
+                print(f"  {side} inset > 15 scan px: y {(run[0] - T) * scale:.1f}-{(run[-1] - T) * scale:.1f} photo px, up to {np.nanmax(depth[run]) * scale:.2f} photo px")
     img.save(dst, "WEBP", quality=QUALITY, alpha_quality=100, method=6, exact=False)
     if "--geometry" in argv:
         import importlib.util

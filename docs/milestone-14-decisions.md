@@ -653,7 +653,7 @@ the ±2000 clamp.
 
 `frontend/src/ui/Badge.tsx`, `Stage.tsx`, `badge-geometry.ts` and
 `keyboard.ts`; the photo is `frontend/public/badge/front.webp` (sha256
-`889d5131…fe758` since Task 11c, from the organizers' scan; Task 11's
+`0eb06bc4…b82a2` since Task 11c, from the organizers' scan; Task 11's
 was the design's `f1e63701…89bd4`).
 
 - **`LED_CHAIN_TO_SPOT = [0, 1, 3, 5, 4, 2]` is a best guess (Ruling
@@ -812,9 +812,9 @@ came from their site. That page serves an orthographic, scanner-style
 image of the real board (5643×3518 PNG, sha256
 `7b080d2904278896a19423ba3ef147df513c9360baf3b13227dd3a1c5636fa4c`; kept
 in `local/m14-source/`, never committed). The human partner confirms in
-Task 14 that we may publish it. New `front.webp`: 974×1523, 238,600
+Task 14 that we may publish it. New `front.webp`: 974×1523, 234,456
 bytes, sha256
-`889d513105b5f426e711ef79a0830ed8322a1fcfaee9fe30130ff86d0c1fe758`.
+`0eb06bc441ac8de61c6989ad47e004391d01ee728a69d21042f152989efb82a2`.
 Task 11b's rotated photo (branch `m14-t11b`) is superseded.
 
 **Reproduce.** Two committed scripts, `frontend/scripts/badge-photo.py`
@@ -839,12 +839,12 @@ scan (robust lines, rms 0.35–0.53 px), counter-clockwise positive:
 |---|---|---|
 | left (long) | +0.348° | +0.012° |
 | right (long) | +0.318° | −0.018° |
-| top | −0.386° | −0.055° |
-| bottom | −0.380° | −0.047° |
+| top | +0.386° | +0.055° |
+| bottom | +0.380° | +0.047° |
 
 The levelling rotation is the long sides' mean, −0.333° (clockwise).
 Shear: the sides and the top/bottom disagree by 0.050°, under the 0.1°
-limit, which is why the short edges read about −0.05° after.
+limit, which is why the short edges still read about +0.05° after.
 
 **LCD and "Hack the North" box against the levelled board** (clockwise
 positive, CSS's sense):
@@ -878,8 +878,19 @@ not modelled, so the photo has the board's real edge:
 - **The right edge tapers** inward from about y 1137 px to the
   bottom-right corner (5.5 px by y 1354); it is traced as it is.
 - **The power switch's actuator** stands 7 px (0.46% of the height)
-  above the board's top edge. It is kept, so the photo's top row is the
-  actuator's top and the board's top edge is at y 7 px.
+  above the board's top edge. It is kept (the controller's ruling: the
+  exact shape covers it), so the photo's top row is the actuator's top
+  and the board's top edge is at y 7 px. Rows above the board's straight
+  sides are bounded by the column trace alone.
+- **The power switch's body** stands on the top edge, and its black
+  fails the column trace's "board" test, so those columns ran on to the
+  purple below it (three transparent slits through the body in the first
+  build; the review's catch). Along the straight top and bottom edges, a
+  column more than 3 scan px deeper than the median of the 101 around it
+  takes that median; columns reaching out past it (the actuator) keep
+  their trace.
+- **Lanczos ringing** leaves a faint lobe (under 6/255) about 2 px
+  outside the edge; it is cleared to 0.
 - **The four holes** are through-holes (the background shows through
   them) and are transparent: centres (189.6, 46.2), (783.7, 46.0),
   (190.1, 1482.0), (784.3, 1481.8) px, radius 24.5–24.7 px.
@@ -898,7 +909,11 @@ not modelled, so the photo has the board's real edge:
   not the arcs. `BOARD_CORNERS` in `badge-geometry.ts` holds the
   fractions, and the lanyard's matter.js body is now a rectangle with
   those per-corner chamfers (it was a sharp rectangle), so grabbing and
-  wall contact follow the board's corners. Nothing modelled the board
+  wall contact follow the board's corners. matter.js centres a body on
+  its polygon's centroid, which the unequal chamfers move about 1 px off
+  the rectangle's centre; the body's centre is set back to the
+  rectangle's (its bounds' centre), where the photo and the hang point
+  are placed. Nothing modelled the board
   with one radius. The badge's invisible 28 px grab margin (`inset: -28`,
   `borderRadius: 32` in `Badge.tsx`) is the design's hit slop, not the
   outline, and is unchanged; the drop shadow follows the alpha.
@@ -926,7 +941,7 @@ on the levelled scan and mapped by the image's own crop and scale:
 | HOME / START | 44.18,81.28 / 59.2,81.28 | 43.77,81.59 / 59.03,81.5 | 〃 |
 | AUX1 | 4.41, 37.28 | 4.7, 37.65 | the side switch's body |
 | hit `s` (desktop / mobile) | DPAD 8.25/9.6, ROUND 10.31/12.5, SIDE 6.09/7.5 | 8.31/9.67, 10.38/12.59, 6.13/7.55 | ×1.007, below |
-| `CHIP_SPOT` (fractions) | 0.414, 0.621 | 0.4115, 0.6191 | the LGA-12's pads' centroid |
+| `CHIP_SPOT` (fractions) | 0.414, 0.621 | 0.406, 0.6234 | the LGA-12's side pads' centre |
 | `BOARD_CORNERS` | (none) | tl 0.093, tr 0.0946, br 0.189, bl 0.0964 | above |
 
 - **SCREEN.** The flat glass inside the polarizer's line is 443.2 ×
@@ -953,6 +968,9 @@ on the levelled scan and mapped by the image's own crop and scale:
   LGA-12 2×2 mm, the SC7A20H's package), and it is the only such part
   on the board. Its marking reads upside down ("A9" / "XXL"), with the
   round pin-1 dot at the package's lower-right as the photo shows it.
-  `CHIP_SPOT` is the centroid of its pads. The dot's corner is a lead
+  `CHIP_SPOT` is the centre of its side pads (4 a side: x halfway
+  between the two columns, y their mean), (395.5, 949.4) px. The first
+  build's centroid of all bright pixels was 8 px off, pulled by the
+  silkscreen at the package's upper right. The dot's corner is a lead
   for Task 14's axis check (`BOARD_AXES` stays unverified; this task
   does not change it).

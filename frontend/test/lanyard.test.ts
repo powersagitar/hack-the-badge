@@ -100,6 +100,26 @@ describe("lanyard", () => {
     expect(l.grab({ x: x + w / 2 - along, y: y + h / 2 - d })).toBe(false);
   });
 
+  test("the pose's centre is the photo rectangle's centre, despite the unequal corners", () => {
+    // Half a pixel inside each straight edge's middle is board, half a
+    // pixel outside is not: the body sits on the rectangle the photo is drawn in.
+    const { l, run } = rig();
+    run(1000);
+    const { x, y, w, h } = l.pose().badge;
+    for (const [dx, dy] of [
+      [w / 2, 0],
+      [-w / 2, 0],
+      [0, h / 2],
+      [0, -h / 2],
+    ]) {
+      const ux = Math.sign(dx);
+      const uy = Math.sign(dy);
+      expect(l.grab({ x: x + dx - ux * 0.5, y: y + dy - uy * 0.5 })).toBe(true);
+      l.release();
+      expect(l.grab({ x: x + dx + ux * 0.5, y: y + dy + uy * 0.5 })).toBe(false);
+    }
+  });
+
   test("relayout mid-swing stays finite and clamped", () => {
     const { l, readings, run } = rig();
     run(300);
