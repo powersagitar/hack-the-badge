@@ -1332,11 +1332,12 @@ in `milestone-14-decisions.md` is the complete list):
       human partner found them "way too faint"): a gamma-2.2 curve with
       a 0.35 floor, and a larger bloom. The renderer boosts them; the
       firmware's colours, `led_colors()`, stay exact.
-    - **A lost touch-up can strand a pad button.** The board releases a
-      button by its `pointerId` (Task 13), so a touch whose `pointerup`
-      and `pointercancel` both never arrive leaves that button held.
-      The old release-everything listener healed that; browsers send
-      `pointercancel` for the usual cases.
+    - **Fixed in the final review: a lost touch-up no longer strands a
+      pad button.** The board releases a button by its `pointerId`
+      (Task 13), so a touch whose `pointerup` and `pointercancel` both
+      never arrived used to leave that button held for good. Now the
+      page going hidden or the window losing focus forgets every
+      pointer and releases the pad's buttons.
     - **Unverified signs and positions.** `BOARD_AXES` (right +x, up +y,
       out +z) and `LED_CHAIN_TO_SPOT` were not verified on the physical
       badge (the browser check passed the LEDs "for now"). The phone's

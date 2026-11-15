@@ -79,9 +79,8 @@ non-physical flip). iOS and iPadOS invert every axis of
 `accelerationIncludingGravity` (verified on an iPhone through the
 self-test's signed axes), so `platformSignFix` is −1 there and 1
 elsewhere; Android's is untested. The board's axis signs (`BOARD_AXES`)
-are not verified on the physical badge. Known page limitations: a phone jolt along gravity alone
-cannot fire a bump, and a touch whose up and cancel both get lost
-leaves its board button held. Every frame
+are not verified on the physical badge. Known page limitation: a
+phone jolt along gravity alone cannot fire a bump. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
@@ -129,7 +128,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 442 of them in 27 files, about 26 s. Most of
+- `bun test`: unit tests, 448 of them in 27 files, about 26 s. Most of
   that is the WASM twins: `test/cpu-wasm.test.ts`, which provisions and
   walks to the launcher, and `test/physics-shake.test.ts`, which shakes
   Setup's page 6 through the lanyard. Run one file with
@@ -249,21 +248,29 @@ frontend/src/
                         ledGlow's boost, sensor sink); makes the
                         lanyard and hands it out (onLanyard). In phone
                         mode the badge gets no lanyard (no drag, S/K).
+                        The hint (its own in phone mode) and, on
+                        desktop, the shortcuts line (shortcutsHint).
   ui/Badge.tsx          The board photo, the screen canvas (level), the
                         LED glows, the hit
-                        <button>s (pressed per pointerId), the power
-                        switch, the rings and clasp.
+                        <button>s (pressed per pointerId; a hidden page
+                        or a window blur releases them all), the power
+                        switch, the rings and clasp. The root is a
+                        group described by the shortcuts
+                        (aria-describedby, sr-only text).
   ui/badge-geometry.ts  The photo's measured geometry (percent): PHOTO,
                         BOARD_CORNERS, SCREEN, POWER, HOLES, LED_SPOTS,
                         BUTTON_SPOTS, LED_CHAIN_TO_SPOT (a best guess).
   ui/keyboard.ts        keyAction(code, target): arrows, Z/X, Enter,
                         Escape, Space (AUX1), S shake, K knock; fields,
                         the role Select and a focused control keep theirs.
+                        shortcutsHint and shortcutsDescription (without
+                        S/K in phone mode).
   ui/ToolsPanel.tsx     FIRMWARE TOOLS: SPEED INDEX, PROVISIONING (ROLE,
                         PROVISION, Skip setup shown disabled unless Setup
                         is on screen), BADGE LINK (Host / Cancel host,
                         Join, one summary line), "Use phone motion" (only
-                        on a touch-first device), the tab notice.
+                        on a touch-first device, or while it is on), the
+                        tab notice.
   ui/ConsolePanel.tsx, ui/console-log.ts
                         CONSOLE.LOG: a bounded model (2,000 lines, a held
                         partial line, 4,096-char flush, a reboot marker),
@@ -278,8 +285,8 @@ frontend/src/
                         source's impacts (broadcastBump) and peerBump.
   ui/theme.css          The design's tokens as shadcn variables on
                         Tailwind v4; dark only.
-  components/ui/        shadcn's Button, Select, Input, ScrollArea (from
-                        the CLI); lib/utils.ts is their cn().
+  components/ui/        shadcn's Button, Select, Input (from the CLI);
+                        lib/utils.ts is their cn().
   motion/source.ts      The MotionSource seam: start(sink), stop(),
                         peerBump(), onImpact.
   motion/axes.ts        BOARD_AXES (right +x, up +y, out +z; UNVERIFIED).
@@ -297,7 +304,7 @@ frontend/src/
                         platformSignFix (−1 on iOS/iPadOS, R21), a
                         +1000 mg peer pulse, jolts over 1500 mg are
                         impacts; needs a secure context.
-  runtime/buttons.ts    BUTTON_NAMES, ButtonName, ButtonSource, Rgb.
+  runtime/buttons.ts    BUTTON_NAMES, ButtonName, ButtonSource.
   runtime/test-identities.ts
                         The roles and where their fake fixtures are served.
   runtime/firmware-runtime.ts

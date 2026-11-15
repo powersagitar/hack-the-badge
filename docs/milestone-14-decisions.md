@@ -444,7 +444,7 @@ All pinned exactly in `frontend/package.json`.
 | `react` | 19.3.1 | The page's UI: React components replace the old `ui/shell.ts` DOM building, now deleted. |
 | `react-dom` | 19.3.1 | Renders the React page into `#root`. |
 | `matter-js` | 0.20.0 | The lanyard and badge physics (the design's swing). |
-| `radix-ui` | 1.8.1 | Primitives under shadcn's Button (`Slot`), Select and ScrollArea; added by the shadcn CLI. |
+| `radix-ui` | 1.8.1 | Primitives under shadcn's Button (`Slot`) and Select; added by the shadcn CLI. |
 | `class-variance-authority` | 0.7.1 | shadcn's Button variants (`cva`). |
 | `clsx` | 2.1.1 | shadcn's `cn` (`src/lib/utils.ts`). |
 | `tailwind-merge` | 3.7.0 | shadcn's `cn` (`src/lib/utils.ts`). |
@@ -470,7 +470,9 @@ only while the CLI ran; `paths` alone serves `tsc`, Bun and Vite (whose
 `@` alias is in `vite.config.ts`).
 
 Removed: `fengari` (^0.1.5) and `fengari-interop` (^0.1.4), removed in
-Task 4 with the Lua sandbox. Tasks 1, 2 and 11c added none.
+Task 4 with the Lua sandbox. Tasks 1, 2 and 11c added none. The final
+review deleted the unused `components/ui/scroll-area.tsx`; `radix-ui`
+stays, since Button and Select still import it.
 
 ## Build size (Task 7)
 
@@ -1029,7 +1031,9 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   pointerup, as before. Taps from a keyboard click and AUX1 are
   unchanged. Residual risk: a touch whose up and cancel never arrive
   would leave its button held. Browsers send `pointercancel` for that
-  case, so no blanket release was kept.
+  case, so no blanket release was kept. **Backstopped in the final
+  review:** a hidden page or a window blur clears the pointers and
+  releases the pad's buttons.
 - **Browser check** (`bun run dev`, Chrome): two hard drags into each
   wall logged no errors (only the existing favicon 404). **Found, not
   caused here:** at 857×778, a 960 px fling over 8 frames swings the
@@ -1412,6 +1416,25 @@ float `2147483520.0` → `2147483520`, `-0.9` → 0), inside the existing
 `soft_float_ops_match_libgcc_soft_fp` test, and `rom.rs`'s "What is NOT
 stubbed" paragraph now names both soft-float families.
 
+## Final review fixes (2026-11-14)
+
+- **Keyboard shortcuts documented** (spec "Keyboard impulses"). The
+  badge's root is a group described (`aria-describedby`, `sr-only`
+  text) by `shortcutsDescription`, and the desktop stage hint has a
+  second line, `shortcutsHint`: `KEYS · ARROWS D-PAD · Z/X A/B · ENTER
+  START · ESC HOME · SPACE AUX1 · S SHAKE · K KNOCK`. In phone mode both
+  leave out S and K, and the hint's first line reads "MOVE THE DEVICE
+  TO SWING IT · …" (mobile: "MOVE THE PHONE TO SWING · TAP THE
+  BUTTONS"), since dragging is off. The mobile layout shows no keys
+  line (a phone has no keyboard); its description still lists them.
+- **Pointer backstop:** a hidden page or a window blur clears the
+  pointers and releases the pad's buttons.
+- **"Use phone motion"** stays shown while phone motion is on, so it
+  can be turned off after availability drops.
+- **Dead code:** `components/ui/scroll-area.tsx` and `buttons.ts`'s
+  `Rgb` deleted.
+- `bun test` 448 pass (was 442), typecheck and build clean.
+
 ## Milestone 15 backlog
 
 ### New in Milestone 14
@@ -1433,10 +1456,8 @@ browser check's open items. The browser check above may close some.
 - **Phone motion (Task 13):** in phone mode, `follow` leaves the
   sideways pull unclamped against as little as 0.25 g down, so the
   drawn badge can swing near horizontal (cosmetic).
-- **Pointers and keys (Tasks 11, 13):** a backstop for the per-pointer
-  release (clear pointers and `releaseAll("pad")` on a hidden page or a
-  window blur), so a lost touch-up cannot strand a pad button; the drag
-  ends on any pointer's up (a second finger); the keyboard tap and the
+- **Pointers and keys (Tasks 11, 13):** the drag ends on any pointer's
+  up (a second finger); the keyboard tap and the
   pointer share the `pad` source, so a 150 ms tap's release frees a
   finger-held button, and an unrelated pointerup can cut that tap short.
 - **The LEDs (Tasks 2, 11):** one WS2812 decoder serves both RMT TX
@@ -1481,6 +1502,18 @@ browser check's open items. The browser check above may close some.
 - **Small cleanups (Tasks 1, 4):** `redraw-bench.ts`'s comment around
   :93–96 wants a reflow; `badge-controller.ts` has doc lines past the
   wrap width.
+- **The photo (Task 11c):** `SCREEN` overhangs the LCD's polarizer by
+  2.2 px per side.
+- **The grip (Task 9):** `lanyard.ts`'s grip y clamp uses the unrotated
+  `off.y`, so it is approximate when the badge is tilted.
+- **Unpinned tools (pre-milestone):** `frontend/package.json` still has
+  `typescript ^7.0.2` and `vite ^8.3.0` carets.
+- **Sign fix (R21):** `platformSignFix`'s UA regex is case-sensitive,
+  and `badge-controller.ts:233-235` has a redundant `typeof navigator`
+  branch.
+- **Swing cost (Ruling R22):** no SPEED INDEX evidence that the swing
+  doesn't slow the emulator (the physics runs on the main thread);
+  worth one reading in Milestone 15.
 ### Carried from Milestone 13's backlog (still open)
 
 Word for word in `docs/milestone-13-decisions.md`, "Milestone 14

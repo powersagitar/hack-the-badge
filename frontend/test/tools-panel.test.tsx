@@ -190,6 +190,14 @@ describe("ToolsPanel", () => {
     expect(r.calls).toEqual(["phone true", "phone false"]);
   });
 
+  test("phone motion that is on can still be turned off after availability drops", () => {
+    const r = render({ phoneMotionAvailable: false, motion: "phone" });
+    const b = r.button(/phone motion/i);
+    expect(b.getAttribute("aria-pressed")).toBe("true");
+    b.click();
+    expect(r.calls).toEqual(["phone false"]);
+  });
+
   test("BADGE LINK: the code is uppercased, Join needs a code, and the status shows", () => {
     const r = render({ linkStatus: "Linked to 2 badges" });
     expect(r.view.getByText("Linked to 2 badges")).toBeTruthy();
