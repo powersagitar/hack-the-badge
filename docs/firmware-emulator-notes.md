@@ -36,8 +36,10 @@ and forensic analysis disproved this:
   statically-linked translation units, not separable files.
 - The firmware genuinely does contain a working embedded Lua VM, but it's
   used only for user-sideloaded apps received via Bluetooth "bump" sharing
-  — exactly what Milestone 1's Lua sandbox already replicates. That code
-  path needed no rework.
+  — exactly what Milestone 1's Lua sandbox replicated. That code
+  path needed no rework. (The page's own Lua sandbox was removed in
+  Milestone 14; the firmware's VM still runs sideloaded apps inside the
+  emulator.)
 
 Given this, Milestone 2 built a real ESP32-C3 processor emulator (RV32IMC
 core + a minimal peripheral set) that boots `frontend/public/firmware/firmware.bin`
@@ -365,9 +367,9 @@ strapping pin).
 | `LCD_DC` | 0 | ST7789 D/C (command vs. data) |
 | `LCD_CLK` | 1 | ST7789 SPI SCLK |
 | `LCD_CS` | 2 | ST7789 SPI CS (not modeled — see Known Limitations) |
-| `LED_DIN` | 3 | WS2812B chain data (RMT TX channel 0; six LEDs decoded from the RMT symbols since Milestone 14 Task 2, `peripherals/ws2812.rs`; the pin itself is not modeled) |
+| `LED_DIN` | 3 | WS2812B chain data (RMT TX channel 0; six LEDs decoded from the RMT symbols since Milestone 14 Task 2, `peripherals/ws2812.rs`; the pin itself is not modeled; the chain's board positions on the page, `LED_CHAIN_TO_SPOT`, are a best guess, Milestone 14's R10) |
 | `LCD_RST` | 4 | ST7789 reset |
-| `I2C_SDA` | 5 | accelerometer (SC7A20H on I2C0, modeled from Milestone 5 Task D-M5-2; the pins themselves are not) |
+| `I2C_SDA` | 5 | accelerometer (SC7A20H on I2C0, modeled from Milestone 5 Task D-M5-2; the pins themselves are not; since Milestone 14 its readings come from the page's motion source, through the unverified `BOARD_AXES`) |
 | `I2C_SCL` | 6 | accelerometer (as `I2C_SDA`) |
 | `HC165_DATA` | 7 | shift register serial data out → CPU (GPIO input) |
 | `PIN_START` | 9 | START button, direct GPIO, also BOOT strap |
@@ -639,7 +641,27 @@ called the speed normal in the prod build and closed the speed items
 
 ## Known limitations / where boot currently stalls
 
-### Current state (end of Milestone 13)
+### Current state (end of Milestone 14)
+
+**Milestone 14 redesigns the badge page.** The page is the real
+firmware only: the Lua sandbox, the mode toggle, the button pad, the
+Shake and Bump buttons, manual pairing and the links list are gone. The
+badge is a photo of the real board (cut from the organizers'
+orthographic scan) hanging on a matter.js lanyard; the visitor presses
+the buttons on the board and swings it by dragging. The swing's proper
+acceleration at the accelerometer's spot feeds the emulated SC7A20H
+continuously, so "Shake it!" and Connect's bump come from the
+visitor's motion (or, on a touch-first phone, from the phone's own
+DeviceMotion). The core gained a passive WS2812 decoder on RMT (the six
+LEDs' real colours, drawn as glows on the board) and
+`FirmwareRuntime::power_cycle()`, the board's power switch: a cold
+power-on that keeps the flash. CONSOLE.LOG streams the badge's USB
+serial output with the page's own `[page]` lines. The only pins that
+moved are the ones on chains that type the renamed (friendly) fixtures;
+`execution_digest_is_unchanged` did not move
+([`milestone-14-decisions.md`](milestone-14-decisions.md), "Re-pins
+(Task 1)"). Its new limitations are item 14 below. The rest of this
+section is otherwise unchanged from Milestone 13.
 
 **Milestone 13 adds Skip setup.** While the onboarding app ("Setup") is
 on screen, the page shows a **Skip setup** button. It types
@@ -708,9 +730,10 @@ are emulated steps, not time, under the Milestone 6 clock; see "Timing
 model" above for how steps relate to emulated time). Step numbers are
 v392's where marked; the others are v335's, measured after Milestone 6
 Task D-M6-1, and v392 reaches each point somewhat earlier (role
-hacker's launcher checkpoint at the end of the test walk: 342,600,776
-steps and 94.52 s of emulated time on v392, against 372,597,011 and
-98.46 s on v335):
+hacker's launcher checkpoint at the end of the test walk: 342,657,333
+steps and 94.50 s of emulated time on v392 with Milestone 14's renamed
+fixtures (342,600,776 and 94.52 s before the rename), against
+372,597,011 and 98.46 s on v335):
 
 - The boot splash ("Hack the North × SOLANA", footer "FW
   v0.1.2-392-gd3089c4") is final from step 4,250,000 on v392
@@ -763,16 +786,18 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   `OK system.onboard_build=2147483647`), then `reboot`
   (`rebooting...`, one software reset). The new boot logs
   `app_reg: launched My Badge`, not Setup, and lands on the registered
-  screen, `0xbd6d_7613_08a7_bf24` for hacker, the walk's own end frame;
+  screen, `0x83ca_0950_da3c_55da` for hacker, the walk's own end frame;
   HOME then opens the launcher (`skipping_setup_lands_on_the_registered_screen`,
-  84,392,000 steps and 8,855,536 µs from a cold boot, the reboot's
-  466 ms included). A reboot while Setup is up comes back to Setup's
+  84,742,000 steps and 8,893,591 µs from a cold boot, the reboot's
+  466 ms included; Milestone 14's renamed fixtures, before which they
+  were `0xbd6d_7613_08a7_bf24`, 84,392,000 steps and 8,855,536 µs). A reboot while Setup is up comes back to Setup's
   page 1 and logs `app_reg: launched Setup`
   (`setup_logs_its_launch_after_a_reboot`), so both ways into Setup log
-  the launch, and the button shows exactly while the current boot's last
-  launch line names Setup. It is hidden while a provision or a skip is
-  in flight; a skip refuses while a provision types, and a provision
-  refuses while a skip types. The rungs still walk all 11 pages
+  the launch, and the button is enabled exactly while the current boot's
+  last launch line names Setup (Milestone 13 hid it otherwise; since
+  Milestone 14 it is shown disabled). It is disabled while a provision
+  or a skip is in flight; a skip refuses while a provision types, and a
+  provision refuses while a skip types. The rungs still walk all 11 pages
   (Milestone 5's R-T4-2).
 - **Registered screen and launcher.** Setup ends on My Badge's registered
   screen (role hacker at about step 337.9M; every role's frame differs,
@@ -783,8 +808,10 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   `onboarding_shake_page_advances_after_a_shake`, `boots_to_launcher`,
   `launcher_is_role_independent` and `launcher_responds_to_navigation`.
   The WASM twin reaches the same launcher through the wasm-bindgen build,
-  and the browser offers the same path (role picker, "Provision test
-  badge", "Shake"; the user walks onboarding with the button pad).
+  and the browser offers the same path (since Milestone 14: the ROLE
+  select and PROVISION; the visitor shakes the badge by swinging it on
+  its lanyard, or with the phone's own motion, and walks onboarding with
+  the board's buttons).
 - **Human comparison, 2026-10-08 (v335):** the human partner compared the
   registered screen, the onboarding pages, the launcher and the launcher
   after DOWN with the physical badge, for role hacker, and confirmed they
@@ -883,16 +910,20 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   (the Web Lock `htn-badge`; a second tab shows "Badge running in another
   tab — Run here"), with a per-browser locally administered MAC kept in
   `localStorage`. The hub (`frontend/src/radio/hub.ts`) carries the
-  Worker's advertisements and the Bump button to linked peers, and
+  Worker's advertisements and the local bumps to linked peers, and
   validates what peers send. Links are direct WebRTC data channels with
   `iceServers: []`, set up through the signaling function `/api/signal`
   (an offer/answer mailbox: Upstash Redis on Vercel, an in-memory store
   under `bun run dev`; rate-limited, Milestone 10's R-T10-8, on
   `@upstash/ratelimit` since Milestone 11; a cancelled host room closes through its `close`
-  op) or by copy-paste codes behind "Manual". Since Milestone 11 a Bump
-  goes to the links only while the local badge runs and the page is
-  visible (Milestone 11's R-T11-1), and a Lua-mode switch frees the
-  badge. The human
+  op) or, until Milestone 14, by copy-paste codes behind "Manual". Since
+  Milestone 11 a bump goes to the links only while the local badge runs
+  and the page is visible (Milestone 11's R-T11-1). **Since Milestone
+  14** there is no Bump button, no manual pairing, no links list and no
+  Lua mode: a bump is the active motion source's impact (the badge
+  swung into a stage wall, or a phone jolt), sent with
+  `RadioHub.broadcastBump()`, and a peer's bump pushes the local badge
+  through the same source. The human
   partner's gate (2026-11-03, `bun run dev --
   --host` on the LAN, two real devices): Connect's and Sync's home
   screens, a room link, a Bump with "SYNCED" on both, and a manual
@@ -929,6 +960,16 @@ steps and 94.52 s of emulated time on v392, against 372,597,011 and
   RNG). In the browser Snake runs at 0.9x to 1.0x of real time and feels
   like the badge (the human's check, 2026-10-20), and at a steady 1.0x in
   the Milestone 7 Worker host (Task 8's smoke test, Chrome 155).
+
+**Resolved in Milestone 14** (details in
+[`milestone-14-decisions.md`](milestone-14-decisions.md) and
+"Milestone 14" below):
+
+- The LEDs: a passive WS2812 decoder on RMT gives the six LEDs' colours
+  (Task 2; item 6 below). The canned shake and bump: the page's motion
+  sources feed the accelerometer instead (Tasks 9, 10 and 13;
+  `DeviceMotionEvent` from Milestone 8's backlog). A console pane:
+  CONSOLE.LOG (Task 8). A power switch that keeps the flash (Task 3).
 
 **Resolved in Milestone 13** (details in
 [`milestone-13-decisions.md`](milestone-13-decisions.md) and
@@ -1106,8 +1147,8 @@ The design decisions behind these fixes (and where they override the
 plan text), plus the full Milestone 4 backlog, are in
 [`docs/milestone-3-decisions.md`](milestone-3-decisions.md).
 
-**Open limitations (Milestone 14 candidates)** (the Milestone 14 backlog
-in `milestone-13-decisions.md` is the complete list):
+**Open limitations (Milestone 15 candidates)** (the Milestone 15 backlog
+in `milestone-14-decisions.md` is the complete list):
 
 1. **The radio is a model, not the controller.** The closed controller
    blob and its mask-ROM half never run. `radio/hci.rs` answers only the
@@ -1149,8 +1190,10 @@ in `milestone-13-decisions.md` is the complete list):
 2. **A cold power-on takes no time.** The shortcut boot starts the app
    at 0 µs after a power-on or the reset button; the badge takes about
    466 ms before `cpu_start`. Adding it would move every pin for no
-   visible gain (Milestone 11's spec, "Non-goals"; Milestone 14
-   backlog). A software
+   visible gain (Milestone 11's spec, "Non-goals"; Milestone 15
+   backlog). The page's power switch (`power_cycle()`, Milestone 14)
+   is such a power-on too, and starts at 0 µs; the browser holds the
+   screen for the 466 ms of wall time, as for a reboot. A software
    reset does take it (Milestone 11).
 3. **The CPU-reset table's silent rows.** Where the TRM and ESP-IDF are
    both silent, the peripheral is reset and the gap recorded. That is the
@@ -1158,7 +1201,7 @@ in `milestone-13-decisions.md` is the complete list):
    external chips (74HC165, SC7A20H, ST7789, flash) are kept with no
    citation beyond "no TRM reset scope reaches them". The SYSTEM clock
    gates and reset bits are not modeled, and the core reset is narrower
-   than the TRM (`milestone-13-decisions.md`, "Milestone 14 backlog").
+   than the TRM (`milestone-14-decisions.md`, "Milestone 15 backlog").
 4. **The launcher's HOME redraw runs slower than real time in the
    browser.** The core runs about 40M to 42M steps per second in WASM
    against the badge's 80M cycles per second (Milestone 7's bench on
@@ -1205,7 +1248,10 @@ in `milestone-13-decisions.md` is the complete list):
    six RGB colours, `FirmwareRuntime::led_colors()`. RMT still runs in
    zero emulated time, so a frame's colours appear the moment its
    transmission starts, and nothing models the LEDs' own timing (a reset
-   code too short to latch would still show).
+   code too short to latch would still show). Which chain index sits at
+   which board position is a best guess (the page's
+   `LED_CHAIN_TO_SPOT`, Milestone 14's Ruling R10), pending the human
+   partner's look at the physical badge.
 7. The dormant items from the history below: flagged ROM-stub guesses
    (item 5) and simplified edge interrupts (item 9). (Items 6 and 7 are
    resolved; so is the old `CPU_FREQ_MHZ` = 160 stub, see "Resolved in
@@ -1258,9 +1304,39 @@ in `milestone-13-decisions.md` is the complete list):
     emulated badges (a scratch probe, Milestone 12 Task 6), but firmware
     mode has no way to install a custom app, so the sender stops at "No
     custom apps yet"; nothing pins the transfer. The committed
-    `smoke-test/manifest.cfg` now has `heap_kb=96` and `wake_lock=0`,
-    within v392's loader rules (Milestone 12's R-T6-2; Milestone 13
-    Task 8), and Lua mode reads it as before.
+    `smoke-test` app (`heap_kb=96`, `wake_lock=0`, within v392's loader
+    rules; Milestone 12's R-T6-2, Milestone 13 Task 8) was deleted with
+    the Lua sandbox in Milestone 14, so an install path would need its
+    own app bundle.
+14. **The page's motion and board (Milestone 14).**
+    - **Fixed in Task 14: the fling flip-over** (Ruling R15). A fast
+      upward fling used to swing the badge over its anchor, where it
+      stayed upside down, leaning on a wall above the stage. The stage
+      now has a ceiling at y = 0 (a collider and the bounds clamp), so
+      the badge can't pass over its anchor.
+    - **Phone mode's sideways swing is non-physical** (Ruling R19, the
+      human partner's call): tilting the phone right swings the drawn
+      badge right. The firmware's readings are the phone's, unchanged.
+    - **A jolt along gravity cannot fire a phone's bump alone.** The
+      phone's impact detector takes the jump between readings that are
+      already clamped per axis to ±2000 mg, so an upright phone jerked
+      straight up jumps at most 1000 mg on that axis, under the 1500 mg
+      threshold (Task 10).
+    - **The LED glows are boosted for the eye** (Ruling R17, after the
+      human partner found them "way too faint"): a gamma-2.2 curve with
+      a 0.35 floor, and a larger bloom. The renderer boosts them; the
+      firmware's colours, `led_colors()`, stay exact.
+    - **A lost touch-up can strand a pad button.** The board releases a
+      button by its `pointerId` (Task 13), so a touch whose `pointerup`
+      and `pointercancel` both never arrive leaves that button held.
+      The old release-everything listener healed that; browsers send
+      `pointercancel` for the usual cases.
+    - **Unverified signs and positions.** `BOARD_AXES` (right +x, up +y,
+      out +z) and `LED_CHAIN_TO_SPOT` were not verified on the physical
+      badge (the browser check passed the LEDs "for now"). The phone's
+      `platformSignFix` (1 everywhere) is unverified on iOS (an upright
+      phone showed about 1 g of G-force, a magnitude, not a sign; the
+      swing suggests iOS may invert every axis) and untested on Android.
 
 ### Ground truth from the physical badge
 
@@ -3524,14 +3600,18 @@ Rulings, measurements and traces are in
   `set_upload_token`, which types `badge_token set` and the token and
   waits for `BADGE_TOKEN READY`, then `BADGE_TOKEN OK`. `provision`
   itself is unchanged. `credential_launcher()` reaches the launcher
-  through every hacker walk frame at 342,894,540 steps and 94,521,622 µs
-  (the token adds 293,859 steps and 7 µs). Two rungs:
+  through every hacker walk frame at 342,985,252 steps and 94,521,739 µs
+  with Milestone 14's renamed fixtures (the token adds 327,919 steps and
+  20,005 µs; before the rename 342,894,540 steps and 94,521,622 µs, and
+  the token added 293,859 steps and 7 µs). Two rungs:
   `launcher_with_a_credential_keeps_every_walk_frame` and
   `sync_with_a_credential_finds_no_station`.
 - **Sync's path** (Task 2's rung, Task 6's trace). From the open Sync
   with the credential, A packs the badge ("Packing your badge...", then
-  the console's `sync: snapshot 1026 bytes, crc ec2f90df, …,
-  complete=1`, about 4.4M steps after the press), then NimBLE's
+  the console's `sync: snapshot 1028 bytes, crc f7cd2dea, …,
+  complete=1`, about 4.4M steps after the press; `1026 bytes, crc
+  ec2f90df` before Milestone 14's renamed fixtures, whose name and email
+  are each a byte longer), then NimBLE's
   `extended advertise` and `extended discovery`. "Asking the
   station..." pulses for 19.98 s of emulated time: v392's timeout is
   the source's 750 ticks (3 OPEN attempts × 250), and its 20 ms LVGL
@@ -3613,6 +3693,75 @@ Milestone 12 pin moved.
   `tsconfig.json`'s `target` ES2022 (Vite's `build.target` stays
   es2020; the build is byte-identical) and all nine of Milestone 12's
   deferred review minors.
+
+### Milestone 14: the badge page redesign
+
+The spec (`docs/superpowers/specs/2026-11-12-milestone14-badge-page-redesign-design.md`)
+turns the page into the human partner's design: the real board's photo
+hanging on a lanyard, swung by dragging, its buttons pressed on the
+board. Rulings, measurements, the re-pins and the Milestone 15 backlog
+are in `docs/milestone-14-decisions.md`.
+
+- **Task 1: friendly identities.** The eleven fixtures take historical
+  figures' names (still `@example.com`, `test-` badge IDs), overriding
+  Milestone 5's "Test <Role>" naming (the human partner, 2026-11-12).
+  Every pin that moved is on a chain that types an identity: the 22
+  role frames, hacker's pages 2 and 7, five chains' step and time
+  totals, hacker's console hash, Sync's snapshot line and four bench
+  redraw pins (old → new in the decisions doc). The values above
+  ("Current state", "Milestone 12") are the new ones.
+- **Task 2: the LEDs.** `peripherals/ws2812.rs` decodes each RMT
+  transmission's symbols into the chain's colours (bits by relative
+  timing, R1; the firmware's encoder sends 9/3 and 3/9 ticks of its
+  10 MHz RMT clock). Six LEDs. Pure observation: nothing moved. Three
+  rungs: `leds_flash_during_prov_apply`,
+  `leds_go_dark_on_the_registered_screen` (R7: renamed from the plan's
+  `leds_show_the_role_colour_when_registered`, since the LEDs are
+  measured dark there) and `mood_leds_light_the_chain`. A soft reset
+  keeps the colours; a cold power-on clears them.
+- **Task 3: the power switch.** `FirmwareRuntime::power_cycle()`:
+  `reset()`'s cold power-on, but the flash is kept. A provisioned hacker
+  boots through the splash straight to the registered screen
+  (`power_cycle_boots_to_the_registered_screen`, 46.5M steps and
+  1,554,210 µs). 96 rungs plus 1 ignored.
+- **Task 4** removed the Lua sandbox (`lua/`, `badge/`,
+  `runtime/lifecycle.ts`, `render/canvas.ts`, `public/apps/`, Fengari).
+  **Task 5** removed manual pairing, the links list, Remove and the
+  Shake and Bump buttons. **Task 6**: the Worker's `accel`, `powerCycle`,
+  `leds` and `console` messages; the client's canned `shake()` and
+  `bump()` are gone (the runtime keeps them for `cpu-wasm.test.ts`).
+- **Tasks 7, 8, 11 and 12: the page.** React with shadcn/ui on Tailwind
+  v4 (`ui/*.tsx`, `components/ui/`), themed to the design (dark only).
+  CONSOLE.LOG (`ui/console-log.ts`, 2,000 lines, `[page]` lines merged
+  in). The badge (`ui/Badge.tsx`, `ui/badge-geometry.ts`), the stage
+  and the keyboard (`ui/keyboard.ts`: arrows, Z/X, Enter, Escape, Space
+  for AUX1, S shakes and K knocks). The controller store
+  (`ui/badge-controller.ts`) and BADGE LINK (`radio/links.ts`).
+- **Tasks 9, 10 and 13: motion.** `motion/lanyard.ts` (matter.js:
+  gravity 2400 px/s², 1/120 s substeps) and `motion/sensor.ts`: the
+  accelerometer reads a true 1 g through the badge's tilt plus the
+  motion at the chip's spot times `GAIN_MG_PER_PX_S2` = 0.2, clamped to
+  ±2000 mg; a hanging badge rests at (0, +1000, 0) mg through the
+  unverified `BOARD_AXES`. A wall hit faster than 840 px/s is an
+  impact and goes to the links as a bump. `motion/device-motion.ts`
+  reads the phone (only on a touch-first device, R12; jolts over
+  1500 mg are impacts). The first browser checks of shaking, bumping
+  and the photo's fit are the human partner's (the decisions doc's
+  "Browser check").
+- **Task 11c: the photo.** `public/badge/front.webp` is cut from the
+  organizers' public orthographic close-up scan, levelled on the board's
+  long edges (R14), its outline traced (four corner radii, both side
+  recesses, the power switch's actuator kept, R16), and every geometry
+  value re-measured by `frontend/scripts/badge-features.py`. The scan
+  puts the LCD 0.32° off the board, but the screen looks level on the
+  badge, so the canvas is drawn unturned (R18, the browser check).
+- **The browser check** (the human partner, 2026-11-14, iOS; Android
+  untested) passed the layouts, Shake it!, Skip setup, the power
+  switch, SYNCED between two browsers by swinging into a wall, and
+  CONSOLE.LOG. Its fixes: brighter LED glows (R17), a level screen
+  (R18), the drawn swing following the phone's tilt (R19) and the
+  fling flip-over (a ceiling).
+- New limitations: item 14 above.
 
 ## Emulated flash chip: what it contains
 
