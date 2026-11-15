@@ -428,7 +428,11 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
    * The grip's target: the pointer, clamped to the stage (±40 px, as the
    * design), within the rope's reach of the anchor, and so that the badge
    * centre stays between the walls; the hand can't pull the badge through
-   * a wall or stretch the rope, which would whip it on release.
+   * a wall or stretch the rope, which would whip it on release. Upward it
+   * stops where the level badge's top meets the ceiling, with no
+   * overreach: pressed into the ceiling, the grip fought the collider and
+   * the clamp every substep, the badge chattered at ±2000 mg (false shakes
+   * and bumps) and tumbled into a wall on release.
    */
   function gripTarget(): Point {
     const g = grip!;
@@ -445,6 +449,7 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       x = geo.anchor.x + (dx * reach) / d;
       y = geo.anchor.y + (dy * reach) / d;
     }
+    y = Math.max(off.y + geo.bh / 2, y);
     return { x, y };
   }
 
@@ -590,8 +595,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       // Sideways, Ruling R19 (the human partner, 2026-11-14) takes the
       // opposite, non-physical sign: the drawn badge swings with the tilt
       // (tilt the phone right, it swings right). On the iOS phone checked,
-      // a tilt to the right reads +right, and the physical −f swung the
-      // badge left. Only the drawing changes; the firmware's readings are
+      // the physical −f swung the badge left on a right tilt, from which a
+      // +right reading is inferred (not read; iOS's signs are unverified). Only the drawing changes; the firmware's readings are
       // the phone's, untouched.
       const x = along(axes.right) * FOLLOW_PX_S2_PER_MG;
       const y = (along(axes.up) - REST_MG) * FOLLOW_PX_S2_PER_MG;

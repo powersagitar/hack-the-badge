@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createLanyard } from "../src/motion/lanyard";
+import { createLanyard, lanyardGeometry } from "../src/motion/lanyard";
 import { BOARD_AXES } from "../src/motion/axes";
 import { CLAMP_MG, REST_MG } from "../src/motion/sensor";
 import type { Mg } from "../src/motion/source";
@@ -339,6 +339,56 @@ describe("lanyard", () => {
       expect(Math.abs(p.badge.angle)).toBeLessThan(0.3);
       expect(Math.abs(p.badge.x - W / 2)).toBeLessThan(40);
     }
+  });
+
+  test("holding the badge up against the ceiling is still, and no impact", () => {
+    for (const [W, H, layout] of [[1000, 780, "desktop"], [390, 640, "mobile"]] as const) {
+      const { l, readings, run } = rig(W, H, layout);
+      run(1000);
+      let impacts = 0;
+      l.onImpact(() => impacts++);
+      const c = centre(l);
+      l.grab(c);
+      // Lift it 400 px over 0.25 s, well past the ceiling, and hold for 1 s.
+      for (let i = 1; i <= 15; i++) {
+        l.drag({ x: c.x, y: c.y - (400 * i) / 15 });
+        run(FRAME_MS);
+      }
+      run(500);
+      const from = readings.length;
+      const angles: number[] = [];
+      for (let t = 0; t < 1000; t += FRAME_MS) {
+        run(FRAME_MS);
+        angles.push(l.pose().badge.angle);
+      }
+      // Held still near the ceiling: near rest, not chattering.
+      for (const mg of readings.slice(from)) expect(dist(mg, REST)).toBeLessThan(150);
+      expect(Math.max(...angles) - Math.min(...angles)).toBeLessThan(0.02);
+      const top = l.pose().badge.y - l.pose().badge.h / 2;
+      expect(top).toBeGreaterThan(-1);
+      expect(top).toBeLessThan(10);
+      l.release();
+      run(3000);
+      expect(impacts).toBe(0);
+    }
+  });
+
+  test("the flip guarantee holds at the page's stage heights: the ring stays above half the badge's width", () => {
+    // Ruling R15's fix relies on it: the ring hangs at most ropeLen − 10 px
+    // below the ceiling, so with the badge's top at y ≥ 0 its centre (at
+    // least half the width down) stays below the ring. The page's stages
+    // are 780 px tall on desktop and 640 px on mobile (Stage.tsx); a much
+    // taller stage (1000×1000) breaks it.
+    const widths = { desktop: [768, 857, 1000, 1016], mobile: [320, 360, 390, 430, 767] } as const;
+    for (const layout of ["desktop", "mobile"] as const) {
+      const H = layout === "desktop" ? 780 : 640;
+      for (const W of widths[layout]) {
+        const g = lanyardGeometry(W, H, layout);
+        expect(g.ropeLen - 10).toBeLessThan(g.bw / 2);
+      }
+    }
+    const tall = lanyardGeometry(1000, 1000, "desktop");
+    expect(tall.ropeLen - 10).toBeGreaterThan(tall.bw / 2);
   });
 
   test("a slow push into the wall is not an impact", () => {

@@ -134,8 +134,14 @@ The ledger rulings that changed behaviour or the plan:
   drawn badge do the opposite of what the human partner wanted. Only
   `follow()`'s sideways (screen x) term changed sign:
   `x = +right · 2.4 px/s² per mg`. The sensor readings the firmware gets
-  are unchanged (1000 mg up is verified on iOS), and `platformSignFix`
-  and `BOARD_AXES` are untouched. Test: `following the phone sways the
+  are unchanged, and `platformSignFix` and `BOARD_AXES` are untouched.
+  **Open (the review):** the iOS check read about 1 g on the Shake it!
+  page's G-force, a magnitude (√(x²+y²+z²), `milestone-5-decisions.md`),
+  so the sign on iOS is unverified. The swing suggests iOS may invert
+  every axis. If it does, the right fix is `platformSignFix` = −1 on
+  iOS with `follow()` kept physical, and R19 would swing the badge the
+  wrong way on phones that keep the W3C convention. The human partner
+  is checking Accel's signed Y with an iPhone upright. Test: `following the phone sways the
   badge…` in `lanyard.test.ts` pins right → right and left → left.
 - **Recorded (Task 6 minor):** the Worker posts a `console` chunk with a
   status only when there is new text (and at once on a reset), not with
@@ -1179,7 +1185,7 @@ On `m14-t14` at `247dac6` plus this task's docs (no code changed),
 | `cargo test -p emulator-core --release --test boot_progress` | 96 passed, 1 ignored, 19.7 s |
 | `cargo clippy --workspace --all-targets` | clean, 0 warnings |
 | `bun run build:wasm` | ok |
-| `bun test` | 434 pass, 0 fail, 27 files, 27.5 s (435 after the fixes below) |
+| `bun test` | 434 pass, 0 fail, 27 files, 27.5 s (437 after the fixes below) |
 | `bun run typecheck` | ok |
 | `bun run build` | ok: JS 486.20 kB (gzip 156.84 kB), CSS 27.61 kB (gzip 6.25 kB), worker 12.77 kB, bridge 6.66 kB, wasm 146.60 kB; `dist/` 4112 KiB |
 
@@ -1205,9 +1211,12 @@ Android was not tested.
 6. **Two linked browsers:** linking and connecting passed. They reached
    "SYNCED" in Connect by swinging into a wall.
 7. **CONSOLE.LOG:** passed.
-8. **Upright phone:** reads 1000 mg up, correct (iOS). It had the same
-   opposite tilt as item 2, fixed by R19. Android was not tested, so
-   `platformSignFix` stays 1 everywhere.
+8. **Upright phone:** the human partner: "reads 1000 mg up, correct"
+   (iOS). That was read from Shake it!'s G-force, a magnitude, so it
+   shows about 1 g but not the sign: **the sign on iOS is unverified**
+   (open; Accel's signed Y with an iPhone upright settles it; see R19).
+   The same opposite tilt as item 2, handled by R19. Android was not
+   tested, so `platformSignFix` stays 1 everywhere.
 9. **`BOARD_AXES`:** not verified on the physical badge. Revisit it if
    it causes problems.
 10. **LED glow:** "way too faint". **Fixed by Ruling R17**: a perceptual
@@ -1222,7 +1231,7 @@ Android was not tested.
 
 ### Fling flip-over fix
 
-After the fixes (R17, R18, R19 and this one): `bun test` 435 pass, 0 fail
+After the fixes (R17, R18, R19 and this one): `bun test` 437 pass, 0 fail (435 before fix round 1)
 (27 files), `bun run typecheck` and `bun run build` ok. Nothing under
 `emulator-core/` or `emulator-wasm/` changed, so the Cargo suites were not
 rerun (their counts above stand).
@@ -1247,7 +1256,22 @@ rerun (their counts above stand).
   y = −10. With the badge's top on the stage, its centre stays below the
   ring on these stages (the ring hangs at most `ropeLen − 10` px down,
   less than half the badge's width), so it can never be inverted. A
-  fling up now hits the ceiling and falls back.
+  fling up now hits the ceiling and falls back. **The guarantee depends
+  on the page's stage heights,** 780 px on desktop and 640 px on mobile
+  (`Stage.tsx`): at 1000×1000, `ropeLen` is 282 against half a width
+  of 179, and the reviewer saw 6 of 150 flings invert. A test pins
+  `ropeLen − 10 < bw / 2` at both layouts' heights.
+- **Fix round 1 (the review): the grip stops at the ceiling.** Dragging
+  the badge up into the ceiling made the grip fight the collider and
+  the clamp every substep. The angle swung about ±0.37 rad per frame,
+  the readings sat at ±2000 mg (1.4 to 1.85 s above 400 mg, against
+  0.52 s before the ceiling), and on release the badge tumbled into a
+  wall and fired an impact (5 of 12 straight-up drags). `gripTarget`
+  now mirrors its wall clamp upward, with no overreach:
+  `y ≥ off.y + bh/2`, so the grip can't press a level badge past
+  y = 0. Test: `holding the badge up against the ceiling is still, and
+  no impact` (both layouts; held 1 s, within 150 mg of rest, the angle
+  still, no impact after release). It failed before the clamp.
 - **Checked.** The same sweep, widened to 800 flings on five stages
   (1000×780, 857×778, 600×780, 390×640 and 430×800): none ends
   inverted or away from hanging. One passes its ring for a moment and
@@ -1291,7 +1315,8 @@ browser check's open items. The browser check above may close some.
   "for now". Check it against the physical badge's Setup chase.
 - **Sensor signs (the browser check):** `BOARD_AXES` is not verified on
   the physical badge (revisit if it causes problems), and Android's
-  `platformSignFix` is untested (iOS reads 1000 mg up correctly).
+  `platformSignFix` is untested. iOS's sign is open (R19's note) and
+  goes here only if it is still open at merge.
 - **The power cycle (Tasks 3, 6):** `power_cycle_boots_to_the_registered_screen`
   ignores Setup's page 1 as well as the splash in
   `run_until_stable_frame`, so a regression back to Setup would time out

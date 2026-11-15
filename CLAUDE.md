@@ -75,10 +75,12 @@ swing into a stage wall (or a phone jolt) is the bump that goes to
 linked peers. The stage has a ceiling, so a fast fling can't swing the
 badge over its anchor. In phone mode the drawn badge swings with the
 phone's tilt (deliberately non-physical, the human partner's call);
-the firmware still gets the phone's own readings, and an upright iOS
-phone reads 1000 mg up. The board's axis signs (`BOARD_AXES`) are not
-verified on the physical badge, and Android's `platformSignFix` is
-untested. Known page limitations: a phone jolt along gravity alone
+the firmware still gets the phone's own readings. An upright iOS phone
+showed about 1 g of G-force, a magnitude, so iOS's sign is unverified
+(it may invert every axis; then `platformSignFix` = −1 there would be
+the fix, with a physical swing). The board's axis signs (`BOARD_AXES`)
+are not verified on the physical badge, and Android's
+`platformSignFix` is untested. Known page limitations: a phone jolt along gravity alone
 cannot fire a bump, and a touch whose up and cancel both get lost
 leaves its board button held. Every frame
 compared with the physical badge (boot, onboarding, the registered
@@ -128,7 +130,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 435 of them in 27 files, about 26 s. Most of
+- `bun test`: unit tests, 437 of them in 27 files, about 26 s. Most of
   that is the WASM twins: `test/cpu-wasm.test.ts`, which provisions and
   walks to the launcher, and `test/physics-shake.test.ts`, which shakes
   Setup's page 6 through the lanyard. Run one file with

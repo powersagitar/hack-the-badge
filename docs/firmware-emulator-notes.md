@@ -1334,8 +1334,9 @@ in `milestone-14-decisions.md` is the complete list):
     - **Unverified signs and positions.** `BOARD_AXES` (right +x, up +y,
       out +z) and `LED_CHAIN_TO_SPOT` were not verified on the physical
       badge (the browser check passed the LEDs "for now"). The phone's
-      `platformSignFix` (1 everywhere) is right on iOS, where an upright
-      phone reads 1000 mg up, and untested on Android.
+      `platformSignFix` (1 everywhere) is unverified on iOS (an upright
+      phone showed about 1 g of G-force, a magnitude, not a sign; the
+      swing suggests iOS may invert every axis) and untested on Android.
 
 ### Ground truth from the physical badge
 
