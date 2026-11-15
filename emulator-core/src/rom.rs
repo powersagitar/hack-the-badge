@@ -989,9 +989,11 @@
 //!
 //! ## What is NOT stubbed, on purpose
 //!
-//! The rest of ROM libc/newlib (`strstr`, `atoi`, …) and the rest of ROM
-//! libgcc's float half (all but the four soft-double helpers in
-//! [`LIBGCC_SOFT_DOUBLE_FAMILY`]) are **absent by design**, for the same
+//! The rest of ROM libc/newlib (`strstr`, …) and the rest of ROM libgcc's
+//! float half (everything outside the eight `double` helpers in
+//! [`LIBGCC_SOFT_DOUBLE_FAMILY`] and the nine `float` helpers in
+//! [`LIBGCC_SOFT_FLOAT_FAMILY`], for example `__divsf3`, `__eqsf2` and
+//! `__subdf3`) are **absent by design**, for the same
 //! reason `memset` and `__udivdi3` are special-cased rather than defaulted:
 //! a generic "return 0, do nothing" stub for a function whose *output* the
 //! caller uses silently corrupts it. Each one gets a real HLE implementation when — and

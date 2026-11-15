@@ -2013,6 +2013,14 @@ mod tests {
         assert_eq!(FixSi.apply(f(-994.7), 0), int(-994));
         assert_eq!(FixSi.apply(f(0.9), 0), 0);
         assert_eq!(FixSi.apply(f(-0.0), 0), 0);
+        assert_eq!(FixSi.apply(f(-0.9), 0), 0);
+        assert_eq!(FixSi.apply(0x0000_0001, 0), 0, "smallest subnormal");
+        assert_eq!(FixSi.apply(0x8000_0001, 0), 0, "negative subnormal");
+        assert_eq!(
+            FixSi.apply(f(2_147_483_520.0), 0),
+            int(2_147_483_520),
+            "largest in-range float"
+        );
         assert_eq!(FixSi.apply(f(2_147_483_648.0), 0), int(i32::MAX));
         assert_eq!(FixSi.apply(f(-2_147_483_648.0), 0), int(i32::MIN));
         assert_eq!(FixSi.apply(f(-3.0e9), 0), int(i32::MIN));
