@@ -18,8 +18,12 @@
  *   reboots. The lanyard sends its reading to `sink` (`start(sink)`) on
  *   every step that ran.
  * - **LEDs.** Chain index i lights `LED_SPOTS[LED_CHAIN_TO_SPOT[i]]`. The
- *   glow's opacity is `max(r,g,b)/255` (off is 0), and its `--rgb` is the
- *   colour scaled to full brightness, so the brightness is counted once.
+ *   glow's `--rgb` is the colour scaled to full brightness, and its
+ *   opacity is the brightness `v = max(r,g,b)/255`, boosted for the eye
+ *   (Ruling R17: the renderer boosts, the firmware's data stays exact):
+ *   `LED_MIN_OPACITY + (1 − LED_MIN_OPACITY) · v^(1/LED_GAMMA)`, and 0 when
+ *   off. The firmware drives the LEDs dimly (at most about 0x42), which
+ *   at `v` alone read at about 26% and looked unlit.
  * - **Width.** On desktop the stage is at most {@link STAGE_MAX_W} px
  *   wide: past about that, the rope can't swing the badge into a wall
  *   (Task 9), and drags would never bump.
@@ -89,12 +93,18 @@ export function ropePath(rope: readonly { x: number; y: number }[], centre: { x:
   return `${d} L${f(P.x - (ux / ul) * 12)} ${f(P.y - (uy / ul) * 12)}`;
 }
 
-/** One LED's glow: `--rgb` at full brightness and the opacity, or off. */
+/** The perceptual curve for a glow's opacity (an sRGB-like gamma). */
+export const LED_GAMMA = 2.2;
+/** The opacity of the dimmest lit LED, so any lit LED reads as lit. */
+export const LED_MIN_OPACITY = 0.35;
+
+/** One LED's glow: `--rgb` at full brightness and the boosted opacity, or off. */
 export function ledGlow(r: number, g: number, b: number): { rgb: string; opacity: number } {
-  const max = Math.max(r, g, b);
+  const max = Math.min(255, Math.max(r, g, b));
   if (!(max > 0)) return { rgb: "255,255,255", opacity: 0 };
   const k = 255 / max;
-  return { rgb: `${Math.round(r * k)},${Math.round(g * k)},${Math.round(b * k)}`, opacity: max / 255 };
+  const opacity = LED_MIN_OPACITY + (1 - LED_MIN_OPACITY) * (max / 255) ** (1 / LED_GAMMA);
+  return { rgb: `${Math.round(r * k)},${Math.round(g * k)},${Math.round(b * k)}`, opacity };
 }
 
 function sizeOf(width: number, height: number, layout: Layout): BadgeSize {

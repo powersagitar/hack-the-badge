@@ -17,6 +17,8 @@ let rtl: typeof import("@testing-library/react/pure");
 let Badge: typeof import("../src/ui/Badge").Badge;
 let Stage: typeof import("../src/ui/Stage").Stage;
 let ledGlow: typeof import("../src/ui/Stage").ledGlow;
+let LED_GAMMA: number;
+let LED_MIN_OPACITY: number;
 
 beforeAll(async () => {
   win = new Window({ url: "http://localhost:5173/", width: 1440, height: 900 });
@@ -32,7 +34,7 @@ beforeAll(async () => {
   }
   rtl = await import("@testing-library/react/pure");
   ({ Badge } = await import("../src/ui/Badge"));
-  ({ Stage, ledGlow } = await import("../src/ui/Stage"));
+  ({ Stage, ledGlow, LED_GAMMA, LED_MIN_OPACITY } = await import("../src/ui/Stage"));
 });
 
 afterEach(() => {
@@ -296,11 +298,12 @@ describe("Badge", () => {
     input.remove();
   });
 
-  test("the screen canvas turns with the LCD glass", () => {
+  test("the screen canvas is drawn level in the LCD (Ruling R18)", () => {
     const b = renderBadge();
     const canvas = b.view.getByRole("img", { name: "Badge screen" });
-    expect(canvas.style.transform).toBe(`rotate(${SCREEN.rotateDeg}deg)`);
-    expect(SCREEN.rotateDeg).toBe(-0.32);
+    expect(canvas.style.transform).toBe("");
+    expect(canvas.style.left).toBe(`${SCREEN.left}%`);
+    expect("rotateDeg" in SCREEN).toBe(false);
   });
 
   test("mobile hit targets are bigger", () => {
@@ -327,10 +330,11 @@ describe("Stage", () => {
     rtl.act(() => fc.emitLeds(rgb));
     fc.setRebooting(true);
     await rtl.act(() => new Promise((r) => setTimeout(r, 100)));
-    expect(leds[0].style.opacity).toBe((0x42 / 255).toFixed(3));
+    expect(leds[0].style.opacity).toBe(ledGlow(0, 0x42, 0).opacity.toFixed(3));
+    expect(leds[0].style.opacity).toBe("0.702");
     expect(leds[0].style.getPropertyValue("--rgb")).toBe("0,255,0");
     // Chain 2 is LED_SPOTS[3] (the mid-right spot).
-    expect(leds[3].style.opacity).toBe((0x30 / 255).toFixed(3));
+    expect(leds[3].style.opacity).toBe(ledGlow(0, 0x30, 0).opacity.toFixed(3));
     expect(leds[1].style.opacity).toBe("0.000");
     expect(view.getByRole("button", { name: "Power switch: reboot the badge" }).className).toContain("is-down");
     expect(view.getByText("DRAG THE BADGE TO SWING IT · PRESS THE BUTTONS ON THE BOARD")).toBeTruthy();
@@ -339,8 +343,23 @@ describe("Stage", () => {
     expect(view.container.querySelector<HTMLElement>("[data-slot=stage]")!.style.maxWidth).toBe("1016px");
   });
 
-  test("ledGlow scales the colour to full and keeps the brightness in opacity", () => {
+  test("ledGlow scales the colour to full and boosts the brightness for the eye (R17)", () => {
     expect(ledGlow(0, 0, 0)).toEqual({ rgb: "255,255,255", opacity: 0 });
-    expect(ledGlow(0x0c, 0x42, 0x0e)).toEqual({ rgb: "46,255,54", opacity: 0x42 / 255 });
+    const g = ledGlow(0x0c, 0x42, 0x0e);
+    expect(g.rgb).toBe("46,255,54");
+    expect(g.opacity).toBeCloseTo(LED_MIN_OPACITY + (1 - LED_MIN_OPACITY) * (0x42 / 255) ** (1 / LED_GAMMA), 12);
+    // The firmware's real levels all read clearly lit: prov apply's 0x06
+    // flash, the role colour's 0x1F, Mood LEDs' 0x21, Setup's 0x42.
+    expect(ledGlow(0, 0x06, 0).opacity).toBeGreaterThan(0.45);
+    expect(ledGlow(6, 0x1f, 6).opacity).toBeGreaterThan(0.55);
+    expect(ledGlow(0, 0x42, 0).opacity).toBeCloseTo(0.7, 2);
+    expect(ledGlow(255, 255, 255).opacity).toBe(1);
+    // Brighter is never dimmer.
+    let prev = 0;
+    for (let v = 1; v <= 255; v++) {
+      const o = ledGlow(v, 0, 0).opacity;
+      expect(o).toBeGreaterThan(prev);
+      prev = o;
+    }
   });
 });

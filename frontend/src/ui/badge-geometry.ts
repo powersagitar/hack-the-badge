@@ -25,13 +25,13 @@ export const BOARD_CORNERS = { tl: 0.093, tr: 0.0946, br: 0.189, bl: 0.0964 } as
  * The LCD's rectangle, where the 320×240 framebuffer is drawn: 4:3,
  * centred on the flat glass (inside the polarizer's line), as wide as the
  * design's relation to the glass (1% wider than it, 2.2 px over each side;
- * 2.9 px of glass above and below). `rotateDeg` is the glass's angle
- * against the levelled board, clockwise positive (CSS `rotate()`'s
- * sense): the LCD is mounted 0.32° counter-clockwise of the board, so the
- * canvas turns with it about the rectangle's centre. `left`, `top`,
- * `width` and `height` are the rectangle before that turn.
+ * 2.9 px of glass above and below). It is drawn level, unturned: the
+ * scan put the glass 0.32° off the board, but the human partner sees
+ * the screen perfectly level on the badge (Ruling R18, superseding R14's
+ * rotation), so the canvas no longer turns. The rectangle was fitted in
+ * the glass's own frame about its centre, so it stays centred.
  */
-export const SCREEN = { left: 15.02, top: 14.75, width: 45.96, height: 22.04, rotateDeg: -0.32 };
+export const SCREEN = { left: 15.02, top: 14.75, width: 45.96, height: 22.04 };
 
 /** The power slide switch at the top edge: centred on its body; the design's hit size, scaled as the hit sizes below. */
 export const POWER = { left: 34.05, top: 1.96, width: 10.57, height: 4 };

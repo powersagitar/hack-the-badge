@@ -22,7 +22,11 @@
  * - Following the phone (follow()): while phone motion drives the
  *   sensor, the phone's in-plane reading is the anchor's (the hand's)
  *   acceleration, felt by the rope and the badge as the equivalent
- *   inertial force, so the drawn badge sways with the phone.
+ *   inertial force, so the drawn badge sways with the phone; sideways
+ *   it swings with the tilt instead (Ruling R19, deliberately
+ *   non-physical).
+ * - The stage has a ceiling at y = 0 (a collider and the bounds clamp),
+ *   so a fast fling can't swing the badge over its anchor (R15's fix).
  *
  * Constants and their tuning: docs/milestone-14-decisions.md, "Lanyard
  * physics and the sensor (Task 9)".
@@ -279,7 +283,13 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     debtMs = 0;
   }
 
-  /** The stage's side walls: static colliders just outside 0 and W. */
+  /**
+   * The stage's side walls, static colliders just outside 0 and W, and its
+   * ceiling, just above y = 0 (the rope, which collides with nothing,
+   * passes through it to the anchor). Without the ceiling a fast upward
+   * fling swung the badge over its anchor, and it stayed upside down,
+   * leaning on a wall above the stage (Ruling R15's flip-over).
+   */
   function makeWalls(W: number, H: number): Matter.Body[] {
     const T = 400;
     const wallOpts = {
@@ -291,7 +301,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     };
     const left = Bodies.rectangle(-T / 2, H / 2, T, H * 6, wallOpts);
     const right = Bodies.rectangle(W + T / 2, H / 2, T, H * 6, wallOpts);
-    return [left, right];
+    const ceiling = Bodies.rectangle(W / 2, -T / 2, W + 2 * T, T, { ...wallOpts, label: "ceiling" });
+    return [left, right, ceiling];
   }
 
   /**
@@ -360,11 +371,16 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
     }
   }
 
-  /** The design's hard clamp: the badge's bounds never leave the walls. */
+  /**
+   * The design's hard clamp: the badge's bounds never leave the walls, nor
+   * rise past the ceiling (y = 0), so the badge can never swing over its
+   * anchor.
+   */
   function keepInside(): void {
     const { min, max } = badge.bounds;
     const dx = min.x < 0 ? -min.x : max.x > geo.W ? geo.W - max.x : 0;
-    if (dx !== 0) Body.translate(badge, { x: dx, y: 0 });
+    const dy = min.y < 0 ? -min.y : 0;
+    if (dx !== 0 || dy !== 0) Body.translate(badge, { x: dx, y: dy });
   }
 
   function fireImpact(): void {
@@ -571,7 +587,13 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       // The reading is proper acceleration, f = a − g. In the anchor's
       // frame each body feels −f; the simulation's gravity already gives
       // the rest's share, so the rest is the difference (screen y is down).
-      const x = -along(axes.right) * FOLLOW_PX_S2_PER_MG;
+      // Sideways, Ruling R19 (the human partner, 2026-11-14) takes the
+      // opposite, non-physical sign: the drawn badge swings with the tilt
+      // (tilt the phone right, it swings right). On the iOS phone checked,
+      // a tilt to the right reads +right, and the physical −f swung the
+      // badge left. Only the drawing changes; the firmware's readings are
+      // the phone's, untouched.
+      const x = along(axes.right) * FOLLOW_PX_S2_PER_MG;
       const y = (along(axes.up) - REST_MG) * FOLLOW_PX_S2_PER_MG;
       hand = { x, y: Math.max(-FOLLOW_MAX_LIFT_PX_S2, y) };
     },

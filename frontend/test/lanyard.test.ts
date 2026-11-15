@@ -306,6 +306,41 @@ describe("lanyard", () => {
     expect(impacts).toBe(1);
   });
 
+  test("a fast upward fling never swings the badge over its anchor (R15)", () => {
+    // Before the ceiling, an up-and-sideways fling (on 1000×780, 600 px
+    // right and 300 px up over 2 frames, or over 16 frames at 300 px)
+    // swung the badge over the anchor, where it stayed upside down,
+    // leaning on a wall above the stage, until "Reset swing".
+    const cases: Array<[number, number, "desktop" | "mobile", number, number, number]> = [
+      [1000, 780, "desktop", 600, -300, 2],
+      [1000, 780, "desktop", 300, -300, 16],
+      [857, 778, "desktop", 960, -300, 8],
+      [857, 778, "desktop", -960, -600, 4],
+      [600, 780, "desktop", 1500, -600, 2],
+      [390, 640, "mobile", 600, -600, 2],
+    ];
+    for (const [W, H, layout, dx, dy, frames] of cases) {
+      const { l, run } = rig(W, H, layout);
+      run(500);
+      const c = centre(l);
+      l.grab(c);
+      for (let i = 1; i <= frames; i++) {
+        l.drag({ x: c.x + (dx * i) / frames, y: c.y + (dy * i) / frames });
+        run(FRAME_MS);
+      }
+      l.release();
+      for (let t = 0; t < 5000; t += FRAME_MS) {
+        run(FRAME_MS);
+        const p = l.pose();
+        // Never inverted: the centre stays below the ring it hangs from.
+        expect(p.badge.y).toBeGreaterThan(p.rope.at(-1)!.y);
+      }
+      const p = l.pose();
+      expect(Math.abs(p.badge.angle)).toBeLessThan(0.3);
+      expect(Math.abs(p.badge.x - W / 2)).toBeLessThan(40);
+    }
+  });
+
   test("a slow push into the wall is not an impact", () => {
     const { l, run } = rig();
     run(1000);
@@ -342,11 +377,17 @@ describe("lanyard", () => {
     const { l, readings, run } = rig();
     run(1000);
     const x0 = centre(l).x;
-    // The phone accelerates right (its reading leans right): the badge lags left.
+    // Ruling R19: the reading leans right (the phone tilted right, as
+    // iOS reports it): the drawn badge swings right, with the tilt.
     const lean: Mg = [...REST];
     lean[BOARD_AXES.right[0]] = 500 * BOARD_AXES.right[1];
     l.follow(lean);
     run(600);
+    expect(centre(l).x).toBeGreaterThan(x0 + 40);
+    // And left for a left tilt.
+    lean[BOARD_AXES.right[0]] = -500 * BOARD_AXES.right[1];
+    l.follow(lean);
+    run(1500);
     expect(centre(l).x).toBeLessThan(x0 - 40);
     // Upside down: the badge still hangs below the anchor, on the stage.
     const upsideDown: Mg = [0, 0, 0];

@@ -58,7 +58,7 @@ describe("badge geometry", () => {
     }
   });
 
-  test("SCREEN is 4:3 in the photo's pixels, inside the photo, turned with the glass", () => {
+  test("SCREEN is 4:3 in the photo's pixels, inside the photo, drawn level", () => {
     const w = (SCREEN.width / 100) * PHOTO.w;
     const h = (SCREEN.height / 100) * PHOTO.h;
     expect(Math.abs(w / h / (4 / 3) - 1)).toBeLessThan(0.005);
@@ -66,9 +66,8 @@ describe("badge geometry", () => {
     expect(SCREEN.top).toBeGreaterThan(0);
     expect(SCREEN.left + SCREEN.width).toBeLessThan(100);
     expect(SCREEN.top + SCREEN.height).toBeLessThan(100);
-    // Ruling R14: only an angle of more than 0.1° turns the canvas.
-    expect(Math.abs(SCREEN.rotateDeg)).toBeGreaterThan(0.1);
-    expect(Math.abs(SCREEN.rotateDeg)).toBeLessThan(1);
+    // Ruling R18: the screen is level on the badge; the canvas never turns.
+    expect("rotateDeg" in SCREEN).toBe(false);
   });
 
   test("each board corner has its own radius, the bottom-right the largest", () => {

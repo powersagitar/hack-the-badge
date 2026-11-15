@@ -184,7 +184,8 @@
   }
   .led {
     position: absolute;
-    width: 15%;
+    /* A larger, stronger bloom than the design's 15% (Ruling R17). */
+    width: 22%;
     aspect-ratio: 1 / 1;
     transform: translate(-50%, -50%);
     border-radius: 50%;
@@ -194,10 +195,10 @@
     background: radial-gradient(
       circle,
       #fff 0 5%,
-      rgb(var(--rgb, 255, 255, 255)) 12%,
-      rgba(var(--rgb, 255, 255, 255), 0.42) 26%,
-      rgba(var(--rgb, 255, 255, 255), 0.12) 46%,
-      transparent 68%
+      rgb(var(--rgb, 255, 255, 255)) 14%,
+      rgba(var(--rgb, 255, 255, 255), 0.65) 28%,
+      rgba(var(--rgb, 255, 255, 255), 0.25) 48%,
+      transparent 70%
     );
   }
 }
