@@ -1314,9 +1314,15 @@ in `milestone-14-decisions.md` is the complete list):
       stayed upside down, leaning on a wall above the stage. The stage
       now has a ceiling at y = 0 (a collider and the bounds clamp), so
       the badge can't pass over its anchor.
-    - **Phone mode's sideways swing is non-physical** (Ruling R19, the
-      human partner's call): tilting the phone right swings the drawn
-      badge right. The firmware's readings are the phone's, unchanged.
+    - **iOS inverts every axis** (Ruling R21, which supersedes R19).
+      The self-test's signed axes on an iPhone read Z ≈ −1000 mg face
+      up, Y ≈ −1000 mg upright and +X with the right edge down, the
+      opposite of the W3C convention on every axis, so
+      `platformSignFix` is −1 on iOS and iPadOS (iPadOS's desktop UA
+      detected by "Macintosh" with touch points). With that fix the
+      physical `follow()` swings the drawn badge with the tilt, the
+      human partner's chosen behaviour; R19's non-physical sign flip is
+      reverted.
     - **A jolt along gravity cannot fire a phone's bump alone.** The
       phone's impact detector takes the jump between readings that are
       already clamped per axis to ±2000 mg, so an upright phone jerked
@@ -1334,9 +1340,8 @@ in `milestone-14-decisions.md` is the complete list):
     - **Unverified signs and positions.** `BOARD_AXES` (right +x, up +y,
       out +z) and `LED_CHAIN_TO_SPOT` were not verified on the physical
       badge (the browser check passed the LEDs "for now"). The phone's
-      `platformSignFix` (1 everywhere) is unverified on iOS (an upright
-      phone showed about 1 g of G-force, a magnitude, not a sign; the
-      swing suggests iOS may invert every axis) and untested on Android.
+      `platformSignFix` is verified on iOS (R21) and untested on
+      Android, which stays 1.
 
 ### Ground truth from the physical badge
 
@@ -2918,7 +2923,10 @@ the ROM `__fixsfsi` stub, see `milestone-14-decisions.md`, "Self-test
 accelerometer reboot"), the lights test drives the LEDs over RMT but the emulator
 does not show them, and the NFC test waits forever for a card (the summary
 lists NFC as skipped). "Hold HOME" exits the self-test back to the
-first-run screen, as A does after the summary.
+first-run screen, as A does after the summary. Nineteen other ROM libgcc helpers that
+`firmware.bin` calls are still unstubbed (`__divsf3` first; listed in
+that section's addendum), and each would panic and reboot the same way
+the first time a walk reaches it.
 
 ### Milestone 5 Task 1: the provisioning path
 
@@ -3761,8 +3769,9 @@ are in `docs/milestone-14-decisions.md`.
   untested) passed the layouts, Shake it!, Skip setup, the power
   switch, SYNCED between two browsers by swinging into a wall, and
   CONSOLE.LOG. Its fixes: brighter LED glows (R17), a level screen
-  (R18), the drawn swing following the phone's tilt (R19) and the
-  fling flip-over (a ceiling).
+  (R18), the drawn swing following the phone's tilt (R19, then R21:
+  iOS's inverted axes flipped by `platformSignFix`, with a physical
+  swing) and the fling flip-over (a ceiling).
 - New limitations: item 14 above.
 
 ## Emulated flash chip: what it contains

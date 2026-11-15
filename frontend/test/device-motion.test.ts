@@ -176,9 +176,42 @@ describe("platform", () => {
     g.isSecureContext = saved.secure;
   });
 
-  test("platformSignFix starts at 1 everywhere", () => {
-    expect(platformSignFix("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)")).toBe(1);
-    expect(platformSignFix("Mozilla/5.0 (Linux; Android 15; Pixel 9)")).toBe(1);
+  // Ruling R21: iOS and iPadOS invert every axis; elsewhere is as W3C says.
+  test("platformSignFix flips iPhone Safari", () => {
+    const ua =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
+    expect(platformSignFix(ua, 5)).toBe(-1);
+  });
+
+  test("platformSignFix flips iPhone Chrome (CriOS is WebKit too)", () => {
+    const ua =
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/131.0.6778.73 Mobile/15E148 Safari/604.1";
+    expect(platformSignFix(ua, 5)).toBe(-1);
+  });
+
+  test("platformSignFix flips an iPad's mobile UA", () => {
+    const ua =
+      "Mozilla/5.0 (iPad; CPU OS 17_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.7 Mobile/15E148 Safari/604.1";
+    expect(platformSignFix(ua, 5)).toBe(-1);
+  });
+
+  test("platformSignFix flips iPadOS's desktop-class UA when it has touch", () => {
+    const ua =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
+    expect(platformSignFix(ua, 5)).toBe(-1);
+  });
+
+  test("platformSignFix keeps macOS Safari without touch at 1", () => {
+    const ua =
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
+    expect(platformSignFix(ua, 0)).toBe(1);
+    expect(platformSignFix(ua)).toBe(1);
+  });
+
+  test("platformSignFix keeps Android Chrome at 1 (untested on a device)", () => {
+    const ua =
+      "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.81 Mobile Safari/537.36";
+    expect(platformSignFix(ua, 5)).toBe(1);
     expect(platformSignFix("")).toBe(1);
   });
 

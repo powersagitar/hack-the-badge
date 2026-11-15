@@ -74,13 +74,12 @@ phone's DeviceMotion. "Shake it!" passes by shaking the badge, and a
 swing into a stage wall (or a phone jolt) is the bump that goes to
 linked peers. The stage has a ceiling, so a fast fling can't swing the
 badge over its anchor. In phone mode the drawn badge swings with the
-phone's tilt (deliberately non-physical, the human partner's call);
-the firmware still gets the phone's own readings. An upright iOS phone
-showed about 1 g of G-force, a magnitude, so iOS's sign is unverified
-(it may invert every axis; then `platformSignFix` = −1 there would be
-the fix, with a physical swing). The board's axis signs (`BOARD_AXES`)
-are not verified on the physical badge, and Android's
-`platformSignFix` is untested. Known page limitations: a phone jolt along gravity alone
+phone's tilt, physically (Ruling R21, which supersedes R19's
+non-physical flip). iOS and iPadOS invert every axis of
+`accelerationIncludingGravity` (verified on an iPhone through the
+self-test's signed axes), so `platformSignFix` is −1 there and 1
+elsewhere; Android's is untested. The board's axis signs (`BOARD_AXES`)
+are not verified on the physical badge. Known page limitations: a phone jolt along gravity alone
 cannot fire a bump, and a touch whose up and cancel both get lost
 leaves its board button held. Every frame
 compared with the physical badge (boot, onboarding, the registered
@@ -130,7 +129,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 437 of them in 27 files, about 26 s. Most of
+- `bun test`: unit tests, 442 of them in 27 files, about 26 s. Most of
   that is the WASM twins: `test/cpu-wasm.test.ts`, which provisions and
   walks to the launcher, and `test/physics-shake.test.ts`, which shakes
   Setup's page 6 through the lanyard. Run one file with
@@ -155,7 +154,7 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   - The rungs share cloned `FirmwareRuntime` checkpoints in `OnceLock`s.
   - When boot moves, update the rung whose budget it affects, and put the
     history in the notes, not the test docs.
-  - `cargo test --workspace` (781 tests, 1 ignored) runs the same rungs
+  - `cargo test --workspace` (782 tests, 1 ignored) runs the same rungs
     in debug, about 30 s.
 - `cargo clippy --workspace --all-targets` runs clean, with no warnings.
 - Benchmarks are never part of a test run; results go in
@@ -290,12 +289,12 @@ frontend/src/
                         (per-corner chamfers), walls; 1/120 s substeps,
                         2400 px/s²; grab/drag/release, impulse("shake" |
                         "knock"), peerBump, follow(mg) for phone mode
-                        (sideways it swings with the tilt, R19), wall
+                        (it swings with the tilt, physically; R21), wall
                         impacts over 840 px/s; a ceiling at y = 0 keeps
                         a fling from swinging it over the anchor.
   motion/device-motion.ts
                         The phone's DeviceMotion as a source:
-                        platformSignFix (1 everywhere, unverified), a
+                        platformSignFix (−1 on iOS/iPadOS, R21), a
                         +1000 mg peer pulse, jolts over 1500 mg are
                         impacts; needs a secure context.
   runtime/buttons.ts    BUTTON_NAMES, ButtonName, ButtonSource, Rgb.

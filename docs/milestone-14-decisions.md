@@ -126,8 +126,8 @@ The ledger rulings that changed behaviour or the plan:
   removed. Nothing else used them. The rectangle was fitted about the
   glass's centre, so it stays centred. This supersedes R14's rotation
   clause; R14's levelling of the photo on the board stands.
-- **R19 (the human partner, browser check items 2 and 8):** in phone
-  mode the drawn badge swings with the tilt: tilt the phone right and
+- **R19 (the human partner, browser check items 2 and 8), superseded
+  by R21:** in phone mode the drawn badge swings with the tilt: tilt the phone right and
   it swings right, tilt it left and it swings left. This is
   deliberately non-physical. A plumb line in a phone tilted right hangs
   toward the screen's lower side, and the physical `follow()` made the
@@ -135,14 +135,51 @@ The ledger rulings that changed behaviour or the plan:
   `follow()`'s sideways (screen x) term changed sign:
   `x = +right · 2.4 px/s² per mg`. The sensor readings the firmware gets
   are unchanged, and `platformSignFix` and `BOARD_AXES` are untouched.
-  **Open (the review):** the iOS check read about 1 g on the Shake it!
-  page's G-force, a magnitude (√(x²+y²+z²), `milestone-5-decisions.md`),
-  so the sign on iOS is unverified. The swing suggests iOS may invert
-  every axis. If it does, the right fix is `platformSignFix` = −1 on
-  iOS with `follow()` kept physical, and R19 would swing the badge the
-  wrong way on phones that keep the W3C convention. The human partner
-  is checking Accel's signed Y with an iPhone upright. Test: `following the phone sways the
-  badge…` in `lanyard.test.ts` pins right → right and left → left.
+  **Open (the review), since closed by R21:** the iOS check read about
+  1 g on the Shake it! page's G-force, a magnitude (√(x²+y²+z²),
+  `milestone-5-decisions.md`), so the sign on iOS was unverified. The
+  swing suggested iOS inverts every axis, in which case the right fix
+  is `platformSignFix` = −1 on iOS with `follow()` kept physical, and
+  R19 would swing the badge the wrong way on phones that keep the W3C
+  convention. The signed readings confirmed it (R21).
+- **R21 (the human partner's signed check on an iPhone, 2026-11-14;
+  supersedes R19):** `platformSignFix(ua, maxTouchPoints)` returns −1 on
+  iOS and iPadOS and 1 elsewhere, and `follow()`'s sideways term is
+  physical again, `x = −right · 2.4 px/s² per mg`.
+  - **Evidence.** Read on the self-test's accelerometer page (signed
+    `"%+5d mg"` axes) with phone motion on, `BOARD_AXES` the identity
+    and `platformSignFix` still 1, so the values are iOS's raw signs:
+    flat and face up, Z ≈ −1000 mg; tilted right (right edge down), X
+    goes positive; face down, all positive; held vertical, screen to
+    the user, top edge up, Y ≈ −1000 mg. The W3C
+    `accelerationIncludingGravity` convention (proper acceleration)
+    gives +Z face up, −X with the right edge down and +Y upright. iOS
+    inverts every axis: the older-Safari quirk, still present.
+  - **Detection.** "iPhone", "iPad" or "iPod" in the UA, which covers
+    every iOS browser (all WebKit: CriOS, FxiOS…), or iPadOS's
+    desktop-class UA: "Macintosh" with `navigator.maxTouchPoints` > 1.
+    The controller passes `navigator.maxTouchPoints`; a Mac without
+    touch stays 1.
+  - **Android and the rest stay 1, untested** on a real device.
+  - **The swing.** Tilting right now reads right = −1000·sinθ, and the
+    physical −f pushes the drawn badge right: R19's chosen behaviour
+    ("swing with the tilt"), reached physically. On a W3C-convention
+    phone it swings the same way.
+  - `BOARD_AXES` is unchanged (unverified on the physical badge, by the
+    human partner's ruling). No pin moves: the sign is browser-side.
+  - **Tests.** Six `platformSignFix` cases in `device-motion.test.ts`
+    (iPhone Safari, iPhone Chrome, iPad, iPadOS desktop UA with touch,
+    macOS Safari without touch, Android Chrome). `following the phone
+    sways the badge…` in `lanyard.test.ts` now feeds iOS's raw tilt
+    through `deviceMotionToMg(…, −1, BOARD_AXES)` (a convention
+    reading, right ≈ −500 mg) and still pins tilt right → swing right,
+    and left → left.
+  - **Suites after R21** (with the self-test addendum's unit cases):
+    `cargo test --workspace` 782 pass, 1 ignored (the new `__fixsfsi`
+    cases sit inside an existing test); `boot_progress` (release) 97
+    pass + 1 ignored; clippy clean; `bun test` 442 pass, 0 fail, 27
+    files (437 − the old `platformSignFix` test + six new ones);
+    `bun run typecheck` and `bun run build` ok.
 - **Recorded (Task 6 minor):** the Worker posts a `console` chunk with a
   status only when there is new text (and at once on a reset), not with
   every status as the brief said; an empty chunk would carry nothing.
@@ -737,8 +774,9 @@ the ±2000 clamp.
   `signFix`, phone x/y/z as the board's right/up/out through
   `BOARD_AXES`, clamped by sensor.ts's `clampRound` (now exported, so
   both sources share one clamp).
-- **`platformSignFix`** returns 1 everywhere until Task 14's real-device
-  check on iOS and Android fills its table.
+- **`platformSignFix`** returned 1 everywhere until Task 14's real-device
+  check; since Ruling R21 it is −1 on iOS and iPadOS (verified on an
+  iPhone) and 1 elsewhere (Android untested).
 - **"Unsupported".** `motionAvailable()` is false when
   `DeviceMotionEvent` is missing or `isSecureContext` is false (Chrome
   hides the API outside a secure context; iOS keeps it but never
@@ -963,7 +1001,7 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   covers the rest reading, so `follow` applies only the difference to the
   rope nodes and the badge, at `GRAVITY_PX_S2 / REST_MG` = 2.4 px/s² per
   mg (1 g is the simulation's gravity):
-  x = −right·2.4 (since R19, +right·2.4), y = (up − 1000)·2.4, in screen
+  x = −right·2.4 (+right·2.4 under R19, −right·2.4 again since R21), y = (up − 1000)·2.4, in screen
   px/s², with y down.
   - **Why every body, not just the anchor point.** The anchor is not a
     body. Moving the anchor is equivalent, in its frame, to this uniform
@@ -973,7 +1011,9 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
     A tilted phone makes the badge hang toward true down.
     **Superseded sideways by Ruling R19 (Task 14):** the x term's sign
     is flipped, so the drawn badge swings with the tilt (and leads a
-    sideways jerk); y is unchanged.
+    sideways jerk); y is unchanged. **R21 restored the physical sign**:
+    with iOS's axes fixed by `platformSignFix`, a right tilt reads
+    −right and the physical term swings the badge with the tilt.
   - **Clamp.** The upward part is limited to 0.75 g
     (`FOLLOW_MAX_LIFT_PX_S2`), so a phone held flat or upside down still
     leaves a quarter g down, and the badge hangs on the stage, not above
@@ -1203,6 +1243,10 @@ Android was not tested.
    tilting the phone right swung the badge left, and left swung it right.
    **Fixed by Ruling R19**: the drawn swing now follows the tilt, which
    is deliberately non-physical. The firmware's readings are unchanged.
+   **Superseded by Ruling R21**: the cause was iOS's inverted axes, now
+   flipped by `platformSignFix`, and `follow()` is physical again; the
+   swing still follows the tilt, and the firmware now gets W3C-convention
+   readings on iOS.
 3. **Skip setup:** passed.
 4. **Mood LEDs:** the LED positions pass for now, **unverified**: R10's
    [0, 1, 3, 5, 4, 2] stays and is recorded as unverified. Caveat: not
@@ -1213,10 +1257,10 @@ Android was not tested.
 7. **CONSOLE.LOG:** passed.
 8. **Upright phone:** the human partner: "reads 1000 mg up, correct"
    (iOS). That was read from Shake it!'s G-force, a magnitude, so it
-   shows about 1 g but not the sign: **the sign on iOS is unverified**
-   (open; Accel's signed Y with an iPhone upright settles it; see R19).
-   The same opposite tilt as item 2, handled by R19. Android was not
-   tested, so `platformSignFix` stays 1 everywhere.
+   showed about 1 g but not the sign. **Since verified on iOS** (R21):
+   the self-test's signed axes read Y ≈ −1000 mg upright, every axis
+   inverted, so `platformSignFix` is −1 on iOS and iPadOS. Android was
+   not tested and stays 1.
 9. **`BOARD_AXES`:** not verified on the physical badge. Revisit it if
    it causes problems.
 10. **LED glow:** "way too faint". **Fixed by Ruling R17**: a perceptual
@@ -1346,6 +1390,28 @@ phone, with no input given.
 
 Suites after the fix: `cargo test --workspace` 782 pass (781 + the new rung), 1 ignored; `boot_progress` (release) 97 pass + 1 ignored; `cargo clippy --workspace --all-targets` clean; `bun test` 435 pass (27 files); `bun run typecheck` and `bun run build` ok.
 
+### Addendum: the other unstubbed libgcc helpers
+
+A reviewer's static scan of `firmware.bin` found more ROM libgcc float
+helpers that the firmware calls and nothing stubs. Each was checked
+against `rom.rs`'s stub table (`LIBGCC_SOFT_FLOAT_FAMILY`,
+`LIBGCC_SOFT_DOUBLE_FAMILY`, `LIBGCC_INT32_FAMILY`); `__divdf3`, in the
+scan's list, is already stubbed and is dropped. Still absent:
+
+- `float`: `__divsf3`, `__eqsf2`, `__gesf2`, `__nesf2`, `__fixunssfsi`,
+  `__floatunsisf`, `__extendsfdf2`, `__truncdfsf2`, `__floatdisf`;
+- `double`: `__subdf3`, `__eqdf2`, `__floatsidf`, `__ltdf2`,
+  `__unorddf2`, `__gtdf2`, `__nedf2`, `__fixdfdi`, `__floatdidf`;
+- integer: `__ctzsi2`.
+
+Any of them is a reboot like this one the first time a walk reaches it.
+`__divsf3`, with 93 call sites, is the likeliest next. In the Milestone 15
+backlog below. Also in this addendum: `__fixsfsi` gained four unit cases
+(the subnormals `0x0000_0001` and `0x8000_0001` → 0, the largest in-range
+float `2147483520.0` → `2147483520`, `-0.9` → 0), inside the existing
+`soft_float_ops_match_libgcc_soft_fp` test, and `rom.rs`'s "What is NOT
+stubbed" paragraph now names both soft-float families.
+
 ## Milestone 15 backlog
 
 ### New in Milestone 14
@@ -1379,8 +1445,11 @@ browser check's open items. The browser check above may close some.
   "for now". Check it against the physical badge's Setup chase.
 - **Sensor signs (the browser check):** `BOARD_AXES` is not verified on
   the physical badge (revisit if it causes problems), and Android's
-  `platformSignFix` is untested. iOS's sign is open (R19's note) and
-  goes here only if it is still open at merge.
+  `platformSignFix` is untested (iOS's is verified, R21).
+- **Unstubbed ROM libgcc helpers (the self-test fix's review):** stub,
+  with real implementations, the nineteen `firmware.bin` calls that
+  `rom.rs` lacks, listed in "Self-test accelerometer reboot"'s addendum,
+  `__divsf3` (93 call sites) first, or pin a walk that reaches each.
 - **The power cycle (Tasks 3, 6):** `power_cycle_boots_to_the_registered_screen`
   ignores Setup's page 1 as well as the splash in
   `run_until_stable_frame`, so a regression back to Setup would time out
