@@ -2912,7 +2912,9 @@ on-screen label (see "Physical pin map").
 **What the self-test shows that the emulator does not model:** the
 accelerometer read "0 mg" on every axis until Milestone 5 Task D-M5-2 (no
 I2C device then; it now reads the host-set acceleration, (0, 0, +1000) mg
-at rest), the lights test drives the LEDs over RMT but the emulator
+at rest; on v392 the page panicked and rebooted until Milestone 14 added
+the ROM `__fixsfsi` stub, see `milestone-14-decisions.md`, "Self-test
+accelerometer reboot"), the lights test drives the LEDs over RMT but the emulator
 does not show them, and the NFC test waits forever for a card (the summary
 lists NFC as skipped). "Hold HOME" exits the self-test back to the
 first-run screen, as A does after the summary.

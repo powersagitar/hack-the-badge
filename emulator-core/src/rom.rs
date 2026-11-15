@@ -967,6 +967,21 @@
 //!     `crc16_le`, `crc16_be`, `crc8_le`, `crc8_be`, `esp_crc8`,
 //!     `esp32c3.rom.ld:416`..`:421`) are not reached and stay unstubbed.
 //!
+//! 29. **libgcc `__fixsfsi`** (`0x4000_07e4`, `esp32c3.rom.libgcc.ld`;
+//!     [`LIBGCC_SOFT_FLOAT_FAMILY`]; the ROM ELF names the slot
+//!     `__call___fixsfsi`) — Milestone 14, "Self-test accelerometer
+//!     reboot". The hardware self-test's accelerometer page (reached from
+//!     the unprovisioned first-run screen: START, all nine buttons, A on
+//!     the screen test) reads the three axes as `float`s (`0x4200_ae2e`)
+//!     and prints each as `"%+5d mg"` (`0x3c13_db44`) of `(int)` the axis,
+//!     the call at `0x4204_53c6`. Observed faulting there (an instruction
+//!     access fault at `0x400007e4`, `RA 0x420453ce`), which the firmware
+//!     turned into a Guru Meditation panic and a reboot. Before Milestone 5
+//!     the accelerometer did not answer, the read failed and the page never
+//!     converted a value. A real [`SoftFloatOp::FixSi`]: truncation toward
+//!     zero, saturating, NaN by its sign bit. Nothing reached it before, so
+//!     adding it moves no earlier pin.
+//!
 //! Anything added here later follows the same default:
 //! `a0 = 0` ("succeeded, returned zero"), `pc = ra`, unless a specific
 //! function's real semantics demonstrably matter — in which case *why* gets
@@ -986,8 +1001,11 @@
 //!
 //! ## Where this gets boot to
 //!
-//! **As of Milestone 12 Task 1**: 128 stubs (`esp32c3_rom_stubs().len()`),
-//! with `crc32_le` (entry 28).
+//! **As of Milestone 14**: 129 stubs (`esp32c3_rom_stubs().len()`), with
+//! `__fixsfsi` (entry 29).
+//!
+//! **As of Milestone 12 Task 1** (history): 128 stubs, with `crc32_le`
+//! (entry 28).
 //!
 //! **As of Milestone 10 Task 6** (history): 127 stubs, with `__popcountsi2`
 //! and `__lesf2` (entry 27).
@@ -2593,8 +2611,9 @@ const LIBGCC_SOFT_DOUBLE_FAMILY: &[(u32, &str, SoftDoubleOp)] = &[
 /// onboarding app's sixth page ("Shake it!") calls these; Task D-M5-2
 /// added `__floatsisf` (`hal_accel`'s sample conversion) and `__subsf3` /
 /// `__gtsf2` (the shake detector); Milestone 10 Task 6 added `__lesf2`
-/// (Connect's home screen, module doc entry 27). The others are left to
-/// fault loudly until something calls them.
+/// (Connect's home screen, module doc entry 27); Milestone 14 added
+/// `__fixsfsi` (the self-test's accelerometer page, module doc entry 29).
+/// The others are left to fault loudly until something calls them.
 const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
     (0x4000_0854, "__mulsf3", SoftFloatOp::Mul),
     (0x4000_0838, "__ltsf2", SoftFloatOp::Lt),
@@ -2604,6 +2623,7 @@ const LIBGCC_SOFT_FLOAT_FAMILY: &[(u32, &str, SoftFloatOp)] = &[
     (0x4000_0898, "__subsf3", SoftFloatOp::Sub),
     (0x4000_0824, "__gtsf2", SoftFloatOp::Gt),
     (0x4000_082c, "__lesf2", SoftFloatOp::Lt),
+    (0x4000_07e4, "__fixsfsi", SoftFloatOp::FixSi),
 ];
 
 /// The `rom_i2c_*Reg*` analog-register accessors (`esp32c3.rom.ld`), the ROM

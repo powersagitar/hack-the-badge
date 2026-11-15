@@ -1258,6 +1258,70 @@ rerun (their counts above stand).
   the headless sweep's horizontal drags; its pointer path in the browser
   had an upward part. The test covers 857×778 with upward flings.
 
+## Self-test accelerometer reboot
+
+The browser check found that the badge "reboots itself" every time the
+hardware self-test reaches its accelerometer page, on desktop and on a
+phone, with no input given.
+
+- **Reproduced headless** at rest, (0, 0, +1000) mg, and with noisy
+  phone-like readings alike: from the first-run screen, START, all nine
+  button slots (the page then moves to "Screen test" by itself), then A.
+  The console shows `Guru Meditation Error: Core 0 panic'ed (Instruction
+  access fault)`, `MEPC 0x400007e4`, `RA 0x420453ce`, the register and
+  stack dump, `Rebooting...`, and the new boot on the first-run screen.
+  The runtime's `last_instruction_fault` is `0x4000_07e4`. So the motion
+  source, the power switch, the LEDs and the reboot pause play no part.
+- **Root cause: a missing ROM stub.** `0x4000_07e4` is libgcc's
+  `__fixsfsi` (`float` to `int`; the ROM ELF names the slot
+  `__call___fixsfsi`, `esp32c3.rom.libgcc.ld`). The page's updater
+  (`0x4204_5384`) reads the three axes as `float`s (`0x4200_ae2e`), and
+  for each axis calls `__fixsfsi` (`0x4204_53c6`, `auipc`/`jalr` to
+  `0x4000_07e4`) and prints it with `"%+5d mg"` (`0x3c13_db44`) into its
+  label. Nothing stubbed `__fixsfsi`, so the fetch trapped (unmapped
+  instruction fetches always trap, by the rules) and the firmware's panic
+  handler rebooted. Not a deliberate `esp_restart`, and not something the
+  real badge does: its ROM has the function.
+- **Why it was never seen.** Milestone 4 walked the self-test on v335
+  with no accelerometer on I2C: the read failed (`bnez` at `0x4204_5398`
+  skips the update) and the page kept "0 mg". Since Milestone 5 the
+  sensor answers, but no rung walked past the self-test's first page, and
+  nothing in Milestone 14 touched this path (`rom.rs` and `cpu/` are
+  unchanged since Milestone 13). Every v392 badge in the emulator had this
+  bug; the browser check was the first walk to that page.
+- **Why the browser console seemed to show only the new boot.** The
+  Worker posts the old boot's tail, panic text included, under the old
+  boot before the reboot marker, so the panic should be above the marker
+  in CONSOLE.LOG (not re-checked in a browser).
+- **The fix:** a real `SoftFloatOp::FixSi` (`cpu/rom_stubs.rs`):
+  truncation toward zero, `INT_MAX`/`INT_MIN` saturation, a NaN by its
+  sign bit, as soft-fp's `_FP_TO_INT(..., rsigned = 1)` and the existing
+  `SoftDoubleOp::FixSi`. It is listed in `LIBGCC_SOFT_FLOAT_FAMILY` and
+  is `rom.rs`'s entry 29; 129 stubs. No pin moves: no earlier run reached
+  the address (it would have faulted), and the equivalence rungs pass.
+  The firmware sees what the real ROM gives it.
+- **Tests.** `soft_float_ops_match_libgcc_soft_fp` checks `FixSi`
+  (failed to build first). The new rung
+  `self_test_reaches_the_accelerometer_page_without_a_reboot` walks
+  START, the nine slots (pins the screen test, `0x920c_3dd3_b75c_bfa9`)
+  and A, asserts no fault, no panic text and no soft reset, and pins the
+  page at rest (`+0 / +0 / +1000 mg`, `0xc575_9b4a_4085_6205`) and tilted
+  to (−29, −994, +179) mg (`0x2954_2e98_ff35_38b2`). It failed on the
+  unfixed core with `last_instruction_fault: Some(0x400007e4)`. Both
+  frames were checked by the controller's eye only, not compared with
+  the badge. A scratch walk past the page went on through the lights
+  test, NFC and the summary, and back to the first-run screen, with no
+  reset.
+- **Signed axes for the iOS sign check.** This page is the reachable
+  screen that shows signed axes: X, Y and Z, each `"%+5d mg"`. Reach it
+  on an unprovisioned badge: START on the first-run screen, press every
+  button (START, A, B, HOME, DOWN, LEFT, RIGHT, UP and the side switch),
+  then A on "Screen test". The apps that read single axes in the table
+  in "Accelerometer axes (Task 9)" (Level, Tilt Maze, Accel, Diag,
+  Hopper, 6-7 Counter) are not among the launcher's 16 cells.
+
+Suites after the fix: `cargo test --workspace` 782 pass (781 + the new rung), 1 ignored; `boot_progress` (release) 97 pass + 1 ignored; `cargo clippy --workspace --all-targets` clean; `bun test` 435 pass (27 files); `bun run typecheck` and `bun run build` ok.
+
 ## Milestone 15 backlog
 
 ### New in Milestone 14
