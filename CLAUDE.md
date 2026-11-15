@@ -29,8 +29,9 @@ provisions a fake test identity through its own USB console, walks the
 11-page onboarding app, and reaches the launcher. In the browser a
 "Skip setup" button, enabled only while that onboarding app is on
 screen (shown disabled otherwise), skips it instead: it types
-`config system onboard_build 2147483647` and `reboot` into the console, and the new boot lands on My Badge's
-registered screen, the walk's end frame (rungs
+`config system onboard_build 2147483647` and `reboot` into the
+console, and the new boot lands on My Badge's registered screen, the
+walk's end frame (rungs
 `skipping_setup_lands_on_the_registered_screen` and
 `setup_logs_its_launch_after_a_reboot`). All 16 of the
 launcher's apps open, each pinned by a rung. v392 enters five apps
@@ -38,24 +39,30 @@ launcher's apps open, each pinned by a rung. v392 enters five apps
 the emulated software reset, which takes the badge's 466 ms (host time
 and the RTC timer jump by it; the new boot's clocks start at 0, and the
 browser holds the screen for it) and keeps what a CPU reset keeps on
-the badge. A cold power-on still starts at 0 µs. Connect and Sync run on a fake BLE
-controller that replaces the mask-ROM one at bt.c's VHCI seam, through
-app-image hooks at v392's addresses. Two emulated badges pair in Connect
-("SYNCED" on both after a bump), in a rung and in two browsers linked
-by WebRTC on the same network (checked by the human partner on two
-devices). Sync, with the fake upload credential the provisioner sets,
-packs the badge, asks for a station for about 20 s of emulated time and
-ends on "No sync station in range" (no station exists in the browser,
-and none is emulated; about 22 s after A in the browser), then returns
-to its home by itself about 10 s of emulated time later. No browser can advertise BLE, so emulated badges hear only each
-other, and two badges provisioned with the same identity never pair
-(Connect drops a card with its own badge ID). Share's transfer works
+the badge. A cold power-on still starts at 0 µs. Connect and Sync run
+on a fake BLE controller that replaces the mask-ROM one at bt.c's VHCI
+seam, through app-image hooks at v392's addresses. Two emulated badges
+pair in Connect ("SYNCED" on both after a bump), in a rung and in two
+browsers linked by WebRTC on the same network, bumped by swinging each
+badge into a stage wall (checked by the human partner, 2026-11-14).
+Sync, with the fake upload credential the provisioner sets, packs the
+badge, asks for a station for about 20 s of emulated time and ends on
+"No sync station in range" (no station exists in the browser, and none
+is emulated; about 22 s after A in the browser), then returns to its
+home by itself about 10 s of emulated time later. No browser can
+advertise BLE, so emulated badges hear only each other, and two badges
+provisioned with the same identity never pair (Connect drops a card
+with its own badge ID). Share's transfer works
 between two emulated badges in a scratch probe; it is neither pinned
 nor reachable in the browser yet. The LEDs are decoded: a passive
 WS2812 decoder on the RMT transmitter (`peripherals/ws2812.rs`) gives
 the six LEDs' colours (`led_colors`, `led_frame_count`), pinned for
 `prov apply`, the registered screen and Mood LEDs. Which chain index
-sits where on the board (`LED_CHAIN_TO_SPOT`) is a best guess. The
+sits where on the board (`LED_CHAIN_TO_SPOT`) is a best guess, which
+the browser check passed "for now", unverified. The glows are boosted
+for the eye in the renderer (a gamma-2.2 curve with a 0.35 floor, and
+a larger bloom); the firmware's colours stay exact. The screen canvas
+is drawn level (the badge's screen looks level). The
 power switch is `power_cycle()`: a cold power-on at 0 µs that keeps
 the flash, so a provisioned badge boots straight back to its
 registered screen (the browser holds the screen 466 ms for it).
@@ -65,12 +72,15 @@ true 1 g through its tilt plus the swing times 0.2 mg per px/s²,
 clamped to ±2000 mg; a hanging badge reads (0, +1000, 0) mg), or the
 phone's DeviceMotion. "Shake it!" passes by shaking the badge, and a
 swing into a stage wall (or a phone jolt) is the bump that goes to
-linked peers. The board's axis signs (`BOARD_AXES`) and the phone's
-`platformSignFix` are unverified. Known page limitations: a very fast
-fling can flip the badge over its anchor ("Reset swing" recovers
-it); a phone jolt along gravity alone cannot fire a bump; the LED
-glows are faint (about 26% opacity); and a touch whose up and cancel
-both get lost leaves its board button held. Every frame
+linked peers. The stage has a ceiling, so a fast fling can't swing the
+badge over its anchor. In phone mode the drawn badge swings with the
+phone's tilt (deliberately non-physical, the human partner's call);
+the firmware still gets the phone's own readings, and an upright iOS
+phone reads 1000 mg up. The board's axis signs (`BOARD_AXES`) are not
+verified on the physical badge, and Android's `platformSignFix` is
+untested. Known page limitations: a phone jolt along gravity alone
+cannot fire a bump, and a touch whose up and cancel both get lost
+leaves its board button held. Every frame
 compared with the physical badge (boot, onboarding, the registered
 screen, the launcher, Dice, Snake) was compared on v335; v392's changed
 frames and its other apps were checked by the human partner's eye. In
@@ -118,7 +128,7 @@ commands from the repo root.
   links.
 - `bun run build`: production build to `frontend/dist/`. `bun run preview`
   serves that build on port 4173.
-- `bun test`: unit tests, 434 of them in 27 files, about 28 s. Most of
+- `bun test`: unit tests, 435 of them in 27 files, about 26 s. Most of
   that is the WASM twins: `test/cpu-wasm.test.ts`, which provisions and
   walks to the launcher, and `test/physics-shake.test.ts`, which shakes
   Setup's page 6 through the lanyard. Run one file with
@@ -234,11 +244,12 @@ frontend/src/
                         CONSOLE.LOG), footer; desktop and mobile layouts
                         split at Tailwind's md (768 px).
   ui/Stage.tsx          The dotted stage, "Reset swing", the one frame
-                        loop (lanyard step, pose, sensor sink); makes the
+                        loop (lanyard step, pose, LED glows through
+                        ledGlow's boost, sensor sink); makes the
                         lanyard and hands it out (onLanyard). In phone
                         mode the badge gets no lanyard (no drag, S/K).
-  ui/Badge.tsx          The board photo, the screen canvas (turned
-                        SCREEN.rotateDeg), the LED glows, the hit
+  ui/Badge.tsx          The board photo, the screen canvas (level), the
+                        LED glows, the hit
                         <button>s (pressed per pointerId), the power
                         switch, the rings and clasp.
   ui/badge-geometry.ts  The photo's measured geometry (percent): PHOTO,
@@ -276,8 +287,10 @@ frontend/src/
   motion/lanyard.ts     matter.js, headless: a 10-segment rope, the badge
                         (per-corner chamfers), walls; 1/120 s substeps,
                         2400 px/s²; grab/drag/release, impulse("shake" |
-                        "knock"), peerBump, follow(mg) for phone mode,
-                        wall impacts over 840 px/s.
+                        "knock"), peerBump, follow(mg) for phone mode
+                        (sideways it swings with the tilt, R19), wall
+                        impacts over 840 px/s; a ceiling at y = 0 keeps
+                        a fling from swinging it over the anchor.
   motion/device-motion.ts
                         The phone's DeviceMotion as a source:
                         platformSignFix (1 everywhere, unverified), a

@@ -1309,31 +1309,33 @@ in `milestone-14-decisions.md` is the complete list):
     the Lua sandbox in Milestone 14, so an install path would need its
     own app bundle.
 14. **The page's motion and board (Milestone 14).**
-    - **A very fast fling flips the badge over its anchor** (Ruling
-      R15). At 857×778, a 960 px fling over 8 frames swings the badge
-      over the top of its anchor, and it stays wedged upside down
-      between the walls above the stage. "Reset swing" recovers it.
-      Task 9's physics; a fix would clamp the board's angle about the
-      anchor.
+    - **Fixed in Task 14: the fling flip-over** (Ruling R15). A fast
+      upward fling used to swing the badge over its anchor, where it
+      stayed upside down, leaning on a wall above the stage. The stage
+      now has a ceiling at y = 0 (a collider and the bounds clamp), so
+      the badge can't pass over its anchor.
+    - **Phone mode's sideways swing is non-physical** (Ruling R19, the
+      human partner's call): tilting the phone right swings the drawn
+      badge right. The firmware's readings are the phone's, unchanged.
     - **A jolt along gravity cannot fire a phone's bump alone.** The
       phone's impact detector takes the jump between readings that are
       already clamped per axis to ±2000 mg, so an upright phone jerked
       straight up jumps at most 1000 mg on that axis, under the 1500 mg
       threshold (Task 10).
-    - **The LED glows are faint.** Their opacity is the colour's
-      brightness, and the firmware's colours peak at about `0x42`, so
-      the glows show at about 26% opacity (Task 11), pending the human
-      partner's look.
+    - **The LED glows are boosted for the eye** (Ruling R17, after the
+      human partner found them "way too faint"): a gamma-2.2 curve with
+      a 0.35 floor, and a larger bloom. The renderer boosts them; the
+      firmware's colours, `led_colors()`, stay exact.
     - **A lost touch-up can strand a pad button.** The board releases a
       button by its `pointerId` (Task 13), so a touch whose `pointerup`
       and `pointercancel` both never arrive leaves that button held.
       The old release-everything listener healed that; browsers send
       `pointercancel` for the usual cases.
     - **Unverified signs and positions.** `BOARD_AXES` (right +x, up +y,
-      out +z), `LED_CHAIN_TO_SPOT` and the phone's `platformSignFix`
-      (1 everywhere) are assumptions until the human partner checks them
-      on the physical badge and on iOS and Android (Milestone 14's
-      browser check).
+      out +z) and `LED_CHAIN_TO_SPOT` were not verified on the physical
+      badge (the browser check passed the LEDs "for now"). The phone's
+      `platformSignFix` (1 everywhere) is right on iOS, where an upright
+      phone reads 1000 mg up, and untested on Android.
 
 ### Ground truth from the physical badge
 
@@ -3749,8 +3751,15 @@ are in `docs/milestone-14-decisions.md`.
   organizers' public orthographic close-up scan, levelled on the board's
   long edges (R14), its outline traced (four corner radii, both side
   recesses, the power switch's actuator kept, R16), and every geometry
-  value re-measured by `frontend/scripts/badge-features.py`. The LCD
-  sits 0.32° off the board, so the screen canvas turns with it.
+  value re-measured by `frontend/scripts/badge-features.py`. The scan
+  puts the LCD 0.32° off the board, but the screen looks level on the
+  badge, so the canvas is drawn unturned (R18, the browser check).
+- **The browser check** (the human partner, 2026-11-14, iOS; Android
+  untested) passed the layouts, Shake it!, Skip setup, the power
+  switch, SYNCED between two browsers by swinging into a wall, and
+  CONSOLE.LOG. Its fixes: brighter LED glows (R17), a level screen
+  (R18), the drawn swing following the phone's tilt (R19) and the
+  fling flip-over (a ceiling).
 - New limitations: item 14 above.
 
 ## Emulated flash chip: what it contains

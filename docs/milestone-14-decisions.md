@@ -100,10 +100,43 @@ The ledger rulings that changed behaviour or the plan:
   768 px layout breakpoint.
 - **R13, R14, R16:** the photo comes from the organizers' orthographic
   scan (R13); it is levelled on the board, not the LCD, which then turns
-  by `SCREEN.rotateDeg` = −0.32 (R14); the power switch's actuator is
+  by `SCREEN.rotateDeg` = −0.32 (R14; that rotation clause is superseded
+  by R18 below); the power switch's actuator is
   kept in the outline rather than cropped (R16).
 - **R15:** the fling flip-over (Task 9's physics) is a documented known
-  limitation and a browser-check item, not a fix task.
+  limitation and a browser-check item, not a fix task. **Superseded:**
+  the human partner asked for it fixed (browser check item 12), and it
+  is ("Fling flip-over fix" below).
+- **R17 (the controller, from browser check item 10):** the LED glows
+  are boosted in the renderer and the firmware's LED data stays exact.
+  `ledGlow`'s opacity is `LED_MIN_OPACITY + (1 − LED_MIN_OPACITY) ·
+  v^(1/LED_GAMMA)` with `v = max(r,g,b)/255`, `LED_MIN_OPACITY` = 0.35
+  and `LED_GAMMA` = 2.2 (0 when off); `--rgb` is still the colour at
+  full brightness. The firmware's levels now read: `0x06` (prov apply's
+  flash) 0.468, `0x1F` (the role colour) 0.599, `0x21` (Mood LEDs)
+  0.607, `0x42` (Setup) 0.702, against 0.024 to 0.259 before. The
+  bloom (`.led` in `theme.css`) is 22% of the board's width (the
+  design's 15%), and its gradient stops are stronger (the colour to
+  14%, 0.65 at 28%, 0.25 at 48%, clear at 70%; were 12%, 0.42 at 26%,
+  0.12 at 46%, clear at 68%).
+- **R18 (the controller, from the human partner, browser check item
+  11):** the screen canvas is drawn level. "The badge screen is
+  perfectly level so if everything lines up the canvas shouldnt need
+  tilting." `SCREEN.rotateDeg` and `Badge.tsx`'s `rotate()` are
+  removed. Nothing else used them. The rectangle was fitted about the
+  glass's centre, so it stays centred. This supersedes R14's rotation
+  clause; R14's levelling of the photo on the board stands.
+- **R19 (the human partner, browser check items 2 and 8):** in phone
+  mode the drawn badge swings with the tilt: tilt the phone right and
+  it swings right, tilt it left and it swings left. This is
+  deliberately non-physical. A plumb line in a phone tilted right hangs
+  toward the screen's lower side, and the physical `follow()` made the
+  drawn badge do the opposite of what the human partner wanted. Only
+  `follow()`'s sideways (screen x) term changed sign:
+  `x = +right · 2.4 px/s² per mg`. The sensor readings the firmware gets
+  are unchanged (1000 mg up is verified on iOS), and `platformSignFix`
+  and `BOARD_AXES` are untouched. Test: `following the phone sways the
+  badge…` in `lanyard.test.ts` pins right → right and left → left.
 - **Recorded (Task 6 minor):** the Worker posts a `console` chunk with a
   status only when there is new text (and at once on a reset), not with
   every status as the brief said; an empty chunk would carry nothing.
@@ -365,7 +398,7 @@ All pinned exactly in `frontend/package.json`.
 
 | package | exact version | why |
 |---|---|---|
-| `react` | 19.3.1 | The page's UI (Milestone 14 replaces `ui/shell.ts`'s DOM building with components). |
+| `react` | 19.3.1 | The page's UI: React components replace the old `ui/shell.ts` DOM building, now deleted. |
 | `react-dom` | 19.3.1 | Renders the React page into `#root`. |
 | `matter-js` | 0.20.0 | The lanyard and badge physics (the design's swing). |
 | `radix-ui` | 1.8.1 | Primitives under shadcn's Button (`Slot`), Select and ScrollArea; added by the shadcn CLI. |
@@ -747,7 +780,9 @@ was the design's `f1e63701…89bd4`).
   brief says, and `--rgb` is the colour scaled to full brightness, so
   the brightness is counted once, not twice. The firmware's colours peak
   at about `0x42`, so the glows read at about 26% opacity; Task 14's
-  look decides whether that needs a curve.
+  look decides whether that needs a curve. **Task 14:** the human
+  partner found them "way too faint", so they now have a curve and a
+  larger bloom (Ruling R17).
 - **Layout and hit sizes** follow `matchMedia("(min-width: 768px)")`
   (Tailwind's `md`, the same breakpoint as the shell), not
   `pointer: coarse`. A layout change builds a new lanyard (its size
@@ -922,13 +957,17 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   covers the rest reading, so `follow` applies only the difference to the
   rope nodes and the badge, at `GRAVITY_PX_S2 / REST_MG` = 2.4 px/s² per
   mg (1 g is the simulation's gravity):
-  x = −right·2.4, y = (up − 1000)·2.4, in screen px/s², with y down.
+  x = −right·2.4 (since R19, +right·2.4), y = (up − 1000)·2.4, in screen
+  px/s², with y down.
   - **Why every body, not just the anchor point.** The anchor is not a
     body. Moving the anchor is equivalent, in its frame, to this uniform
     inertial force. It is the brief's "force at the rope anchor", stated
     so the physics is exact.
   - **What you see.** A phone jerked right leaves the badge lagging left.
     A tilted phone makes the badge hang toward true down.
+    **Superseded sideways by Ruling R19 (Task 14):** the x term's sign
+    is flipped, so the drawn badge swings with the tilt (and leads a
+    sideways jerk); y is unchanged.
   - **Clamp.** The upward part is limited to 0.75 g
     (`FOLLOW_MAX_LIFT_PX_S2`), so a phone held flat or upside down still
     leaves a quarter g down, and the badge hangs on the stage, not above
@@ -952,6 +991,7 @@ moved to `test/badge-controller.test.ts`, `test/tools-panel.test.tsx`,
   between the walls above the stage. The same happens with this task's
   lanyard change reverted (a headless probe gives identical poses).
   "Reset swing" recovers it. Task 9's physics, for Task 14 or a later fix.
+  **Fixed in Task 14** ("Fling flip-over fix").
 
 ## Badge photo from the scan (Task 11c)
 
@@ -1004,6 +1044,10 @@ positive, CSS's sense):
   camera photo). Past R14's 0.1°, so `SCREEN.rotateDeg = -0.32` and
   `Badge.tsx` turns the screen canvas by it (CSS `rotate()` about the
   rectangle's centre). The rectangle is fitted in the glass's own frame.
+  **Superseded in Task 14 (Ruling R18):** the human partner sees the
+  screen perfectly level on the badge, so the canvas is drawn unturned
+  and `rotateDeg` is removed. The rectangle keeps its centre in the
+  glass. The 0.32° measured here stays on record.
 - "Hack the North" box: left −0.067°, right +0.125°, top −0.013°,
   bottom −0.004°; mean +0.010°: level with the board, as silkscreen is.
 
@@ -1135,7 +1179,7 @@ On `m14-t14` at `247dac6` plus this task's docs (no code changed),
 | `cargo test -p emulator-core --release --test boot_progress` | 96 passed, 1 ignored, 19.7 s |
 | `cargo clippy --workspace --all-targets` | clean, 0 warnings |
 | `bun run build:wasm` | ok |
-| `bun test` | 434 pass, 0 fail, 27 files, 27.5 s |
+| `bun test` | 434 pass, 0 fail, 27 files, 27.5 s (435 after the fixes below) |
 | `bun run typecheck` | ok |
 | `bun run build` | ok: JS 486.20 kB (gzip 156.84 kB), CSS 27.61 kB (gzip 6.25 kB), worker 12.77 kB, bridge 6.66 kB, wasm 146.60 kB; `dist/` 4112 KiB |
 
@@ -1143,47 +1187,76 @@ Every count matches the milestone's expected baselines (Milestone 13
 ended at 764 / 92 / 395). The movements are this milestone's new tests
 and rungs, and the pins that moved are only Task 1's ("Re-pins").
 
-## Browser check (pending)
+## Browser check (2026-11-14)
 
-**PENDING: the human partner's answers go here.** Run `bun run build &&
-bun run preview` (port 4173) on desktop; on the phone, the deployed
-build or an HTTPS dev server (iOS grants DeviceMotion only in a secure
-context). Each item: pass, or what was seen.
+The human partner's answers, on the preview build and on an iOS phone.
+Android was not tested.
 
-1. Desktop and phone layouts against each artboard (`Main.dc.html`,
-   `Mobile.dc.html`). —
-2. Provision, then shake to pass "Shake it!": by dragging on desktop;
-   with phone motion on the phone (iOS, and Android if available). —
-3. Skip setup works. —
-4. Mood LEDs: **the LED positions match the physical badge's chain**
-   (where Setup's chase starts and which way it turns). Fix
-   `LED_CHAIN_TO_SPOT` (`frontend/src/ui/badge-geometry.ts`) if not; R10's
-   [0, 1, 3, 5, 4, 2] is a best guess. —
-5. Power switch: the badge reboots and stays registered. —
-6. Two linked browsers reach "SYNCED" in Connect by swinging into a
-   wall. —
-7. CONSOLE.LOG streams serial output with `[page]` lines. —
-8. On the phone, an upright phone reads about 1 g "up" (the Shake it!
-   page shows G-force). Fix `platformSignFix`
-   (`frontend/src/motion/device-motion.ts`, 1 everywhere, unverified)
-   per platform if not: iOS —, Android —.
+1. **Layouts:** they agree with the artboards.
+2. **Provision, then "Shake it!":** iOS's accelerometer works. Caveat:
+   tilting the phone right swung the badge left, and left swung it right.
+   **Fixed by Ruling R19**: the drawn swing now follows the tilt, which
+   is deliberately non-physical. The firmware's readings are unchanged.
+3. **Skip setup:** passed.
+4. **Mood LEDs:** the LED positions pass for now, **unverified**: R10's
+   [0, 1, 3, 5, 4, 2] stays and is recorded as unverified. Caveat: not
+   bright enough (item 10).
+5. **Power switch:** the reboot passed.
+6. **Two linked browsers:** linking and connecting passed. They reached
+   "SYNCED" in Connect by swinging into a wall.
+7. **CONSOLE.LOG:** passed.
+8. **Upright phone:** reads 1000 mg up, correct (iOS). It had the same
+   opposite tilt as item 2, fixed by R19. Android was not tested, so
+   `platformSignFix` stays 1 everywhere.
+9. **`BOARD_AXES`:** not verified on the physical badge. Revisit it if
+   it causes problems.
+10. **LED glow:** "way too faint". **Fixed by Ruling R17**: a perceptual
+    boost and a larger bloom in the renderer; the firmware's LED data is
+    exact.
+11. **Photo alignment:** the level and the corner radii are correct, and
+    the buttons and LEDs line up. "The badge screen is perfectly level so
+    if everything lines up the canvas shouldnt need tilting." **Fixed by
+    Ruling R18**: the canvas is no longer turned.
+12. **Fling flip-over:** fix it. **Fixed** ("Fling flip-over fix" below).
+13. **The scan:** yes, it may be published (it is already public).
 
-Extras:
+### Fling flip-over fix
 
-9. `BOARD_AXES`' signs on the physical badge, through the Level or
-   Accel app (right +x, up +y, out +z is assumed). —
-10. The LED glows' brightness: at the firmware's levels they show at
-    about 26% opacity. Faint, or fine? —
-11. The new badge photo's alignment: the outline's per-corner shape
-    (the bottom-right about twice the others), the screen in its glass
-    (SCREEN overhangs the polarizer by 2.2 px each side, kept from the
-    design's relation), the buttons, LEDs and power switch. —
-12. The fling flip-over (R15): a very fast fling can swing the badge
-    over its anchor; "Reset swing" recovers it. Acceptable as a known
-    limitation? —
-13. The close-up scan (https://badge.hackthenorth.com/closeup?side=front,
-    the organizers' public site) may be published as the cut-out
-    `front.webp`? —
+After the fixes (R17, R18, R19 and this one): `bun test` 435 pass, 0 fail
+(27 files), `bun run typecheck` and `bun run build` ok. Nothing under
+`emulator-core/` or `emulator-wasm/` changed, so the Cargo suites were not
+rerun (their counts above stand).
+
+- **Reproduced first.** A headless sweep of 384 flings found two that
+  flipped, both up and sideways on 1000×780: 600 px right and 300 px up
+  over 2 frames, and 300 px right and 300 px up over 16 frames. The new
+  test `a fast upward fling never swings the badge over its anchor
+  (R15)` in `lanyard.test.ts` failed on the unfixed lanyard, with the
+  badge's centre above its ring.
+- **The cause.** The rope is short (74 px on 1000×780) and the fling
+  sends the badge over the top of its anchor, as a pendulum does past
+  about 2000 px/s. Above the stage, the side walls (static colliders
+  H × 6 tall) and `keepInside`'s x clamp held the inverted badge: it
+  stood on its ring, leaning on the right wall at y ≈ −194 and an angle
+  of 3.9 rad. A badge leaning against a wall like that is stable.
+  Traced frame by frame.
+- **The fix, the smallest physical change:** the stage gets a ceiling
+  at y = 0, a static collider like the walls (`makeWalls`), plus the
+  bounds clamp `keepInside` now also keeps the badge's top at or below
+  0. The rope collides with nothing, so it still reaches the anchor at
+  y = −10. With the badge's top on the stage, its centre stays below the
+  ring on these stages (the ring hangs at most `ropeLen − 10` px down,
+  less than half the badge's width), so it can never be inverted. A
+  fling up now hits the ceiling and falls back.
+- **Checked.** The same sweep, widened to 800 flings on five stages
+  (1000×780, 857×778, 600×780, 390×640 and 430×800): none ends
+  inverted or away from hanging. One passes its ring for a moment and
+  rights itself. Every lanyard and physics-shake test passes, with no
+  threshold touched (the shake, knock, wall-drag and bump tests); the
+  only lanyard test that changed is the follow test, for R19.
+- Task 13's case (857×778, a 960 px fling over 8 frames) did not flip in
+  the headless sweep's horizontal drags; its pointer path in the browser
+  had an upward part. The test covers 857×778 with upward flings.
 
 ## Milestone 15 backlog
 
@@ -1192,8 +1265,6 @@ Extras:
 The deferred review minors from the controller's ledger and the
 browser check's open items. The browser check above may close some.
 
-- **Physics (Task 9, R15):** the fling flip-over: clamp the board's
-  angle about the anchor, or stop the rope whipping it over.
 - **Physics (Task 9):** "Shake it!" passes by sampling phase (100% of
   phases on 1000×780, 96% on 390×640, per the replica); on stages
   narrower than about 600 px a moderate shake hits the walls and sends
@@ -1215,9 +1286,12 @@ browser check's open items. The browser check above may close some.
   pointer share the `pad` source, so a 150 ms tap's release frees a
   finger-held button, and an unrelated pointerup can cut that tap short.
 - **The LEDs (Tasks 2, 11):** one WS2812 decoder serves both RMT TX
-  channels (fine while only channel 0 is used); a brightness curve if
-  the human partner finds the glows faint; `LED_CHAIN_TO_SPOT` if the
-  check finds it wrong.
+  channels (fine while only channel 0 is used); `LED_CHAIN_TO_SPOT`
+  ([0, 1, 3, 5, 4, 2]) is still unverified: the browser check passed it
+  "for now". Check it against the physical badge's Setup chase.
+- **Sensor signs (the browser check):** `BOARD_AXES` is not verified on
+  the physical badge (revisit if it causes problems), and Android's
+  `platformSignFix` is untested (iOS reads 1000 mg up correctly).
 - **The power cycle (Tasks 3, 6):** `power_cycle_boots_to_the_registered_screen`
   ignores Setup's page 1 as well as the splash in
   `run_until_stable_frame`, so a regression back to Setup would time out
@@ -1249,10 +1323,6 @@ browser check's open items. The browser check above may close some.
 - **Small cleanups (Tasks 1, 4):** `redraw-bench.ts`'s comment around
   :93–96 wants a reflow; `badge-controller.ts` has doc lines past the
   wrap width.
-- **The photo (Task 11c):** the SCREEN rectangle overhangs the
-  polarizer's glass by 2.2 px each side (the design's 4:3 relation,
-  kept); inset it if the browser check prefers.
-
 ### Carried from Milestone 13's backlog (still open)
 
 Word for word in `docs/milestone-13-decisions.md`, "Milestone 14
