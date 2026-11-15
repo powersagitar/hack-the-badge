@@ -24,6 +24,12 @@ serial output with the page's own `[page]` lines. Beside it, FIRMWARE
 TOOLS holds PROVISIONING (ROLE, PROVISION, Skip setup), BADGE LINK and,
 on a touch-first phone, "Use phone motion".
 
+**The project wrapped up on 2026-11-15**, after Milestone 14. Start with
+`docs/README.md` (the docs index) and `docs/handoff.md` (the end state,
+what is unverified, and the open work ranked); `docs/architecture.md`,
+`docs/development-guide.md` and `docs/project-history.md` cover how it
+works, how to work on it, and how it got here.
+
 **Current state:** the firmware boots to My Badge's first-run screen,
 provisions a fake test identity through its own USB console, walks the
 11-page onboarding app, and reaches the launcher. In the browser a

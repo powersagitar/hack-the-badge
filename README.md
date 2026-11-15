@@ -133,11 +133,15 @@ emulator-wasm/   Thin wasm-bindgen shim over emulator-core
 frontend/        Vite + React + Tailwind v4 (shadcn/ui) web app, matter.js
                  lanyard physics, the Worker runtime, WebRTC badge links
 frontend/api/    /api/signal, the Vercel function for WebRTC signaling
-docs/            Emulator notes and per-milestone design decisions
+docs/            The documentation (index: docs/README.md): handoff,
+                 architecture, development guide, history, the emulator
+                 notes and per-milestone design decisions
 ```
 
 [`CLAUDE.md`](CLAUDE.md) has a file-by-file architecture map and the
-project's rules.
+project's rules. [`docs/README.md`](docs/README.md) indexes the docs; start
+with [`docs/handoff.md`](docs/handoff.md) for the state the project ended in.
+The project wrapped up on 2026-11-15, after Milestone 14.
 
 ## How it works
 
