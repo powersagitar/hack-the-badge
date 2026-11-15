@@ -2,8 +2,9 @@
  * Real-firmware runtime (Milestone 2). Owns a `FirmwareEmulatorHandle`
  * (`src/cpu/bridge.ts`), drives a frame loop that runs the CPU to the
  * frame's wall-clock time target and hands the reconstructed framebuffer to
- * a `present` callback, and exposes the `injectButton` API `shell.ts`'s
- * button-pad/keyboard wiring drives.
+ * a `present` callback, and exposes the `injectButton` API that
+ * `ui/Badge.tsx`'s board buttons and keyboard shortcuts drive (through
+ * `./firmware-worker-client.ts`).
  *
  * ## Where it runs (Milestone 7 Task 8)
  *

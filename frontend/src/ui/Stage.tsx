@@ -11,6 +11,11 @@
  * - **Phone motion** (`phoneMotion`): the phone is the badge, so the
  *   badge gets no lanyard to grab or push: drags and the S/K keys do
  *   nothing, and a drag in progress ends.
+ * - **The hint** says how to move the badge (dragging, or with phone
+ *   motion on, moving the phone) and, on desktop, a second line lists the
+ *   keyboard shortcuts ({@link shortcutsHint}; without S and K in phone
+ *   mode). The badge's accessible description lists them in every
+ *   layout.
  * - **The frame loop** (`requestAnimationFrame`) steps the lanyard by the
  *   frame's wall time, then writes the badge's transform, the rope's SVG
  *   paths (the design's `tick`), the LED glows from the client's latest
@@ -34,6 +39,7 @@ import type { Mg, MotionSource } from "../motion/source";
 import { Button } from "@/components/ui/button";
 import { Badge, type BadgeClient, type BadgeParts, type BadgeSize, type Layout } from "./Badge";
 import { LED_CHAIN_TO_SPOT, LED_SPOTS } from "./badge-geometry";
+import { shortcutsHint } from "./keyboard";
 
 /** The desktop stage's width cap (px): the design's stage at 1440 px is about 1016. */
 export const STAGE_MAX_W = 1016;
@@ -41,9 +47,16 @@ export const STAGE_MAX_W = 1016;
 /** The breakpoint between the two layouts (Tailwind's `md`). */
 export const DESKTOP_QUERY = "(min-width: 768px)";
 
-const HINT: Record<Layout, string> = {
-  desktop: "DRAG THE BADGE TO SWING IT · PRESS THE BUTTONS ON THE BOARD",
-  mobile: "DRAG TO SWING · TAP THE BUTTONS",
+/** The stage's hint, by layout; phone motion has its own (dragging is off then). */
+export const HINT: Record<"drag" | "phone", Record<Layout, string>> = {
+  drag: {
+    desktop: "DRAG THE BADGE TO SWING IT · PRESS THE BUTTONS ON THE BOARD",
+    mobile: "DRAG TO SWING · TAP THE BUTTONS",
+  },
+  phone: {
+    desktop: "MOVE THE DEVICE TO SWING IT · PRESS THE BUTTONS ON THE BOARD",
+    mobile: "MOVE THE PHONE TO SWING · TAP THE BUTTONS",
+  },
 };
 
 /** The layout from {@link DESKTOP_QUERY}, following the window as it changes. */
@@ -228,6 +241,7 @@ export function Stage({ client = null, sink = null, onLanyard, phoneMotion = fal
         stageRef={stageRef}
         parts={parts}
         onCanvas={onCanvas}
+        phoneMotion={phoneMotion}
       />
       <Button type="button" className="absolute top-3 right-3" onClick={() => lanyard?.reset()}>
         Reset swing
@@ -235,27 +249,30 @@ export function Stage({ client = null, sink = null, onLanyard, phoneMotion = fal
       <div
         className={
           mobile
-            ? "pointer-events-none absolute right-3 bottom-4 left-3 flex items-center justify-center gap-2 text-center font-mono text-[10.5px] leading-[1.4] font-medium tracking-[.04em] text-muted-foreground"
-            : "pointer-events-none absolute right-4 bottom-5 left-4 flex items-center justify-center gap-2 text-center font-mono text-[11px] leading-[1.4] font-medium tracking-[.04em] text-muted-foreground"
+            ? "pointer-events-none absolute right-3 bottom-4 left-3 flex flex-col items-center gap-1 text-center font-mono text-[10.5px] leading-[1.4] font-medium tracking-[.04em] text-muted-foreground"
+            : "pointer-events-none absolute right-4 bottom-5 left-4 flex flex-col items-center gap-1 text-center font-mono text-[11px] leading-[1.4] font-medium tracking-[.04em] text-muted-foreground"
         }
       >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.8"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
-          <path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12" />
-          <path d="M11 11.5v-2a1.5 1.5 0 0 1 3 0V12" />
-          <path d="M14 10.5a1.5 1.5 0 0 1 3 0V12" />
-          <path d="M17 11.5a1.5 1.5 0 0 1 3 0V16a6 6 0 0 1-6 6h-2a6 6 0 0 1-5-2.7l-3-4.6a1.6 1.6 0 0 1 2.6-1.8L8 15" />
-        </svg>
-        <span>{HINT[layout]}</span>
+        <div className="flex items-center justify-center gap-2">
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12" />
+            <path d="M11 11.5v-2a1.5 1.5 0 0 1 3 0V12" />
+            <path d="M14 10.5a1.5 1.5 0 0 1 3 0V12" />
+            <path d="M17 11.5a1.5 1.5 0 0 1 3 0V16a6 6 0 0 1-6 6h-2a6 6 0 0 1-5-2.7l-3-4.6a1.6 1.6 0 0 1 2.6-1.8L8 15" />
+          </svg>
+          <span>{HINT[phoneMotion ? "phone" : "drag"][layout]}</span>
+        </div>
+        {!mobile && <span data-slot="shortcuts">{shortcutsHint(phoneMotion)}</span>}
       </div>
     </div>
   );

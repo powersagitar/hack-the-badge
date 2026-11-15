@@ -15,7 +15,8 @@
  *   host" (the design's `.ghost.on`) and cancels it, which also closes the
  *   room on the server; the design has no other place for it.
  * - "Use phone motion" is shown only where DeviceMotion exists, below
- *   BADGE LINK, as a toggle (`aria-pressed`).
+ *   BADGE LINK, as a toggle (`aria-pressed`). While phone motion is on
+ *   it stays shown even if availability drops, so it can be turned off.
  *
  * {@link TabNotice} is the design's `tabNotice` banner.
  */
@@ -134,7 +135,7 @@ export function ToolsPanel({ snapshot, actions }: ToolsPanelProps) {
             </Button>
           </div>
         </div>
-        {snapshot.phoneMotionAvailable && (
+        {(phoneOn || snapshot.phoneMotionAvailable) && (
           <div role="group" aria-label="Motion" className="flex flex-col gap-2.5 border-t border-border pt-3.5">
             <span className={SECTION_LABEL}>MOTION</span>
             <Button

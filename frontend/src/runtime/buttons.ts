@@ -23,6 +23,3 @@ export type ButtonName = (typeof BUTTON_NAMES)[number];
  * (Milestone 11 Task 13).
  */
 export type ButtonSource = "key" | "pad";
-
-/** One LED's colour, each channel 0..255. */
-export type Rgb = [number, number, number];

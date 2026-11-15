@@ -9,7 +9,11 @@
  *   window listener, as the design's `onUp`, but by `pointerId`: on
  *   multi-touch, a second finger lifting off leaves the thumb's D-pad
  *   press held; a button two fingers hold is released when both lift).
- *   A hit button never stops a pointerup: a mouse gets no implicit
+ *   A backstop: the page going hidden or the window losing focus
+ *   forgets every pointer and releases the pad's buttons, so a touch
+ *   whose up and cancel both get lost cannot strand a button (a new
+ *   pointer pressing it again would otherwise be a no-op, and its lift
+ *   would leave the stale pointer holding it). A hit button never stops a pointerup: a mouse gets no implicit
  *   capture, so a press released over another hit target must still
  *   reach the window. A keyboard
  *   click (`detail === 0`) taps: pressed, then released 150 ms later; the
@@ -20,6 +24,10 @@
  * - **Keyboard** ({@link keyAction}): held keys press with the `key`
  *   source; a window blur releases them (a keyup that never arrives
  *   would strand the button). S and K are impulses on the lanyard.
+ *   The root is a group whose accessible description
+ *   (`aria-describedby`, visually hidden text) lists the shortcuts
+ *   ({@link shortcutsDescription}); with phone motion on it leaves out
+ *   S and K, which do nothing then.
  * - **Power** calls `client.powerCycle()`; the runtime ignores a press
  *   while it reboots. The stage's frame loop shows `.is-down` on it
  *   while `client.rebooting()`.
@@ -31,12 +39,12 @@
  * The stage owns the frame loop: it writes the badge's transform, the
  * LED glows and the power switch's state through {@link BadgeParts}.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, RefObject } from "react";
 import type { Lanyard, Point } from "../motion/lanyard";
 import type { ButtonName, ButtonSource } from "../runtime/buttons";
 import { BUTTON_ORDER, BUTTON_SPOTS, HOLES, LED_SPOTS, PHOTO, POWER, SCREEN } from "./badge-geometry";
-import { keyAction } from "./keyboard";
+import { keyAction, shortcutsDescription } from "./keyboard";
 
 /** What the badge needs from the firmware client (`WorkerFirmwareRuntime` has it all). */
 export interface BadgeClient {
@@ -76,6 +84,8 @@ export interface BadgeProps {
    * once per canvas element; it need not be a stable function.
    */
   onCanvas?: (canvas: HTMLCanvasElement | null) => void;
+  /** Phone motion drives the badge: the description leaves out S and K. */
+  phoneMotion?: boolean;
 }
 
 /** How long a keyboard click holds a button (the design's 150 ms). */
@@ -111,7 +121,8 @@ function ringGeometry({ bw, bh, clip }: BadgeSize) {
 
 type Held = Map<ButtonName, Set<ButtonSource>>;
 
-export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas }: BadgeProps) {
+export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas, phoneMotion = false }: BadgeProps) {
+  const descriptionId = useId();
   const [down, setDown] = useState<ReadonlySet<ButtonName>>(new Set());
   const [aux, setAux] = useState(false);
   const [grabbing, setGrabbing] = useState(false);
@@ -187,6 +198,11 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
       pointers.current.set(pointerId, name);
       press(name, "pad");
     };
+    /** The backstop: forget every pointer and let go of the pad's buttons. */
+    const releasePointers = () => {
+      pointers.current.clear();
+      releaseAll("pad");
+    };
     /** A pointer lifted: its button lets go, unless another pointer still holds it. */
     const releasePointer = (pointerId: number) => {
       const name = pointers.current.get(pointerId);
@@ -213,7 +229,7 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
       live.current.lanyard?.release();
       setGrabbing(false);
     };
-    return { press, release, releaseAll, pressPointer, releasePointer, toggleAux, tap, endDrag };
+    return { press, release, releaseAll, pressPointer, releasePointer, releasePointers, toggleAux, tap, endDrag };
   }, []);
 
   // Window listeners: the drag, pad releases, the keyboard and visibility.
@@ -241,9 +257,14 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
       const action = keyAction(e.code, e.target);
       if (action && "button" in action) api.release(action.button, "key");
     };
-    const onBlur = () => api.releaseAll("key");
+    const onBlur = () => {
+      api.releaseAll("key");
+      api.releasePointers();
+    };
     const onVisibility = () => {
-      if (document.visibilityState === "hidden") api.endDrag();
+      if (document.visibilityState !== "hidden") return;
+      api.endDrag();
+      api.releasePointers();
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
@@ -291,9 +312,15 @@ export function Badge({ layout, size, client, lanyard, stageRef, parts, onCanvas
         parts.root = el;
       }}
       className={grabbing ? "badge grabbing" : "badge"}
+      role="group"
+      aria-label="Badge"
+      aria-describedby={descriptionId}
       onPointerDown={onBodyDown}
       style={{ position: "absolute", left: 0, top: 0, width: size.bw, height: size.bh, transformOrigin: "50% 50%" }}
     >
+      <span id={descriptionId} className="sr-only">
+        {shortcutsDescription(phoneMotion)}
+      </span>
       <div aria-hidden="true" style={{ position: "absolute", inset: -28, borderRadius: 32 }} />
       <svg
         aria-hidden="true"

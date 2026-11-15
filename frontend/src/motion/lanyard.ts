@@ -590,12 +590,12 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       };
       // The reading is proper acceleration, f = a − g. In the anchor's
       // frame each body feels −f; the simulation's gravity already gives
-      // the rest's share, so the rest is the difference (screen y is down).
-      // Tilting the phone right (right edge down) reads right = −1000·sinθ
-      // under the W3C convention (iOS's inverted axes are fixed upstream,
-      // by platformSignFix; Ruling R21), so −f pushes the drawn badge
-      // right: it swings with the tilt, the human partner's chosen
-      // behaviour (R19), reached physically.
+      // the rest's share, so the rest is the difference (screen y is
+      // down). Tilting the phone right (right edge down) reads
+      // right = −1000·sinθ under the W3C convention (iOS's inverted axes
+      // are fixed upstream, by platformSignFix; Ruling R21), so −f pushes
+      // the drawn badge right: it swings with the tilt, the human
+      // partner's chosen behaviour (R19), reached physically.
       const x = -along(axes.right) * FOLLOW_PX_S2_PER_MG;
       const y = (along(axes.up) - REST_MG) * FOLLOW_PX_S2_PER_MG;
       hand = { x, y: Math.max(-FOLLOW_MAX_LIFT_PX_S2, y) };
@@ -607,7 +607,8 @@ export function createLanyard(opts: LanyardOptions): Lanyard & MotionSource {
       sink = null;
     },
     peerBump() {
-      const dir = badge.position.x < geo.W / 2 ? 1 : -1; // away from the nearer wall
+      // Away from the nearer wall.
+      const dir = badge.position.x < geo.W / 2 ? 1 : -1;
       pushes.push({ from: simMs, to: simMs + PEER_BUMP_MS, ax: dir * PEER_BUMP_PX_S2 });
       quietUntil = simMs + PEER_BUMP_QUIET_MS;
     },

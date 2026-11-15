@@ -219,6 +219,72 @@ describe("Badge", () => {
     ]);
   });
 
+  test("a hidden page or a window blur releases pad buttons a lost touch-up left held", () => {
+    for (const lose of ["hidden", "blur"] as const) {
+      const b = renderBadge();
+      const up = b.view.getByRole("button", { name: "Badge button UP" });
+      const touch = (type: string, id: number) => pointer(type, { pointerType: "touch", pointerId: id });
+      // Finger 3's up and cancel both get lost.
+      rtl.act(() => void up.dispatchEvent(touch("pointerdown", 3) as unknown as Event));
+      if (lose === "hidden") {
+        Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+        rtl.act(() => void document.dispatchEvent(new win.Event("visibilitychange") as unknown as Event));
+        delete (document as unknown as Record<string, unknown>).visibilityState;
+      } else {
+        rtl.act(() => void window.dispatchEvent(new win.Event("blur") as unknown as Event));
+      }
+      expect(b.calls).toEqual([
+        ["UP", "pressed", "pad"],
+        ["UP", "released", "pad"],
+      ]);
+      expect(up.className).not.toContain("is-down");
+      // A new finger presses and lifts as normal: the stale pointer is gone.
+      rtl.act(() => void up.dispatchEvent(touch("pointerdown", 4) as unknown as Event));
+      rtl.act(() => void window.dispatchEvent(touch("pointerup", 4) as unknown as Event));
+      expect(b.calls.slice(2)).toEqual([
+        ["UP", "pressed", "pad"],
+        ["UP", "released", "pad"],
+      ]);
+      expect(up.className).not.toContain("is-down");
+      rtl.cleanup();
+    }
+  });
+
+  test("the badge's accessible description lists the keyboard shortcuts", () => {
+    const b = renderBadge();
+    const group = b.view.getByRole("group", { name: "Badge" });
+    const id = group.getAttribute("aria-describedby");
+    expect(id).toBeTruthy();
+    const desc = document.getElementById(id!)!;
+    expect(desc.className).toContain("sr-only");
+    for (const k of ["arrow keys", "Z presses A", "X presses B", "Enter", "Escape", "Space", "AUX1", "S shakes", "K knocks"]) {
+      expect(desc.textContent).toContain(k);
+    }
+  });
+
+  test("with phone motion on, the description leaves out S and K", () => {
+    const stage = document.createElement("div");
+    document.body.appendChild(stage);
+    const parts: BadgeParts = { root: null, leds: [], power: null };
+    const view = rtl.render(
+      <Badge
+        layout="mobile"
+        size={{ bw: 354, bh: 550, clip: 71 }}
+        client={null}
+        lanyard={null}
+        stageRef={{ current: stage }}
+        parts={parts}
+        phoneMotion
+      />,
+      { container: stage },
+    );
+    const group = view.getByRole("group", { name: "Badge" });
+    const desc = document.getElementById(group.getAttribute("aria-describedby")!)!;
+    expect(desc.textContent).toContain("Escape presses HOME");
+    expect(desc.textContent).not.toContain("S shakes");
+    expect(desc.textContent).not.toContain("K knocks");
+  });
+
   test("AUX1 toggles and reports its state", () => {
     const b = renderBadge();
     const aux = b.view.getByRole("button", { name: "AUX1 switch, off" });
@@ -341,6 +407,24 @@ describe("Stage", () => {
     expect(view.getByRole("button", { name: "Reset swing" })).toBeTruthy();
     // The desktop cap, so the rope can still reach the walls.
     expect(view.container.querySelector<HTMLElement>("[data-slot=stage]")!.style.maxWidth).toBe("1016px");
+  });
+
+  test("the hint lists the shortcuts, and phone motion has its own hint without S and K", () => {
+    const drag = rtl.render(<Stage />);
+    const keys = drag.container.querySelector("[data-slot=shortcuts]")!;
+    expect(keys.textContent).toContain("Z/X A/B");
+    expect(keys.textContent).toContain("S SHAKE");
+    expect(keys.textContent).toContain("K KNOCK");
+    rtl.cleanup();
+    const phone = rtl.render(<Stage phoneMotion />);
+    expect(phone.queryByText(/DRAG/)).toBeNull();
+    expect(phone.getByText("MOVE THE DEVICE TO SWING IT · PRESS THE BUTTONS ON THE BOARD")).toBeTruthy();
+    const phoneKeys = phone.container.querySelector("[data-slot=shortcuts]")!;
+    expect(phoneKeys.textContent).toContain("SPACE AUX1");
+    expect(phoneKeys.textContent).not.toContain("SHAKE");
+    expect(phoneKeys.textContent).not.toContain("KNOCK");
+    const desc = document.getElementById(phone.getByRole("group", { name: "Badge" }).getAttribute("aria-describedby")!)!;
+    expect(desc.textContent).not.toContain("S shakes");
   });
 
   test("ledGlow scales the colour to full and boosts the brightness for the eye (R17)", () => {

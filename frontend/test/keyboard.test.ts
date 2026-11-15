@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { keyAction } from "../src/ui/keyboard";
+import { keyAction, shortcutsDescription, shortcutsHint } from "../src/ui/keyboard";
 
 /** A stand-in for an event target: only its tag name matters. */
 const el = (tagName: string, extra: Record<string, unknown> = {}) => ({ tagName, ...extra });
@@ -48,5 +48,22 @@ describe("keyAction", () => {
       expect(keyAction(code, role("BUTTON", "combobox"))).toBeNull();
     }
     expect(keyAction("Escape", role("DIV", "img"))).toEqual({ button: "HOME" });
+  });
+});
+
+describe("shortcuts text", () => {
+  test("the hint and the description name every key, and S/K only without phone motion", () => {
+    const hint = shortcutsHint(false);
+    for (const k of ["ARROWS", "Z/X", "ENTER", "ESC", "SPACE", "S SHAKE", "K KNOCK"]) expect(hint).toContain(k);
+    const desc = shortcutsDescription(false);
+    for (const k of ["arrow keys", "Z presses A", "X presses B", "Enter", "Escape", "Space", "S shakes", "K knocks"]) {
+      expect(desc).toContain(k);
+    }
+    expect(shortcutsHint(true)).not.toContain("SHAKE");
+    expect(shortcutsHint(true)).not.toContain("KNOCK");
+    expect(shortcutsHint(true)).toContain("SPACE AUX1");
+    expect(shortcutsDescription(true)).not.toContain("S shakes");
+    expect(shortcutsDescription(true)).not.toContain("K knocks");
+    expect(shortcutsDescription(true)).toContain("Escape presses HOME");
   });
 });

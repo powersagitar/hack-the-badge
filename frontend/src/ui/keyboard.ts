@@ -52,3 +52,26 @@ export function keyAction(code: string, target?: unknown): KeyAction | null {
   if ((code === "Enter" || code === "Space") && ACTIVATABLE.has(tag)) return null;
   return KEYS[code];
 }
+
+/**
+ * The shortcuts as the stage's visible hint shows them (the design's
+ * hint style: upper case, `·` between items). With phone motion on, the
+ * phone is the badge and S and K do nothing, so they are left out.
+ */
+export function shortcutsHint(phoneMotion: boolean): string {
+  const keys = ["ARROWS D-PAD", "Z/X A/B", "ENTER START", "ESC HOME", "SPACE AUX1"];
+  if (!phoneMotion) keys.push("S SHAKE", "K KNOCK");
+  return `KEYS · ${keys.join(" · ")}`;
+}
+
+/**
+ * The shortcuts in words, for the badge's accessible description
+ * (`aria-describedby`); S and K are left out with phone motion on, as in
+ * {@link shortcutsHint}.
+ */
+export function shortcutsDescription(phoneMotion: boolean): string {
+  const buttons =
+    "Keyboard shortcuts: the arrow keys press the D-pad, Z presses A, X presses B, " +
+    "Enter presses START, Escape presses HOME, and Space toggles the AUX1 switch.";
+  return phoneMotion ? buttons : `${buttons} S shakes the badge on its lanyard, and K knocks it into a wall.`;
+}
