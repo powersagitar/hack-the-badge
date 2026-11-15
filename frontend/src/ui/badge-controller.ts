@@ -230,7 +230,9 @@ function defaultMotion(): PhoneMotionDeps {
     create: () =>
       createDeviceMotionSource(
         window,
-        platformSignFix(typeof navigator === "undefined" ? "" : navigator.userAgent),
+        typeof navigator === "undefined"
+          ? platformSignFix("")
+          : platformSignFix(navigator.userAgent, navigator.maxTouchPoints),
       ),
   };
 }

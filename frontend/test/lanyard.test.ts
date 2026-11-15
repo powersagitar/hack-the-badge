@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createLanyard, lanyardGeometry } from "../src/motion/lanyard";
 import { BOARD_AXES } from "../src/motion/axes";
+import { STANDARD_GRAVITY, deviceMotionToMg } from "../src/motion/device-motion";
 import { CLAMP_MG, REST_MG } from "../src/motion/sensor";
 import type { Mg } from "../src/motion/source";
 
@@ -427,16 +428,19 @@ describe("lanyard", () => {
     const { l, readings, run } = rig();
     run(1000);
     const x0 = centre(l).x;
-    // Ruling R19: the reading leans right (the phone tilted right, as
-    // iOS reports it): the drawn badge swings right, with the tilt.
-    const lean: Mg = [...REST];
-    lean[BOARD_AXES.right[0]] = 500 * BOARD_AXES.right[1];
-    l.follow(lean);
+    // Ruling R21: the phone tilted 30° right (right edge down), as iOS
+    // reports it (every axis inverted), through deviceMotionToMg's sign
+    // fix: a W3C-convention reading, right ≈ −500 mg. The drawn badge
+    // swings right, with the tilt.
+    const s = Math.sin(Math.PI / 6) * STANDARD_GRAVITY;
+    const c = Math.cos(Math.PI / 6) * STANDARD_GRAVITY;
+    const tiltRight = deviceMotionToMg({ x: s, y: -c, z: 0 }, -1, BOARD_AXES);
+    expect(tiltRight[BOARD_AXES.right[0]] * BOARD_AXES.right[1]).toBe(-500);
+    l.follow(tiltRight);
     run(600);
     expect(centre(l).x).toBeGreaterThan(x0 + 40);
     // And left for a left tilt.
-    lean[BOARD_AXES.right[0]] = -500 * BOARD_AXES.right[1];
-    l.follow(lean);
+    l.follow(deviceMotionToMg({ x: -s, y: -c, z: 0 }, -1, BOARD_AXES));
     run(1500);
     expect(centre(l).x).toBeLessThan(x0 - 40);
     // Upside down: the badge still hangs below the anchor, on the stage.

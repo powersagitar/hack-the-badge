@@ -45,13 +45,23 @@ export function deviceMotionToMg(
 }
 
 /**
- * The sign that makes an upright phone read +1000 mg up on this platform
- * (older iOS Safari is documented to report the opposite sign). It starts
- * at 1 everywhere: Task 14's real-device check on iOS and Android fills
- * this table, and until then no platform is flipped.
+ * The sign that makes this platform's `accelerationIncludingGravity`
+ * follow the W3C convention (proper acceleration: a flat, face-up phone
+ * reads +Z, an upright one +Y, and tilting the right edge down drives X
+ * negative). Ruling R21 (docs/milestone-14-decisions.md):
+ *
+ * - iOS and iPadOS: −1. On the iPhone checked (2026-11-14, the self-test's
+ *   accelerometer page with no flip), every axis read inverted: face up
+ *   Z ≈ −1000 mg, face down all positive, right edge down X positive,
+ *   upright Y ≈ −1000 mg. The older-iOS quirk, still present. Every iOS
+ *   browser is WebKit, so CriOS, FxiOS and the rest flip too.
+ * - iPadOS's desktop-class UA says "Macintosh"; a Mac reporting touch
+ *   points (`maxTouchPoints` > 1) is taken as an iPad.
+ * - Everything else: 1. Android is untested (no real-device check yet).
  */
-export function platformSignFix(ua: string): 1 | -1 {
-  void ua;
+export function platformSignFix(ua: string, maxTouchPoints = 0): 1 | -1 {
+  if (/iPhone|iPad|iPod/.test(ua)) return -1;
+  if (/Macintosh/.test(ua) && maxTouchPoints > 1) return -1;
   return 1;
 }
 
