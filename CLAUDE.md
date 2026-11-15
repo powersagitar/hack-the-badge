@@ -148,7 +148,7 @@ Rust/WASM. These need `rustup` with the `wasm32-unknown-unknown` and
   `emulator-core/` or `emulator-wasm/`**, before `bun run dev`,
   `bun run build` or `bun test`. Nothing else regenerates it.
 - `cargo test -p emulator-core --release --test boot_progress`: the
-  real-firmware boot ratchet, 96 rungs plus 1 ignored benchmark, about
+  real-firmware boot ratchet, 97 rungs plus 1 ignored benchmark, about
   20 s.
   - Each rung boots `firmware.bin` and asserts a console line, a no-fault
     point or a framebuffer hash.

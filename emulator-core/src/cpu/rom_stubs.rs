@@ -868,6 +868,13 @@ pub enum SoftFloatOp {
     /// by order, -2 if either is a NaN, so `> 0` is false for unordered
     /// operands. The `int` result is returned in `a0`.
     Gt,
+    /// `int __fixsfsi(float a)`: truncates toward zero, as
+    /// [`SoftDoubleOp::FixSi`] (`_FP_TO_INT(..., rsigned = 1)`): an
+    /// out-of-range `a` (including +/-inf) saturates to `INT_MAX` or
+    /// `INT_MIN` by its sign, and a NaN goes the same way by its sign bit
+    /// (sign clear: `INT_MAX`), where Rust's `as i32` would give 0. `a1`
+    /// is ignored; the `int` result is returned in `a0`.
+    FixSi,
 }
 
 /// The canonical quiet `float` NaN RISC-V soft-fp returns (see
@@ -894,6 +901,18 @@ impl SoftFloatOp {
             SoftFloatOp::FloatSi => (a as i32 as f32).to_bits(),
             SoftFloatOp::Sub => canonical(x - y),
             SoftFloatOp::Gt => soft_fp_cmp(x.partial_cmp(&y), -2) as u32,
+            SoftFloatOp::FixSi => {
+                let r = if x.is_nan() {
+                    if x.is_sign_negative() {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
+                } else {
+                    x as i32
+                };
+                r as u32
+            }
         }
     }
 }
@@ -1988,6 +2007,19 @@ mod tests {
             0x4F00_0000,
             "rounds to 2^31"
         );
+        // __fixsfsi: truncation toward zero, signed saturation, NaN by sign.
+        let int = |x: i32| x as u32;
+        assert_eq!(FixSi.apply(f(1000.0), 0xDEAD), int(1000));
+        assert_eq!(FixSi.apply(f(-994.7), 0), int(-994));
+        assert_eq!(FixSi.apply(f(0.9), 0), 0);
+        assert_eq!(FixSi.apply(f(-0.0), 0), 0);
+        assert_eq!(FixSi.apply(f(2_147_483_648.0), 0), int(i32::MAX));
+        assert_eq!(FixSi.apply(f(-2_147_483_648.0), 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(f(-3.0e9), 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(f(f32::INFINITY), 0), int(i32::MAX));
+        assert_eq!(FixSi.apply(f(f32::NEG_INFINITY), 0), int(i32::MIN));
+        assert_eq!(FixSi.apply(nan, 0), int(i32::MAX), "sign clear");
+        assert_eq!(FixSi.apply(0xFFC0_0000, 0), int(i32::MIN), "sign set");
     }
 
     #[test]

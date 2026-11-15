@@ -1075,6 +1075,57 @@ fn first_run_screen_responds_to_start() {
     assert_no_panic_text(&rt);
 }
 
+/// The self-test's "Screen test" page (fiducials in the four corners),
+/// which follows the button page once all nine slots have been pressed.
+const SELF_TEST_SCREEN_HASH: u64 = 0x920c_3dd3_b75c_bfa9;
+
+/// The self-test's accelerometer page at rest, (0, 0, +1000) mg.
+const SELF_TEST_ACCEL_REST_HASH: u64 = 0xc575_9b4a_4085_6205;
+
+/// The self-test's accelerometer page with the badge tilted to
+/// (-29, -994, +179) mg (a phone's reading).
+const SELF_TEST_ACCEL_TILTED_HASH: u64 = 0x2954_2e98_ff35_38b2;
+
+/// Milestone 14, "Self-test accelerometer reboot": the self-test walks
+/// from the button page (every slot pressed) to the screen test, and A
+/// opens the accelerometer page, which prints each axis as `"%+5d mg"` of
+/// `(int)` the axis's `float` (libgcc `__fixsfsi`). The page draws, at
+/// rest and tilted, with no panic and no reboot.
+#[test]
+fn self_test_reaches_the_accelerometer_page_without_a_reboot() {
+    const START: usize = 0;
+    const A: usize = 1;
+    let mut rt = first_run_screen();
+    let (mut hash, step) = press_and_settle(&mut rt, START, FIRST_RUN_HASH);
+    assert_eq!(hash, SELF_TEST_BUTTONS_HASH, "stable at step {step}");
+    for slot in 0..9 {
+        (hash, _) = press_and_settle(&mut rt, slot, hash);
+    }
+    assert_eq!(hash, SELF_TEST_SCREEN_HASH);
+
+    (hash, _) = press_and_settle(&mut rt, A, hash);
+    assert_eq!(
+        rt.soft_reset_count(),
+        0,
+        "console:\n{}",
+        rt.console_output()
+    );
+    assert_no_panic_text(&rt);
+    assert_eq!(hash, SELF_TEST_ACCEL_REST_HASH);
+
+    rt.set_acceleration(-29, -994, 179);
+    let cap = rt.total_steps() + AFTER_PRESS_STABLE_FOR + ONBOARDING_RESPONSE_MARGIN;
+    (hash, _) = run_until_stable_frame(&mut rt, cap, AFTER_PRESS_STABLE_FOR, &[hash]);
+    assert_eq!(
+        rt.soft_reset_count(),
+        0,
+        "console:\n{}",
+        rt.console_output()
+    );
+    assert_no_panic_text(&rt);
+    assert_eq!(hash, SELF_TEST_ACCEL_TILTED_HASH);
+}
+
 /// Milestone 5 Task 3: `app_main` reaches `hal_console_start()` on blank
 /// flash, as on the physical badge (the line follows `app_reg: launched My
 /// Badge`); the console runs the interrupt-driven USB-Serial-JTAG driver,
